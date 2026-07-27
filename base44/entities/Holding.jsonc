@@ -1,0 +1,32 @@
+{
+  "name": "Holding",
+  "type": "object",
+  "properties": {
+    "symbol": {
+      "type": "string"
+    },
+    "company_name": {
+      "type": "string"
+    },
+    "shares": {
+      "type": "number"
+    },
+    "avg_price": {
+      "type": "number"
+    },
+    "current_price": {
+      "type": "number"
+    },
+    "sector": {
+      "type": "string"
+    },
+    "day_change_percent": {
+      "type": "number"
+    }
+  },
+  "required": [
+    "symbol",
+    "shares",
+    "avg_price"
+  ]
+}

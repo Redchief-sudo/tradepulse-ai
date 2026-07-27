@@ -1,0 +1,40 @@
+{
+  "name": "Trade",
+  "type": "object",
+  "properties": {
+    "symbol": {
+      "type": "string"
+    },
+    "company_name": {
+      "type": "string"
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "buy",
+        "sell"
+      ]
+    },
+    "shares": {
+      "type": "number"
+    },
+    "price": {
+      "type": "number"
+    },
+    "total_value": {
+      "type": "number"
+    },
+    "notes": {
+      "type": "string"
+    },
+    "ai_recommended": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "symbol",
+    "action",
+    "shares",
+    "price"
+  ]
+}
