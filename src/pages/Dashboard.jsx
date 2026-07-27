@@ -16,6 +16,7 @@ import { AreaChart, Area, PieChart, Pie, Cell, Tooltip, ResponsiveContainer } fr
 import StatCard from '@/components/StatCard';
 import AddPositionDialog from '@/components/AddPositionDialog';
 import SectorExposure from '@/components/SectorExposure';
+import ExitAlerts from '@/components/ExitAlerts';
 import { Button } from '@/components/ui/button';
 
 const COLORS = ['#10b981', '#8b5cf6', '#3b82f6', '#f59e0b', '#ec4899', '#06b6d4', '#84cc16', '#f97316'];
@@ -110,6 +111,21 @@ export default function Dashboard() {
     await loadData();
   };
 
+  const handleExitPosition = async (holding) => {
+    const exitPrice = holding.current_price || holding.avg_price;
+    await base44.entities.Trade.create({
+      symbol: holding.symbol,
+      company_name: holding.company_name || holding.symbol,
+      action: 'sell',
+      shares: holding.shares,
+      price: exitPrice,
+      total_value: holding.shares * exitPrice,
+      ai_recommended: true,
+    });
+    await base44.entities.Holding.delete(holding.id);
+    await loadData();
+  };
+
   const totalValue = holdings.reduce(
     (sum, h) => sum + h.shares * (h.current_price || h.avg_price),
     0
@@ -191,6 +207,8 @@ export default function Dashboard() {
         />
         <StatCard label="Today's Change" value={formatCurrency(dayPL)} icon={TrendingUp} />
       </div>
+
+      <ExitAlerts holdings={holdings} onExit={handleExitPosition} />
 
       {holdings.length === 0 ? (
         <motion.div

@@ -22,6 +22,12 @@
     },
     "day_change_percent": {
       "type": "number"
+    },
+    "stop_loss": {
+      "type": "number"
+    },
+    "target_price": {
+      "type": "number"
     }
   },
   "required": [

@@ -8,6 +8,9 @@
     "company_name": {
       "type": "string"
     },
+    "sector": {
+      "type": "string"
+    },
     "action": {
       "type": "string",
       "enum": [
@@ -21,10 +24,16 @@
     "price": {
       "type": "number"
     },
+    "position_value": {
+      "type": "number"
+    },
     "confidence": {
       "type": "number"
     },
     "target_price": {
+      "type": "number"
+    },
+    "stop_loss": {
       "type": "number"
     },
     "reasoning": {

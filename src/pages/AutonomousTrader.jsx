@@ -12,19 +12,22 @@ import {
   Sparkles,
   ArrowDownRight,
   ArrowUpRight,
+  ChevronDown,
+  ChevronUp,
+  Shield,
+  Activity,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import RecommendationBadge from '@/components/RecommendationBadge';
+import TradePerformance from '@/components/TradePerformance';
+import { runAutonomousScan } from '@/lib/autonomousScan';
+import {
+  computeSectorExposure,
+  computePortfolioValue,
+  computeCappedPositionSize,
+  formatCurrency,
+} from '@/lib/portfolio';
 import { cn } from '@/lib/utils';
-
-function formatCurrency(n) {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(n || 0);
-}
 
 function timeAgo(date) {
   if (!date) return '';
@@ -39,18 +42,22 @@ function timeAgo(date) {
 
 export default function AutonomousTrader() {
   const [scanning, setScanning] = useState(false);
+  const [scanStage, setScanStage] = useState('');
   const [executing, setExecuting] = useState(false);
   const [marketSummary, setMarketSummary] = useState('');
+  const [riskAssessment, setRiskAssessment] = useState('');
+  const [candidates, setCandidates] = useState([]);
   const [proposals, setProposals] = useState([]);
   const [holdings, setHoldings] = useState([]);
   const [decisions, setDecisions] = useState([]);
   const [executedIds, setExecutedIds] = useState(new Set());
+  const [showCandidates, setShowCandidates] = useState(false);
 
   const loadData = useCallback(async () => {
     try {
       const [h, d] = await Promise.all([
         base44.entities.Holding.list(),
-        base44.entities.AITradeDecision.list('-created_date', 20),
+        base44.entities.AITradeDecision.list('-created_date', 30),
       ]);
       setHoldings(h || []);
       setDecisions(d || []);
@@ -66,81 +73,56 @@ export default function AutonomousTrader() {
   const runScan = async () => {
     setScanning(true);
     setProposals([]);
+    setCandidates([]);
     setMarketSummary('');
+    setRiskAssessment('');
     setExecutedIds(new Set());
     try {
-      const portfolioContext =
-        holdings.length > 0
-          ? holdings
-              .map(
-                (h) =>
-                  `${h.symbol} (${h.shares} shares, avg $${h.avg_price}, current $${h.current_price || h.avg_price})`
-              )
-              .join(', ')
-          : 'No current positions';
-
-      const result = await base44.integrations.Core.InvokeLLM({
-        prompt: `You are AlphaTrade AI in fully autonomous mode. Scan today's real-time stock market for the best trading opportunities.
-
-Current portfolio: ${portfolioContext}
-
-Identify 3-5 high-conviction trades to execute right now. Consider:
-- Today's market trends and momentum
-- Strong fundamental + technical setups
-- Diversification across sectors
-- Risk management — sensible position sizing, avoid over-concentration
-- For SELL actions, only suggest selling stocks that are in the current portfolio
-
-For each trade, provide a clear action (buy or sell), appropriate share count, confidence score (0-100), price target, and detailed reasoning grounded in real-time data.`,
-        add_context_from_internet: true,
-        model: 'gemini_3_flash',
-        response_json_schema: {
-          type: 'object',
-          properties: {
-            market_summary: {
-              type: 'string',
-              description: "Brief overview of today's market conditions and sentiment",
-            },
-            proposals: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  symbol: { type: 'string' },
-                  company_name: { type: 'string' },
-                  action: { type: 'string', enum: ['buy', 'sell'] },
-                  shares: { type: 'number' },
-                  current_price: { type: 'number' },
-                  confidence: { type: 'number' },
-                  target_price: { type: 'number' },
-                  recommendation: {
-                    type: 'string',
-                    enum: ['STRONG_BUY', 'BUY', 'HOLD', 'SELL', 'STRONG_SELL'],
-                  },
-                  reasoning: { type: 'string' },
-                },
-              },
-            },
-          },
-          required: ['market_summary', 'proposals'],
-        },
-      });
-      setMarketSummary(result.market_summary || '');
-      setProposals(result.proposals || []);
+      setScanStage('Pass 1: Deep market scan');
+      const result = await runAutonomousScan(holdings);
+      setScanStage('Pass 2: Portfolio fit & risk');
+      setMarketSummary(result.marketSummary);
+      setCandidates(result.candidates);
+      setRiskAssessment(result.riskAssessment);
+      setProposals(result.proposals);
     } catch (e) {
       console.error(e);
     }
+    setScanStage('');
     setScanning(false);
   };
 
   const executeProposal = async (proposal, index) => {
+    const portfolioValue = computePortfolioValue(holdings);
+    const sectorData = computeSectorExposure(holdings);
+    const currentSectorValue =
+      sectorData.sectors.find((s) => s.sector === (proposal.sector || 'Other'))?.value || 0;
+
+    let shares, positionValue;
+    if (proposal.action === 'buy') {
+      const sized = computeCappedPositionSize(
+        proposal.suggested_position_pct || 10,
+        proposal.current_price,
+        portfolioValue,
+        currentSectorValue
+      );
+      shares = sized.shares;
+      positionValue = sized.positionValue;
+    } else {
+      const existing = holdings.find((h) => h.symbol === proposal.symbol);
+      shares = existing ? Math.min(proposal.shares || existing.shares, existing.shares) : 0;
+      positionValue = shares * proposal.current_price;
+    }
+
+    if (shares <= 0) return;
+
     const trade = {
       symbol: proposal.symbol,
       company_name: proposal.company_name || proposal.symbol,
       action: proposal.action,
-      shares: proposal.shares,
+      shares,
       price: proposal.current_price,
-      total_value: proposal.shares * proposal.current_price,
+      total_value: positionValue,
       ai_recommended: true,
     };
     await base44.entities.Trade.create(trade);
@@ -148,29 +130,32 @@ For each trade, provide a clear action (buy or sell), appropriate share count, c
     if (proposal.action === 'buy') {
       const existing = holdings.find((h) => h.symbol === proposal.symbol);
       if (existing) {
-        const totalShares = existing.shares + proposal.shares;
-        const totalCost =
-          existing.shares * existing.avg_price + proposal.shares * proposal.current_price;
+        const totalShares = existing.shares + shares;
+        const totalCost = existing.shares * existing.avg_price + positionValue;
         await base44.entities.Holding.update(existing.id, {
           shares: totalShares,
           avg_price: totalCost / totalShares,
           current_price: proposal.current_price,
+          stop_loss: proposal.stop_loss,
+          target_price: proposal.target_price,
         });
       } else {
         await base44.entities.Holding.create({
           symbol: proposal.symbol,
           company_name: proposal.company_name || proposal.symbol,
-          shares: proposal.shares,
+          shares,
           avg_price: proposal.current_price,
           current_price: proposal.current_price,
-          sector: '',
+          sector: proposal.sector || '',
           day_change_percent: 0,
+          stop_loss: proposal.stop_loss,
+          target_price: proposal.target_price,
         });
       }
-    } else if (proposal.action === 'sell') {
+    } else {
       const existing = holdings.find((h) => h.symbol === proposal.symbol);
       if (existing) {
-        const newShares = existing.shares - proposal.shares;
+        const newShares = existing.shares - shares;
         if (newShares <= 0) {
           await base44.entities.Holding.delete(existing.id);
         } else {
@@ -182,11 +167,14 @@ For each trade, provide a clear action (buy or sell), appropriate share count, c
     await base44.entities.AITradeDecision.create({
       symbol: proposal.symbol,
       company_name: proposal.company_name || proposal.symbol,
+      sector: proposal.sector || '',
       action: proposal.action,
-      shares: proposal.shares,
+      shares,
       price: proposal.current_price,
+      position_value: positionValue,
       confidence: proposal.confidence,
       target_price: proposal.target_price,
+      stop_loss: proposal.stop_loss,
       reasoning: proposal.reasoning,
       status: 'executed',
     });
@@ -211,14 +199,14 @@ For each trade, provide a clear action (buy or sell), appropriate share count, c
     <div className="p-4 md:p-8 pb-24 md:pb-8 max-w-7xl mx-auto">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
         <div>
-          <h1 className="text-2xl md:text-3xl font-bold font-heading tracking-tight flex items-center gap-2">
+          <h1 className="text-2xl md:text-3xl font-bold font-heading tracking-tight">
             Autonomous Trader
           </h1>
           <p className="text-muted-foreground text-sm mt-1">
-            AI scans the market and executes trades on its own
+            Multi-pass AI analysis with risk-aware execution
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap">
           {proposals.length > 0 && pendingCount > 0 && (
             <Button
               onClick={executeAll}
@@ -236,7 +224,7 @@ For each trade, provide a clear action (buy or sell), appropriate share count, c
             className="gap-2"
           >
             {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Brain className="w-4 h-4" />}
-            {scanning ? 'Scanning Market...' : 'Run Market Scan'}
+            {scanning ? 'Scanning...' : 'Run Market Scan'}
           </Button>
         </div>
       </div>
@@ -246,20 +234,18 @@ For each trade, provide a clear action (buy or sell), appropriate share count, c
         <motion.div
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
-          className="rounded-2xl border border-accent/30 bg-gradient-to-br from-accent/10 to-primary/5 p-8 md:p-12 text-center"
+          className="rounded-2xl border border-accent/30 bg-gradient-to-br from-accent/10 to-primary/5 p-8 md:p-12 text-center mb-6"
         >
-          <div className="relative w-16 h-16 mx-auto mb-4">
-            <motion.div
-              animate={{ scale: [1, 1.1, 1], opacity: [0.7, 1, 0.7] }}
-              transition={{ duration: 2, repeat: Infinity }}
-              className="w-16 h-16 rounded-2xl bg-gradient-to-br from-accent to-primary flex items-center justify-center glow-accent"
-            >
-              <Brain className="w-8 h-8 text-white" />
-            </motion.div>
-          </div>
-          <h3 className="text-lg font-semibold mb-1">Scanning the market</h3>
+          <motion.div
+            animate={{ scale: [1, 1.1, 1], opacity: [0.7, 1, 0.7] }}
+            transition={{ duration: 2, repeat: Infinity }}
+            className="w-16 h-16 rounded-2xl bg-gradient-to-br from-accent to-primary flex items-center justify-center mx-auto mb-4 glow-accent"
+          >
+            <Brain className="w-8 h-8 text-white" />
+          </motion.div>
+          <h3 className="text-lg font-semibold mb-1">{scanStage || 'Scanning...'}</h3>
           <p className="text-muted-foreground text-sm">
-            Analyzing real-time prices, fundamentals, and sentiment across sectors...
+            Analyzing real-time prices, fundamentals, technicals, news, and portfolio fit...
           </p>
         </motion.div>
       )}
@@ -269,7 +255,7 @@ For each trade, provide a clear action (buy or sell), appropriate share count, c
         <motion.div
           initial={{ opacity: 0, y: 10 }}
           animate={{ opacity: 1, y: 0 }}
-          className="rounded-2xl border border-border bg-card p-5 mb-6"
+          className="rounded-2xl border border-border bg-card p-5 mb-4"
         >
           <div className="flex items-center gap-2 mb-2">
             <Sparkles className="w-4 h-4 text-accent" />
@@ -279,13 +265,121 @@ For each trade, provide a clear action (buy or sell), appropriate share count, c
         </motion.div>
       )}
 
-      {/* Proposals */}
+      {/* Risk assessment */}
+      {!scanning && riskAssessment && (
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="rounded-2xl border border-primary/20 bg-primary/5 p-5 mb-6"
+        >
+          <div className="flex items-center gap-2 mb-2">
+            <Shield className="w-4 h-4 text-primary" />
+            <h3 className="font-semibold text-sm">Risk Assessment & Rebalancing</h3>
+          </div>
+          <p className="text-sm text-muted-foreground leading-relaxed">{riskAssessment}</p>
+        </motion.div>
+      )}
+
+      {/* Candidates deep scan (collapsible) */}
+      {!scanning && candidates.length > 0 && (
+        <div className="mb-6">
+          <button
+            onClick={() => setShowCandidates(!showCandidates)}
+            className="flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors mb-3"
+          >
+            <Activity className="w-4 h-4" />
+            Deep Scan: {candidates.length} Candidates Analyzed
+            {showCandidates ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+          </button>
+          <AnimatePresence>
+            {showCandidates && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }}
+                className="overflow-hidden space-y-3"
+              >
+                {candidates.map((c, i) => (
+                  <div key={i} className="rounded-xl border border-border bg-card p-4">
+                    <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
+                      <div>
+                        <span className="font-bold">{c.symbol}</span>
+                        <span className="text-muted-foreground text-sm ml-2">{c.company_name}</span>
+                        {c.sector && (
+                          <span className="text-xs text-muted-foreground ml-2">· {c.sector}</span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {c.rsi > 0 && (
+                          <span className="text-xs text-muted-foreground">
+                            RSI {c.rsi.toFixed(0)}
+                          </span>
+                        )}
+                        <RecommendationBadge recommendation={c.recommendation} />
+                      </div>
+                    </div>
+                    <div className="text-sm font-medium mb-2">
+                      {formatCurrency(c.current_price)} · Target {formatCurrency(c.target_price)}
+                    </div>
+                    {c.fundamentals && (
+                      <p className="text-xs text-muted-foreground mb-1">
+                        <span className="font-medium text-foreground/70">Fundamentals:</span>{' '}
+                        {c.fundamentals}
+                      </p>
+                    )}
+                    {c.technicals && (
+                      <p className="text-xs text-muted-foreground mb-1">
+                        <span className="font-medium text-foreground/70">Technicals:</span>{' '}
+                        {c.technicals}
+                      </p>
+                    )}
+                    {c.news_catalysts && (
+                      <p className="text-xs text-muted-foreground mb-1">
+                        <span className="font-medium text-foreground/70">News:</span>{' '}
+                        {c.news_catalysts}
+                      </p>
+                    )}
+                    {c.summary && (
+                      <p className="text-xs text-muted-foreground mt-2 italic">{c.summary}</p>
+                    )}
+                  </div>
+                ))}
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+      )}
+
+      {/* Trade proposals */}
       {!scanning && proposals.length > 0 && (
         <div className="space-y-4 mb-8">
           <AnimatePresence>
             {proposals.map((p, i) => {
               const isExecuted = executedIds.has(i);
-              const canSell = p.action !== 'sell' || holdings.some((h) => h.symbol === p.symbol);
+              const canSell =
+                p.action !== 'sell' || holdings.some((h) => h.symbol === p.symbol);
+              const portfolioValue = computePortfolioValue(holdings);
+              const sectorData = computeSectorExposure(holdings);
+              const currentSectorValue =
+                sectorData.sectors.find((s) => s.sector === (p.sector || 'Other'))?.value || 0;
+              const sized =
+                p.action === 'buy'
+                  ? computeCappedPositionSize(
+                      p.suggested_position_pct || 10,
+                      p.current_price,
+                      portfolioValue,
+                      currentSectorValue
+                    )
+                  : { shares: 0, positionValue: 0 };
+              const upsidePct =
+                p.current_price > 0 && p.target_price > 0
+                  ? ((p.target_price - p.current_price) / p.current_price) * 100
+                  : 0;
+              const downsidePct =
+                p.current_price > 0 && p.stop_loss > 0
+                  ? ((p.stop_loss - p.current_price) / p.current_price) * 100
+                  : 0;
+
               return (
                 <motion.div
                   key={i}
@@ -317,10 +411,16 @@ For each trade, provide a clear action (buy or sell), appropriate share count, c
                         <div className="flex items-center gap-2">
                           <span className="font-bold text-base">{p.symbol}</span>
                           <span className="text-xs text-muted-foreground">{p.company_name}</span>
+                          {p.sector && (
+                            <span className="text-xs text-muted-foreground hidden sm:inline">
+                              · {p.sector}
+                            </span>
+                          )}
                         </div>
                         <div className="text-sm text-muted-foreground mt-0.5">
-                          {p.action === 'buy' ? 'Buy' : 'Sell'} {p.shares} shares @{' '}
-                          {formatCurrency(p.current_price)}
+                          {p.action === 'buy' ? 'Buy' : 'Sell'} {sized.shares} shares @{' '}
+                          {formatCurrency(p.current_price)} ·{' '}
+                          {formatCurrency(sized.positionValue)}
                         </div>
                       </div>
                     </div>
@@ -334,7 +434,7 @@ For each trade, provide a clear action (buy or sell), appropriate share count, c
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-3 gap-3 text-sm mb-3">
+                  <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-sm mb-3">
                     <div>
                       <div className="text-xs text-muted-foreground">Confidence</div>
                       <div className="font-semibold">{p.confidence}%</div>
@@ -342,21 +442,51 @@ For each trade, provide a clear action (buy or sell), appropriate share count, c
                     <div>
                       <div className="text-xs text-muted-foreground">Target</div>
                       <div className="font-semibold text-emerald-500">
-                        {formatCurrency(p.target_price)}
+                        {formatCurrency(p.target_price)}{' '}
+                        <span className="text-xs">(+{upsidePct.toFixed(1)}%)</span>
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-muted-foreground">Stop Loss</div>
+                      <div className="font-semibold text-red-500">
+                        {formatCurrency(p.stop_loss)}{' '}
+                        <span className="text-xs">({downsidePct.toFixed(1)}%)</span>
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-muted-foreground">Allocation</div>
+                      <div className="font-semibold">
+                        {p.suggested_position_pct
+                          ? `${p.suggested_position_pct.toFixed(0)}%`
+                          : '—'}
                       </div>
                     </div>
                     <div>
                       <div className="text-xs text-muted-foreground">Total</div>
-                      <div className="font-semibold">
-                        {formatCurrency(p.shares * p.current_price)}
-                      </div>
+                      <div className="font-semibold">{formatCurrency(sized.positionValue)}</div>
                     </div>
                   </div>
 
                   {p.reasoning && (
-                    <p className="text-sm text-muted-foreground leading-relaxed mb-3">
+                    <p className="text-sm text-muted-foreground leading-relaxed mb-2">
                       {p.reasoning}
                     </p>
+                  )}
+                  {(p.technicals || p.news_catalysts) && (
+                    <div className="text-xs text-muted-foreground space-y-1 mb-3">
+                      {p.technicals && (
+                        <p>
+                          <span className="font-medium text-foreground/70">Technicals:</span>{' '}
+                          {p.technicals}
+                        </p>
+                      )}
+                      {p.news_catalysts && (
+                        <p>
+                          <span className="font-medium text-foreground/70">Catalysts:</span>{' '}
+                          {p.news_catalysts}
+                        </p>
+                      )}
+                    </div>
                   )}
 
                   {!isExecuted && (
@@ -383,15 +513,15 @@ For each trade, provide a clear action (buy or sell), appropriate share count, c
         <motion.div
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
-          className="rounded-2xl border border-border bg-card p-12 text-center"
+          className="rounded-2xl border border-border bg-card p-12 text-center mb-8"
         >
           <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-accent to-primary flex items-center justify-center mx-auto mb-4 glow-accent">
             <Brain className="w-8 h-8 text-white" />
           </div>
           <h3 className="text-lg font-semibold mb-2">Autonomous mode is ready</h3>
           <p className="text-muted-foreground text-sm mb-6 max-w-md mx-auto">
-            Click "Run Market Scan" and the AI will analyze the live market, identify the best
-            opportunities, and propose trades you can execute in one click.
+            The AI runs a two-pass analysis: first a deep market scan with fundamentals, technicals,
+            and news; then a risk-aware portfolio fit with confidence-weighted position sizing.
           </p>
           <Button onClick={runScan} className="gap-2 bg-gradient-to-r from-primary to-accent">
             <Brain className="w-4 h-4" />
@@ -399,6 +529,9 @@ For each trade, provide a clear action (buy or sell), appropriate share count, c
           </Button>
         </motion.div>
       )}
+
+      {/* AI Track Record */}
+      {decisions.length > 0 && <TradePerformance decisions={decisions} />}
 
       {/* Decision history */}
       {decisions.length > 0 && (
@@ -432,6 +565,9 @@ For each trade, provide a clear action (buy or sell), appropriate share count, c
                   <div className="min-w-0">
                     <div className="font-medium text-sm">
                       {d.action.toUpperCase()} {d.symbol}
+                      {d.sector && (
+                        <span className="text-xs text-muted-foreground ml-2">· {d.sector}</span>
+                      )}
                     </div>
                     <div className="text-xs text-muted-foreground truncate max-w-[300px]">
                       {d.shares} @ {formatCurrency(d.price)} · {d.confidence}% confidence
