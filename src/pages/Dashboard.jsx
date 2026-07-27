@@ -15,6 +15,7 @@ import {
 import { AreaChart, Area, PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
 import StatCard from '@/components/StatCard';
 import AddPositionDialog from '@/components/AddPositionDialog';
+import SectorExposure from '@/components/SectorExposure';
 import { Button } from '@/components/ui/button';
 
 const COLORS = ['#10b981', '#8b5cf6', '#3b82f6', '#f59e0b', '#ec4899', '#06b6d4', '#84cc16', '#f97316'];
@@ -280,6 +281,8 @@ export default function Dashboard() {
               </ResponsiveContainer>
             </motion.div>
           </div>
+
+          <SectorExposure holdings={holdings} />
 
           <motion.div
             initial={{ opacity: 0, y: 10 }}
