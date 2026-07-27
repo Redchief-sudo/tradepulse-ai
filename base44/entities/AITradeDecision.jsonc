@@ -1,0 +1,47 @@
+{
+  "name": "AITradeDecision",
+  "type": "object",
+  "properties": {
+    "symbol": {
+      "type": "string"
+    },
+    "company_name": {
+      "type": "string"
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "buy",
+        "sell"
+      ]
+    },
+    "shares": {
+      "type": "number"
+    },
+    "price": {
+      "type": "number"
+    },
+    "confidence": {
+      "type": "number"
+    },
+    "target_price": {
+      "type": "number"
+    },
+    "reasoning": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "executed",
+        "skipped"
+      ]
+    }
+  },
+  "required": [
+    "symbol",
+    "action",
+    "shares",
+    "price"
+  ]
+}

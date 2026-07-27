@@ -1,12 +1,13 @@
 import React from 'react';
 import { Outlet, Link, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Bot, Eye } from 'lucide-react';
+import { LayoutDashboard, Bot, Eye, Zap } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 const navItems = [
   { path: '/', label: 'Dashboard', icon: LayoutDashboard },
   { path: '/ai-trader', label: 'AI Trader', icon: Bot },
   { path: '/watchlist', label: 'Watchlist', icon: Eye },
+  { path: '/autonomous', label: 'Autonomous', icon: Zap },
 ];
 
 export default function Layout() {

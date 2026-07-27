@@ -11,6 +11,7 @@ import Layout from '@/components/Layout';
 import Dashboard from '@/pages/Dashboard';
 import AIAssistant from '@/pages/AIAssistant';
 import Watchlist from '@/pages/Watchlist';
+import AutonomousTrader from '@/pages/AutonomousTrader';
 import Login from '@/pages/Login';
 import Register from '@/pages/Register';
 import ForgotPassword from '@/pages/ForgotPassword';
@@ -50,6 +51,7 @@ const AuthenticatedApp = () => {
         <Route path="/" element={<Dashboard />} />
         <Route path="/ai-trader" element={<AIAssistant />} />
         <Route path="/watchlist" element={<Watchlist />} />
+        <Route path="/autonomous" element={<AutonomousTrader />} />
       </Route>
       <Route path="*" element={<PageNotFound />} />
     </Routes>
