@@ -20,6 +20,7 @@ import { Button } from '@/components/ui/button';
 import TradePerformance from '@/components/TradePerformance';
 import TradeProposalCard from '@/components/TradeProposalCard';
 import CandidateCard from '@/components/CandidateCard';
+import StopLossScanner from '@/components/StopLossScanner';
 import { runPass1, runPass2, runPass3 } from '@/lib/autonomousScan';
 import {
   computePortfolioValue,
@@ -58,15 +59,18 @@ export default function AutonomousTrader() {
   const [decisions, setDecisions] = useState([]);
   const [executedIds, setExecutedIds] = useState(new Set());
   const [showCandidates, setShowCandidates] = useState(false);
+  const [stopLossPct, setStopLossPct] = useState(8);
 
   const loadData = useCallback(async () => {
     try {
-      const [h, d] = await Promise.all([
+      const [h, d, me] = await Promise.all([
         base44.entities.Holding.list(),
         base44.entities.AITradeDecision.list('-created_date', 30),
+        base44.auth.me(),
       ]);
       setHoldings(h || []);
       setDecisions(d || []);
+      if (me.stop_loss_pct) setStopLossPct(me.stop_loss_pct);
     } catch (e) {
       console.error(e);
     }
@@ -75,6 +79,15 @@ export default function AutonomousTrader() {
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  const saveStopLossPct = async (pct) => {
+    setStopLossPct(pct);
+    try {
+      await base44.auth.updateMe({ stop_loss_pct: pct });
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const runScan = async () => {
     setScanning(true);
@@ -258,6 +271,13 @@ export default function AutonomousTrader() {
           </Button>
         </div>
       </div>
+
+      <StopLossScanner
+        holdings={holdings}
+        stopLossPct={stopLossPct}
+        onStopLossPctChange={saveStopLossPct}
+        onHoldingsChange={loadData}
+      />
 
       {/* Scanning state with pass indicators */}
       {scanning && (

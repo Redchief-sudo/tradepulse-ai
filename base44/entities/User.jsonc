@@ -27,6 +27,10 @@
         "live"
       ],
       "description": "Trading mode: paper (simulation) or live (real orders)"
+    },
+    "stop_loss_pct": {
+      "type": "number",
+      "description": "Default stop-loss percentage threshold for auto-exit"
     }
   },
   "required": [
