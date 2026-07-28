@@ -7,6 +7,26 @@
         "admin",
         "user"
       ]
+    },
+    "broker": {
+      "type": "string",
+      "description": "Selected broker platform (alpaca, ibkr, tradestation, custom)"
+    },
+    "broker_api_key": {
+      "type": "string",
+      "description": "Broker API key"
+    },
+    "broker_api_secret": {
+      "type": "string",
+      "description": "Broker API secret"
+    },
+    "broker_mode": {
+      "type": "string",
+      "enum": [
+        "paper",
+        "live"
+      ],
+      "description": "Trading mode: paper (simulation) or live (real orders)"
     }
   },
   "required": [
