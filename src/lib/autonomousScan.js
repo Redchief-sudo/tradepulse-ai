@@ -19,39 +19,35 @@ function buildSectorContext(holdings) {
     .join(', ');
 }
 
-export async function runAutonomousScan(holdings) {
+// Pass 1 — Deep Market Scan using Gemini 3.1 Pro (top-tier with web search)
+export async function runPass1(holdings) {
   const portfolioContext = buildPortfolioContext(holdings);
   const sectorContext = buildSectorContext(holdings);
-  const { total } = computeSectorExposure(holdings);
 
-  // Pass 1 — Market Deep Scan: identify candidates and analyze each deeply
-  const pass1 = await base44.integrations.Core.InvokeLLM({
-    prompt: `You are AlphaTrade AI. PASS 1 — Market Deep Scan.
+  return await base44.integrations.Core.InvokeLLM({
+    prompt: `You are AlphaTrade AI. PASS 1 — Deep Market Scan using real-time data.
 
 Current portfolio:
 ${portfolioContext}
 
-Current sector exposure (use for diversification):
+Current sector exposure:
 ${sectorContext}
 
-Scan today's real-time market and identify 5-7 high-potential candidate stocks. For each, provide a DEEP analysis:
-- Current price and recent performance
-- Key fundamentals (P/E ratio, revenue growth, profit margins, debt)
-- Technical analysis: RSI (0-100), 50-day MA, 200-day MA, key support/resistance levels
-- Recent news, earnings, and catalysts that could move the stock
+Scan today's real-time market and identify 5-7 high-potential candidate stocks. For each, provide a comprehensive analysis with FULL TECHNICAL INDICATORS:
+- Current price and recent performance (1-day, 1-week, 1-month returns)
+- Key fundamentals: P/E ratio, revenue growth %, profit margins, debt-to-equity, ROE
+- Technical indicators: RSI (0-100), MACD signal (bullish/bearish), 50-day MA, 200-day MA, Bollinger Band position, volume trend, support and resistance levels
+- Recent news, earnings, analyst ratings, and catalysts
 - Sector classification
-- Correlation considerations vs the existing portfolio
+- Correlation vs existing portfolio holdings
 
-Prioritize stocks that would IMPROVE portfolio diversification (underweight sectors) and have strong technical+fundamental setups. Also flag any current holdings that look weak (potential sells).`,
+Prioritize stocks with strong setups that would IMPROVE diversification. Also flag weak current holdings as potential sells.`,
     add_context_from_internet: true,
-    model: 'gemini_3_flash',
+    model: 'gemini_3_1_pro',
     response_json_schema: {
       type: 'object',
       properties: {
-        market_summary: {
-          type: 'string',
-          description: "Overview of today's market conditions, trends, and sentiment",
-        },
+        market_summary: { type: 'string' },
         candidates: {
           type: 'array',
           items: {
@@ -64,6 +60,13 @@ Prioritize stocks that would IMPROVE portfolio diversification (underweight sect
               fundamentals: { type: 'string' },
               technicals: { type: 'string' },
               rsi: { type: 'number' },
+              macd_signal: { type: 'string', enum: ['bullish', 'bearish', 'neutral'] },
+              ma50: { type: 'number' },
+              ma200: { type: 'number' },
+              bollinger_position: { type: 'string', enum: ['upper', 'middle', 'lower'] },
+              volume_trend: { type: 'string', enum: ['increasing', 'stable', 'decreasing'] },
+              support_level: { type: 'number' },
+              resistance_level: { type: 'number' },
               news_catalysts: { type: 'string' },
               recommendation: {
                 type: 'string',
@@ -80,9 +83,15 @@ Prioritize stocks that would IMPROVE portfolio diversification (underweight sect
       required: ['market_summary', 'candidates'],
     },
   });
+}
 
-  // Pass 2 — Portfolio Fit & Risk-Aware Selection with position sizing
-  const candidatesCompact = (pass1.candidates || []).map((c) => ({
+// Pass 2 — Portfolio Fit & Risk-Aware Selection using Claude Sonnet 5 (top-tier reasoning)
+export async function runPass2(holdings, candidates) {
+  const portfolioContext = buildPortfolioContext(holdings);
+  const sectorContext = buildSectorContext(holdings);
+  const { total } = computeSectorExposure(holdings);
+
+  const candidatesCompact = (candidates || []).map((c) => ({
     symbol: c.symbol,
     company_name: c.company_name,
     sector: c.sector,
@@ -92,11 +101,15 @@ Prioritize stocks that would IMPROVE portfolio diversification (underweight sect
     target_price: c.target_price,
     stop_loss: c.stop_loss,
     rsi: c.rsi,
+    macd_signal: c.macd_signal,
+    ma50: c.ma50,
+    ma200: c.ma200,
     summary: c.summary,
   }));
 
-  const pass2 = await base44.integrations.Core.InvokeLLM({
-    prompt: `You are AlphaTrade AI. PASS 2 — Portfolio Fit & Risk-Aware Selection.
+  return await base44.integrations.Core.InvokeLLM({
+    model: 'claude-sonnet-5',
+    prompt: `You are AlphaTrade AI. PASS 2 — Portfolio Fit & Risk-Aware Selection (Claude Sonnet 5 reasoning engine).
 
 Current portfolio:
 ${portfolioContext}
@@ -109,20 +122,17 @@ Candidate analyses from Pass 1:
 ${JSON.stringify(candidatesCompact, null, 2)}
 
 Select the best 3-5 trades to execute NOW. Apply these rules strictly:
-1. RISK-AWARE REBALANCING: Prioritize buys in UNDERWEIGHT sectors (< 20% exposure). For OVERWEIGHT sectors (> 40%), prefer sells or trim positions.
+1. RISK-AWARE REBALANCING: Prioritize buys in UNDERWEIGHT sectors (< 20%). For OVERWEIGHT sectors (> 40%), prefer sells or trim.
 2. CORRELATION-AWARE: Avoid adding multiple highly-correlated stocks. Don't pile into the same sector.
-3. CONFIDENCE-WEIGHTED SIZING: For each buy, suggest suggested_position_pct (0-25) = what % of total portfolio value to allocate. Higher confidence = larger position. Respect 25% max per position and 40% max per sector AFTER the trade.
-4. EXIT MANAGEMENT: Every buy must have a realistic stop_loss (typically 8-15% below entry) and target_price (realistic upside).
+3. CONFIDENCE-WEIGHTED SIZING: For each buy, suggest suggested_position_pct (0-25) = % of total portfolio value. Max 25% per position, max 40% per sector after the trade.
+4. EXIT MANAGEMENT: Every buy must have a realistic stop_loss (8-15% below entry) and target_price.
 5. For SELL actions, only sell stocks currently in the portfolio.
 
 Return final trade proposals with full reasoning, technicals, and catalysts.`,
     response_json_schema: {
       type: 'object',
       properties: {
-        risk_assessment: {
-          type: 'string',
-          description: 'Assessment of portfolio risk and how these trades improve it',
-        },
+        risk_assessment: { type: 'string' },
         proposals: {
           type: 'array',
           items: {
@@ -136,10 +146,7 @@ Return final trade proposals with full reasoning, technicals, and catalysts.`,
               confidence: { type: 'number' },
               target_price: { type: 'number' },
               stop_loss: { type: 'number' },
-              suggested_position_pct: {
-                type: 'number',
-                description: '0-25, percentage of total portfolio value to allocate',
-              },
+              suggested_position_pct: { type: 'number' },
               recommendation: {
                 type: 'string',
                 enum: ['STRONG_BUY', 'BUY', 'HOLD', 'SELL', 'STRONG_SELL'],
@@ -154,11 +161,114 @@ Return final trade proposals with full reasoning, technicals, and catalysts.`,
       required: ['risk_assessment', 'proposals'],
     },
   });
+}
 
-  return {
-    marketSummary: pass1.market_summary || '',
-    candidates: pass1.candidates || [],
-    riskAssessment: pass2.risk_assessment || '',
-    proposals: pass2.proposals || [],
-  };
+// Pass 3 — ML Multi-Factor Scoring Engine using Claude Sonnet 5
+export async function runPass3(proposals, candidates) {
+  if (!proposals.length) return { scores: [] };
+
+  const analysisData = (candidates || []).map((c) => ({
+    symbol: c.symbol,
+    sector: c.sector,
+    current_price: c.current_price,
+    fundamentals: c.fundamentals,
+    technicals: c.technicals,
+    rsi: c.rsi,
+    macd_signal: c.macd_signal,
+    ma50: c.ma50,
+    ma200: c.ma200,
+    bollinger_position: c.bollinger_position,
+    volume_trend: c.volume_trend,
+    support_level: c.support_level,
+    resistance_level: c.resistance_level,
+    news_catalysts: c.news_catalysts,
+    recommendation: c.recommendation,
+    confidence: c.confidence,
+  }));
+
+  return await base44.integrations.Core.InvokeLLM({
+    model: 'claude-sonnet-5',
+    prompt: `You are AlphaTrade AI's Machine Learning scoring engine — a multi-factor quantitative model (like those used in hedge funds).
+
+For each proposed trade, compute scores (0-100) across 5 factors using the analysis data below:
+
+FACTOR DEFINITIONS:
+1. TECHNICAL SCORE (0-100):
+   - RSI: 30-50 = bullish/oversold, 50-70 = neutral, >70 = overbought/bearish
+   - 50/200 MA alignment: golden cross (MA50 > MA200) = bullish
+   - MACD signal: bullish = +, bearish = -, neutral = 0
+   - Bollinger position: lower band = bounce potential, upper = reversal risk
+   - Support/resistance proximity
+
+2. FUNDAMENTAL SCORE (0-100):
+   - P/E ratio: <15 = undervalued, 15-25 = fair, >35 = overvalued
+   - Revenue growth: >20% = strong, 10-20% = moderate, <5% = weak
+   - Profit margins and ROE
+   - Debt levels
+
+3. SENTIMENT SCORE (0-100):
+   - News sentiment (positive/negative/neutral)
+   - Analyst ratings and upgrades/downgrades
+   - Earnings surprises
+   - Social buzz and catalyst strength
+
+4. MOMENTUM SCORE (0-100):
+   - Short-term price momentum
+   - Relative strength vs sector and market
+   - Volume trend (increasing = confirming move)
+
+5. RISK SCORE (0-100, INVERTED — lower risk = higher score):
+   - Volatility/beta
+   - Drawdown potential
+   - Sector concentration risk
+   - Correlation with existing portfolio
+
+COMPOSITE ML SCORE = weighted average:
+- Technical: 25%
+- Fundamental: 25%
+- Sentiment: 20%
+- Momentum: 15%
+- Risk: 15%
+
+ML SIGNAL:
+- >80: STRONG_BUY
+- 65-80: BUY
+- 45-65: HOLD
+- 30-45: SELL
+- <30: STRONG_SELL
+
+Proposed trades to score:
+${JSON.stringify(proposals.map((p) => ({ symbol: p.symbol, action: p.action, sector: p.sector, current_price: p.current_price, confidence: p.confidence })), null, 2)}
+
+Candidate analysis data:
+${JSON.stringify(analysisData, null, 2)}
+
+Score each proposal. Provide a brief score_reasoning explaining the key drivers of the composite score.`,
+    response_json_schema: {
+      type: 'object',
+      properties: {
+        scores: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              symbol: { type: 'string' },
+              technical_score: { type: 'number' },
+              fundamental_score: { type: 'number' },
+              sentiment_score: { type: 'number' },
+              momentum_score: { type: 'number' },
+              risk_score: { type: 'number' },
+              ml_score: { type: 'number' },
+              ml_signal: {
+                type: 'string',
+                enum: ['STRONG_BUY', 'BUY', 'HOLD', 'SELL', 'STRONG_SELL'],
+              },
+              score_reasoning: { type: 'string' },
+            },
+          },
+        },
+      },
+      required: ['scores'],
+    },
+  });
 }

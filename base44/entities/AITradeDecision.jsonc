@@ -45,6 +45,24 @@
         "executed",
         "skipped"
       ]
+    },
+    "ml_score": {
+      "type": "number"
+    },
+    "technical_score": {
+      "type": "number"
+    },
+    "fundamental_score": {
+      "type": "number"
+    },
+    "sentiment_score": {
+      "type": "number"
+    },
+    "momentum_score": {
+      "type": "number"
+    },
+    "risk_score": {
+      "type": "number"
     }
   },
   "required": [

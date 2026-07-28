@@ -10,20 +10,20 @@ import {
   TrendingDown,
   History,
   Sparkles,
-  ArrowDownRight,
-  ArrowUpRight,
   ChevronDown,
   ChevronUp,
   Shield,
   Activity,
+  Cpu,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import RecommendationBadge from '@/components/RecommendationBadge';
 import TradePerformance from '@/components/TradePerformance';
-import { runAutonomousScan } from '@/lib/autonomousScan';
+import TradeProposalCard from '@/components/TradeProposalCard';
+import CandidateCard from '@/components/CandidateCard';
+import { runPass1, runPass2, runPass3 } from '@/lib/autonomousScan';
 import {
-  computeSectorExposure,
   computePortfolioValue,
+  computeSectorExposure,
   computeCappedPositionSize,
   formatCurrency,
 } from '@/lib/portfolio';
@@ -40,9 +40,15 @@ function timeAgo(date) {
   return `${Math.floor(hrs / 24)}d ago`;
 }
 
+const SCAN_STAGES = [
+  { key: 'pass1', label: 'Pass 1: Deep market scan', model: 'Gemini 3.1 Pro' },
+  { key: 'pass2', label: 'Pass 2: Portfolio fit & risk', model: 'Claude Sonnet 5' },
+  { key: 'pass3', label: 'Pass 3: ML multi-factor scoring', model: 'Claude Sonnet 5' },
+];
+
 export default function AutonomousTrader() {
   const [scanning, setScanning] = useState(false);
-  const [scanStage, setScanStage] = useState('');
+  const [scanStageIndex, setScanStageIndex] = useState(-1);
   const [executing, setExecuting] = useState(false);
   const [marketSummary, setMarketSummary] = useState('');
   const [riskAssessment, setRiskAssessment] = useState('');
@@ -77,18 +83,33 @@ export default function AutonomousTrader() {
     setMarketSummary('');
     setRiskAssessment('');
     setExecutedIds(new Set());
+
     try {
-      setScanStage('Pass 1: Deep market scan');
-      const result = await runAutonomousScan(holdings);
-      setScanStage('Pass 2: Portfolio fit & risk');
-      setMarketSummary(result.marketSummary);
-      setCandidates(result.candidates);
-      setRiskAssessment(result.riskAssessment);
-      setProposals(result.proposals);
+      setScanStageIndex(0);
+      const p1 = await runPass1(holdings);
+      setMarketSummary(p1.market_summary || '');
+      setCandidates(p1.candidates || []);
+
+      setScanStageIndex(1);
+      const p2 = await runPass2(holdings, p1.candidates || []);
+      setRiskAssessment(p2.risk_assessment || '');
+      setProposals(p2.proposals || []);
+
+      setScanStageIndex(2);
+      const p3 = await runPass3(p2.proposals || [], p1.candidates || []);
+      const scoreMap = {};
+      (p3.scores || []).forEach((s) => {
+        scoreMap[s.symbol.toUpperCase()] = s;
+      });
+      const merged = (p2.proposals || []).map((p) => ({
+        ...p,
+        ...(scoreMap[p.symbol.toUpperCase()] || {}),
+      }));
+      setProposals(merged);
     } catch (e) {
       console.error(e);
     }
-    setScanStage('');
+    setScanStageIndex(-1);
     setScanning(false);
   };
 
@@ -177,6 +198,12 @@ export default function AutonomousTrader() {
       stop_loss: proposal.stop_loss,
       reasoning: proposal.reasoning,
       status: 'executed',
+      ml_score: proposal.ml_score,
+      technical_score: proposal.technical_score,
+      fundamental_score: proposal.fundamental_score,
+      sentiment_score: proposal.sentiment_score,
+      momentum_score: proposal.momentum_score,
+      risk_score: proposal.risk_score,
     });
 
     setExecutedIds((prev) => new Set([...prev, index]));
@@ -199,11 +226,14 @@ export default function AutonomousTrader() {
     <div className="p-4 md:p-8 pb-24 md:pb-8 max-w-7xl mx-auto">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
         <div>
-          <h1 className="text-2xl md:text-3xl font-bold font-heading tracking-tight">
+          <h1 className="text-2xl md:text-3xl font-bold font-heading tracking-tight flex items-center gap-2">
             Autonomous Trader
+            <span className="text-xs font-normal px-2 py-1 rounded-full bg-accent/15 text-accent border border-accent/30 flex items-center gap-1">
+              <Cpu className="w-3 h-3" /> ML Engine
+            </span>
           </h1>
           <p className="text-muted-foreground text-sm mt-1">
-            Multi-pass AI analysis with risk-aware execution
+            3-pass AI: Gemini 3.1 Pro scan → Claude Sonnet 5 fit → ML multi-factor scoring
           </p>
         </div>
         <div className="flex gap-2 flex-wrap">
@@ -229,24 +259,54 @@ export default function AutonomousTrader() {
         </div>
       </div>
 
-      {/* Scanning state */}
+      {/* Scanning state with pass indicators */}
       {scanning && (
         <motion.div
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
-          className="rounded-2xl border border-accent/30 bg-gradient-to-br from-accent/10 to-primary/5 p-8 md:p-12 text-center mb-6"
+          className="rounded-2xl border border-accent/30 bg-gradient-to-br from-accent/10 to-primary/5 p-6 md:p-8 mb-6"
         >
-          <motion.div
-            animate={{ scale: [1, 1.1, 1], opacity: [0.7, 1, 0.7] }}
-            transition={{ duration: 2, repeat: Infinity }}
-            className="w-16 h-16 rounded-2xl bg-gradient-to-br from-accent to-primary flex items-center justify-center mx-auto mb-4 glow-accent"
-          >
-            <Brain className="w-8 h-8 text-white" />
-          </motion.div>
-          <h3 className="text-lg font-semibold mb-1">{scanStage || 'Scanning...'}</h3>
-          <p className="text-muted-foreground text-sm">
-            Analyzing real-time prices, fundamentals, technicals, news, and portfolio fit...
-          </p>
+          <div className="flex items-center gap-3 mb-4">
+            <motion.div
+              animate={{ scale: [1, 1.1, 1], opacity: [0.7, 1, 0.7] }}
+              transition={{ duration: 2, repeat: Infinity }}
+              className="w-12 h-12 rounded-xl bg-gradient-to-br from-accent to-primary flex items-center justify-center glow-accent"
+            >
+              <Brain className="w-6 h-6 text-white" />
+            </motion.div>
+            <div>
+              <h3 className="font-semibold">
+                {scanStageIndex >= 0 ? SCAN_STAGES[scanStageIndex].label : 'Initializing...'}
+              </h3>
+              <p className="text-xs text-muted-foreground">
+                {scanStageIndex >= 0 && `Model: ${SCAN_STAGES[scanStageIndex].model}`}
+              </p>
+            </div>
+          </div>
+          <div className="flex gap-2">
+            {SCAN_STAGES.map((s, i) => (
+              <div key={s.key} className="flex-1">
+                <div
+                  className={cn(
+                    'h-1.5 rounded-full transition-all',
+                    i < scanStageIndex
+                      ? 'bg-emerald-500'
+                      : i === scanStageIndex
+                      ? 'bg-accent animate-pulse'
+                      : 'bg-muted'
+                  )}
+                />
+                <p
+                  className={cn(
+                    'text-xs mt-1.5 transition-colors hidden md:block',
+                    i <= scanStageIndex ? 'text-foreground' : 'text-muted-foreground'
+                  )}
+                >
+                  {s.label.replace(/Pass \d: /, '')}
+                </p>
+              </div>
+            ))}
+          </div>
         </motion.div>
       )}
 
@@ -300,49 +360,7 @@ export default function AutonomousTrader() {
                 className="overflow-hidden space-y-3"
               >
                 {candidates.map((c, i) => (
-                  <div key={i} className="rounded-xl border border-border bg-card p-4">
-                    <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
-                      <div>
-                        <span className="font-bold">{c.symbol}</span>
-                        <span className="text-muted-foreground text-sm ml-2">{c.company_name}</span>
-                        {c.sector && (
-                          <span className="text-xs text-muted-foreground ml-2">· {c.sector}</span>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-2">
-                        {c.rsi > 0 && (
-                          <span className="text-xs text-muted-foreground">
-                            RSI {c.rsi.toFixed(0)}
-                          </span>
-                        )}
-                        <RecommendationBadge recommendation={c.recommendation} />
-                      </div>
-                    </div>
-                    <div className="text-sm font-medium mb-2">
-                      {formatCurrency(c.current_price)} · Target {formatCurrency(c.target_price)}
-                    </div>
-                    {c.fundamentals && (
-                      <p className="text-xs text-muted-foreground mb-1">
-                        <span className="font-medium text-foreground/70">Fundamentals:</span>{' '}
-                        {c.fundamentals}
-                      </p>
-                    )}
-                    {c.technicals && (
-                      <p className="text-xs text-muted-foreground mb-1">
-                        <span className="font-medium text-foreground/70">Technicals:</span>{' '}
-                        {c.technicals}
-                      </p>
-                    )}
-                    {c.news_catalysts && (
-                      <p className="text-xs text-muted-foreground mb-1">
-                        <span className="font-medium text-foreground/70">News:</span>{' '}
-                        {c.news_catalysts}
-                      </p>
-                    )}
-                    {c.summary && (
-                      <p className="text-xs text-muted-foreground mt-2 italic">{c.summary}</p>
-                    )}
-                  </div>
+                  <CandidateCard key={i} candidate={c} index={i} />
                 ))}
               </motion.div>
             )}
@@ -350,160 +368,21 @@ export default function AutonomousTrader() {
         </div>
       )}
 
-      {/* Trade proposals */}
+      {/* Trade proposals with ML scores */}
       {!scanning && proposals.length > 0 && (
         <div className="space-y-4 mb-8">
           <AnimatePresence>
-            {proposals.map((p, i) => {
-              const isExecuted = executedIds.has(i);
-              const canSell =
-                p.action !== 'sell' || holdings.some((h) => h.symbol === p.symbol);
-              const portfolioValue = computePortfolioValue(holdings);
-              const sectorData = computeSectorExposure(holdings);
-              const currentSectorValue =
-                sectorData.sectors.find((s) => s.sector === (p.sector || 'Other'))?.value || 0;
-              const sized =
-                p.action === 'buy'
-                  ? computeCappedPositionSize(
-                      p.suggested_position_pct || 10,
-                      p.current_price,
-                      portfolioValue,
-                      currentSectorValue
-                    )
-                  : { shares: 0, positionValue: 0 };
-              const upsidePct =
-                p.current_price > 0 && p.target_price > 0
-                  ? ((p.target_price - p.current_price) / p.current_price) * 100
-                  : 0;
-              const downsidePct =
-                p.current_price > 0 && p.stop_loss > 0
-                  ? ((p.stop_loss - p.current_price) / p.current_price) * 100
-                  : 0;
-
-              return (
-                <motion.div
-                  key={i}
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: i * 0.08 }}
-                  className={cn(
-                    'rounded-2xl border bg-card p-5 transition-colors',
-                    isExecuted ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-border'
-                  )}
-                >
-                  <div className="flex items-start justify-between flex-wrap gap-3 mb-3">
-                    <div className="flex items-center gap-3">
-                      <div
-                        className={cn(
-                          'w-10 h-10 rounded-full flex items-center justify-center',
-                          p.action === 'buy'
-                            ? 'bg-emerald-500/10 text-emerald-500'
-                            : 'bg-red-500/10 text-red-500'
-                        )}
-                      >
-                        {p.action === 'buy' ? (
-                          <ArrowDownRight className="w-5 h-5" />
-                        ) : (
-                          <ArrowUpRight className="w-5 h-5" />
-                        )}
-                      </div>
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="font-bold text-base">{p.symbol}</span>
-                          <span className="text-xs text-muted-foreground">{p.company_name}</span>
-                          {p.sector && (
-                            <span className="text-xs text-muted-foreground hidden sm:inline">
-                              · {p.sector}
-                            </span>
-                          )}
-                        </div>
-                        <div className="text-sm text-muted-foreground mt-0.5">
-                          {p.action === 'buy' ? 'Buy' : 'Sell'} {sized.shares} shares @{' '}
-                          {formatCurrency(p.current_price)} ·{' '}
-                          {formatCurrency(sized.positionValue)}
-                        </div>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <RecommendationBadge recommendation={p.recommendation} />
-                      {isExecuted && (
-                        <span className="flex items-center gap-1 text-xs text-emerald-500 font-medium">
-                          <CheckCircle2 className="w-4 h-4" /> Executed
-                        </span>
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-sm mb-3">
-                    <div>
-                      <div className="text-xs text-muted-foreground">Confidence</div>
-                      <div className="font-semibold">{p.confidence}%</div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-muted-foreground">Target</div>
-                      <div className="font-semibold text-emerald-500">
-                        {formatCurrency(p.target_price)}{' '}
-                        <span className="text-xs">(+{upsidePct.toFixed(1)}%)</span>
-                      </div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-muted-foreground">Stop Loss</div>
-                      <div className="font-semibold text-red-500">
-                        {formatCurrency(p.stop_loss)}{' '}
-                        <span className="text-xs">({downsidePct.toFixed(1)}%)</span>
-                      </div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-muted-foreground">Allocation</div>
-                      <div className="font-semibold">
-                        {p.suggested_position_pct
-                          ? `${p.suggested_position_pct.toFixed(0)}%`
-                          : '—'}
-                      </div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-muted-foreground">Total</div>
-                      <div className="font-semibold">{formatCurrency(sized.positionValue)}</div>
-                    </div>
-                  </div>
-
-                  {p.reasoning && (
-                    <p className="text-sm text-muted-foreground leading-relaxed mb-2">
-                      {p.reasoning}
-                    </p>
-                  )}
-                  {(p.technicals || p.news_catalysts) && (
-                    <div className="text-xs text-muted-foreground space-y-1 mb-3">
-                      {p.technicals && (
-                        <p>
-                          <span className="font-medium text-foreground/70">Technicals:</span>{' '}
-                          {p.technicals}
-                        </p>
-                      )}
-                      {p.news_catalysts && (
-                        <p>
-                          <span className="font-medium text-foreground/70">Catalysts:</span>{' '}
-                          {p.news_catalysts}
-                        </p>
-                      )}
-                    </div>
-                  )}
-
-                  {!isExecuted && (
-                    <Button
-                      size="sm"
-                      onClick={() => executeProposal(p, i)}
-                      disabled={executing || !canSell}
-                      variant="secondary"
-                      className="gap-1.5"
-                    >
-                      <Zap className="w-3.5 h-3.5" />
-                      {canSell ? 'Execute Trade' : 'Cannot sell — not held'}
-                    </Button>
-                  )}
-                </motion.div>
-              );
-            })}
+            {proposals.map((p, i) => (
+              <TradeProposalCard
+                key={i}
+                proposal={p}
+                index={i}
+                isExecuted={executedIds.has(i)}
+                isExecuting={executing}
+                holdings={holdings}
+                onExecute={executeProposal}
+              />
+            ))}
           </AnimatePresence>
         </div>
       )}
@@ -518,10 +397,12 @@ export default function AutonomousTrader() {
           <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-accent to-primary flex items-center justify-center mx-auto mb-4 glow-accent">
             <Brain className="w-8 h-8 text-white" />
           </div>
-          <h3 className="text-lg font-semibold mb-2">Autonomous mode is ready</h3>
+          <h3 className="text-lg font-semibold mb-2">ML-Powered Autonomous Trading</h3>
           <p className="text-muted-foreground text-sm mb-6 max-w-md mx-auto">
-            The AI runs a two-pass analysis: first a deep market scan with fundamentals, technicals,
-            and news; then a risk-aware portfolio fit with confidence-weighted position sizing.
+            Three AI passes work together: Gemini 3.1 Pro scans the market with real-time data and
+            full technicals, Claude Sonnet 5 fits trades to your portfolio with risk-aware sizing,
+            then a multi-factor ML engine scores each trade across technical, fundamental,
+            sentiment, momentum, and risk factors.
           </p>
           <Button onClick={runScan} className="gap-2 bg-gradient-to-r from-primary to-accent">
             <Brain className="w-4 h-4" />
@@ -571,6 +452,9 @@ export default function AutonomousTrader() {
                     </div>
                     <div className="text-xs text-muted-foreground truncate max-w-[300px]">
                       {d.shares} @ {formatCurrency(d.price)} · {d.confidence}% confidence
+                      {d.ml_score !== undefined && (
+                        <span className="ml-2 text-accent">· ML {d.ml_score.toFixed(0)}</span>
+                      )}
                     </div>
                   </div>
                 </div>
