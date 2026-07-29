@@ -31,6 +31,15 @@
     "stop_loss_pct": {
       "type": "number",
       "description": "Default stop-loss percentage threshold for auto-exit"
+    },
+    "trade_profile": {
+      "type": "string",
+      "enum": [
+        "aggressive",
+        "balanced",
+        "conservative"
+      ],
+      "description": "AI trading risk profile governing position limits and confidence thresholds"
     }
   },
   "required": [

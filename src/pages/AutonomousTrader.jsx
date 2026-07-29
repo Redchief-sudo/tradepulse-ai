@@ -29,6 +29,8 @@ import {
   formatCurrency,
 } from '@/lib/portfolio';
 import { cn } from '@/lib/utils';
+import { getProfile, profileParams } from '@/lib/tradeProfiles';
+import ActiveProfileBanner from '@/components/ActiveProfileBanner';
 
 function timeAgo(date) {
   if (!date) return '';
@@ -60,6 +62,8 @@ export default function AutonomousTrader() {
   const [executedIds, setExecutedIds] = useState(new Set());
   const [showCandidates, setShowCandidates] = useState(false);
   const [stopLossPct, setStopLossPct] = useState(8);
+  const [tradeProfile, setTradeProfile] = useState('balanced');
+  const [filteredCount, setFilteredCount] = useState(0);
 
   const loadData = useCallback(async () => {
     try {
@@ -71,6 +75,7 @@ export default function AutonomousTrader() {
       setHoldings(h || []);
       setDecisions(d || []);
       if (me.stop_loss_pct) setStopLossPct(me.stop_loss_pct);
+      if (me.trade_profile) setTradeProfile(me.trade_profile);
     } catch (e) {
       console.error(e);
     }
@@ -104,9 +109,14 @@ export default function AutonomousTrader() {
       setCandidates(p1.candidates || []);
 
       setScanStageIndex(1);
-      const p2 = await runPass2(holdings, p1.candidates || []);
+      const pp = profileParams(tradeProfile);
+      const p2 = await runPass2(holdings, p1.candidates || [], pp);
       setRiskAssessment(p2.risk_assessment || '');
-      setProposals(p2.proposals || []);
+      // Apply institutional confidence threshold + daily trade cap
+      const allProposals = p2.proposals || [];
+      const compliant = allProposals.filter((p) => (p.confidence || 0) >= pp.min_confidence);
+      setFilteredCount(allProposals.length - compliant.length);
+      setProposals(compliant.slice(0, pp.max_daily_trades));
 
       setScanStageIndex(2);
       const p3 = await runPass3(p2.proposals || [], p1.candidates || []);
@@ -134,11 +144,14 @@ export default function AutonomousTrader() {
 
     let shares, positionValue;
     if (proposal.action === 'buy') {
+      const pp = profileParams(tradeProfile);
       const sized = computeCappedPositionSize(
         proposal.suggested_position_pct || 10,
         proposal.current_price,
         portfolioValue,
-        currentSectorValue
+        currentSectorValue,
+        pp.max_sector_pct / 100,
+        pp.max_position_pct / 100
       );
       shares = sized.shares;
       positionValue = sized.positionValue;
@@ -278,6 +291,9 @@ export default function AutonomousTrader() {
         onStopLossPctChange={saveStopLossPct}
         onHoldingsChange={loadData}
       />
+
+      {/* Active risk profile */}
+      <ActiveProfileBanner profile={getProfile(tradeProfile)} filteredCount={filteredCount} />
 
       {/* Scanning state with pass indicators */}
       {scanning && (

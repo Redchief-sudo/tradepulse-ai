@@ -20,6 +20,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { cn } from '@/lib/utils';
+import TradingProfileSelector from '@/components/TradingProfileSelector';
 
 const BROKERS = [
   { id: 'alpaca', name: 'Alpaca', note: 'Best for algorithmic trading · Free API · Paper & Live' },
@@ -41,6 +42,7 @@ export default function Settings() {
     broker_api_key: '',
     broker_api_secret: '',
     broker_mode: 'paper',
+    trade_profile: 'balanced',
   });
 
   const loadUser = useCallback(async () => {
@@ -52,6 +54,7 @@ export default function Settings() {
         broker_api_key: me.broker_api_key || '',
         broker_api_secret: me.broker_api_secret || '',
         broker_mode: me.broker_mode || 'paper',
+        trade_profile: me.trade_profile || 'balanced',
       });
     } catch (e) {
       console.error(e);
@@ -97,7 +100,7 @@ export default function Settings() {
   };
 
   const disconnect = async () => {
-    setForm({ broker: '', broker_api_key: '', broker_api_secret: '', broker_mode: 'paper' });
+    setForm((prev) => ({ ...prev, broker: '', broker_api_key: '', broker_api_secret: '', broker_mode: 'paper' }));
     setTestResult(null);
     setSaving(true);
     try {
@@ -163,6 +166,14 @@ export default function Settings() {
           </p>
         </div>
       </motion.div>
+
+      {/* Trading Profile */}
+      <div className="mb-6">
+        <TradingProfileSelector
+          value={form.trade_profile}
+          onChange={(id) => setForm({ ...form, trade_profile: id })}
+        />
+      </div>
 
       {/* Broker connection card */}
       <motion.div

@@ -86,7 +86,8 @@ Prioritize stocks with strong setups that would IMPROVE diversification. Also fl
 }
 
 // Pass 2 — Portfolio Fit & Risk-Aware Selection using Claude Sonnet 5 (top-tier reasoning)
-export async function runPass2(holdings, candidates) {
+export async function runPass2(holdings, candidates, profile) {
+  const pp = profile || { max_position_pct: 10, max_sector_pct: 25, min_confidence: 80, max_daily_trades: 5, stop_loss_pct: 8 };
   const portfolioContext = buildPortfolioContext(holdings);
   const sectorContext = buildSectorContext(holdings);
   const { total } = computeSectorExposure(holdings);
@@ -121,12 +122,20 @@ Total portfolio value: $${total.toFixed(0)}
 Candidate analyses from Pass 1:
 ${JSON.stringify(candidatesCompact, null, 2)}
 
-Select the best 3-5 trades to execute NOW. Apply these rules strictly:
-1. RISK-AWARE REBALANCING: Prioritize buys in UNDERWEIGHT sectors (< 20%). For OVERWEIGHT sectors (> 40%), prefer sells or trim.
+Select the best trades to execute NOW. Apply these INSTITUTIONAL-GRADE risk parameters STRICTLY:
+- MAX POSITION SIZE: ${pp.max_position_pct}% of portfolio per single trade (HARD CAP)
+- MAX SECTOR EXPOSURE: ${pp.max_sector_pct}% per sector including the new position (HARD CAP)
+- MIN CONFIDENCE: ${pp.min_confidence}% — do NOT propose any trade with confidence below this
+- MAX TRADES PER SCAN: ${pp.max_daily_trades}
+- STOP-LOSS: set ${pp.stop_loss_pct}% below entry price for every buy
+
+Rules:
+1. RISK-AWARE REBALANCING: Prioritize buys in UNDERWEIGHT sectors. For sectors already above ${pp.max_sector_pct}%, prefer sells or trim.
 2. CORRELATION-AWARE: Avoid adding multiple highly-correlated stocks. Don't pile into the same sector.
-3. CONFIDENCE-WEIGHTED SIZING: For each buy, suggest suggested_position_pct (0-25) = % of total portfolio value. Max 25% per position, max 40% per sector after the trade.
-4. EXIT MANAGEMENT: Every buy must have a realistic stop_loss (8-15% below entry) and target_price.
+3. CONFIDENCE-WEIGHTED SIZING: For each buy, suggest suggested_position_pct (0-${pp.max_position_pct}) = % of total portfolio value. NEVER exceed ${pp.max_position_pct}% per position or ${pp.max_sector_pct}% per sector after the trade.
+4. EXIT MANAGEMENT: Every buy must have a stop_loss at ${pp.stop_loss_pct}% below entry and a realistic target_price.
 5. For SELL actions, only sell stocks currently in the portfolio.
+6. Do not propose more than ${pp.max_daily_trades} trades.
 
 Return final trade proposals with full reasoning, technicals, and catalysts.`,
     response_json_schema: {
