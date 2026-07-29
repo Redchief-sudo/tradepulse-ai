@@ -47,13 +47,21 @@ Scan today's real-time market and identify 5-7 high-potential candidate stocks. 
 - Correlation vs existing portfolio holdings
 - Multi-modal signals: order book / options flow bias, alt-data momentum, and news/filing sentiment (bullish/bearish/neutral)
 
-Prioritize stocks with strong setups that would IMPROVE diversification. Also flag weak current holdings as potential sells.`,
+FIRST, detect the current market regime using HMM-style analysis (low-volatility bull, high-volatility bear, range-bound choppy, liquidity crisis, or transition). State the regime, your confidence, and which sub-strategy is optimal for it (e.g., trend-following in low_vol_bull, mean-reversion in range_bound_choppy, defensive/capital-preservation in liquidity_crisis).
+
+Prioritize stocks with strong setups that would IMPROVE diversification AND match the current regime's optimal strategy. Also flag weak current holdings as potential sells.`,
     add_context_from_internet: true,
     model: 'gemini_3_1_pro',
     response_json_schema: {
       type: 'object',
       properties: {
         market_summary: { type: 'string' },
+        market_regime: {
+          type: 'string',
+          enum: ['low_vol_bull', 'high_vol_bear', 'range_bound_choppy', 'liquidity_crisis', 'transition'],
+        },
+        regime_confidence: { type: 'number' },
+        regime_strategy: { type: 'string' },
         candidates: {
           type: 'array',
           items: {
@@ -92,8 +100,11 @@ Prioritize stocks with strong setups that would IMPROVE diversification. Also fl
 }
 
 // Pass 2 — Portfolio Fit & Risk-Aware Selection using Claude Sonnet 5 (top-tier reasoning)
-export async function runPass2(holdings, candidates, profile) {
+export async function runPass2(holdings, candidates, profile, regime) {
   const pp = profile || { max_position_pct: 10, max_sector_pct: 25, min_confidence: 80, max_daily_trades: 5, stop_loss_pct: 8 };
+  const regimeContext = regime && regime.market_regime
+    ? `Detected market regime: ${regime.market_regime} (${(regime.regime_confidence || 0)}% confidence). Optimal strategy: ${regime.regime_strategy || 'adaptive'}. Apply this strategy.`
+    : 'Market regime: not detected — use adaptive strategy.';
   const portfolioContext = buildPortfolioContext(holdings);
   const sectorContext = buildSectorContext(holdings);
   const { total } = computeSectorExposure(holdings);
@@ -127,6 +138,8 @@ Total portfolio value: $${total.toFixed(0)}
 
 Candidate analyses from Pass 1:
 ${JSON.stringify(candidatesCompact, null, 2)}
+
+${regimeContext}
 
 Select the best trades to execute NOW. Apply these INSTITUTIONAL-GRADE risk parameters STRICTLY:
 - MAX POSITION SIZE: ${pp.max_position_pct}% of portfolio per single trade (HARD CAP)
@@ -287,6 +300,56 @@ Score each proposal. Provide a brief score_reasoning explaining the key drivers 
         },
       },
       required: ['scores'],
+    },
+  });
+}
+
+// Pass 4 — Adversarial Risk Officer (multi-agent veto layer)
+export async function runAdversarialReview(proposals, holdings, regime) {
+  if (!proposals.length) return { reviews: [] };
+  const portfolioContext = buildPortfolioContext(holdings);
+  const sectorContext = buildSectorContext(holdings);
+  const regimeLabel = regime && regime.market_regime ? regime.market_regime : 'unknown';
+
+  return await base44.integrations.Core.InvokeLLM({
+    model: 'claude-sonnet-5',
+    prompt: `You are the ADVERSARIAL RISK OFFICER — a ruthlessly conservative, independent AI agent in AlphaTrade AI's multi-agent system. Your sole job is to find flaws in the Alpha Generator's trade proposals and VETO dangerous ones.
+
+You are adversarial by design. You actively try to block trades by predicting hidden correlation risks, liquidity traps, regime mismatches, and concentration dangers.
+
+Current portfolio:
+${portfolioContext}
+
+Current sector exposure:
+${sectorContext}
+
+Current market regime: ${regimeLabel}
+
+Trade proposals under review:
+${JSON.stringify(proposals.map((p) => ({ symbol: p.symbol, action: p.action, sector: p.sector, confidence: p.confidence, suggested_position_pct: p.suggested_position_pct, ml_score: p.ml_score })), null, 2)}
+
+For EACH proposal, return a verdict:
+- "approved": the trade is sound — no hidden risk found
+- "flagged": notable risk exists but trade may proceed with caution (explain the risk)
+- "vetoed": the trade is dangerous and must NOT execute (hidden correlation, liquidity trap, regime mismatch, or concentration breach)
+
+Be skeptical. When in doubt, flag. Only veto when the risk is clear and material.`,
+    response_json_schema: {
+      type: 'object',
+      properties: {
+        reviews: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              symbol: { type: 'string' },
+              verdict: { type: 'string', enum: ['approved', 'flagged', 'vetoed'] },
+              note: { type: 'string' },
+            },
+          },
+        },
+      },
+      required: ['reviews'],
     },
   });
 }

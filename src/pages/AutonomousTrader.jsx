@@ -22,7 +22,7 @@ import TradePerformance from '@/components/TradePerformance';
 import TradeProposalCard from '@/components/TradeProposalCard';
 import CandidateCard from '@/components/CandidateCard';
 import StopLossScanner from '@/components/StopLossScanner';
-import { runPass1, runPass2, runPass3 } from '@/lib/autonomousScan';
+import { runPass1, runPass2, runPass3, runAdversarialReview } from '@/lib/autonomousScan';
 import {
   computePortfolioValue,
   computeSectorExposure,
@@ -33,6 +33,8 @@ import { cn } from '@/lib/utils';
 import { getProfile, profileParams } from '@/lib/tradeProfiles';
 import ActiveProfileBanner from '@/components/ActiveProfileBanner';
 import ArchitectureOverview from '@/components/ArchitectureOverview';
+import RegimeBanner from '@/components/RegimeBanner';
+import StressTestSimulator from '@/components/StressTestSimulator';
 
 function timeAgo(date) {
   if (!date) return '';
@@ -49,6 +51,7 @@ const SCAN_STAGES = [
   { key: 'pass1', label: 'Pass 1: Multi-modal market scan', model: 'Gemini 3.1 Pro · Transformer' },
   { key: 'pass2', label: 'Pass 2: RL execution & risk fit', model: 'Claude Sonnet 5 · RL-DQN' },
   { key: 'pass3', label: 'Pass 3: GNN + ML multi-factor scoring', model: 'Claude Sonnet 5 · GNN ensemble' },
+  { key: 'pass4', label: 'Pass 4: Adversarial risk veto', model: 'Claude Sonnet 5 · Risk Officer' },
 ];
 
 export default function AutonomousTrader() {
@@ -67,6 +70,8 @@ export default function AutonomousTrader() {
   const [tradeProfile, setTradeProfile] = useState('balanced');
   const [filteredCount, setFilteredCount] = useState(0);
   const [showArchitecture, setShowArchitecture] = useState(false);
+  const [marketRegime, setMarketRegime] = useState(null);
+  const [vetoedCount, setVetoedCount] = useState(0);
 
   const loadData = useCallback(async () => {
     try {
@@ -104,22 +109,24 @@ export default function AutonomousTrader() {
     setMarketSummary('');
     setRiskAssessment('');
     setExecutedIds(new Set());
+    setMarketRegime(null);
+    setVetoedCount(0);
 
     try {
       setScanStageIndex(0);
       const p1 = await runPass1(holdings);
       setMarketSummary(p1.market_summary || '');
       setCandidates(p1.candidates || []);
+      setMarketRegime({
+        market_regime: p1.market_regime,
+        regime_confidence: p1.regime_confidence,
+        regime_strategy: p1.regime_strategy,
+      });
 
       setScanStageIndex(1);
       const pp = profileParams(tradeProfile);
-      const p2 = await runPass2(holdings, p1.candidates || [], pp);
+      const p2 = await runPass2(holdings, p1.candidates || [], pp, p1);
       setRiskAssessment(p2.risk_assessment || '');
-      // Apply institutional confidence threshold + daily trade cap
-      const allProposals = p2.proposals || [];
-      const compliant = allProposals.filter((p) => (p.confidence || 0) >= pp.min_confidence);
-      setFilteredCount(allProposals.length - compliant.length);
-      setProposals(compliant.slice(0, pp.max_daily_trades));
 
       setScanStageIndex(2);
       const p3 = await runPass3(p2.proposals || [], p1.candidates || []);
@@ -127,11 +134,31 @@ export default function AutonomousTrader() {
       (p3.scores || []).forEach((s) => {
         scoreMap[s.symbol.toUpperCase()] = s;
       });
-      const merged = (p2.proposals || []).map((p) => ({
+      let merged = (p2.proposals || []).map((p) => ({
         ...p,
         ...(scoreMap[p.symbol.toUpperCase()] || {}),
       }));
-      setProposals(merged);
+
+      // Apply institutional confidence threshold + daily trade cap
+      const compliant = merged.filter((p) => (p.confidence || 0) >= pp.min_confidence);
+      setFilteredCount(merged.length - compliant.length);
+      merged = compliant.slice(0, pp.max_daily_trades);
+
+      // Pass 4: Adversarial Risk Officer veto layer
+      setScanStageIndex(3);
+      const adv = await runAdversarialReview(merged, holdings, p1);
+      const reviewMap = {};
+      (adv.reviews || []).forEach((r) => {
+        reviewMap[r.symbol.toUpperCase()] = r;
+      });
+      merged = merged.map((p) => ({
+        ...p,
+        adversarial_verdict: reviewMap[p.symbol.toUpperCase()]?.verdict || 'approved',
+        adversarial_note: reviewMap[p.symbol.toUpperCase()]?.note || '',
+      }));
+      const vetoed = merged.filter((p) => p.adversarial_verdict === 'vetoed');
+      setVetoedCount(vetoed.length);
+      setProposals(merged.filter((p) => p.adversarial_verdict !== 'vetoed'));
     } catch (e) {
       console.error(e);
     }
@@ -307,8 +334,14 @@ export default function AutonomousTrader() {
       {/* Active risk profile */}
       <ActiveProfileBanner profile={getProfile(tradeProfile)} filteredCount={filteredCount} />
 
+      {/* Market regime detection */}
+      {marketRegime && <RegimeBanner regime={marketRegime} vetoedCount={vetoedCount} />}
+
       {/* Institutional architecture overview */}
       {showArchitecture && <ArchitectureOverview onClose={() => setShowArchitecture(false)} />}
+
+      {/* Generative stress-test simulation */}
+      {holdings.length > 0 && !scanning && <StressTestSimulator holdings={holdings} />}
 
       {/* Scanning state with pass indicators */}
       {scanning && (

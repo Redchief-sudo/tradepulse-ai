@@ -12,6 +12,11 @@ import {
   Lock,
   X,
   Network,
+  Activity,
+  FlaskConical,
+  Users,
+  Cpu,
+  Sparkles,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -60,6 +65,49 @@ const PILLARS = [
   },
 ];
 
+const ELITE_PILLARS = [
+  {
+    icon: Activity,
+    title: 'Adaptive Regime Detection',
+    color: 'text-violet-400',
+    items: [
+      { label: 'Continuous online learning', status: 'active' },
+      { label: 'Hidden Markov Model regime detection', status: 'active' },
+      { label: 'Dynamic sub-model switching', status: 'active' },
+    ],
+  },
+  {
+    icon: FlaskConical,
+    title: 'Generative AI Simulation',
+    color: 'text-blue-400',
+    items: [
+      { label: 'GAN synthetic time-series generation', status: 'active' },
+      { label: 'Black-swan stress-test scenarios', status: 'active' },
+      { label: 'Pre-computed execution playbooks', status: 'active' },
+    ],
+  },
+  {
+    icon: Users,
+    title: 'Multi-Agent Collaborative System',
+    color: 'text-emerald-400',
+    items: [
+      { label: 'Alpha Generator (Passes 1–3)', status: 'active' },
+      { label: 'Adversarial Risk Officer (veto layer)', status: 'active' },
+      { label: 'Cost Optimizer (execution timing)', status: 'planned' },
+    ],
+  },
+  {
+    icon: Cpu,
+    title: 'Nano-Second Execution',
+    color: 'text-amber-400',
+    items: [
+      { label: 'FPGA / ASIC model inference', status: 'planned' },
+      { label: 'Kernel-bypass network stack', status: 'planned' },
+      { label: 'AI-driven VWAP predatory routing', status: 'planned' },
+    ],
+  },
+];
+
 const ROADMAP = [
   { step: 1, label: 'Data Aggregation', status: 'done' },
   { step: 2, label: 'Feature Engineering', status: 'done' },
@@ -67,6 +115,14 @@ const ROADMAP = [
   { step: 4, label: 'Risk Layer', status: 'done' },
   { step: 5, label: 'Paper Trading', status: 'current' },
   { step: 6, label: 'Live Deploy', status: 'pending' },
+];
+
+const BENCHMARK = [
+  { feature: 'Data Ingestion', outstanding: 'News sentiment + historical ticks', elite: 'Live Level 3 order-book queues', ours: 'Multi-modal web search' },
+  { feature: 'Adaptability', outstanding: 'Suffers in market crashes', elite: 'Profits via regime detection', ours: 'HMM regime detection active' },
+  { feature: 'Hardware', outstanding: 'Cloud GPU instances', elite: 'Co-located FPGA chips', ours: 'Cloud (FPGA planned)' },
+  { feature: 'Execution', outstanding: 'Simple broker API', elite: 'Kernel-bypass sub-μs', ours: 'Paper (Builder+ for live)' },
+  { feature: 'Simulations', outstanding: 'Backtests on past data', elite: 'Millions of GAN scenarios', ours: 'Synthetic stress tests' },
 ];
 
 function StatusDot({ status }) {
@@ -79,6 +135,25 @@ function StatusDot({ status }) {
   if (status === 'locked')
     return <Lock className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />;
   return <Circle className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />;
+}
+
+function PillarCard({ pillar }) {
+  return (
+    <div className="rounded-xl border border-border bg-muted/20 p-3">
+      <div className="flex items-center gap-2 mb-2">
+        <pillar.icon className={cn('w-4 h-4', pillar.color)} />
+        <span className="text-xs font-semibold">{pillar.title}</span>
+      </div>
+      <div className="space-y-1.5">
+        {pillar.items.map((item) => (
+          <div key={item.label} className="flex items-start gap-1.5 text-xs text-muted-foreground">
+            <StatusDot status={item.status} />
+            <span className="leading-snug">{item.label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 export default function ArchitectureOverview({ onClose }) {
@@ -102,25 +177,23 @@ export default function ArchitectureOverview({ onClose }) {
 
       <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
         {PILLARS.map((p) => (
-          <div key={p.title} className="rounded-xl border border-border bg-muted/20 p-3">
-            <div className="flex items-center gap-2 mb-2">
-              <p.icon className={cn('w-4 h-4', p.color)} />
-              <span className="text-xs font-semibold">{p.title}</span>
-            </div>
-            <div className="space-y-1.5">
-              {p.items.map((item) => (
-                <div key={item.label} className="flex items-start gap-1.5 text-xs text-muted-foreground">
-                  <StatusDot status={item.status} />
-                  <span className="leading-snug">{item.label}</span>
-                </div>
-              ))}
-            </div>
-          </div>
+          <PillarCard key={p.title} pillar={p} />
+        ))}
+      </div>
+
+      {/* Elite capabilities */}
+      <div className="flex items-center gap-2 mb-3">
+        <Sparkles className="w-4 h-4 text-violet-400" />
+        <span className="text-xs font-semibold">Elite-Status Capabilities</span>
+      </div>
+      <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
+        {ELITE_PILLARS.map((p) => (
+          <PillarCard key={p.title} pillar={p} />
         ))}
       </div>
 
       {/* 6-step roadmap */}
-      <div className="rounded-xl border border-border bg-muted/20 p-3">
+      <div className="rounded-xl border border-border bg-muted/20 p-3 mb-4">
         <div className="flex items-center gap-2 mb-3">
           <GitBranch className="w-4 h-4 text-accent" />
           <span className="text-xs font-semibold">Implementation Roadmap</span>
@@ -145,6 +218,36 @@ export default function ArchitectureOverview({ onClose }) {
               )}
             </React.Fragment>
           ))}
+        </div>
+      </div>
+
+      {/* Outstanding vs Elite benchmark */}
+      <div className="rounded-xl border border-border bg-muted/20 p-3">
+        <div className="flex items-center gap-2 mb-3">
+          <Cpu className="w-4 h-4 text-accent" />
+          <span className="text-xs font-semibold">Outstanding vs Elite — Where We Stand</span>
+        </div>
+        <div className="overflow-x-auto scrollbar-thin">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-muted-foreground border-b border-border">
+                <th className="text-left font-medium p-2">Feature</th>
+                <th className="text-left font-medium p-2">Outstanding</th>
+                <th className="text-left font-medium p-2">Elite Status</th>
+                <th className="text-left font-medium p-2 text-primary">Our System</th>
+              </tr>
+            </thead>
+            <tbody>
+              {BENCHMARK.map((b) => (
+                <tr key={b.feature} className="border-b border-border/40">
+                  <td className="p-2 font-medium whitespace-nowrap">{b.feature}</td>
+                  <td className="p-2 text-muted-foreground">{b.outstanding}</td>
+                  <td className="p-2 text-muted-foreground">{b.elite}</td>
+                  <td className="p-2 text-primary">{b.ours}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
     </motion.div>
