@@ -25,7 +25,12 @@ export async function runPass1(holdings) {
   const sectorContext = buildSectorContext(holdings);
 
   return await base44.integrations.Core.InvokeLLM({
-    prompt: `You are AlphaTrade AI. PASS 1 — Deep Market Scan using real-time data.
+    prompt: `You are AlphaTrade AI. PASS 1 — Multi-Modal Deep Market Scan (Transformer architecture for time-series + financial NLP sentiment).
+
+Ingest data across ALL modalities:
+- Structured market data: price, volume, order book flow, options activity, tick-by-tick trends
+- Alternative datasets: supply chain logistics, consumer spending trends, foot-traffic signals where available
+- Unstructured text: real-time SEC filings, earnings call transcripts, analyst notes, global breaking news — extract semantic sentiment
 
 Current portfolio:
 ${portfolioContext}
@@ -40,6 +45,7 @@ Scan today's real-time market and identify 5-7 high-potential candidate stocks. 
 - Recent news, earnings, analyst ratings, and catalysts
 - Sector classification
 - Correlation vs existing portfolio holdings
+- Multi-modal signals: order book / options flow bias, alt-data momentum, and news/filing sentiment (bullish/bearish/neutral)
 
 Prioritize stocks with strong setups that would IMPROVE diversification. Also flag weak current holdings as potential sells.`,
     add_context_from_internet: true,
@@ -110,7 +116,7 @@ export async function runPass2(holdings, candidates, profile) {
 
   return await base44.integrations.Core.InvokeLLM({
     model: 'claude-sonnet-5',
-    prompt: `You are AlphaTrade AI. PASS 2 — Portfolio Fit & Risk-Aware Selection (Claude Sonnet 5 reasoning engine).
+    prompt: `You are AlphaTrade AI. PASS 2 — Portfolio Fit & Risk-Aware Selection (Reinforcement Learning / Deep Q-Network for execution & position-sizing optimization · Claude Sonnet 5 reasoning).
 
 Current portfolio:
 ${portfolioContext}
@@ -135,7 +141,9 @@ Rules:
 3. CONFIDENCE-WEIGHTED SIZING: For each buy, suggest suggested_position_pct (0-${pp.max_position_pct}) = % of total portfolio value. NEVER exceed ${pp.max_position_pct}% per position or ${pp.max_sector_pct}% per sector after the trade.
 4. EXIT MANAGEMENT: Every buy must have a stop_loss at ${pp.stop_loss_pct}% below entry and a realistic target_price.
 5. For SELL actions, only sell stocks currently in the portfolio.
-6. Do not propose more than ${pp.max_daily_trades} trades.
+6. DYNAMIC POSITION SIZING: Assess the current market volatility regime (high macro uncertainty / elevated VIX = high regime). In a HIGH-volatility regime, scale suggested_position_pct DOWN by up to 50% from the max. In a LOW-volatility regime, sizing may approach the max ${pp.max_position_pct}%.
+7. DRAWDOWN GUARDRAIL: Ensure the portfolio's estimated max drawdown risk after all proposed trades stays within ${pp.max_drawdown_pct}%. Prefer lower-correlation trades when portfolio risk is elevated.
+8. Do not propose more than ${pp.max_daily_trades} trades.
 
 Return final trade proposals with full reasoning, technicals, and catalysts.`,
     response_json_schema: {
@@ -197,7 +205,7 @@ export async function runPass3(proposals, candidates) {
 
   return await base44.integrations.Core.InvokeLLM({
     model: 'claude-sonnet-5',
-    prompt: `You are AlphaTrade AI's Machine Learning scoring engine — a multi-factor quantitative model (like those used in hedge funds).
+    prompt: `You are AlphaTrade AI's Machine Learning scoring engine — a hybrid ensemble: multi-factor quantitative model + Graph Neural Network (GNN) for sector contagion mapping (like those used in hedge funds).
 
 For each proposed trade, compute scores (0-100) across 5 factors using the analysis data below:
 
@@ -227,10 +235,11 @@ FACTOR DEFINITIONS:
    - Volume trend (increasing = confirming move)
 
 5. RISK SCORE (0-100, INVERTED — lower risk = higher score):
-   - Volatility/beta
-   - Drawdown potential
-   - Sector concentration risk
-   - Correlation with existing portfolio
+    - Volatility/beta
+    - Drawdown potential
+    - Sector concentration risk
+    - Correlation with existing portfolio
+    - SECTOR CONTAGION (GNN): how a downturn in this stock's sector would propagate to existing holdings — high contagion = lower score
 
 COMPOSITE ML SCORE = weighted average:
 - Technical: 25%

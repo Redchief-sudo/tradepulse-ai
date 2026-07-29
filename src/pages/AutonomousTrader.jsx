@@ -15,6 +15,7 @@ import {
   Shield,
   Activity,
   Cpu,
+  Layers,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import TradePerformance from '@/components/TradePerformance';
@@ -31,6 +32,7 @@ import {
 import { cn } from '@/lib/utils';
 import { getProfile, profileParams } from '@/lib/tradeProfiles';
 import ActiveProfileBanner from '@/components/ActiveProfileBanner';
+import ArchitectureOverview from '@/components/ArchitectureOverview';
 
 function timeAgo(date) {
   if (!date) return '';
@@ -44,9 +46,9 @@ function timeAgo(date) {
 }
 
 const SCAN_STAGES = [
-  { key: 'pass1', label: 'Pass 1: Deep market scan', model: 'Gemini 3.1 Pro' },
-  { key: 'pass2', label: 'Pass 2: Portfolio fit & risk', model: 'Claude Sonnet 5' },
-  { key: 'pass3', label: 'Pass 3: ML multi-factor scoring', model: 'Claude Sonnet 5' },
+  { key: 'pass1', label: 'Pass 1: Multi-modal market scan', model: 'Gemini 3.1 Pro · Transformer' },
+  { key: 'pass2', label: 'Pass 2: RL execution & risk fit', model: 'Claude Sonnet 5 · RL-DQN' },
+  { key: 'pass3', label: 'Pass 3: GNN + ML multi-factor scoring', model: 'Claude Sonnet 5 · GNN ensemble' },
 ];
 
 export default function AutonomousTrader() {
@@ -64,6 +66,7 @@ export default function AutonomousTrader() {
   const [stopLossPct, setStopLossPct] = useState(8);
   const [tradeProfile, setTradeProfile] = useState('balanced');
   const [filteredCount, setFilteredCount] = useState(0);
+  const [showArchitecture, setShowArchitecture] = useState(false);
 
   const loadData = useCallback(async () => {
     try {
@@ -263,6 +266,15 @@ export default function AutonomousTrader() {
           </p>
         </div>
         <div className="flex gap-2 flex-wrap">
+          <Button
+            onClick={() => setShowArchitecture(!showArchitecture)}
+            variant="outline"
+            size="sm"
+            className="gap-1.5"
+          >
+            <Layers className="w-4 h-4" />
+            {showArchitecture ? 'Hide' : 'Architecture'}
+          </Button>
           {proposals.length > 0 && pendingCount > 0 && (
             <Button
               onClick={executeAll}
@@ -294,6 +306,9 @@ export default function AutonomousTrader() {
 
       {/* Active risk profile */}
       <ActiveProfileBanner profile={getProfile(tradeProfile)} filteredCount={filteredCount} />
+
+      {/* Institutional architecture overview */}
+      {showArchitecture && <ArchitectureOverview onClose={() => setShowArchitecture(false)} />}
 
       {/* Scanning state with pass indicators */}
       {scanning && (
