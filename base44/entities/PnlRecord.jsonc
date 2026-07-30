@@ -1,0 +1,32 @@
+{
+  "name": "PnlRecord",
+  "type": "object",
+  "properties": {
+    "date": {
+      "type": "string",
+      "format": "date"
+    },
+    "symbol": {
+      "type": "string"
+    },
+    "asset_class": {
+      "type": "string"
+    },
+    "price": {
+      "type": "number"
+    },
+    "daily_return_pct": {
+      "type": "number"
+    },
+    "cumulative_pnl_pct": {
+      "type": "number"
+    },
+    "equity": {
+      "type": "number"
+    }
+  },
+  "required": [
+    "date",
+    "symbol"
+  ]
+}

@@ -17,6 +17,7 @@ import StatCard from '@/components/StatCard';
 import AddPositionDialog from '@/components/AddPositionDialog';
 import SectorExposure from '@/components/SectorExposure';
 import ExitAlerts from '@/components/ExitAlerts';
+import RealDataPipeline from '@/components/RealDataPipeline';
 import { Button } from '@/components/ui/button';
 
 const COLORS = ['#10b981', '#8b5cf6', '#3b82f6', '#f59e0b', '#ec4899', '#06b6d4', '#84cc16', '#f97316'];
@@ -207,6 +208,8 @@ export default function Dashboard() {
         />
         <StatCard label="Today's Change" value={formatCurrency(dayPL)} icon={TrendingUp} />
       </div>
+
+      <RealDataPipeline />
 
       <ExitAlerts holdings={holdings} onExit={handleExitPosition} />
 
