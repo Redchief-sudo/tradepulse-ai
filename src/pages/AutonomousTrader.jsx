@@ -22,7 +22,7 @@ import TradePerformance from '@/components/TradePerformance';
 import TradeProposalCard from '@/components/TradeProposalCard';
 import CandidateCard from '@/components/CandidateCard';
 import StopLossScanner from '@/components/StopLossScanner';
-import { runPass1, runPass2, runPass3, runAdversarialReview } from '@/lib/autonomousScan';
+import { runPass1, runPass2, runPass3, runAdversarialReview, runCommitteeDebate } from '@/lib/autonomousScan';
 import {
   computePortfolioValue,
   computeSectorExposure,
@@ -35,6 +35,8 @@ import ActiveProfileBanner from '@/components/ActiveProfileBanner';
 import ArchitectureOverview from '@/components/ArchitectureOverview';
 import RegimeBanner from '@/components/RegimeBanner';
 import StressTestSimulator from '@/components/StressTestSimulator';
+import AssetClassSelector from '@/components/AssetClassSelector';
+import SelfLearningMemory from '@/components/SelfLearningMemory';
 
 function timeAgo(date) {
   if (!date) return '';
@@ -48,10 +50,11 @@ function timeAgo(date) {
 }
 
 const SCAN_STAGES = [
-  { key: 'pass1', label: 'Pass 1: Multi-modal market scan', model: 'Gemini 3.1 Pro · Transformer' },
-  { key: 'pass2', label: 'Pass 2: RL execution & risk fit', model: 'Claude Sonnet 5 · RL-DQN' },
-  { key: 'pass3', label: 'Pass 3: GNN + ML multi-factor scoring', model: 'Claude Sonnet 5 · GNN ensemble' },
-  { key: 'pass4', label: 'Pass 4: Adversarial risk veto', model: 'Claude Sonnet 5 · Risk Officer' },
+  { key: 'pass1', label: 'Pass 1: Multi-asset market scan', model: 'Gemini 3.1 Pro · Transformer' },
+  { key: 'pass2', label: 'Pass 2: Investment committee debate', model: 'Claude Sonnet 5 · 4 Archetypes' },
+  { key: 'pass3', label: 'Pass 3: RL execution & cross-asset fit', model: 'Claude Sonnet 5 · RL-DQN' },
+  { key: 'pass4', label: 'Pass 4: GNN + ML multi-factor scoring', model: 'Claude Sonnet 5 · GNN ensemble' },
+  { key: 'pass5', label: 'Pass 5: Adversarial risk veto', model: 'Claude Sonnet 5 · Risk Officer' },
 ];
 
 export default function AutonomousTrader() {
@@ -72,6 +75,8 @@ export default function AutonomousTrader() {
   const [showArchitecture, setShowArchitecture] = useState(false);
   const [marketRegime, setMarketRegime] = useState(null);
   const [vetoedCount, setVetoedCount] = useState(0);
+  const [assetClasses, setAssetClasses] = useState([]);
+  const [mlWeights, setMlWeights] = useState(null);
 
   const loadData = useCallback(async () => {
     try {
@@ -114,7 +119,7 @@ export default function AutonomousTrader() {
 
     try {
       setScanStageIndex(0);
-      const p1 = await runPass1(holdings);
+      const p1 = await runPass1(holdings, assetClasses);
       setMarketSummary(p1.market_summary || '');
       setCandidates(p1.candidates || []);
       setMarketRegime({
@@ -122,20 +127,34 @@ export default function AutonomousTrader() {
         regime_confidence: p1.regime_confidence,
         regime_strategy: p1.regime_strategy,
       });
+      const candidateMap = {};
+      (p1.candidates || []).forEach((c) => { candidateMap[c.symbol.toUpperCase()] = c; });
 
+      // Pass 2: Investment Committee Debate (4-archetype consensus)
       setScanStageIndex(1);
+      const committee = await runCommitteeDebate(p1.candidates || []);
+      const debateMap = {};
+      (committee.debates || []).forEach((d) => { debateMap[d.symbol.toUpperCase()] = d; });
+      const consensusCandidates = (p1.candidates || []).filter(
+        (c) => debateMap[c.symbol.toUpperCase()]?.consensus
+      );
+
+      // Pass 3: Portfolio fit + cross-asset correlation
+      setScanStageIndex(2);
       const pp = profileParams(tradeProfile);
-      const p2 = await runPass2(holdings, p1.candidates || [], pp, p1);
+      const p2 = await runPass2(holdings, consensusCandidates, pp, p1);
       setRiskAssessment(p2.risk_assessment || '');
 
-      setScanStageIndex(2);
-      const p3 = await runPass3(p2.proposals || [], p1.candidates || []);
+      // Pass 4: ML scoring with self-learning weights
+      setScanStageIndex(3);
+      const p3 = await runPass3(p2.proposals || [], consensusCandidates, mlWeights);
       const scoreMap = {};
-      (p3.scores || []).forEach((s) => {
-        scoreMap[s.symbol.toUpperCase()] = s;
-      });
+      (p3.scores || []).forEach((s) => { scoreMap[s.symbol.toUpperCase()] = s; });
       let merged = (p2.proposals || []).map((p) => ({
         ...p,
+        asset_class: candidateMap[p.symbol.toUpperCase()]?.asset_class || 'stocks',
+        microstructure_signal: candidateMap[p.symbol.toUpperCase()]?.microstructure_signal,
+        committee_debate: debateMap[p.symbol.toUpperCase()],
         ...(scoreMap[p.symbol.toUpperCase()] || {}),
       }));
 
@@ -144,13 +163,11 @@ export default function AutonomousTrader() {
       setFilteredCount(merged.length - compliant.length);
       merged = compliant.slice(0, pp.max_daily_trades);
 
-      // Pass 4: Adversarial Risk Officer veto layer
-      setScanStageIndex(3);
+      // Pass 5: Adversarial Risk Officer veto layer
+      setScanStageIndex(4);
       const adv = await runAdversarialReview(merged, holdings, p1);
       const reviewMap = {};
-      (adv.reviews || []).forEach((r) => {
-        reviewMap[r.symbol.toUpperCase()] = r;
-      });
+      (adv.reviews || []).forEach((r) => { reviewMap[r.symbol.toUpperCase()] = r; });
       merged = merged.map((p) => ({
         ...p,
         adversarial_verdict: reviewMap[p.symbol.toUpperCase()]?.verdict || 'approved',
@@ -245,6 +262,7 @@ export default function AutonomousTrader() {
       symbol: proposal.symbol,
       company_name: proposal.company_name || proposal.symbol,
       sector: proposal.sector || '',
+      asset_class: proposal.asset_class || 'stocks',
       action: proposal.action,
       shares,
       price: proposal.current_price,
@@ -324,6 +342,8 @@ export default function AutonomousTrader() {
         </div>
       </div>
 
+      <AssetClassSelector value={assetClasses} onChange={setAssetClasses} />
+
       <StopLossScanner
         holdings={holdings}
         stopLossPct={stopLossPct}
@@ -342,6 +362,9 @@ export default function AutonomousTrader() {
 
       {/* Generative stress-test simulation */}
       {holdings.length > 0 && !scanning && <StressTestSimulator holdings={holdings} />}
+
+      {/* Self-learning model memory */}
+      <SelfLearningMemory decisions={decisions} onWeights={setMlWeights} />
 
       {/* Scanning state with pass indicators */}
       {scanning && (

@@ -11,6 +11,17 @@
     "sector": {
       "type": "string"
     },
+    "asset_class": {
+      "type": "string",
+      "enum": [
+        "stocks",
+        "crypto",
+        "forex",
+        "commodities",
+        "fixed_income"
+      ],
+      "default": "stocks"
+    },
     "action": {
       "type": "string",
       "enum": [

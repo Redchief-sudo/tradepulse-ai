@@ -4,6 +4,9 @@ import { Zap, CheckCircle2, ArrowDownRight, ArrowUpRight, ShieldAlert, ShieldChe
 import { Button } from '@/components/ui/button';
 import RecommendationBadge from '@/components/RecommendationBadge';
 import MLScoreCard from '@/components/MLScoreCard';
+import CommitteeDebate from '@/components/CommitteeDebate';
+import ExecutionBreakdown from '@/components/ExecutionBreakdown';
+import CausalContagionGraph from '@/components/CausalContagionGraph';
 import { computePortfolioValue, computeSectorExposure, computeCappedPositionSize, formatCurrency } from '@/lib/portfolio';
 import { cn } from '@/lib/utils';
 
@@ -62,6 +65,11 @@ export default function TradeProposalCard({ proposal, index, isExecuted, isExecu
             <div className="flex items-center gap-2 flex-wrap">
               <span className="font-bold text-base">{proposal.symbol}</span>
               <span className="text-xs text-muted-foreground">{proposal.company_name}</span>
+              {proposal.asset_class && proposal.asset_class !== 'stocks' && (
+                <span className="text-xs px-1.5 py-0.5 rounded-full bg-accent/15 text-accent border border-accent/30 capitalize">
+                  {proposal.asset_class.replace('_', ' ')}
+                </span>
+              )}
               {proposal.sector && (
                 <span className="text-xs text-muted-foreground hidden sm:inline">
                   · {proposal.sector}
@@ -163,6 +171,16 @@ export default function TradeProposalCard({ proposal, index, isExecuted, isExecu
           )}
         </div>
       )}
+
+      {proposal.committee_debate && (
+        <div className="mb-3">
+          <CommitteeDebate debate={proposal.committee_debate} />
+        </div>
+      )}
+      <div className="mb-3 space-y-2">
+        <ExecutionBreakdown proposal={proposal} />
+        <CausalContagionGraph proposal={proposal} holdings={holdings} />
+      </div>
 
       {!isExecuted && (
         <Button

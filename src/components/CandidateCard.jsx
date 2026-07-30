@@ -1,5 +1,6 @@
 import React from 'react';
 import RecommendationBadge from '@/components/RecommendationBadge';
+import MicrostructureBadge from '@/components/MicrostructureBadge';
 
 export default function CandidateCard({ candidate, index }) {
   const c = candidate;
@@ -9,6 +10,11 @@ export default function CandidateCard({ candidate, index }) {
         <div>
           <span className="font-bold">{c.symbol}</span>
           <span className="text-muted-foreground text-sm ml-2">{c.company_name}</span>
+          {c.asset_class && c.asset_class !== 'stocks' && (
+            <span className="text-xs px-1.5 py-0.5 rounded-full bg-accent/15 text-accent border border-accent/30 capitalize ml-1">
+              {c.asset_class.replace('_', ' ')}
+            </span>
+          )}
           {c.sector && (
             <span className="text-xs text-muted-foreground ml-2">· {c.sector}</span>
           )}
@@ -30,6 +36,7 @@ export default function CandidateCard({ candidate, index }) {
               MACD {c.macd_signal}
             </span>
           )}
+          <MicrostructureBadge signal={c.microstructure_signal} />
           <RecommendationBadge recommendation={c.recommendation} />
         </div>
       </div>
