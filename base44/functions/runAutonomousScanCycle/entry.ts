@@ -3,6 +3,8 @@ import { secrets } from 'base44:runtime';
 import { getAlpacaAccount } from '../../shared/alpaca.ts';
 import { settleTrade } from '../../shared/execution.ts';
 import { computeRealFactors, weightedComposite, signalFromComposite } from '../../shared/quantScore.ts';
+import { classifyRegimeFromSnapshots } from '../../shared/regime.ts';
+import { netEdge } from '../../shared/costModel.ts';
 
 const PROFILES = {
   aggressive: { max_position_pct: 15, max_sector_pct: 40, min_confidence: 70, max_daily_trades: 8, stop_loss_pct: 12 },
@@ -62,6 +64,10 @@ export default async function(req) {
     const pCtx = portfolioContext(holdings);
     const sec = sectorExposure(holdings);
     const secCtx = sec.sectors.length ? sec.sectors.map((s) => `${s.sector}: ${s.percent.toFixed(1)}% ($${s.value.toFixed(0)})`).join(', ') : 'No sector exposure yet.';
+
+    // Deterministic market regime (from SPY snapshots — NOT LLM estimation).
+    // Governs regime-aware position sizing and blocks new buys in a liquidity crisis.
+    const regime = await classifyRegimeFromSnapshots(sr);
 
     // PASS 1 — Multi-asset deep market scan (Gemini 3.1 Pro, web search)
     const p1 = await sr.integrations.Core.InvokeLLM({
@@ -227,11 +233,18 @@ export default async function(req) {
       const price = pr.realPrice || pr.current_price;
       let shares;
       if (pr.action === 'buy') {
+        // Regime gate: block new buys in a liquidity crisis (position_multiplier = 0).
+        if (regime.position_multiplier <= 0) continue;
+        // Net-edge gate: skip trades whose expected gross return is smaller than
+        // the round-trip transaction cost (no edge after costs).
+        const grossReturnPct = pr.target_price && price > 0 ? ((pr.target_price - price) / price) * 100 : null;
+        if (grossReturnPct !== null && netEdge(grossReturnPct, pr.asset_class || 'stocks') <= 0) continue;
         const maxPos = (pp.max_position_pct / 100) * accountEquity;
         const sectorVal = sec.sectors.find((s) => s.sector === (pr.sector || 'Other'))?.value || 0;
         const sectorCap = Math.max(0, (pp.max_sector_pct / 100) * accountEquity - sectorVal);
         const aiVal = ((pr.suggested_position_pct || 5) / 100) * accountEquity;
-        const positionValue = Math.min(aiVal, maxPos, sectorCap);
+        // Regime-aware sizing: scale down in high-vol/bear regimes, full in low-vol bull.
+        const positionValue = Math.min(aiVal, maxPos, sectorCap) * regime.position_multiplier;
         // Do NOT buy when authorized notional is below the cost of one whole share.
         shares = price > 0 && positionValue >= price ? Math.floor(positionValue / price) : 0;
       } else {
@@ -305,6 +318,7 @@ export default async function(req) {
       ok: true,
       market_summary: p1.market_summary,
       risk_assessment: p2.risk_assessment,
+      regime,
       candidates_scanned: candidates.length,
       proposals_after_fit: (p2.proposals || []).length,
       proposals_after_committee: proposals.length,

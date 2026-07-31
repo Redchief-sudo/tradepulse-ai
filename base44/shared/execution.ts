@@ -9,7 +9,7 @@
 // Accounting is derived from the immutable Fill ledger; Holding is a projection of it.
 
 import { placeAlpacaOrder, getAlpacaOrder } from './alpaca.ts';
-import { evaluateRisk, riskLimitsForProfile, buildPortfolioSnapshot } from './riskEngine.ts';
+import { evaluateRisk, riskLimitsForProfile, buildPortfolioSnapshot, checkDataFreshness } from './riskEngine.ts';
 
 const FILL_TIMEOUT_MS = 15000;
 const POLL_INTERVAL_MS = 1000;
@@ -102,6 +102,18 @@ export async function executeIntent(base44, user, input) {
     momentum_score: input.momentum_score,
     risk_score: input.risk_score,
   });
+
+  // 1b. Market-data freshness guard (LIVE only). Stale prices ⇒ stale risk ⇒ reject.
+  if (executionMode === 'live') {
+    const freshness = await checkDataFreshness(sr, symbol, 5);
+    if (!freshness.fresh) {
+      await sr.entities.TradeIntent.update(intentRecord.id, {
+        status: 'rejected',
+        rejection_reason: `${freshness.reason} (age ${freshness.ageMinutes}m)`,
+      });
+      return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, reasons: [`${freshness.reason} (age ${freshness.ageMinutes}m)`], symbol, side, requestedQty };
+    }
+  }
 
   // 2. RISK evaluation — deterministic, veto authority. DENIED ⇒ zero order, zero mutation.
   const snapshot = await buildPortfolioSnapshot(sr);

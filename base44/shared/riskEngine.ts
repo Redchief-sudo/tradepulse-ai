@@ -126,3 +126,17 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
   if (approvedQty >= qty) reasons.push('OK');
   return { approved: true, approvedQuantity: Math.max(0, approvedQty), reasons, snapshot };
 }
+
+// Market-data freshness guard. Rejects execution when the latest price snapshot
+// for the symbol is older than maxAgeMinutes — stale prices produce stale risk.
+export async function checkDataFreshness(sr, symbol, maxAgeMinutes = 5) {
+  const snaps = await sr.entities.PriceSnapshot.list('-timestamp', 200);
+  const sym = String(symbol).toUpperCase();
+  const latest = snaps.find((s) => String(s.symbol).toUpperCase() === sym);
+  if (!latest) return { fresh: false, reason: 'NO_PRICE_SNAPSHOT', ageMinutes: null };
+  const ageMinutes = (Date.now() - new Date(latest.timestamp).getTime()) / 60000;
+  if (ageMinutes > maxAgeMinutes) {
+    return { fresh: false, reason: 'STALE_MARKET_DATA', ageMinutes: Math.round(ageMinutes) };
+  }
+  return { fresh: true, ageMinutes: Math.round(ageMinutes) };
+}
