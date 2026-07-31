@@ -2,8 +2,9 @@ import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { secrets } from 'base44:runtime';
 
 // Finnhub quote endpoint returns { c: current, d: change, dp: percent change, h, l, o, pc }
-// Free tier: 60 calls/min — we batch with Promise.all but cap to stay safe.
+// Finnhub profile2 endpoint returns company fundamentals: name, finnhubIndustry, marketCapitalization, peNormalized, etc.
 const FINNHUB_QUOTE = 'https://finnhub.io/api/v1/quote';
+const FINNHUB_PROFILE = 'https://finnhub.io/api/v1/stock/profile2';
 
 export default async function(req) {
   try {
@@ -13,12 +14,12 @@ export default async function(req) {
 
     const body = await req.json().catch(() => ({}));
     const symbols = Array.isArray(body.symbols) ? body.symbols : [];
+    const includeFundamentals = !!body.include_fundamentals;
     if (symbols.length === 0) return Response.json({ quotes: [] });
 
     const key = secrets.get('FINNHUB_API_KEY');
     if (!key) return Response.json({ error: 'FINNHUB_API_KEY not set' }, { status: 500 });
 
-    // Cap to 40 symbols per call to stay within free-tier rate limits.
     const batch = symbols.slice(0, 40).map((s) => String(s).toUpperCase().trim()).filter(Boolean);
 
     const results = await Promise.all(
@@ -27,11 +28,10 @@ export default async function(req) {
           const res = await fetch(`${FINNHUB_QUOTE}?symbol=${encodeURIComponent(symbol)}&token=${key}`);
           if (!res.ok) return { symbol, error: `HTTP ${res.status}` };
           const data = await res.json();
-          // Finnhub returns c:0 for invalid/closed symbols — treat 0 current as no data.
           if (!data || typeof data.c !== 'number' || data.c === 0) {
             return { symbol, error: 'no data' };
           }
-          return {
+          const quote = {
             symbol,
             current_price: data.c,
             day_change_percent: typeof data.dp === 'number' ? data.dp : 0,
@@ -41,6 +41,25 @@ export default async function(req) {
             open: data.o,
             prev_close: data.pc,
           };
+          if (includeFundamentals) {
+            try {
+              const pres = await fetch(`${FINNHUB_PROFILE}?symbol=${encodeURIComponent(symbol)}&token=${key}`);
+              if (pres.ok) {
+                const p = await pres.json();
+                quote.fundamentals = {
+                  name: p.name || null,
+                  industry: p.finnhubIndustry || null,
+                  market_cap: p.marketCapitalization || null,
+                  pe_ratio: p.peNormalized || p.pe || null,
+                  shares_outstanding: p.shareOutstanding || null,
+                  logo: p.logo || null,
+                };
+              }
+            } catch (e) {
+              /* fundamentals optional */
+            }
+          }
+          return quote;
         } catch (e) {
           return { symbol, error: e.message };
         }

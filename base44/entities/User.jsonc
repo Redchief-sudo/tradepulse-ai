@@ -40,6 +40,27 @@
         "conservative"
       ],
       "description": "AI trading risk profile governing position limits and confidence thresholds"
+    },
+    "ml_weights": {
+      "type": "object",
+      "description": "Self-learning adjusted 5-factor weights (technical/fundamental/sentiment/momentum/risk) persisted across autonomous scan cycles",
+      "properties": {
+        "technical": {
+          "type": "number"
+        },
+        "fundamental": {
+          "type": "number"
+        },
+        "sentiment": {
+          "type": "number"
+        },
+        "momentum": {
+          "type": "number"
+        },
+        "risk": {
+          "type": "number"
+        }
+      }
     }
   },
   "required": [
