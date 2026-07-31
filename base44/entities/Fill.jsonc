@@ -1,0 +1,86 @@
+{
+  "name": "Fill",
+  "type": "object",
+  "properties": {
+    "fill_id": {
+      "type": "string",
+      "description": "Unique fill identifier (broker-assigned, or generated for paper/shadow)"
+    },
+    "broker_order_id": {
+      "type": "string"
+    },
+    "client_order_id": {
+      "type": "string"
+    },
+    "trade_intent_id": {
+      "type": "string",
+      "description": "Canonical TradeIntent this fill settles"
+    },
+    "symbol": {
+      "type": "string"
+    },
+    "asset_id": {
+      "type": "string",
+      "description": "Native instrument id at the venue"
+    },
+    "side": {
+      "type": "string",
+      "enum": [
+        "buy",
+        "sell"
+      ]
+    },
+    "filled_quantity": {
+      "type": "number"
+    },
+    "filled_price": {
+      "type": "number"
+    },
+    "notional": {
+      "type": "number"
+    },
+    "commission": {
+      "type": "number"
+    },
+    "fees": {
+      "type": "number"
+    },
+    "slippage": {
+      "type": "number"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "venue": {
+      "type": "string",
+      "description": "paper | shadow | alpaca | external"
+    },
+    "strategy_id": {
+      "type": "string"
+    },
+    "decision_id": {
+      "type": "string"
+    },
+    "execution_mode": {
+      "type": "string",
+      "enum": [
+        "paper",
+        "shadow_live",
+        "live"
+      ]
+    },
+    "asset_class": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "fill_id",
+    "trade_intent_id",
+    "symbol",
+    "side",
+    "filled_quantity",
+    "filled_price",
+    "execution_mode"
+  ]
+}

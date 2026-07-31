@@ -1,0 +1,186 @@
+{
+  "name": "TradeIntent",
+  "type": "object",
+  "properties": {
+    "trade_intent_id": {
+      "type": "string",
+      "description": "Canonical idempotency key assigned by the execution gateway"
+    },
+    "strategy_id": {
+      "type": "string",
+      "description": "Originating strategy or surface (autonomous, stoploss, dashboard_exit, ai_assistant, manual...)"
+    },
+    "decision_id": {
+      "type": "string",
+      "description": "Linked AITradeDecision id when the intent is AI-driven"
+    },
+    "asset_class": {
+      "type": "string",
+      "enum": [
+        "stocks",
+        "crypto",
+        "forex",
+        "commodities",
+        "fixed_income"
+      ],
+      "default": "stocks"
+    },
+    "symbol": {
+      "type": "string"
+    },
+    "native_asset_id": {
+      "type": "string",
+      "description": "Broker-native instrument identifier"
+    },
+    "broker": {
+      "type": "string",
+      "description": "Target broker / venue"
+    },
+    "side": {
+      "type": "string",
+      "enum": [
+        "buy",
+        "sell"
+      ]
+    },
+    "order_type": {
+      "type": "string",
+      "enum": [
+        "market",
+        "limit",
+        "stop",
+        "stop_limit"
+      ],
+      "default": "market"
+    },
+    "requested_quantity": {
+      "type": "number"
+    },
+    "requested_notional": {
+      "type": "number"
+    },
+    "limit_price": {
+      "type": "number"
+    },
+    "stop_price": {
+      "type": "number"
+    },
+    "time_in_force": {
+      "type": "string",
+      "enum": [
+        "day",
+        "gtc",
+        "ioc",
+        "fok"
+      ],
+      "default": "day"
+    },
+    "execution_mode": {
+      "type": "string",
+      "enum": [
+        "paper",
+        "shadow_live",
+        "live"
+      ],
+      "default": "paper"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "proposed",
+        "risk_approved",
+        "submitted",
+        "accepted",
+        "partially_filled",
+        "filled",
+        "settled",
+        "rejected",
+        "canceled",
+        "expired",
+        "failed"
+      ],
+      "default": "proposed"
+    },
+    "risk_snapshot": {
+      "type": "string",
+      "description": "JSON snapshot of the risk evaluation"
+    },
+    "portfolio_snapshot": {
+      "type": "string",
+      "description": "JSON snapshot of the portfolio at signal time"
+    },
+    "signal_timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "decision_timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "rejection_reason": {
+      "type": "string"
+    },
+    "broker_order_id": {
+      "type": "string"
+    },
+    "client_order_id": {
+      "type": "string"
+    },
+    "filled_quantity": {
+      "type": "number"
+    },
+    "filled_avg_price": {
+      "type": "number"
+    },
+    "commission": {
+      "type": "number"
+    },
+    "fees": {
+      "type": "number"
+    },
+    "slippage": {
+      "type": "number"
+    },
+    "realized_pnl": {
+      "type": "number"
+    },
+    "company_name": {
+      "type": "string"
+    },
+    "sector": {
+      "type": "string"
+    },
+    "confidence": {
+      "type": "number"
+    },
+    "target_price": {
+      "type": "number"
+    },
+    "stop_loss": {
+      "type": "number"
+    },
+    "reasoning": {
+      "type": "string"
+    },
+    "ml_score": {
+      "type": "number"
+    },
+    "technical_score": {
+      "type": "number"
+    },
+    "momentum_score": {
+      "type": "number"
+    },
+    "risk_score": {
+      "type": "number"
+    }
+  },
+  "required": [
+    "trade_intent_id",
+    "symbol",
+    "side",
+    "requested_quantity",
+    "execution_mode",
+    "status"
+  ]
+}
