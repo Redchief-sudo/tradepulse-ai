@@ -266,6 +266,7 @@ export async function executeIntent(base44, user, input) {
         day_change_percent: 0,
         stop_loss: input.stop_loss,
         target_price: input.target_price,
+        asset_class: input.asset_class || 'stocks',
       });
     }
   } else {

@@ -28,6 +28,17 @@
     },
     "target_price": {
       "type": "number"
+    },
+    "asset_class": {
+      "type": "string",
+      "enum": [
+        "stocks",
+        "crypto",
+        "forex",
+        "commodities",
+        "fixed_income"
+      ],
+      "default": "stocks"
     }
   },
   "required": [

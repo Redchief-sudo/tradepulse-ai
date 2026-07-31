@@ -1,23 +1,7 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { secrets } from 'base44:runtime';
 import { settleTrade } from '../../shared/execution.ts';
-
-const FINNHUB_QUOTE = 'https://finnhub.io/api/v1/quote';
-
-async function fetchQuotes(symbols, key) {
-  return Promise.all(
-    symbols.map(async (symbol) => {
-      try {
-        const res = await fetch(`${FINNHUB_QUOTE}?symbol=${encodeURIComponent(symbol)}&token=${key}`);
-        const d = await res.json();
-        if (!d || typeof d.c !== 'number' || d.c === 0) return { symbol, error: 'no data' };
-        return { symbol, current_price: d.c, day_change_percent: typeof d.dp === 'number' ? d.dp : 0 };
-      } catch (e) {
-        return { symbol, error: e.message };
-      }
-    })
-  );
-}
+import { fetchQuotes as fetchMultiAssetQuotes } from '../../shared/marketDataAdapter.ts';
 
 // Admin / scheduled autonomous stop-loss monitor.
 // 1. Refreshes real prices from Finnhub for every holding.
@@ -34,18 +18,19 @@ export default async function(req) {
     }
 
     const key = secrets.get('FINNHUB_API_KEY');
-    if (!key) return Response.json({ error: 'FINNHUB_API_KEY not set' }, { status: 500 });
-
     const holdings = await base44.asServiceRole.entities.Holding.list();
     if (!holdings.length) return Response.json({ ok: true, checked: 0, triggered: [] });
 
+    const hasStocks = holdings.some((h) => (h.asset_class || 'stocks') === 'stocks');
+    if (!key && hasStocks) return Response.json({ error: 'FINNHUB_API_KEY not set' }, { status: 500 });
+
     const threshold = user.stop_loss_pct || 8;
-    const symbols = [...new Set(holdings.map((h) => String(h.symbol).toUpperCase()))];
-    const quotes = await fetchQuotes(symbols, key);
+    const items = holdings.map((h) => ({ symbol: h.symbol, asset_class: h.asset_class || 'stocks' }));
+    const quotes = await fetchMultiAssetQuotes(items, key);
     const priceMap = {};
     const changeMap = {};
     quotes.filter((q) => !q.error).forEach((q) => {
-      priceMap[q.symbol.toUpperCase()] = q.current_price;
+      priceMap[q.symbol.toUpperCase()] = q.price;
       changeMap[q.symbol.toUpperCase()] = q.day_change_percent;
     });
 

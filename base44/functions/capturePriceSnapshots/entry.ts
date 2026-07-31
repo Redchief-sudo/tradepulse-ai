@@ -1,7 +1,6 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { secrets } from 'base44:runtime';
-
-const FINNHUB_QUOTE = 'https://finnhub.io/api/v1/quote';
+import { fetchQuotes } from '../../shared/marketDataAdapter.ts';
 
 // Scheduled price-snapshot capture. Records a point-in-time price for every
 // symbol that has an open AI buy decision (plus current holdings + SPY benchmark),
@@ -26,20 +25,26 @@ export default async function(req) {
       if (!hasSell) openSyms.add(sym);
     });
     const holdings = await sr.entities.Holding.list();
+    const assetClassBySym = {};
+    holdings.forEach((h) => { assetClassBySym[String(h.symbol).toUpperCase()] = h.asset_class || 'stocks'; });
+    decisions.forEach((d) => { if (!assetClassBySym[String(d.symbol).toUpperCase()]) assetClassBySym[String(d.symbol).toUpperCase()] = d.asset_class || 'stocks'; });
+    assetClassBySym['SPY'] = 'stocks';
     holdings.forEach((h) => openSyms.add(String(h.symbol).toUpperCase()));
     openSyms.add('SPY');
 
     const symbols = [...openSyms].slice(0, 40);
+    const items = symbols.map((s) => ({ symbol: s, asset_class: assetClassBySym[s] || 'stocks' }));
     const now = new Date().toISOString();
+    const quotes = await fetchQuotes(items, key);
     let captured = 0;
-    await Promise.all(symbols.map(async (symbol) => {
+    await Promise.all(quotes.filter((q) => !q.error && q.price > 0).map(async (q) => {
       try {
-        const res = await fetch(`${FINNHUB_QUOTE}?symbol=${encodeURIComponent(symbol)}&token=${key}`);
-        const d = await res.json();
-        if (!d || typeof d.c !== 'number' || d.c === 0) return;
-        await sr.entities.PriceSnapshot.create({ symbol, price: d.c, timestamp: now, source: 'finnhub' });
+        await sr.entities.PriceSnapshot.create({
+          symbol: q.symbol, price: q.price, timestamp: now,
+          source: q.asset_class === 'crypto' ? 'binance' : 'finnhub',
+        });
         captured++;
-      } catch (e) { /* skip individual failures */ }
+      } catch (e) { /* skip */ }
     }));
 
     return Response.json({ ok: true, captured, symbols: symbols.length });
