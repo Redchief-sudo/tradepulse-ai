@@ -18,6 +18,7 @@ import AddPositionDialog from '@/components/AddPositionDialog';
 import SectorExposure from '@/components/SectorExposure';
 import ExitAlerts from '@/components/ExitAlerts';
 import RealDataPipeline from '@/components/RealDataPipeline';
+import RealPnlChart from '@/components/RealPnlChart';
 import { Button } from '@/components/ui/button';
 
 const COLORS = ['#10b981', '#8b5cf6', '#3b82f6', '#f59e0b', '#ec4899', '#06b6d4', '#84cc16', '#f97316'];
@@ -210,6 +211,8 @@ export default function Dashboard() {
       </div>
 
       <RealDataPipeline />
+
+      <RealPnlChart />
 
       <ExitAlerts holdings={holdings} onExit={handleExitPosition} />
 
