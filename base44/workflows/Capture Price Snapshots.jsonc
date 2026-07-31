@@ -1,0 +1,40 @@
+{
+  "name": "Capture Price Snapshots",
+  "description": "Captures point-in-time prices every 5 minutes for symbols with open AI decisions, current holdings, and the SPY benchmark \u2014 feeds the outcome-labeling engine.",
+  "trigger": {
+    "condition": null,
+    "config": {
+      "trigger_type": "scheduled",
+      "events": [],
+      "schedule_mode": "recurring",
+      "cron_expression": "*/5 * * * *",
+      "one_time_date": null,
+      "timezone": "America/Los_Angeles",
+      "interval_value": null,
+      "interval_unit": null,
+      "interval_anchor": null,
+      "ends_type": "never",
+      "ends_on_date": null,
+      "ends_after_count": null
+    }
+  },
+  "definition": {
+    "document": {
+      "dsl": "1.0.0",
+      "name": "capture_price_snapshots",
+      "version": "1.0",
+      "namespace": "base44"
+    },
+    "do": [
+      {
+        "capture": {
+          "call": "invoke_backend_function",
+          "with": {
+            "function_name": "capturePriceSnapshots"
+          },
+          "then": "end"
+        }
+      }
+    ]
+  }
+}

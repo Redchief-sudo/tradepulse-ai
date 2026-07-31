@@ -1,0 +1,57 @@
+{
+  "name": "ReconciliationEvent",
+  "type": "object",
+  "properties": {
+    "run_timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "matched",
+        "qty_drift",
+        "price_drift",
+        "externally_closed",
+        "new_from_broker",
+        "broker_unreachable"
+      ]
+    },
+    "symbol": {
+      "type": "string"
+    },
+    "app_qty": {
+      "type": "number"
+    },
+    "broker_qty": {
+      "type": "number"
+    },
+    "app_avg_price": {
+      "type": "number"
+    },
+    "broker_avg_price": {
+      "type": "number"
+    },
+    "app_current_price": {
+      "type": "number"
+    },
+    "broker_current_price": {
+      "type": "number"
+    },
+    "action_taken": {
+      "type": "string",
+      "description": "none | updated_holding | created_holding | recorded_sell_and_removed | flagged_for_review"
+    },
+    "realized_pnl": {
+      "type": "number"
+    },
+    "details": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_timestamp",
+    "event_type",
+    "symbol"
+  ]
+}

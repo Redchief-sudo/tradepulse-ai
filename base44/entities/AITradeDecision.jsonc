@@ -74,6 +74,53 @@
     },
     "risk_score": {
       "type": "number"
+    },
+    "return_5m": {
+      "type": "number",
+      "description": "Forward return 5 minutes after entry"
+    },
+    "return_1h": {
+      "type": "number",
+      "description": "Forward return 1 hour after entry"
+    },
+    "return_1d": {
+      "type": "number",
+      "description": "Forward return 1 day after entry"
+    },
+    "return_5d": {
+      "type": "number",
+      "description": "Forward return 5 days after entry"
+    },
+    "realized_return": {
+      "type": "number",
+      "description": "Realized return at exit (closed positions)"
+    },
+    "benchmark_return": {
+      "type": "number",
+      "description": "SPY return over the same holding window"
+    },
+    "max_adverse_excursion": {
+      "type": "number",
+      "description": "Max drawdown from entry while held"
+    },
+    "max_favorable_excursion": {
+      "type": "number",
+      "description": "Max upside from entry while held"
+    },
+    "holding_period_minutes": {
+      "type": "number"
+    },
+    "outcome_status": {
+      "type": "string",
+      "enum": [
+        "open",
+        "realized"
+      ],
+      "description": "Whether the position is still open or has been exited"
+    },
+    "labeled_at": {
+      "type": "string",
+      "format": "date-time"
     }
   },
   "required": [

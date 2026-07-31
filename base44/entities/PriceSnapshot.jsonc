@@ -1,0 +1,25 @@
+{
+  "name": "PriceSnapshot",
+  "type": "object",
+  "properties": {
+    "symbol": {
+      "type": "string"
+    },
+    "price": {
+      "type": "number"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source": {
+      "type": "string",
+      "description": "finnhub | binance | alpaca"
+    }
+  },
+  "required": [
+    "symbol",
+    "price",
+    "timestamp"
+  ]
+}
