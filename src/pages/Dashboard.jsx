@@ -60,30 +60,11 @@ export default function Dashboard() {
     if (holdings.length === 0) return;
     setRefreshing(true);
     try {
-      const symbols = holdings.map((h) => h.symbol).join(', ');
-      const result = await base44.integrations.Core.InvokeLLM({
-        prompt: `Get the current stock prices and today's percentage change for these ticker symbols: ${symbols}. Return accurate real-time data.`,
-        add_context_from_internet: true,
-        model: 'gemini_3_flash',
-        response_json_schema: {
-          type: 'object',
-          properties: {
-            stocks: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  symbol: { type: 'string' },
-                  current_price: { type: 'number' },
-                  day_change_percent: { type: 'number' },
-                },
-              },
-            },
-          },
-        },
-      });
-      const stockData = (result.stocks || []).reduce((acc, s) => {
-        acc[s.symbol.toUpperCase()] = s;
+      const symbols = holdings.map((h) => h.symbol);
+      const result = await base44.functions.invoke('marketData', { symbols });
+      const quotes = (result.data?.quotes || []).filter((q) => !q.error);
+      const stockData = quotes.reduce((acc, q) => {
+        acc[q.symbol.toUpperCase()] = q;
         return acc;
       }, {});
       const updates = holdings
