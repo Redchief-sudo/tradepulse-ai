@@ -77,6 +77,7 @@ export default function AutonomousTrader() {
   const [vetoedCount, setVetoedCount] = useState(0);
   const [assetClasses, setAssetClasses] = useState([]);
   const [mlWeights, setMlWeights] = useState(null);
+  const [broker, setBroker] = useState(null);
 
   const loadData = useCallback(async () => {
     try {
@@ -89,6 +90,7 @@ export default function AutonomousTrader() {
       setDecisions(d || []);
       if (me.stop_loss_pct) setStopLossPct(me.stop_loss_pct);
       if (me.trade_profile) setTradeProfile(me.trade_profile);
+      if (me.broker === 'alpaca' && me.broker_api_key) setBroker({ mode: me.broker_mode || 'paper' });
     } catch (e) {
       console.error(e);
     }
@@ -209,6 +211,19 @@ export default function AutonomousTrader() {
     }
 
     if (shares <= 0) return;
+
+    // Route through the real broker if Alpaca is connected (paper or live).
+    if (broker) {
+      try {
+        await base44.functions.invoke('executeBrokerOrder', {
+          symbol: proposal.symbol,
+          qty: shares,
+          side: proposal.action,
+        });
+      } catch (e) {
+        console.error('Broker order failed, recording as paper:', e);
+      }
+    }
 
     const trade = {
       symbol: proposal.symbol,

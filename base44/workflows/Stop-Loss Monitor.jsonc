@@ -1,0 +1,44 @@
+{
+  "description": "Every 5 minutes: refreshes real prices from Finnhub and auto-exits any position down >= the stop-loss threshold, then emails a summary.",
+  "definition": {
+    "document": {
+      "dsl": "1.0.0",
+      "name": "stop_loss_monitor",
+      "version": "1.0",
+      "namespace": "base44"
+    },
+    "do": [
+      {
+        "scan": {
+          "call": "invoke_backend_function",
+          "with": {
+            "function_name": "runStopLossCycle"
+          },
+          "then": "end",
+          "x-base44": {
+            "title": "Run stop-loss cycle",
+            "description": "Refresh prices & auto-exit triggered positions"
+          }
+        }
+      }
+    ]
+  },
+  "name": "Stop-Loss Monitor",
+  "trigger": {
+    "condition": null,
+    "config": {
+      "trigger_type": "scheduled",
+      "events": [],
+      "schedule_mode": "recurring",
+      "cron_expression": "*/5 * * * *",
+      "one_time_date": null,
+      "timezone": "America/Los_Angeles",
+      "interval_value": null,
+      "interval_unit": null,
+      "interval_anchor": null,
+      "ends_type": "never",
+      "ends_on_date": null,
+      "ends_after_count": null
+    }
+  }
+}

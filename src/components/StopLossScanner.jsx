@@ -57,30 +57,12 @@ export default function StopLossScanner({ holdings, stopLossPct, onStopLossPctCh
     setHasScanned(false);
     try {
       // 1. Refresh live prices
-      const symbols = holdings.map((h) => h.symbol).join(', ');
-      const result = await base44.integrations.Core.InvokeLLM({
-        prompt: `Get current stock prices for these tickers: ${symbols}. Return accurate real-time data.`,
-        add_context_from_internet: true,
-        model: 'gemini_3_flash',
-        response_json_schema: {
-          type: 'object',
-          properties: {
-            stocks: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  symbol: { type: 'string' },
-                  current_price: { type: 'number' },
-                },
-              },
-            },
-          },
-        },
-      });
+      const symbols = holdings.map((h) => h.symbol);
+      const result = await base44.functions.invoke('marketData', { symbols });
+      const quotes = (result.data?.quotes || []).filter((q) => !q.error);
       const priceMap = {};
-      (result.stocks || []).forEach((s) => {
-        priceMap[s.symbol.toUpperCase()] = s.current_price;
+      quotes.forEach((q) => {
+        priceMap[q.symbol.toUpperCase()] = q.current_price;
       });
 
       // Update stored prices
