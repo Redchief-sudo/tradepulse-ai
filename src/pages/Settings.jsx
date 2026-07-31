@@ -23,10 +23,54 @@ import { cn } from '@/lib/utils';
 import TradingProfileSelector from '@/components/TradingProfileSelector';
 
 const BROKERS = [
-  { id: 'alpaca', name: 'Alpaca', note: 'Best for algorithmic trading · Free API · Paper & Live' },
-  { id: 'ibkr', name: 'Interactive Brokers', note: 'Professional · TWS API · Global markets' },
-  { id: 'tradestation', name: 'TradeStation', note: 'API access · Stocks, options, futures' },
-  { id: 'custom', name: 'Custom Broker', note: 'Bring your own REST API endpoint' },
+  {
+    id: 'ibkr',
+    name: 'Interactive Brokers',
+    badge: '🏆 Best Overall — Multi-Asset',
+    tagline: 'True institutional multi-asset coverage across 150+ global markets',
+    assets: 'Stocks, Options, Futures, Forex (20+ currencies), Crypto, Commodities, Fixed Income / Bonds',
+    why: [
+      'Direct Market Access (DMA) & Level 3 order book depth for institutional-grade microstructure signals',
+      'Native algorithmic order slicing (TWAP, VWAP, Accumulate/Distribute) built into the execution engine',
+      'Unlimited paper trading accounts (Sandbox) for simulated testing',
+    ],
+    api: 'Modern REST API + WebSockets, or Python TWS API gateway (IBKR Client Portal Web API / TWS API)',
+  },
+  {
+    id: 'alpaca',
+    name: 'Alpaca Markets',
+    badge: '🚀 Best Developer Experience',
+    tagline: 'Developer-first, cloud-native API — easy to wire up without local software gateways',
+    assets: 'US Equities (Stocks & ETFs), Options, and 50+ Cryptocurrency pairs (limited direct Forex/Commodity futures vs IBKR)',
+    why: [
+      'Free, instantaneous Paper Trading sandbox with zero friction',
+      '100% cloud-based REST API and WebSockets — no desktop terminal required',
+      'Built specifically for automated trading bots and programmatic execution',
+    ],
+    api: 'Cloud REST API + WebSockets',
+  },
+  {
+    id: 'tradestation',
+    name: 'TradeStation',
+    badge: '🌐 Best for Futures & Commodities',
+    tagline: 'High-frequency API access for macro commodities and index futures',
+    assets: 'Stocks, Options, Futures, Forex, and Crypto',
+    why: [
+      'Excellent futures execution and institutional order routing',
+      'Strong for Crude Oil, Gold, Wheat and Index Futures (E-mini S&P, Nasdaq)',
+      'Real-time streaming capabilities',
+    ],
+    api: 'REST API with real-time streaming',
+  },
+  {
+    id: 'custom',
+    name: 'Custom Broker',
+    badge: '🔧 Bring Your Own',
+    tagline: 'Connect any REST API endpoint',
+    assets: 'Any asset class supported by your endpoint',
+    why: ['Use your own broker or proprietary execution venue', 'Flexible REST integration'],
+    api: 'Custom REST endpoint',
+  },
 ];
 
 export default function Settings() {
@@ -202,10 +246,51 @@ export default function Settings() {
                 )}
               >
                 <div className="font-medium text-sm">{b.name}</div>
-                <div className="text-xs text-muted-foreground mt-0.5">{b.note}</div>
+                <div className="text-xs text-muted-foreground mt-0.5">{b.tagline}</div>
               </button>
             ))}
           </div>
+
+          {/* Selected broker details */}
+          {form.broker &&
+            (() => {
+              const b = BROKERS.find((x) => x.id === form.broker);
+              if (!b) return null;
+              return (
+                <div className="mt-3 rounded-xl border border-accent/20 bg-accent/5 p-4 space-y-3">
+                  <div>
+                    <div className="text-xs font-semibold text-accent">{b.badge}</div>
+                    <div className="text-sm font-medium mt-0.5">{b.name}</div>
+                    <div className="text-xs text-muted-foreground mt-0.5">{b.tagline}</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1">
+                      Supported Assets
+                    </div>
+                    <p className="text-xs leading-relaxed">{b.assets}</p>
+                  </div>
+                  <div>
+                    <div className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1">
+                      Why it fits the Superior Trader
+                    </div>
+                    <ul className="space-y-1">
+                      {b.why.map((w, i) => (
+                        <li key={i} className="text-xs leading-relaxed flex gap-1.5">
+                          <CheckCircle2 className="w-3 h-3 text-primary flex-shrink-0 mt-0.5" />
+                          <span>{w}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div>
+                    <div className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1">
+                      API Access
+                    </div>
+                    <p className="text-xs leading-relaxed">{b.api}</p>
+                  </div>
+                </div>
+              );
+            })()}
         </div>
 
         {/* API Key */}
