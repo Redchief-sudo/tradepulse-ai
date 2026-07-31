@@ -19,6 +19,7 @@ import SectorExposure from '@/components/SectorExposure';
 import ExitAlerts from '@/components/ExitAlerts';
 import RealDataPipeline from '@/components/RealDataPipeline';
 import RealPnlChart from '@/components/RealPnlChart';
+import PerformanceAttribution from '@/components/PerformanceAttribution';
 import { Button } from '@/components/ui/button';
 
 const COLORS = ['#10b981', '#8b5cf6', '#3b82f6', '#f59e0b', '#ec4899', '#06b6d4', '#84cc16', '#f97316'];
@@ -198,6 +199,8 @@ export default function Dashboard() {
       <RealDataPipeline />
 
       <RealPnlChart />
+
+      <PerformanceAttribution />
 
       <ExitAlerts holdings={holdings} onExit={handleExitPosition} />
 
