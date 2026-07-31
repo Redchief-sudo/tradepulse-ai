@@ -190,10 +190,10 @@ export default function AutonomousTrader() {
     const sectorData = computeSectorExposure(holdings);
     const currentSectorValue =
       sectorData.sectors.find((s) => s.sector === (proposal.sector || 'Other'))?.value || 0;
+    const pp = profileParams(tradeProfile);
 
-    let shares, positionValue;
+    let qty;
     if (proposal.action === 'buy') {
-      const pp = profileParams(tradeProfile);
       const sized = computeCappedPositionSize(
         proposal.suggested_position_pct || 10,
         proposal.current_price,
@@ -202,100 +202,42 @@ export default function AutonomousTrader() {
         pp.max_sector_pct / 100,
         pp.max_position_pct / 100
       );
-      shares = sized.shares;
-      positionValue = sized.positionValue;
+      qty = sized.shares;
     } else {
       const existing = holdings.find((h) => h.symbol === proposal.symbol);
-      shares = existing ? Math.min(proposal.shares || existing.shares, existing.shares) : 0;
-      positionValue = shares * proposal.current_price;
+      qty = existing ? Math.min(proposal.shares || existing.shares, existing.shares) : 0;
     }
+    if (qty <= 0) return;
 
-    if (shares <= 0) return;
-
-    // Route through the real broker if Alpaca is connected (paper or live).
-    if (broker) {
-      try {
-        await base44.functions.invoke('executeBrokerOrder', {
-          symbol: proposal.symbol,
-          qty: shares,
-          side: proposal.action,
-        });
-      } catch (e) {
-        console.error('Broker order failed, recording as paper:', e);
+    // Single canonical execution boundary: the backend validates, submits to the
+    // broker, polls the fill, and settles accounting atomically. A rejected broker
+    // order returns non-2xx and mutates NOTHING — no silent paper downgrade.
+    try {
+      const result = await base44.functions.invoke('executeTrade', {
+        symbol: proposal.symbol,
+        action: proposal.action,
+        qty,
+        price: proposal.current_price,
+        company_name: proposal.company_name,
+        sector: proposal.sector,
+        confidence: proposal.confidence,
+        target_price: proposal.target_price,
+        stop_loss: proposal.stop_loss,
+        ai_recommended: true,
+        source: 'autonomous_ui',
+        reasoning: proposal.reasoning,
+        ml_score: proposal.ml_score,
+        technical_score: proposal.technical_score,
+        momentum_score: proposal.momentum_score,
+        risk_score: proposal.risk_score,
+        recordDecision: true,
+      });
+      if (result?.data?.status === 'filled' || result?.data?.status === 'paper_filled') {
+        setExecutedIds((prev) => new Set([...prev, index]));
       }
+    } catch (e) {
+      console.error('Trade execution failed:', e);
     }
-
-    const trade = {
-      symbol: proposal.symbol,
-      company_name: proposal.company_name || proposal.symbol,
-      action: proposal.action,
-      shares,
-      price: proposal.current_price,
-      total_value: positionValue,
-      ai_recommended: true,
-    };
-    await base44.entities.Trade.create(trade);
-
-    if (proposal.action === 'buy') {
-      const existing = holdings.find((h) => h.symbol === proposal.symbol);
-      if (existing) {
-        const totalShares = existing.shares + shares;
-        const totalCost = existing.shares * existing.avg_price + positionValue;
-        await base44.entities.Holding.update(existing.id, {
-          shares: totalShares,
-          avg_price: totalCost / totalShares,
-          current_price: proposal.current_price,
-          stop_loss: proposal.stop_loss,
-          target_price: proposal.target_price,
-        });
-      } else {
-        await base44.entities.Holding.create({
-          symbol: proposal.symbol,
-          company_name: proposal.company_name || proposal.symbol,
-          shares,
-          avg_price: proposal.current_price,
-          current_price: proposal.current_price,
-          sector: proposal.sector || '',
-          day_change_percent: 0,
-          stop_loss: proposal.stop_loss,
-          target_price: proposal.target_price,
-        });
-      }
-    } else {
-      const existing = holdings.find((h) => h.symbol === proposal.symbol);
-      if (existing) {
-        const newShares = existing.shares - shares;
-        if (newShares <= 0) {
-          await base44.entities.Holding.delete(existing.id);
-        } else {
-          await base44.entities.Holding.update(existing.id, { shares: newShares });
-        }
-      }
-    }
-
-    await base44.entities.AITradeDecision.create({
-      symbol: proposal.symbol,
-      company_name: proposal.company_name || proposal.symbol,
-      sector: proposal.sector || '',
-      asset_class: proposal.asset_class || 'stocks',
-      action: proposal.action,
-      shares,
-      price: proposal.current_price,
-      position_value: positionValue,
-      confidence: proposal.confidence,
-      target_price: proposal.target_price,
-      stop_loss: proposal.stop_loss,
-      reasoning: proposal.reasoning,
-      status: 'executed',
-      ml_score: proposal.ml_score,
-      technical_score: proposal.technical_score,
-      fundamental_score: proposal.fundamental_score,
-      sentiment_score: proposal.sentiment_score,
-      momentum_score: proposal.momentum_score,
-      risk_score: proposal.risk_score,
-    });
-
-    setExecutedIds((prev) => new Set([...prev, index]));
   };
 
   const executeAll = async () => {

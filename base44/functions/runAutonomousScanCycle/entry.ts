@@ -1,6 +1,7 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { secrets } from 'base44:runtime';
-import { placeAlpacaOrder } from '../../shared/alpaca.ts';
+import { getAlpacaAccount } from '../../shared/alpaca.ts';
+import { settleTrade } from '../../shared/execution.ts';
 import { computeRealFactors, weightedComposite, signalFromComposite } from '../../shared/quantScore.ts';
 
 const PROFILES = {
@@ -212,68 +213,70 @@ export default async function(req) {
       approved = approved.filter((p) => (crMap[p.symbol.toUpperCase()] || 0) < 80);
     }
 
-    // Execute approved proposals
-    const portfolioValue = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
+    // Authoritative capital base: use broker account equity when connected, else securities market value.
+    let accountEquity = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
+    if (user.broker === 'alpaca' && user.broker_api_key && user.broker_api_secret) {
+      try {
+        const acct = await getAlpacaAccount({ apiKey: user.broker_api_key, secretKey: user.broker_api_secret, mode: user.broker_mode || 'paper' });
+        if (acct && Number(acct.equity) > 0) accountEquity = Number(acct.equity);
+      } catch (e) { /* fall back to securities market value */ }
+    }
+
     const executed = [];
     for (const pr of approved) {
-      let shares, positionValue;
       const price = pr.realPrice || pr.current_price;
+      let shares;
       if (pr.action === 'buy') {
-        const maxPos = (pp.max_position_pct / 100) * portfolioValue;
+        const maxPos = (pp.max_position_pct / 100) * accountEquity;
         const sectorVal = sec.sectors.find((s) => s.sector === (pr.sector || 'Other'))?.value || 0;
-        const sectorCap = Math.max(0, (pp.max_sector_pct / 100) * portfolioValue - sectorVal);
-        const aiVal = ((pr.suggested_position_pct || 5) / 100) * portfolioValue;
-        positionValue = Math.min(aiVal, maxPos, sectorCap);
-        shares = price > 0 ? Math.max(1, Math.floor(positionValue / price)) : 0;
-        positionValue = shares * price;
+        const sectorCap = Math.max(0, (pp.max_sector_pct / 100) * accountEquity - sectorVal);
+        const aiVal = ((pr.suggested_position_pct || 5) / 100) * accountEquity;
+        const positionValue = Math.min(aiVal, maxPos, sectorCap);
+        // Do NOT buy when authorized notional is below the cost of one whole share.
+        shares = price > 0 && positionValue >= price ? Math.floor(positionValue / price) : 0;
       } else {
         const existing = holdings.find((h) => h.symbol === pr.symbol);
         shares = existing ? existing.shares : 0;
-        positionValue = shares * price;
       }
       if (shares <= 0) continue;
 
-      let brokerOrder = null;
-      if (user.broker === 'alpaca' && user.broker_api_key && user.broker_api_secret) {
-        try {
-          brokerOrder = await placeAlpacaOrder({ apiKey: user.broker_api_key, secretKey: user.broker_api_secret, mode: user.broker_mode || 'paper', symbol: pr.symbol, qty: shares, side: pr.action });
-        } catch (e) { brokerOrder = { error: e.message }; }
-      }
-
-      await sr.entities.Trade.create({ symbol: pr.symbol, company_name: pr.company_name || pr.symbol, action: pr.action, shares, price, total_value: positionValue, ai_recommended: true });
-      if (pr.action === 'buy') {
-        const existing = holdings.find((h) => h.symbol === pr.symbol);
-        if (existing) {
-          const ts = existing.shares + shares;
-          const tc = existing.shares * existing.avg_price + positionValue;
-          await sr.entities.Holding.update(existing.id, { shares: ts, avg_price: tc / ts, current_price: price, stop_loss: pr.stop_loss, target_price: pr.target_price });
-        } else {
-          await sr.entities.Holding.create({ symbol: pr.symbol, company_name: pr.company_name || pr.symbol, shares, avg_price: price, current_price: price, sector: pr.sector || '', day_change_percent: 0, stop_loss: pr.stop_loss, target_price: pr.target_price });
-        }
-      } else {
-        const existing = holdings.find((h) => h.symbol === pr.symbol);
-        if (existing) { const ns = existing.shares - shares; if (ns <= 0) await sr.entities.Holding.delete(existing.id); else await sr.entities.Holding.update(existing.id, { shares: ns }); }
-      }
-
       const f = pr.realFactors || {};
-      await sr.entities.AITradeDecision.create({
-        symbol: pr.symbol, company_name: pr.company_name || pr.symbol, sector: pr.sector || '',
-        asset_class: 'stocks', action: pr.action, shares, price, position_value: positionValue,
-        confidence: pr.confidence, target_price: pr.target_price, stop_loss: pr.stop_loss,
-        reasoning: pr.reasoning, status: 'executed',
-        ml_score: pr.ml_score, technical_score: f.technical_score, momentum_score: f.momentum_score, risk_score: f.risk_score,
+      const result = await settleTrade(base44, user, {
+        symbol: pr.symbol, action: pr.action, qty: shares, price,
+        company_name: pr.company_name, sector: pr.sector, confidence: pr.confidence,
+        target_price: pr.target_price, stop_loss: pr.stop_loss, ai_recommended: true,
+        source: 'autonomous', reasoning: pr.reasoning, ml_score: pr.ml_score,
+        technical_score: f.technical_score, momentum_score: f.momentum_score, risk_score: f.risk_score,
+        recordDecision: true,
       });
-      executed.push({ symbol: pr.symbol, action: pr.action, shares, price, ml_score: pr.ml_score, brokerOrder });
+      executed.push({ symbol: pr.symbol, action: pr.action, qty: shares, price, ml_score: pr.ml_score, settlement: result });
     }
 
-    // SELF-LEARNING — adjust 5-factor weights from past decision outcomes
+    // SELF-LEARNING — adjust 5-factor weights from REALIZED trade outcomes (evidence-based)
     let newWeights = weights;
     try {
       const past = await sr.entities.AITradeDecision.list('-created_date', 30);
-      if (past.length >= 5) {
+      const allTrades = await sr.entities.Trade.list('-created_date', 200);
+      const outcomes = past.map((d) => {
+        const sells = allTrades.filter(
+          (t) => t.symbol === d.symbol && t.action === 'sell' && new Date(t.created_date) >= new Date(d.created_date)
+        );
+        let realizedPnl = null;
+        if (d.action === 'buy' && sells.length) {
+          realizedPnl = sells.reduce((s, t) => s + (t.price - d.price) * t.shares, 0);
+        }
+        return {
+          symbol: d.symbol, action: d.action, ml_score: d.ml_score,
+          technical_score: d.technical_score, momentum_score: d.momentum_score, risk_score: d.risk_score,
+          outcome: realizedPnl === null ? 'open' : realizedPnl > 0 ? 'win' : 'loss',
+          realized_pnl: realizedPnl,
+        };
+      });
+      const labeled = outcomes.filter((o) => o.outcome !== 'open');
+      if (labeled.length >= 3) {
         const sl = await sr.integrations.Core.InvokeLLM({
           model: 'claude-sonnet-5',
-          prompt: `You are AlphaTrade AI's SELF-LEARNING ENGINE. Diagnose past trade decisions and produce ADJUSTED 5-factor weights (must sum to 100, each 5-40).\nPast decisions:\n${JSON.stringify(past.map((d) => ({ symbol: d.symbol, action: d.action, ml_score: d.ml_score, technical_score: d.technical_score, momentum_score: d.momentum_score, risk_score: d.risk_score, status: d.status })), null, 2)}\nCurrent weights: ${JSON.stringify(weights)}. Adjust based on which factors predicted winners vs losers. Return weights + accuracy + summary.`,
+          prompt: `You are AlphaTrade AI's SELF-LEARNING ENGINE. Below are PAST decisions with their REALIZED outcomes (win/loss + realized P&L). Diagnose which factors predicted winners vs losers and produce ADJUSTED 5-factor weights (must sum to 100, each 5-40).\nDecisions with outcomes:\n${JSON.stringify(labeled, null, 2)}\nCurrent weights: ${JSON.stringify(weights)}. Return weights + accuracy (% of labeled that were wins) + summary.`,
           response_json_schema: {
             type: 'object',
             properties: {
@@ -293,7 +296,7 @@ export default async function(req) {
         await sr.integrations.Core.SendEmail({
           to: user.email,
           subject: `TradePulse: Autonomous AI executed ${executed.length} trade(s)`,
-          body: executed.map((e) => `${e.action.toUpperCase()} ${e.shares} ${e.symbol} @ $${e.price.toFixed(2)} (ML score ${e.ml_score})`).join('\n'),
+          body: executed.map((e) => `${e.action.toUpperCase()} ${e.qty} ${e.symbol} @ $${e.price.toFixed(2)} (ML score ${e.ml_score})`).join('\n'),
         });
       } catch (e) {}
     }

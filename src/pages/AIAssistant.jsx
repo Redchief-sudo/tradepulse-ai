@@ -133,39 +133,15 @@ export default function AIAssistant() {
 
   const executeTrade = async (analysis) => {
     try {
-      const shares = 10;
-      const trade = {
+      await base44.functions.invoke('executeTrade', {
         symbol: analysis.symbol,
-        company_name: analysis.company_name || analysis.symbol,
         action: 'buy',
-        shares,
+        qty: 10,
         price: analysis.current_price,
-        total_value: shares * analysis.current_price,
+        company_name: analysis.company_name,
         ai_recommended: true,
-      };
-      await base44.entities.Trade.create(trade);
-
-      const existing = holdings.find((h) => h.symbol === analysis.symbol);
-      if (existing) {
-        const totalShares = existing.shares + shares;
-        const totalCost = existing.shares * existing.avg_price + shares * analysis.current_price;
-        const newAvg = totalCost / totalShares;
-        await base44.entities.Holding.update(existing.id, {
-          shares: totalShares,
-          avg_price: newAvg,
-          current_price: analysis.current_price,
-        });
-      } else {
-        await base44.entities.Holding.create({
-          symbol: analysis.symbol,
-          company_name: analysis.company_name || analysis.symbol,
-          shares,
-          avg_price: analysis.current_price,
-          current_price: analysis.current_price,
-          sector: '',
-          day_change_percent: 0,
-        });
-      }
+        source: 'ai_assistant',
+      });
       const refreshed = await base44.entities.Holding.list();
       setHoldings(refreshed || []);
     } catch (e) {

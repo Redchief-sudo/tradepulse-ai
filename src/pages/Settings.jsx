@@ -81,6 +81,7 @@ export default function Settings() {
   const [testResult, setTestResult] = useState(null);
   const [showKey, setShowKey] = useState(false);
   const [showSecret, setShowSecret] = useState(false);
+  const [secretSuffix, setSecretSuffix] = useState('');
   const [form, setForm] = useState({
     broker: '',
     broker_api_key: '',
@@ -93,10 +94,11 @@ export default function Settings() {
     try {
       const me = await base44.auth.me();
       setUser(me);
+      setSecretSuffix(me.broker_api_secret ? `••••${me.broker_api_secret.slice(-4)}` : '');
       setForm({
         broker: me.broker || '',
         broker_api_key: me.broker_api_key || '',
-        broker_api_secret: me.broker_api_secret || '',
+        broker_api_secret: '',
         broker_mode: me.broker_mode || 'paper',
         trade_profile: me.trade_profile || 'balanced',
       });
@@ -113,7 +115,17 @@ export default function Settings() {
   const save = async () => {
     setSaving(true);
     try {
-      await base44.auth.updateMe(form);
+      const payload = {
+        broker: form.broker,
+        broker_api_key: form.broker_api_key,
+        broker_mode: form.broker_mode,
+        trade_profile: form.trade_profile,
+      };
+      // Only overwrite the secret when a new one is entered; never blank out an existing secret.
+      if (form.broker_api_secret.trim()) {
+        payload.broker_api_secret = form.broker_api_secret.trim();
+      }
+      await base44.auth.updateMe(payload);
       await loadUser();
     } catch (e) {
       console.error(e);
@@ -134,7 +146,7 @@ export default function Settings() {
       } else {
         setTestResult({
           ok: true,
-          message: `Credentials saved for ${BROKERS.find((b) => b.id === form.broker)?.name || form.broker}. Live order execution requires a Builder+ backend function.`,
+          message: `Credentials saved for ${BROKERS.find((b) => b.id === form.broker)?.name || form.broker}. You can now place orders through this broker.`,
         });
       }
     } catch (e) {
@@ -161,7 +173,7 @@ export default function Settings() {
     setSaving(false);
   };
 
-  const isConnected = !!(form.broker && form.broker_api_key && form.broker_api_secret);
+  const isConnected = !!(user?.broker && user?.broker_api_key && user?.broker_api_secret);
 
   if (loading) {
     return (
@@ -205,8 +217,8 @@ export default function Settings() {
           </h3>
           <p className="text-xs text-muted-foreground leading-relaxed">
             {isConnected
-              ? `Connected to ${BROKERS.find((b) => b.id === form.broker)?.name || form.broker} in ${form.broker_mode === 'live' ? 'LIVE' : 'paper'} mode. Trades are tracked in your portfolio. Live order execution to your broker requires a Builder+ backend function.`
-              : 'Right now all trades are simulated in the app database — no real orders are placed. Connect a broker below to enable live trading (requires Builder+ for order execution).'}
+              ? `Connected to ${BROKERS.find((b) => b.id === form.broker)?.name || form.broker} in ${form.broker_mode === 'live' ? 'LIVE' : 'paper'} mode. Orders are submitted to your broker and fills settle your portfolio automatically.`
+              : 'Right now all trades are paper — recorded in the app with no real broker orders. Connect a broker below to route orders through your brokerage account.'}
           </p>
         </div>
       </motion.div>
@@ -318,13 +330,18 @@ export default function Settings() {
         {/* API Secret */}
         <div>
           <Label className="mb-1.5 block">API Secret</Label>
+          {secretSuffix && (
+            <p className="text-xs text-muted-foreground mb-1.5">
+              Current secret: <span className="font-mono">{secretSuffix}</span> — leave blank to keep it.
+            </p>
+          )}
           <div className="relative">
             <Key className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
             <Input
               type={showSecret ? 'text' : 'password'}
               value={form.broker_api_secret}
               onChange={(e) => setForm({ ...form, broker_api_secret: e.target.value })}
-              placeholder="Enter your API secret"
+              placeholder={secretSuffix ? 'Enter new secret to replace' : 'Enter your API secret'}
               className="pl-9 pr-10 font-mono"
             />
             <button

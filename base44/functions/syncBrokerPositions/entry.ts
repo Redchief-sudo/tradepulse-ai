@@ -66,9 +66,26 @@ export default async function(req) {
         updated.push({ symbol: sym, from: existing.shares, to: bp.shares });
       }
     }
-    // Remove app holdings no longer at the broker
+    // App holdings no longer at the broker: record a reconciliation sell trade
+    // (with realized P&L + provenance) BEFORE removing, so the ledger keeps
+    // transaction history for externally-closed positions.
     for (const [sym, h] of Object.entries(appMap)) {
       if (!brokerMap[sym]) {
+        const exitPrice = h.current_price || h.avg_price;
+        const realizedPnl = (exitPrice - h.avg_price) * h.shares;
+        await sr.entities.Trade.create({
+          symbol: h.symbol,
+          company_name: h.company_name || h.symbol,
+          action: 'sell',
+          shares: h.shares,
+          price: exitPrice,
+          total_value: h.shares * exitPrice,
+          notes: 'Reconciliation: position no longer held at broker (externally closed)',
+          ai_recommended: false,
+          order_status: 'reconciled_external',
+          source: 'reconciliation',
+          realized_pnl: realizedPnl,
+        });
         await sr.entities.Holding.delete(h.id);
         removed.push(sym);
       }

@@ -39,7 +39,7 @@ export function computeCappedPositionSize(
     maxPositionValue,
     Math.max(0, remainingSectorCapacity)
   );
-  const shares = price > 0 ? Math.max(1, Math.floor(positionValue / price)) : 0;
+  const shares = price > 0 && positionValue >= price ? Math.floor(positionValue / price) : 0;
   return { shares, positionValue: shares * price };
 }
 

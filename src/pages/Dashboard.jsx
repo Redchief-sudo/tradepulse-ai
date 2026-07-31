@@ -96,17 +96,21 @@ export default function Dashboard() {
 
   const handleExitPosition = async (holding) => {
     const exitPrice = holding.current_price || holding.avg_price;
-    await base44.entities.Trade.create({
-      symbol: holding.symbol,
-      company_name: holding.company_name || holding.symbol,
-      action: 'sell',
-      shares: holding.shares,
-      price: exitPrice,
-      total_value: holding.shares * exitPrice,
-      ai_recommended: true,
-    });
-    await base44.entities.Holding.delete(holding.id);
-    await loadData();
+    try {
+      await base44.functions.invoke('executeTrade', {
+        symbol: holding.symbol,
+        action: 'sell',
+        qty: holding.shares,
+        price: exitPrice,
+        company_name: holding.company_name,
+        ai_recommended: true,
+        source: 'dashboard_exit',
+        notes: 'Manual exit from Dashboard',
+      });
+      await loadData();
+    } catch (e) {
+      console.error('Exit failed:', e);
+    }
   };
 
   const totalValue = holdings.reduce(

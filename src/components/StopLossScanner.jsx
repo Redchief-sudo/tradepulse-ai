@@ -81,18 +81,23 @@ export default function StopLossScanner({ holdings, stopLossPct, onStopLossPctCh
         const dropPct =
           h.avg_price > 0 ? ((h.avg_price - livePrice) / h.avg_price) * 100 : 0;
         if (dropPct >= localPct) {
-          await base44.entities.Trade.create({
-            symbol: h.symbol,
-            company_name: h.company_name || h.symbol,
-            action: 'sell',
-            shares: h.shares,
-            price: livePrice,
-            total_value: h.shares * livePrice,
-            notes: `Auto stop-loss triggered at -${dropPct.toFixed(1)}% (threshold: ${localPct}%)`,
-            ai_recommended: true,
-          });
-          await base44.entities.Holding.delete(h.id);
-          executed.push({ ...h, current_price: livePrice, dropPct });
+          try {
+            const result = await base44.functions.invoke('executeTrade', {
+              symbol: h.symbol,
+              action: 'sell',
+              qty: h.shares,
+              price: livePrice,
+              company_name: h.company_name,
+              ai_recommended: true,
+              source: 'stoploss_ui',
+              notes: `Auto stop-loss triggered at -${dropPct.toFixed(1)}% (threshold: ${localPct}%)`,
+            });
+            if (result?.data?.status === 'filled' || result?.data?.status === 'paper_filled') {
+              executed.push({ ...h, current_price: livePrice, dropPct });
+            }
+          } catch (e) {
+            console.error('Stop-loss execution failed:', e);
+          }
         } else if (dropPct >= localPct - 3 && dropPct > 0) {
           stillAtRisk.push({ ...h, current_price: livePrice, dropPct });
         }
