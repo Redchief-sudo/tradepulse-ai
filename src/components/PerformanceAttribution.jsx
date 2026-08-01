@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Activity, Award, AlertTriangle, Clock, Gauge, TrendingDown, TrendingUp } from 'lucide-react';
+import { Activity, Award, AlertTriangle, Clock, Gauge, Layers, TrendingDown, TrendingUp } from 'lucide-react';
 import { base44 } from '@/api/base44Client';
 import { Loader2 } from 'lucide-react';
 
@@ -79,7 +79,7 @@ export default function PerformanceAttribution() {
   }
   if (!data) return null;
 
-  const { strategies, health, totals } = data;
+  const { strategies, health, totals, byAssetClass } = data;
   const hasData = strategies.length > 0 || health.totalIntents > 0;
 
   return (
@@ -153,6 +153,54 @@ export default function PerformanceAttribution() {
           </div>
         )}
       </motion.div>
+
+      {/* Asset Class Attribution */}
+      {byAssetClass && byAssetClass.length > 0 && (
+        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="rounded-2xl border border-border bg-card overflow-hidden">
+          <div className="p-5 border-b border-border">
+            <h3 className="font-semibold flex items-center gap-2">
+              <Layers className="w-4 h-4 text-chart-3" />
+              Asset Class Attribution
+            </h3>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-muted-foreground text-xs border-b border-border">
+                  <th className="text-left font-medium p-3">Asset Class</th>
+                  <th className="text-right font-medium p-3">Trades</th>
+                  <th className="text-right font-medium p-3 hidden sm:table-cell">Win Rate</th>
+                  <th className="text-right font-medium p-3 hidden md:table-cell">Realized</th>
+                  <th className="text-right font-medium p-3 hidden lg:table-cell">Open P&L</th>
+                  <th className="text-right font-medium p-3 hidden md:table-cell">Notional</th>
+                  <th className="text-right font-medium p-3">Total P&L</th>
+                </tr>
+              </thead>
+              <tbody>
+                {byAssetClass.map((a) => (
+                  <tr key={a.assetClass} className="border-b border-border/30 hover:bg-muted/20 transition-colors">
+                    <td className="p-3 font-medium capitalize">{a.assetClass}</td>
+                    <td className="text-right p-3 font-mono text-xs">{a.trades}</td>
+                    <td className="text-right p-3 hidden sm:table-cell font-mono text-xs">
+                      {a.sells > 0 ? fmtPct(a.winRate) : '—'}
+                    </td>
+                    <td className="text-right p-3 hidden md:table-cell font-mono text-xs">
+                      <span className={a.realizedPnl >= 0 ? 'text-emerald-400' : 'text-red-400'}>{fmtCurrency(a.realizedPnl)}</span>
+                    </td>
+                    <td className="text-right p-3 hidden lg:table-cell font-mono text-xs">
+                      <span className={a.openPnl >= 0 ? 'text-emerald-400' : 'text-red-400'}>{fmtCurrency(a.openPnl)}</span>
+                    </td>
+                    <td className="text-right p-3 hidden md:table-cell font-mono text-xs text-muted-foreground">{fmtCurrency(a.notional)}</td>
+                    <td className="text-right p-3 font-mono font-semibold">
+                      <span className={a.totalPnl >= 0 ? 'text-emerald-400' : 'text-red-400'}>{fmtCurrency(a.totalPnl)}</span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </motion.div>
+      )}
 
       {/* Strategy Attribution */}
       <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="rounded-2xl border border-border bg-card overflow-hidden">

@@ -1,5 +1,5 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
-import { computeStrategyAttribution, computeExecutionHealth } from '../../shared/attribution.ts';
+import { computeStrategyAttribution, computeExecutionHealth, computeAssetClassAttribution } from '../../shared/attribution.ts';
 
 // Performance attribution + execution observability.
 // Returns deterministic P&L decomposition by strategy and execution-pipeline
@@ -21,6 +21,7 @@ export default async function (req) {
 
     const strategies = computeStrategyAttribution(trades, fills, holdings);
     const health = computeExecutionHealth(intents, fills);
+    const byAssetClass = computeAssetClassAttribution(trades, fills, holdings);
 
     const totals = {
       realizedPnl: strategies.reduce((s, r) => s + r.realizedPnl, 0),
@@ -36,6 +37,7 @@ export default async function (req) {
       ok: true,
       strategies,
       health,
+      byAssetClass,
       totals,
     });
   } catch (error) {

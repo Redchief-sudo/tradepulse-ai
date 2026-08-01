@@ -16,11 +16,29 @@ export interface StrategyRow {
   notional: number;
   wins: number;
   losses: number;
+  grossWin: number;
+  grossLoss: number;
   winRate: number;
   profitFactor: number;
   avgWin: number;
   avgLoss: number;
   openPnl: number;
+  totalPnl: number;
+}
+
+export interface AssetClassRow {
+  assetClass: string;
+  trades: number;
+  sells: number;
+  wins: number;
+  realizedPnl: number;
+  openPnl: number;
+  netPnl: number;
+  notional: number;
+  commissions: number;
+  fees: number;
+  slippage: number;
+  winRate: number;
   totalPnl: number;
 }
 
@@ -66,8 +84,8 @@ export function computeStrategyAttribution(
     if (!byStrategy[strategy]) {
       byStrategy[strategy] = {
         strategy, trades: 0, buys: 0, sells: 0, realizedPnl: 0, commissions: 0,
-        netPnl: 0, notional: 0, wins: 0, losses: 0, winRate: 0, profitFactor: 0,
-        avgWin: 0, avgLoss: 0, openPnl: 0, totalPnl: 0,
+        netPnl: 0, notional: 0, wins: 0, losses: 0, grossWin: 0, grossLoss: 0,
+        winRate: 0, profitFactor: 0, avgWin: 0, avgLoss: 0, openPnl: 0, totalPnl: 0,
       };
     }
     return byStrategy[strategy];
@@ -85,8 +103,8 @@ export function computeStrategyAttribution(
       s.sells++;
       const pnl = safeNum(t.realized_pnl);
       s.realizedPnl += pnl;
-      if (pnl > 0) { s.wins++; }
-      else if (pnl < 0) { s.losses++; }
+      if (pnl > 0) { s.wins++; s.grossWin += pnl; }
+      else if (pnl < 0) { s.losses++; s.grossLoss += Math.abs(pnl); }
     }
   }
 
@@ -114,12 +132,9 @@ export function computeStrategyAttribution(
   // Derived metrics.
   for (const s of Object.values(byStrategy)) {
     s.winRate = s.sells > 0 ? (s.wins / s.sells) * 100 : 0;
-    const grossWin = s.realizedPnl > 0 ? s.realizedPnl : 0;
-    const grossLoss = s.realizedPnl < 0 ? Math.abs(s.realizedPnl) : 0;
-    // profit factor from per-trade decomposition would need individual pnl; approximate from net realized.
-    s.profitFactor = grossLoss > 0 ? grossWin / grossLoss : (grossWin > 0 ? 99 : 0);
-    s.avgWin = s.wins > 0 ? grossWin / s.wins : 0;
-    s.avgLoss = s.losses > 0 ? grossLoss / s.losses : 0;
+    s.profitFactor = s.grossLoss > 0 ? s.grossWin / s.grossLoss : (s.grossWin > 0 ? 99 : 0);
+    s.avgWin = s.wins > 0 ? s.grossWin / s.wins : 0;
+    s.avgLoss = s.losses > 0 ? s.grossLoss / s.losses : 0;
     s.netPnl = s.realizedPnl - s.commissions;
     s.totalPnl = s.netPnl + s.openPnl;
   }
@@ -190,4 +205,67 @@ export function computeExecutionHealth(intents: any[], fills: any[]): ExecutionH
     byVenue: Object.values(byVenueMap).sort((a, b) => b.notional - a.notional),
     totalCost, totalSlippage,
   };
+}
+
+// Asset-class attribution: P&L decomposition by asset class (stocks, crypto, ...).
+// Uses the Fill ledger for cost/notional/slippage, Holding for open P&L, and joins
+// Trade → Fill on client_order_id for realized P&L attribution.
+export function computeAssetClassAttribution(
+  trades: any[],
+  fills: any[],
+  holdings: any[]
+): AssetClassRow[] {
+  const assetClassByOrderId: Record<string, string> = {};
+  for (const f of fills) {
+    if (f.client_order_id && f.asset_class) {
+      assetClassByOrderId[f.client_order_id] = f.asset_class;
+    }
+  }
+
+  const byAc: Record<string, AssetClassRow> = {};
+  function row(ac: string): AssetClassRow {
+    if (!byAc[ac]) {
+      byAc[ac] = {
+        assetClass: ac, trades: 0, sells: 0, wins: 0, realizedPnl: 0, openPnl: 0,
+        netPnl: 0, notional: 0, commissions: 0, fees: 0, slippage: 0, winRate: 0, totalPnl: 0,
+      };
+    }
+    return byAc[ac];
+  }
+
+  for (const t of trades) {
+    const ac = assetClassByOrderId[t.client_order_id] || 'stocks';
+    const s = row(ac);
+    s.trades++;
+    s.notional += safeNum(t.total_value || (safeNum(t.shares) * safeNum(t.price)));
+    s.commissions += safeNum(t.commission);
+    if (t.action === 'sell') {
+      s.sells++;
+      const pnl = safeNum(t.realized_pnl);
+      s.realizedPnl += pnl;
+      if (pnl > 0) s.wins++;
+    }
+  }
+
+  for (const h of holdings) {
+    const ac = h.asset_class || 'stocks';
+    const s = row(ac);
+    const cur = safeNum(h.current_price || h.avg_price);
+    s.openPnl += safeNum(h.shares) * (cur - safeNum(h.avg_price));
+  }
+
+  for (const f of fills) {
+    const ac = f.asset_class || 'stocks';
+    const s = row(ac);
+    s.fees += safeNum(f.fees);
+    s.slippage += safeNum(f.slippage);
+  }
+
+  for (const s of Object.values(byAc)) {
+    s.winRate = s.sells > 0 ? (s.wins / s.sells) * 100 : 0;
+    s.netPnl = s.realizedPnl - s.commissions;
+    s.totalPnl = s.netPnl + s.openPnl;
+  }
+
+  return Object.values(byAc).sort((a, b) => b.totalPnl - a.totalPnl);
 }
