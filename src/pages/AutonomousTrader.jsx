@@ -35,6 +35,7 @@ import ActiveProfileBanner from '@/components/ActiveProfileBanner';
 import ArchitectureOverview from '@/components/ArchitectureOverview';
 import RegimeBanner from '@/components/RegimeBanner';
 import StressTestSimulator from '@/components/StressTestSimulator';
+import BacktestPanel from '@/components/BacktestPanel';
 import AssetClassSelector from '@/components/AssetClassSelector';
 import SelfLearningMemory from '@/components/SelfLearningMemory';
 
@@ -322,6 +323,9 @@ export default function AutonomousTrader() {
 
       {/* Self-learning model memory */}
       <SelfLearningMemory decisions={decisions} onWeights={setMlWeights} />
+
+      {/* Deterministic strategy backtest + walk-forward */}
+      <BacktestPanel />
 
       {/* Scanning state with pass indicators */}
       {scanning && (
