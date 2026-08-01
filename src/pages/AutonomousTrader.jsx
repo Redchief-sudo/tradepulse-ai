@@ -38,6 +38,7 @@ import StressTestSimulator from '@/components/StressTestSimulator';
 import BacktestPanel from '@/components/BacktestPanel';
 import AssetClassSelector from '@/components/AssetClassSelector';
 import SelfLearningMemory from '@/components/SelfLearningMemory';
+import OutcomeAnalytics from '@/components/OutcomeAnalytics';
 
 function timeAgo(date) {
   if (!date) return '';
@@ -481,6 +482,9 @@ export default function AutonomousTrader() {
 
       {/* AI Track Record */}
       {decisions.length > 0 && <TradePerformance decisions={decisions} />}
+
+      {/* Outcome labeling analytics (alpha vs benchmark, factor validation) */}
+      <OutcomeAnalytics />
 
       {/* Decision history */}
       {decisions.length > 0 && (
