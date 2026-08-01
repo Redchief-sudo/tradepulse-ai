@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import { Loader2, GitBranch } from 'lucide-react';
 import { base44 } from '@/api/base44Client';
+import IntentDetail from '@/components/operations/IntentDetail';
 
 const STATUS_STYLE = {
   proposed: 'text-sky-400 bg-sky-500/10 border-sky-500/20',
@@ -32,6 +33,7 @@ export default function IntentLifecycle() {
   const [intents, setIntents] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [selected, setSelected] = useState(null);
 
   const load = async () => {
     setLoading(true);
@@ -71,7 +73,7 @@ export default function IntentLifecycle() {
           </thead>
           <tbody>
             {intents.map((i) => (
-              <tr key={i.id} className="border-b border-border/30 hover:bg-muted/20 transition-colors">
+              <tr key={i.id} onClick={() => setSelected(i)} className="border-b border-border/30 hover:bg-muted/20 transition-colors cursor-pointer">
                 <td className="p-3 font-mono text-xs text-muted-foreground">{i.trade_intent_id?.slice(0, 12) || '—'}</td>
                 <td className="p-3 font-medium">{i.symbol}</td>
                 <td className="p-3"><span className={i.side === 'buy' ? 'text-emerald-400' : 'text-red-400'}>{i.side}</span></td>
@@ -85,6 +87,7 @@ export default function IntentLifecycle() {
           </tbody>
         </table>
       </div>
+      <IntentDetail intent={selected} open={!!selected} onOpenChange={(v) => !v && setSelected(null)} />
     </motion.div>
   );
 }
