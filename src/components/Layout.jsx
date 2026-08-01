@@ -1,6 +1,6 @@
 import React from 'react';
 import { Outlet, Link, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Bot, Eye, Zap, Settings } from 'lucide-react';
+import { Activity, LayoutDashboard, Bot, Eye, Zap, Settings } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 const navItems = [
@@ -8,6 +8,7 @@ const navItems = [
   { path: '/ai-trader', label: 'AI Trader', icon: Bot },
   { path: '/watchlist', label: 'Watchlist', icon: Eye },
   { path: '/autonomous', label: 'Autonomous', icon: Zap },
+  { path: '/operations', label: 'Operations', icon: Activity },
   { path: '/settings', label: 'Settings', icon: Settings },
 ];
 
