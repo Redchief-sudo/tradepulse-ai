@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { base44 } from '@/api/base44Client';
 import { motion } from 'framer-motion';
-import { Eye, Plus, Trash2, RefreshCw, Loader2, Target, Bot } from 'lucide-react';
+import { Eye, Plus, Trash2, RefreshCw, Loader2, Target, Bot, Bitcoin, LineChart } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -30,12 +30,46 @@ const recConfig = {
   STRONG_SELL: 'text-red-400',
 };
 
+const CRYPTO_NAMES = {
+  BTC: 'Bitcoin',
+  ETH: 'Ethereum',
+  SOL: 'Solana',
+  ADA: 'Cardano',
+  DOGE: 'Dogecoin',
+  XRP: 'XRP',
+  DOT: 'Polkadot',
+  AVAX: 'Avalanche',
+  MATIC: 'Polygon',
+  LINK: 'Chainlink',
+  LTC: 'Litecoin',
+  BCH: 'Bitcoin Cash',
+  UNI: 'Uniswap',
+  ATOM: 'Cosmos',
+  ALGO: 'Algorand',
+};
+
+function AssetClassBadge({ assetClass }) {
+  const isCrypto = (assetClass || 'stocks') === 'crypto';
+  return (
+    <span
+      className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${
+        isCrypto
+          ? 'bg-amber-500/15 text-amber-400'
+          : 'bg-primary/15 text-primary'
+      }`}
+    >
+      {isCrypto ? 'CRYPTO' : 'STOCK'}
+    </span>
+  );
+}
+
 export default function Watchlist() {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [open, setOpen] = useState(false);
   const [newSymbol, setNewSymbol] = useState('');
+  const [newAssetClass, setNewAssetClass] = useState('stocks');
   const [analyzing, setAnalyzing] = useState(null);
   const [analysisResult, setAnalysisResult] = useState(null);
   const [adding, setAdding] = useState(false);
@@ -58,38 +92,22 @@ export default function Watchlist() {
     if (items.length === 0) return;
     setRefreshing(true);
     try {
-      const symbols = items.map((i) => i.symbol).join(', ');
-      const result = await base44.integrations.Core.InvokeLLM({
-        prompt: `Get current stock prices and today's percentage change for these tickers: ${symbols}. Return accurate real-time data.`,
-        add_context_from_internet: true,
-        model: 'gemini_3_flash',
-        response_json_schema: {
-          type: 'object',
-          properties: {
-            stocks: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  symbol: { type: 'string' },
-                  current_price: { type: 'number' },
-                  day_change_percent: { type: 'number' },
-                },
-              },
-            },
-          },
-        },
+      const quoteItems = items.map((i) => ({
+        symbol: i.symbol,
+        asset_class: i.asset_class || 'stocks',
+      }));
+      const result = await base44.functions.invoke('getMultiAssetQuotes', { items: quoteItems });
+      const quotes = (result.data?.quotes || []).filter((q) => !q.error && q.price > 0);
+      const priceMap = {};
+      quotes.forEach((q) => {
+        priceMap[q.symbol.toUpperCase()] = q;
       });
-      const stockData = (result.stocks || []).reduce((acc, s) => {
-        acc[s.symbol.toUpperCase()] = s;
-        return acc;
-      }, {});
       const updates = items
-        .filter((i) => stockData[i.symbol])
+        .filter((i) => priceMap[i.symbol])
         .map((i) => ({
           id: i.id,
-          current_price: stockData[i.symbol].current_price,
-          day_change_percent: stockData[i.symbol].day_change_percent,
+          current_price: priceMap[i.symbol].price,
+          day_change_percent: priceMap[i.symbol].day_change_percent,
         }));
       if (updates.length) {
         await base44.entities.WatchlistItem.bulkUpdate(updates);
@@ -105,28 +123,46 @@ export default function Watchlist() {
     if (!newSymbol.trim()) return;
     setAdding(true);
     try {
-      const result = await base44.integrations.Core.InvokeLLM({
-        prompt: `Look up stock ticker "${newSymbol}". Return company name, current stock price, and today's percent change. Use real-time data.`,
-        add_context_from_internet: true,
-        model: 'gemini_3_flash',
-        response_json_schema: {
-          type: 'object',
-          properties: {
-            company_name: { type: 'string' },
-            current_price: { type: 'number' },
-            day_change_percent: { type: 'number' },
-          },
-        },
-      });
+      const sym = newSymbol.toUpperCase().trim();
+      const assetClass = newAssetClass;
+      let companyName = '';
+      let currentPrice = 0;
+      let dayChange = 0;
+
+      if (assetClass === 'crypto') {
+        const result = await base44.functions.invoke('getMultiAssetQuotes', {
+          items: [{ symbol: sym, asset_class: 'crypto' }],
+        });
+        const q = (result.data?.quotes || [])[0];
+        if (q && !q.error && q.price > 0) {
+          currentPrice = q.price;
+          dayChange = q.day_change_percent;
+        }
+        companyName = CRYPTO_NAMES[sym] || sym;
+      } else {
+        const result = await base44.functions.invoke('marketData', {
+          symbols: [sym],
+          include_fundamentals: true,
+        });
+        const q = (result.data?.quotes || [])[0];
+        if (q && !q.error) {
+          currentPrice = q.current_price || 0;
+          dayChange = q.day_change_percent || 0;
+          companyName = q.fundamentals?.name || '';
+        }
+      }
+
       await base44.entities.WatchlistItem.create({
-        symbol: newSymbol.toUpperCase(),
-        company_name: result.company_name || '',
-        current_price: result.current_price || 0,
-        day_change_percent: result.day_change_percent || 0,
+        symbol: sym,
+        company_name: companyName,
+        current_price: currentPrice,
+        day_change_percent: dayChange,
         target_price: 0,
         notes: '',
+        asset_class: assetClass,
       });
       setNewSymbol('');
+      setNewAssetClass('stocks');
       setOpen(false);
       await loadData();
     } catch (e) {
@@ -140,18 +176,19 @@ export default function Watchlist() {
     await loadData();
   };
 
-  const analyzeStock = async (symbol) => {
+  const analyzeAsset = async (item) => {
+    const symbol = item.symbol;
+    const assetClass = item.asset_class || 'stocks';
     setAnalyzing(symbol);
     setAnalysisResult(null);
     try {
       const result = await base44.integrations.Core.InvokeLLM({
-        prompt: `Analyze the stock ${symbol}. Provide current price, recommendation (STRONG_BUY, BUY, HOLD, SELL, STRONG_SELL), confidence score (0-100), target price, and a concise analysis summary. Use real-time market data.`,
+        prompt: `Analyze ${assetClass === 'crypto' ? 'cryptocurrency' : 'stock'} ${symbol}. Current price is $${item.current_price || 0}. Provide a recommendation (STRONG_BUY, BUY, HOLD, SELL, STRONG_SELL), confidence score (0-100), target price, and a concise analysis summary. Use real-time market data.`,
         add_context_from_internet: true,
         model: 'gemini_3_flash',
         response_json_schema: {
           type: 'object',
           properties: {
-            current_price: { type: 'number' },
             recommendation: {
               type: 'string',
               enum: ['STRONG_BUY', 'BUY', 'HOLD', 'SELL', 'STRONG_SELL'],
@@ -164,11 +201,9 @@ export default function Watchlist() {
       });
       setAnalysisResult({ symbol, ...result });
 
-      const item = items.find((i) => i.symbol === symbol);
       if (item) {
         await base44.entities.WatchlistItem.update(item.id, {
           target_price: result.target_price,
-          current_price: result.current_price,
         });
         await loadData();
       }
@@ -191,7 +226,9 @@ export default function Watchlist() {
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
         <div>
           <h1 className="text-2xl md:text-3xl font-bold font-heading tracking-tight">Watchlist</h1>
-          <p className="text-muted-foreground text-sm mt-1">Track stocks and get AI analysis</p>
+          <p className="text-muted-foreground text-sm mt-1">
+            Track stocks and crypto with live prices and AI analysis
+          </p>
         </div>
         <div className="flex gap-2">
           <Button
@@ -203,28 +240,59 @@ export default function Watchlist() {
             {refreshing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
             Refresh
           </Button>
-          <Dialog open={open} onOpenChange={setOpen}>
+          <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) setNewAssetClass('stocks'); }}>
             <DialogTrigger asChild>
               <Button className="gap-2">
-                <Plus className="w-4 h-4" /> Add Stock
+                <Plus className="w-4 h-4" /> Add Asset
               </Button>
             </DialogTrigger>
             <DialogContent className="bg-card border-border">
               <DialogHeader>
                 <DialogTitle>Add to Watchlist</DialogTitle>
               </DialogHeader>
-              <div className="space-y-2">
-                <Label>Stock Symbol</Label>
-                <Input
-                  value={newSymbol}
-                  onChange={(e) => setNewSymbol(e.target.value)}
-                  placeholder="AAPL"
-                  className="uppercase"
-                  onKeyDown={(e) => e.key === 'Enter' && addItem()}
-                />
-                <p className="text-xs text-muted-foreground">
-                  AI will look up the company name and current price automatically.
-                </p>
+              <div className="space-y-3">
+                <div>
+                  <Label>Asset Class</Label>
+                  <div className="flex gap-2 mt-2">
+                    <button
+                      type="button"
+                      onClick={() => setNewAssetClass('stocks')}
+                      className={`flex-1 flex items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                        newAssetClass === 'stocks'
+                          ? 'border-primary bg-primary/10 text-primary'
+                          : 'border-border text-muted-foreground hover:bg-muted/50'
+                      }`}
+                    >
+                      <LineChart className="w-4 h-4" /> Stock
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setNewAssetClass('crypto')}
+                      className={`flex-1 flex items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                        newAssetClass === 'crypto'
+                          ? 'border-amber-500 bg-amber-500/10 text-amber-400'
+                          : 'border-border text-muted-foreground hover:bg-muted/50'
+                      }`}
+                    >
+                      <Bitcoin className="w-4 h-4" /> Crypto
+                    </button>
+                  </div>
+                </div>
+                <div>
+                  <Label>Symbol</Label>
+                  <Input
+                    value={newSymbol}
+                    onChange={(e) => setNewSymbol(e.target.value)}
+                    placeholder={newAssetClass === 'crypto' ? 'BTC' : 'AAPL'}
+                    className="uppercase"
+                    onKeyDown={(e) => e.key === 'Enter' && addItem()}
+                  />
+                  <p className="text-xs text-muted-foreground mt-2">
+                    {newAssetClass === 'crypto'
+                      ? 'Live price from Coinbase. Common coins: BTC, ETH, SOL, ADA, DOGE.'
+                      : 'Live price and company name from Finnhub.'}
+                  </p>
+                </div>
               </div>
               <DialogFooter>
                 <Button
@@ -248,14 +316,14 @@ export default function Watchlist() {
           className="rounded-2xl border border-border bg-card p-12 text-center"
         >
           <Eye className="w-12 h-12 mx-auto text-muted-foreground mb-4" />
-          <h3 className="text-lg font-semibold mb-2">No stocks on your watchlist</h3>
+          <h3 className="text-lg font-semibold mb-2">No assets on your watchlist</h3>
           <p className="text-muted-foreground text-sm mb-6 max-w-md mx-auto">
-            Add stocks to track and get AI-powered analysis with price targets.
+            Add stocks or crypto to track with live prices and AI-powered analysis.
           </p>
-          <Dialog open={open} onOpenChange={setOpen}>
+          <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) setNewAssetClass('stocks'); }}>
             <DialogTrigger asChild>
               <Button className="gap-2">
-                <Plus className="w-4 h-4" /> Add Stock
+                <Plus className="w-4 h-4" /> Add Asset
               </Button>
             </DialogTrigger>
           </Dialog>
@@ -283,6 +351,7 @@ export default function Watchlist() {
                   <div>
                     <div className="flex items-center gap-2">
                       <span className="font-bold text-lg">{item.symbol}</span>
+                      <AssetClassBadge assetClass={item.asset_class} />
                       <span
                         className={`text-xs ${
                           (item.day_change_percent || 0) >= 0 ? 'text-emerald-500' : 'text-red-500'
@@ -351,7 +420,7 @@ export default function Watchlist() {
                 <Button
                   variant="secondary"
                   size="sm"
-                  onClick={() => analyzeStock(item.symbol)}
+                  onClick={() => analyzeAsset(item)}
                   disabled={isAnalyzing}
                   className="w-full gap-2"
                 >
