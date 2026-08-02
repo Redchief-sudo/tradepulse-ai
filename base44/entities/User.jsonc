@@ -10,15 +10,12 @@
     },
     "broker": {
       "type": "string",
-      "description": "Selected broker platform (alpaca, ibkr, tradestation, custom)"
+      "description": "Selected broker platform (alpaca, ibkr, tradestation, custom) \u2014 non-sensitive"
     },
-    "broker_api_key": {
-      "type": "string",
-      "description": "Broker API key"
-    },
-    "broker_api_secret": {
-      "type": "string",
-      "description": "Broker API secret"
+    "broker_connected": {
+      "type": "boolean",
+      "description": "Whether the user has active broker credentials stored server-side",
+      "default": false
     },
     "broker_mode": {
       "type": "string",
@@ -26,7 +23,7 @@
         "paper",
         "live"
       ],
-      "description": "Trading mode: paper (simulation) or live (real orders)"
+      "description": "Trading mode: paper (simulation) or live (real orders) \u2014 non-sensitive"
     },
     "stop_loss_pct": {
       "type": "number",
@@ -43,7 +40,7 @@
     },
     "ml_weights": {
       "type": "object",
-      "description": "Self-learning adjusted 5-factor weights (technical/fundamental/sentiment/momentum/risk) persisted across autonomous scan cycles",
+      "description": "Self-learning adjusted 5-factor weights",
       "properties": {
         "technical": {
           "type": "number"

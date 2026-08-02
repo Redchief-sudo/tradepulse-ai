@@ -2,6 +2,10 @@
   "name": "Trade",
   "type": "object",
   "properties": {
+    "user_id": {
+      "type": "string",
+      "description": "Owner user id \u2014 every query must filter by this"
+    },
     "symbol": {
       "type": "string"
     },
@@ -31,41 +35,49 @@
       "type": "boolean"
     },
     "broker_order_id": {
-      "type": "string",
-      "description": "Broker-assigned order id once submitted"
+      "type": "string"
     },
     "client_order_id": {
-      "type": "string",
-      "description": "Idempotency key assigned by the execution engine"
+      "type": "string"
     },
     "filled_qty": {
-      "type": "number",
-      "description": "Quantity actually filled by the broker"
+      "type": "number"
     },
     "filled_avg_price": {
-      "type": "number",
-      "description": "Average fill price reported by the broker"
+      "type": "number"
     },
     "order_status": {
-      "type": "string",
-      "description": "Terminal/paper fill status: filled, paper_filled, rejected, pending, reconciled_external, etc."
+      "type": "string"
     },
     "commission": {
       "type": "number"
     },
     "source": {
-      "type": "string",
-      "description": "Origin of the trade: autonomous, stoploss, dashboard_exit, ai_assistant, autonomous_ui, stoploss_ui, manual, reconciliation"
+      "type": "string"
     },
     "realized_pnl": {
-      "type": "number",
-      "description": "Realized P&L for sell trades (exit price - avg cost) * shares"
+      "type": "number"
     }
   },
   "required": [
+    "user_id",
     "symbol",
     "action",
     "shares",
     "price"
-  ]
+  ],
+  "rls": {
+    "read": {
+      "data.user_id": "{{user.id}}"
+    },
+    "create": {
+      "data.user_id": "{{user.id}}"
+    },
+    "update": {
+      "data.user_id": "{{user.id}}"
+    },
+    "delete": {
+      "data.user_id": "{{user.id}}"
+    }
+  }
 }

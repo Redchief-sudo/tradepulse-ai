@@ -2,6 +2,10 @@
   "name": "AITradeDecision",
   "type": "object",
   "properties": {
+    "user_id": {
+      "type": "string",
+      "description": "Owner user id \u2014 every query must filter by this"
+    },
     "symbol": {
       "type": "string"
     },
@@ -76,36 +80,28 @@
       "type": "number"
     },
     "return_5m": {
-      "type": "number",
-      "description": "Forward return 5 minutes after entry"
+      "type": "number"
     },
     "return_1h": {
-      "type": "number",
-      "description": "Forward return 1 hour after entry"
+      "type": "number"
     },
     "return_1d": {
-      "type": "number",
-      "description": "Forward return 1 day after entry"
+      "type": "number"
     },
     "return_5d": {
-      "type": "number",
-      "description": "Forward return 5 days after entry"
+      "type": "number"
     },
     "realized_return": {
-      "type": "number",
-      "description": "Realized return at exit (closed positions)"
+      "type": "number"
     },
     "benchmark_return": {
-      "type": "number",
-      "description": "SPY return over the same holding window"
+      "type": "number"
     },
     "max_adverse_excursion": {
-      "type": "number",
-      "description": "Max drawdown from entry while held"
+      "type": "number"
     },
     "max_favorable_excursion": {
-      "type": "number",
-      "description": "Max upside from entry while held"
+      "type": "number"
     },
     "holding_period_minutes": {
       "type": "number"
@@ -115,8 +111,7 @@
       "enum": [
         "open",
         "realized"
-      ],
-      "description": "Whether the position is still open or has been exited"
+      ]
     },
     "labeled_at": {
       "type": "string",
@@ -124,9 +119,24 @@
     }
   },
   "required": [
+    "user_id",
     "symbol",
     "action",
     "shares",
     "price"
-  ]
+  ],
+  "rls": {
+    "read": {
+      "data.user_id": "{{user.id}}"
+    },
+    "create": {
+      "data.user_id": "{{user.id}}"
+    },
+    "update": {
+      "data.user_id": "{{user.id}}"
+    },
+    "delete": {
+      "data.user_id": "{{user.id}}"
+    }
+  }
 }

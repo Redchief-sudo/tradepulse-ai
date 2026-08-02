@@ -2,9 +2,13 @@
   "name": "Fill",
   "type": "object",
   "properties": {
+    "user_id": {
+      "type": "string",
+      "description": "Owner user id \u2014 every query must filter by this"
+    },
     "fill_id": {
       "type": "string",
-      "description": "Unique fill identifier (broker-assigned, or generated for paper/shadow)"
+      "description": "Unique fill identifier \u2014 idempotency key for settlement"
     },
     "broker_order_id": {
       "type": "string"
@@ -13,15 +17,13 @@
       "type": "string"
     },
     "trade_intent_id": {
-      "type": "string",
-      "description": "Canonical TradeIntent this fill settles"
+      "type": "string"
     },
     "symbol": {
       "type": "string"
     },
     "asset_id": {
-      "type": "string",
-      "description": "Native instrument id at the venue"
+      "type": "string"
     },
     "side": {
       "type": "string",
@@ -53,8 +55,7 @@
       "format": "date-time"
     },
     "venue": {
-      "type": "string",
-      "description": "paper | shadow | alpaca | external"
+      "type": "string"
     },
     "strategy_id": {
       "type": "string"
@@ -65,6 +66,8 @@
     "execution_mode": {
       "type": "string",
       "enum": [
+        "internal_paper",
+        "broker_paper",
         "paper",
         "shadow_live",
         "live"
@@ -75,6 +78,7 @@
     }
   },
   "required": [
+    "user_id",
     "fill_id",
     "trade_intent_id",
     "symbol",
@@ -82,5 +86,19 @@
     "filled_quantity",
     "filled_price",
     "execution_mode"
-  ]
+  ],
+  "rls": {
+    "read": {
+      "data.user_id": "{{user.id}}"
+    },
+    "create": {
+      "data.user_id": "{{user.id}}"
+    },
+    "update": {
+      "data.user_id": "{{user.id}}"
+    },
+    "delete": {
+      "data.user_id": "{{user.id}}"
+    }
+  }
 }

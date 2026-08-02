@@ -2,6 +2,10 @@
   "name": "ReconciliationEvent",
   "type": "object",
   "properties": {
+    "user_id": {
+      "type": "string",
+      "description": "Owner user id \u2014 every query must filter by this"
+    },
     "run_timestamp": {
       "type": "string",
       "format": "date-time"
@@ -14,7 +18,8 @@
         "price_drift",
         "externally_closed",
         "new_from_broker",
-        "broker_unreachable"
+        "broker_unreachable",
+        "reconciliation_adjustment"
       ]
     },
     "symbol": {
@@ -39,8 +44,7 @@
       "type": "number"
     },
     "action_taken": {
-      "type": "string",
-      "description": "none | updated_holding | created_holding | recorded_sell_and_removed | flagged_for_review"
+      "type": "string"
     },
     "realized_pnl": {
       "type": "number"
@@ -50,8 +54,23 @@
     }
   },
   "required": [
+    "user_id",
     "run_timestamp",
     "event_type",
     "symbol"
-  ]
+  ],
+  "rls": {
+    "read": {
+      "data.user_id": "{{user.id}}"
+    },
+    "create": {
+      "data.user_id": "{{user.id}}"
+    },
+    "update": {
+      "data.user_id": "{{user.id}}"
+    },
+    "delete": {
+      "data.user_id": "{{user.id}}"
+    }
+  }
 }

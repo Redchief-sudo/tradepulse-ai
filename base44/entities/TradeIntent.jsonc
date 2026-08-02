@@ -2,17 +2,23 @@
   "name": "TradeIntent",
   "type": "object",
   "properties": {
+    "user_id": {
+      "type": "string",
+      "description": "Owner user id \u2014 every query must filter by this"
+    },
     "trade_intent_id": {
       "type": "string",
-      "description": "Canonical idempotency key assigned by the execution gateway"
+      "description": "Canonical idempotency key \u2014 stable across retries"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "description": "Caller-provided stable key (decision_id+signal_timestamp+symbol+side) \u2014 prevents duplicate orders on retry"
     },
     "strategy_id": {
-      "type": "string",
-      "description": "Originating strategy or surface (autonomous, stoploss, dashboard_exit, ai_assistant, manual...)"
+      "type": "string"
     },
     "decision_id": {
-      "type": "string",
-      "description": "Linked AITradeDecision id when the intent is AI-driven"
+      "type": "string"
     },
     "asset_class": {
       "type": "string",
@@ -29,12 +35,10 @@
       "type": "string"
     },
     "native_asset_id": {
-      "type": "string",
-      "description": "Broker-native instrument identifier"
+      "type": "string"
     },
     "broker": {
-      "type": "string",
-      "description": "Target broker / venue"
+      "type": "string"
     },
     "side": {
       "type": "string",
@@ -78,11 +82,13 @@
     "execution_mode": {
       "type": "string",
       "enum": [
+        "internal_paper",
+        "broker_paper",
         "paper",
         "shadow_live",
         "live"
       ],
-      "default": "paper"
+      "default": "internal_paper"
     },
     "status": {
       "type": "string",
@@ -102,12 +108,10 @@
       "default": "proposed"
     },
     "risk_snapshot": {
-      "type": "string",
-      "description": "JSON snapshot of the risk evaluation"
+      "type": "string"
     },
     "portfolio_snapshot": {
-      "type": "string",
-      "description": "JSON snapshot of the portfolio at signal time"
+      "type": "string"
     },
     "signal_timestamp": {
       "type": "string",
@@ -176,11 +180,26 @@
     }
   },
   "required": [
+    "user_id",
     "trade_intent_id",
     "symbol",
     "side",
     "requested_quantity",
     "execution_mode",
     "status"
-  ]
+  ],
+  "rls": {
+    "read": {
+      "data.user_id": "{{user.id}}"
+    },
+    "create": {
+      "data.user_id": "{{user.id}}"
+    },
+    "update": {
+      "data.user_id": "{{user.id}}"
+    },
+    "delete": {
+      "data.user_id": "{{user.id}}"
+    }
+  }
 }
