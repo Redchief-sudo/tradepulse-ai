@@ -4,10 +4,9 @@ import { settleTrade } from '../../shared/execution.ts';
 import { fetchQuotes as fetchMultiAssetQuotes } from '../../shared/marketDataAdapter.ts';
 
 // Admin / scheduled autonomous stop-loss monitor.
-// 1. Refreshes real prices from Finnhub for every holding.
+// USER-SCOPED: all queries filter by user_id.
+// 1. Refreshes real prices for every holding.
 // 2. Auto-sells any position down >= stop_loss_pct from its avg buy price.
-//    - Routes through Alpaca if the user has it connected (paper or live).
-//    - Otherwise records a paper sell trade.
 // 3. Emails the user a summary of any auto-exits.
 export default async function(req) {
   try {
@@ -17,8 +16,10 @@ export default async function(req) {
       return Response.json({ error: 'Admin only' }, { status: 403 });
     }
 
+    const sr = base44.asServiceRole;
     const key = secrets.get('FINNHUB_API_KEY');
-    const holdings = await base44.asServiceRole.entities.Holding.list();
+    // USER-SCOPED: only this user's holdings
+    const holdings = await sr.entities.Holding.filter({ user_id: user.id });
     if (!holdings.length) return Response.json({ ok: true, checked: 0, triggered: [] });
 
     const hasStocks = holdings.some((h) => (h.asset_class || 'stocks') === 'stocks');
@@ -42,7 +43,7 @@ export default async function(req) {
         current_price: priceMap[h.symbol],
         day_change_percent: changeMap[h.symbol] || 0,
       }));
-    if (updates.length) await base44.asServiceRole.entities.Holding.bulkUpdate(updates);
+    if (updates.length) await sr.entities.Holding.bulkUpdate(updates);
 
     // Detect triggered positions
     const triggered = holdings.filter((h) => {
@@ -56,8 +57,7 @@ export default async function(req) {
       const live = priceMap[h.symbol] || h.current_price || h.avg_price;
       const dropPct = h.avg_price > 0 ? ((h.avg_price - live) / h.avg_price) * 100 : 0;
 
-      // Route through the canonical execution boundary. Accounting is settled
-      // ONLY from a confirmed broker fill — a rejected order leaves the holding intact.
+      // Route through the canonical execution boundary.
       const result = await settleTrade(base44, user, {
         symbol: h.symbol,
         action: 'sell',
@@ -67,6 +67,8 @@ export default async function(req) {
         ai_recommended: true,
         source: 'stoploss',
         notes: `Auto stop-loss @ -${dropPct.toFixed(1)}% (threshold ${threshold}%)`,
+        idempotency_key: `stoploss-${h.symbol}-${new Date().toISOString().slice(0, 13)}`,
+        signal_timestamp: new Date().toISOString(),
       });
       results.push({ symbol: h.symbol, shares: h.shares, price: live, dropPct, settlement: result });
     }
@@ -77,7 +79,7 @@ export default async function(req) {
         const body = results
           .map((r) => `SOLD ${r.shares} ${r.symbol} @ $${r.price.toFixed(2)} (down ${r.dropPct.toFixed(1)}%)`)
           .join('\n');
-        await base44.asServiceRole.integrations.Core.SendEmail({
+        await sr.integrations.Core.SendEmail({
           to: user.email,
           subject: `TradePulse Alert: ${results.length} stop-loss position(s) auto-exited`,
           body,

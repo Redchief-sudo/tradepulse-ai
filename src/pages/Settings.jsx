@@ -75,13 +75,13 @@ const BROKERS = [
 
 export default function Settings() {
   const [user, setUser] = useState(null);
+  const [brokerStatus, setBrokerStatus] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState(null);
   const [showKey, setShowKey] = useState(false);
   const [showSecret, setShowSecret] = useState(false);
-  const [secretSuffix, setSecretSuffix] = useState('');
   const [form, setForm] = useState({
     broker: '',
     broker_api_key: '',
@@ -94,12 +94,14 @@ export default function Settings() {
     try {
       const me = await base44.auth.me();
       setUser(me);
-      setSecretSuffix(me.broker_api_secret ? `••••${me.broker_api_secret.slice(-4)}` : '');
+      // Load broker status from the secure backend function (no secrets returned)
+      const status = await base44.functions.invoke('getBrokerStatus', {});
+      setBrokerStatus(status);
       setForm({
-        broker: me.broker || '',
-        broker_api_key: me.broker_api_key || '',
+        broker: status?.broker || me.broker || '',
+        broker_api_key: '',
         broker_api_secret: '',
-        broker_mode: me.broker_mode || 'paper',
+        broker_mode: status?.broker_mode || me.broker_mode || 'paper',
         trade_profile: me.trade_profile || 'balanced',
       });
     } catch (e) {
@@ -115,20 +117,27 @@ export default function Settings() {
   const save = async () => {
     setSaving(true);
     try {
-      const payload = {
-        broker: form.broker,
-        broker_api_key: form.broker_api_key,
-        broker_mode: form.broker_mode,
-        trade_profile: form.trade_profile,
-      };
-      // Only overwrite the secret when a new one is entered; never blank out an existing secret.
-      if (form.broker_api_secret.trim()) {
-        payload.broker_api_secret = form.broker_api_secret.trim();
+      // Save trade profile via auth.updateMe (non-sensitive)
+      await base44.auth.updateMe({ trade_profile: form.trade_profile });
+
+      // Save broker credentials via the secure backend function
+      // (validates against the broker, stores in BrokerCredential entity, never on User)
+      if (form.broker && form.broker_api_key.trim() && form.broker_api_secret.trim()) {
+        const result = await base44.functions.invoke('saveBrokerCredentials', {
+          broker: form.broker,
+          api_key: form.broker_api_key.trim(),
+          api_secret: form.broker_api_secret.trim(),
+          mode: form.broker_mode,
+        });
+        if (result.error) {
+          setTestResult({ ok: false, message: result.error });
+        } else {
+          setTestResult({ ok: true, message: `Credentials validated and saved for ${BROKERS.find((b) => b.id === form.broker)?.name || form.broker}.` });
+        }
       }
-      await base44.auth.updateMe(payload);
       await loadUser();
     } catch (e) {
-      console.error(e);
+      setTestResult({ ok: false, message: e.message || 'Failed to save credentials.' });
     }
     setSaving(false);
   };
@@ -137,18 +146,13 @@ export default function Settings() {
     setTesting(true);
     setTestResult(null);
     try {
-      // Verify the key format looks valid — actual broker API call needs a backend function (Builder+)
-      await new Promise((r) => setTimeout(r, 800));
-      if (!form.broker_api_key.trim() || !form.broker_api_secret.trim()) {
-        setTestResult({ ok: false, message: 'API key and secret are required.' });
-      } else if (form.broker_api_key.trim().length < 10) {
-        setTestResult({ ok: false, message: 'API key looks too short — check your broker dashboard.' });
-      } else {
-        setTestResult({
-          ok: true,
-          message: `Credentials saved for ${BROKERS.find((b) => b.id === form.broker)?.name || form.broker}. You can now place orders through this broker.`,
-        });
-      }
+      const result = await base44.functions.invoke('validateBrokerCredentials', {
+        broker: form.broker,
+        api_key: form.broker_api_key.trim(),
+        api_secret: form.broker_api_secret.trim(),
+        mode: form.broker_mode,
+      });
+      setTestResult(result);
     } catch (e) {
       setTestResult({ ok: false, message: 'Connection test failed.' });
     }
@@ -156,16 +160,11 @@ export default function Settings() {
   };
 
   const disconnect = async () => {
-    setForm((prev) => ({ ...prev, broker: '', broker_api_key: '', broker_api_secret: '', broker_mode: 'paper' }));
-    setTestResult(null);
     setSaving(true);
+    setTestResult(null);
     try {
-      await base44.auth.updateMe({
-        broker: '',
-        broker_api_key: '',
-        broker_api_secret: '',
-        broker_mode: 'paper',
-      });
+      await base44.functions.invoke('saveBrokerCredentials', { disconnect: true });
+      setForm((prev) => ({ ...prev, broker: '', broker_api_key: '', broker_api_secret: '', broker_mode: 'paper' }));
       await loadUser();
     } catch (e) {
       console.error(e);
@@ -173,7 +172,8 @@ export default function Settings() {
     setSaving(false);
   };
 
-  const isConnected = !!(user?.broker && user?.broker_api_key && user?.broker_api_secret);
+  const isConnected = !!brokerStatus?.connected;
+  const secretSuffix = brokerStatus?.credential_suffix || '';
 
   if (loading) {
     return (
@@ -217,7 +217,7 @@ export default function Settings() {
           </h3>
           <p className="text-xs text-muted-foreground leading-relaxed">
             {isConnected
-              ? `Connected to ${BROKERS.find((b) => b.id === form.broker)?.name || form.broker} in ${form.broker_mode === 'live' ? 'LIVE' : 'paper'} mode. Orders are submitted to your broker and fills settle your portfolio automatically.`
+              ? `Connected to ${BROKERS.find((b) => b.id === brokerStatus?.broker)?.name || brokerStatus?.broker} in ${brokerStatus?.broker_mode === 'live' ? 'LIVE' : 'paper'} mode. Orders are submitted to your broker and fills settle your portfolio automatically.`
               : 'Right now all trades are paper — recorded in the app with no real broker orders. Connect a broker below to route orders through your brokerage account.'}
           </p>
         </div>
@@ -314,7 +314,7 @@ export default function Settings() {
               type={showKey ? 'text' : 'password'}
               value={form.broker_api_key}
               onChange={(e) => setForm({ ...form, broker_api_key: e.target.value })}
-              placeholder="Enter your API key"
+              placeholder={isConnected ? '•••••••• (enter new key to replace)' : 'Enter your API key'}
               className="pl-9 pr-10 font-mono"
             />
             <button
@@ -424,7 +424,7 @@ export default function Settings() {
           </Button>
           <Button
             onClick={testConnection}
-            disabled={testing || !form.broker}
+            disabled={testing || !form.broker || !form.broker_api_key.trim() || !form.broker_api_secret.trim()}
             variant="secondary"
             className="gap-2 flex-1"
           >
@@ -449,7 +449,8 @@ export default function Settings() {
       <div className="mt-4 flex items-start gap-2 text-xs text-muted-foreground px-1">
         <Shield className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
         <p>
-          Your API credentials are stored securely on your user profile and only accessible to you.
+          Your API credentials are stored in an encrypted server-side vault and never exposed
+          to the browser. The connection test validates your keys against the broker's live API.
           Never share your API secret. We recommend using paper trading keys until you're confident
           in the system.
         </p>

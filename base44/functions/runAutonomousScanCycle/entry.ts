@@ -1,10 +1,11 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { secrets } from 'base44:runtime';
-import { getAlpacaAccount } from '../../shared/alpaca.ts';
 import { settleTrade } from '../../shared/execution.ts';
 import { computeRealFactors, weightedComposite, signalFromComposite } from '../../shared/quantScore.ts';
 import { classifyRegimeFromSnapshots } from '../../shared/regime.ts';
 import { netEdge } from '../../shared/costModel.ts';
+import { getChampion } from '../../shared/modelGovernance.ts';
+import { getAlpacaAccount } from '../../shared/alpaca.ts';
 
 const PROFILES = {
   aggressive: { max_position_pct: 15, max_sector_pct: 40, min_confidence: 70, max_daily_trades: 8, stop_loss_pct: 12 },
@@ -46,10 +47,10 @@ async function fetchCandles(symbol, key) {
   }
 }
 
-// Full 5-pass autonomous AI trading cycle with REAL deterministic scoring.
-// Pass 1: Gemini scan -> Pass 2: Claude portfolio fit -> Committee debate ->
-// Deterministic ML scoring (real indicators) -> Adversarial veto -> Causal contagion ->
-// Execute -> Self-learning weight update -> Email alert.
+// Full 5-pass autonomous AI trading cycle.
+// Uses CHAMPION model weights from the versioned StrategyModel registry.
+// Weight evolution is handled by the separate Model Governance workflow —
+// this cycle only executes trades, it does not mutate the model.
 export default async function(req) {
   try {
     const base44 = createClientFromRequest(req);
@@ -58,15 +59,20 @@ export default async function(req) {
 
     const sr = base44.asServiceRole;
     const key = secrets.get('FINNHUB_API_KEY');
-    const holdings = await sr.entities.Holding.list();
+    // USER-SCOPED: only this user's holdings
+    const holdings = await sr.entities.Holding.filter({ user_id: user.id });
     const pp = profileParams(user.trade_profile || 'balanced');
-    const weights = user.ml_weights || { technical: 25, fundamental: 25, sentiment: 20, momentum: 15, risk: 15 };
+
+    // CHAMPION MODEL: use the versioned champion's weights, not raw user.ml_weights.
+    // The governance workflow promotes challengers; this cycle always uses the champion.
+    const champion = await getChampion(sr, user.id);
+    const weights = champion?.weights || user.ml_weights || { technical: 25, fundamental: 25, sentiment: 20, momentum: 15, risk: 15 };
+
     const pCtx = portfolioContext(holdings);
     const sec = sectorExposure(holdings);
     const secCtx = sec.sectors.length ? sec.sectors.map((s) => `${s.sector}: ${s.percent.toFixed(1)}% ($${s.value.toFixed(0)})`).join(', ') : 'No sector exposure yet.';
 
-    // Deterministic market regime (from SPY snapshots — NOT LLM estimation).
-    // Governs regime-aware position sizing and blocks new buys in a liquidity crisis.
+    // Deterministic market regime
     const regime = await classifyRegimeFromSnapshots(sr);
 
     // PASS 1 — Multi-asset deep market scan (Gemini 3.1 Pro, web search)
@@ -95,9 +101,9 @@ export default async function(req) {
       },
     });
     const candidates = p1.candidates || [];
-    if (!candidates.length) return Response.json({ ok: true, message: 'No candidates', market_summary: p1.market_summary });
+    if (!candidates.length) return Response.json({ ok: true, message: 'No candidates', market_summary: p1.market_summary, champion_version: champion?.version });
 
-    // Enrich each candidate with REAL indicators from live daily candles
+    // Enrich each candidate with REAL indicators
     const enriched = [];
     for (const c of candidates) {
       const candles = key ? await fetchCandles(c.symbol, key) : null;
@@ -131,7 +137,7 @@ export default async function(req) {
     });
     let proposals = (p2.proposals || []).filter((pr) => (pr.confidence || 0) >= pp.min_confidence).slice(0, pp.max_daily_trades);
 
-    // PASS 3a — Investment Committee Debate (4-archetype consensus)
+    // PASS 3a — Investment Committee Debate
     if (proposals.length) {
       const committee = await sr.integrations.Core.InvokeLLM({
         model: 'claude-sonnet-5',
@@ -143,9 +149,7 @@ export default async function(req) {
               type: 'array',
               items: {
                 type: 'object',
-                properties: {
-                  symbol: { type: 'string' }, consensus_votes: { type: 'number' }, consensus: { type: 'boolean' },
-                },
+                properties: { symbol: { type: 'string' }, consensus_votes: { type: 'number' }, consensus: { type: 'boolean' } },
               },
             },
           },
@@ -157,7 +161,7 @@ export default async function(req) {
       proposals = proposals.filter((p) => consensusMap[p.symbol.toUpperCase()] !== false);
     }
 
-    // PASS 3b — Deterministic ML multi-factor scoring (REAL indicators + self-learning weights)
+    // PASS 3b — Deterministic ML multi-factor scoring (CHAMPION weights)
     const scored = proposals.map((p) => {
       const ef = enriched.find((e) => e.symbol === p.symbol);
       const f = ef?.realFactors;
@@ -195,7 +199,7 @@ export default async function(req) {
       approved = approved.filter((p) => (vetoMap[p.symbol.toUpperCase()] || 'approved') !== 'vetoed');
     }
 
-    // PASS 5 — Causal Contagion (DAG) — systemic risk note per approved trade
+    // PASS 5 — Causal Contagion
     let contagion = null;
     if (approved.length) {
       try {
@@ -212,18 +216,19 @@ export default async function(req) {
         });
       } catch (e) { /* non-fatal */ }
     }
-    // Block trades with extreme contagion risk
     if (contagion?.items) {
       const crMap = {};
       contagion.items.forEach((c) => { crMap[c.symbol.toUpperCase()] = c.contagion_risk || 0; });
       approved = approved.filter((p) => (crMap[p.symbol.toUpperCase()] || 0) < 80);
     }
 
-    // Authoritative capital base: use broker account equity when connected, else securities market value.
+    // Authoritative capital base: use broker account equity when connected.
+    // Credentials are read from the secure BrokerCredential entity, NOT the User object.
     let accountEquity = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
-    if (user.broker === 'alpaca' && user.broker_api_key && user.broker_api_secret) {
+    const brokerCreds = await sr.entities.BrokerCredential.filter({ user_id: user.id, status: 'active' });
+    if (brokerCreds[0] && brokerCreds[0].broker === 'alpaca') {
       try {
-        const acct = await getAlpacaAccount({ apiKey: user.broker_api_key, secretKey: user.broker_api_secret, mode: user.broker_mode || 'paper' });
+        const acct = await getAlpacaAccount({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode });
         if (acct && Number(acct.equity) > 0) accountEquity = Number(acct.equity);
       } catch (e) { /* fall back to securities market value */ }
     }
@@ -233,19 +238,14 @@ export default async function(req) {
       const price = pr.realPrice || pr.current_price;
       let shares;
       if (pr.action === 'buy') {
-        // Regime gate: block new buys in a liquidity crisis (position_multiplier = 0).
         if (regime.position_multiplier <= 0) continue;
-        // Net-edge gate: skip trades whose expected gross return is smaller than
-        // the round-trip transaction cost (no edge after costs).
         const grossReturnPct = pr.target_price && price > 0 ? ((pr.target_price - price) / price) * 100 : null;
         if (grossReturnPct !== null && netEdge(grossReturnPct, pr.asset_class || 'stocks') <= 0) continue;
         const maxPos = (pp.max_position_pct / 100) * accountEquity;
         const sectorVal = sec.sectors.find((s) => s.sector === (pr.sector || 'Other'))?.value || 0;
         const sectorCap = Math.max(0, (pp.max_sector_pct / 100) * accountEquity - sectorVal);
         const aiVal = ((pr.suggested_position_pct || 5) / 100) * accountEquity;
-        // Regime-aware sizing: scale down in high-vol/bear regimes, full in low-vol bull.
         const positionValue = Math.min(aiVal, maxPos, sectorCap) * regime.position_multiplier;
-        // Do NOT buy when authorized notional is below the cost of one whole share.
         shares = price > 0 && positionValue >= price ? Math.floor(positionValue / price) : 0;
       } else {
         const existing = holdings.find((h) => h.symbol === pr.symbol);
@@ -261,47 +261,16 @@ export default async function(req) {
         source: 'autonomous', reasoning: pr.reasoning, ml_score: pr.ml_score,
         technical_score: f.technical_score, momentum_score: f.momentum_score, risk_score: f.risk_score,
         recordDecision: true,
+        // STABLE IDEMPOTENCY: derive from signal identity so retries don't duplicate
+        idempotency_key: `autonomous-${pr.symbol}-${pr.action}-${new Date().toISOString().slice(0, 13)}`,
+        signal_timestamp: new Date().toISOString(),
       });
       executed.push({ symbol: pr.symbol, action: pr.action, qty: shares, price, ml_score: pr.ml_score, settlement: result });
     }
 
-    // SELF-LEARNING — adjust 5-factor weights from REALIZED trade outcomes (evidence-based)
-    let newWeights = weights;
-    try {
-      const past = await sr.entities.AITradeDecision.list('-created_date', 30);
-      const allTrades = await sr.entities.Trade.list('-created_date', 200);
-      const outcomes = past.map((d) => {
-        const sells = allTrades.filter(
-          (t) => t.symbol === d.symbol && t.action === 'sell' && new Date(t.created_date) >= new Date(d.created_date)
-        );
-        let realizedPnl = null;
-        if (d.action === 'buy' && sells.length) {
-          realizedPnl = sells.reduce((s, t) => s + (t.price - d.price) * t.shares, 0);
-        }
-        return {
-          symbol: d.symbol, action: d.action, ml_score: d.ml_score,
-          technical_score: d.technical_score, momentum_score: d.momentum_score, risk_score: d.risk_score,
-          outcome: realizedPnl === null ? 'open' : realizedPnl > 0 ? 'win' : 'loss',
-          realized_pnl: realizedPnl,
-        };
-      });
-      const labeled = outcomes.filter((o) => o.outcome !== 'open');
-      if (labeled.length >= 3) {
-        const sl = await sr.integrations.Core.InvokeLLM({
-          model: 'claude-sonnet-5',
-          prompt: `You are AlphaTrade AI's SELF-LEARNING ENGINE. Below are PAST decisions with their REALIZED outcomes (win/loss + realized P&L). Diagnose which factors predicted winners vs losers and produce ADJUSTED 5-factor weights (must sum to 100, each 5-40).\nDecisions with outcomes:\n${JSON.stringify(labeled, null, 2)}\nCurrent weights: ${JSON.stringify(weights)}. Return weights + accuracy (% of labeled that were wins) + summary.`,
-          response_json_schema: {
-            type: 'object',
-            properties: {
-              weights: { type: 'object', properties: { technical: { type: 'number' }, fundamental: { type: 'number' }, sentiment: { type: 'number' }, momentum: { type: 'number' }, risk: { type: 'number' } } },
-              accuracy: { type: 'number' }, summary: { type: 'string' },
-            },
-          },
-        });
-        if (sl.weights) newWeights = sl.weights;
-      }
-    } catch (e) { /* non-fatal */ }
-    try { await sr.entities.User.update(user.id, { ml_weights: newWeights }); } catch (e) { /* non-fatal */ }
+    // NOTE: Self-learning weight evolution is now handled by the separate
+    // Model Governance workflow (runModelGovernance). This cycle only executes
+    // trades using the champion model's weights — it does NOT mutate the model.
 
     // Email alert
     if (executed.length) {
@@ -319,12 +288,13 @@ export default async function(req) {
       market_summary: p1.market_summary,
       risk_assessment: p2.risk_assessment,
       regime,
+      champion_version: champion?.version || 'default',
       candidates_scanned: candidates.length,
       proposals_after_fit: (p2.proposals || []).length,
       proposals_after_committee: proposals.length,
       proposals_after_veto: approved.length,
       executed,
-      ml_weights: newWeights,
+      ml_weights: weights,
     });
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });

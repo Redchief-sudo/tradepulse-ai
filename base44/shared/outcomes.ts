@@ -1,7 +1,7 @@
 // Outcome measurement — closes the feedback loop by labeling each AI buy decision
 // with realized/forward returns, benchmark-relative return, and excursion metrics,
 // computed from the immutable Fill ledger + the PriceSnapshot time series.
-// This is what turns "AI confidence" into measurable, attributable intelligence.
+// USER-SCOPED: all queries filter by user_id.
 
 const WINDOWS = [
   { field: 'return_5m', ms: 5 * 60 * 1000 },
@@ -30,14 +30,14 @@ function nearestOverall(snaps, targetTs) {
   return best;
 }
 
-// labelOutcomes — label every executed BUY decision with forward/realized returns,
-// benchmark-relative return, and max adverse/favorable excursion.
-export async function labelOutcomes(sr) {
-  const decisions = await sr.entities.AITradeDecision.list('-created_date', 200);
+// labelOutcomes — label every executed BUY decision with forward/realized returns.
+// USER-SCOPED: filters by userId to prevent cross-user data leakage.
+export async function labelOutcomes(sr, userId) {
+  const decisions = await sr.entities.AITradeDecision.filter({ user_id: userId }, '-created_date', 200);
   const buyDecisions = decisions.filter((d) => d.action === 'buy' && d.status === 'executed');
   if (!buyDecisions.length) return { labeled: 0 };
 
-  const fills = await sr.entities.Fill.list('-created_date', 5000);
+  const fills = await sr.entities.Fill.filter({ user_id: userId }, '-created_date', 5000);
   const allSnaps = await sr.entities.PriceSnapshot.list('-timestamp', 5000);
   const snapsBySym = {};
   allSnaps.forEach((s) => {

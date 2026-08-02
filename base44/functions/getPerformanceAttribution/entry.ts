@@ -13,10 +13,10 @@ export default async function (req) {
 
     const sr = base44.asServiceRole;
     const [trades, fills, intents, holdings] = await Promise.all([
-      sr.entities.Trade.list('-created_date', 1000),
-      sr.entities.Fill.list('-created_date', 1000),
-      sr.entities.TradeIntent.list('-created_date', 1000),
-      sr.entities.Holding.list(),
+      sr.entities.Trade.filter({ user_id: user.id }, '-created_date', 1000),
+      sr.entities.Fill.filter({ user_id: user.id }, '-created_date', 1000),
+      sr.entities.TradeIntent.filter({ user_id: user.id }, '-created_date', 1000),
+      sr.entities.Holding.filter({ user_id: user.id }),
     ]);
 
     const strategies = computeStrategyAttribution(trades, fills, holdings);

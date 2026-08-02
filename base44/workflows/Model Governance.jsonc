@@ -1,0 +1,44 @@
+{
+  "name": "Model Governance",
+  "description": "Weekly: runs the controlled model governance cycle \u2014 collects labeled outcomes, generates a bounded candidate, validates it walk-forward out-of-sample, promotes only if statistically significant, and auto-rolls back if recent performance degrades.",
+  "trigger": {
+    "condition": null,
+    "config": {
+      "trigger_type": "scheduled",
+      "events": [],
+      "schedule_mode": "recurring",
+      "cron_expression": "0 1 * * 0",
+      "one_time_date": null,
+      "timezone": "America/Los_Angeles",
+      "interval_value": null,
+      "interval_unit": null,
+      "interval_anchor": null,
+      "ends_type": "never",
+      "ends_on_date": null,
+      "ends_after_count": null
+    }
+  },
+  "definition": {
+    "document": {
+      "dsl": "1.0.0",
+      "name": "model_governance",
+      "version": "1.0",
+      "namespace": "base44"
+    },
+    "do": [
+      {
+        "govern": {
+          "call": "invoke_backend_function",
+          "with": {
+            "function_name": "runModelGovernance"
+          },
+          "then": "end",
+          "x-base44": {
+            "title": "Run model governance cycle",
+            "description": "Walk-forward validate candidate weights, promote only if proven, auto-rollback if degraded"
+          }
+        }
+      }
+    ]
+  }
+}
