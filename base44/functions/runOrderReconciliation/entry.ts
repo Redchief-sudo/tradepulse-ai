@@ -48,6 +48,42 @@ export default async function(req) {
     const results = [];
     const staleOrders = [];
 
+    // === STALE CLAIM RECOVERY ===
+    // Find intents stuck in 'claimed' state with stale claims (> 5 min).
+    // These are workers that crashed mid-settlement. Re-claim and recover.
+    const allClaimed = await sr.entities.TradeIntent.filter({ user_id: user.id, settlement_state: 'claimed' }, '-created_date', 50);
+    const staleClaimed = allClaimed.filter((i) => {
+      if (!i.settlement_claimed_at) return true;
+      return Date.now() - new Date(i.settlement_claimed_at).getTime() > 5 * 60 * 1000;
+    });
+
+    for (const intent of staleClaimed) {
+      const claim = await claimSettlement(sr, user.id, intent.trade_intent_id, workerId);
+      if (!claim.claimed) continue;
+
+      // Check if Trade already exists (settlement was partially completed before crash)
+      const existingTrades = await sr.entities.Trade.filter({ user_id: user.id, client_order_id: intent.client_order_id });
+      if (existingTrades && existingTrades.length > 0) {
+        await sr.entities.TradeIntent.update(claim.intent.id, { status: 'settled', settlement_state: 'settled' });
+        results.push({ intent_id: intent.trade_intent_id, symbol: intent.symbol, status: 'recovered_settled', reason: 'trade_already_exists' });
+      } else if (intent.filled_quantity > 0) {
+        const venue = intent.execution_mode === 'live' ? 'alpaca' : 'alpaca_paper';
+        await settleFromFills(sr, user.id, claim.intent,
+          { company_name: intent.company_name, sector: intent.sector, asset_class: intent.asset_class,
+            confidence: intent.confidence, target_price: intent.target_price, stop_loss: intent.stop_loss,
+            reasoning: intent.reasoning, ml_score: intent.ml_score, technical_score: intent.technical_score,
+            momentum_score: intent.momentum_score, risk_score: intent.risk_score, ai_recommended: intent.strategy_id !== 'manual',
+            recordDecision: !!intent.decision_id, portfolio_id: intent.portfolio_id },
+          intent.broker_order_id, intent.client_order_id, intent.trade_intent_id, intent.strategy_id,
+          intent.filled_quantity, intent.filled_avg_price, intent.execution_mode, venue, 0);
+        results.push({ intent_id: intent.trade_intent_id, symbol: intent.symbol, status: 'recovered_settled', reason: 'settleFromFills_completed' });
+      } else {
+        await sr.entities.TradeIntent.update(claim.intent.id, { status: 'canceled', settlement_state: 'settled', rejection_reason: 'CRASH_RECOVERY_NO_FILLS' });
+        results.push({ intent_id: intent.trade_intent_id, symbol: intent.symbol, status: 'recovered_canceled', reason: 'no_fills' });
+      }
+    }
+
+    // === PENDING ORDER RECONCILIATION ===
     for (const intent of pending) {
       const alpacaMode = intent.execution_mode === 'live' ? 'live' : 'paper';
       const orderCreds = { ...brokerCreds, mode: alpacaMode };

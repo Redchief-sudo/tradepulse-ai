@@ -620,7 +620,12 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
         broker_terminal_status: status,
         unfilled_quantity: Math.max(0, intentRecord.requested_quantity - cumulativeFilled),
       });
-      return await settleFromFills(sr, userId, intentRecord, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, cumulativeFilled, cumulativeAvgPrice, executionMode, venue, accumulatedRealizedPnl);
+      // Atomically claim the settlement — prevents double-settlement if the
+      // reconciliation worker also observes this terminal state.
+      const fillClaim = await claimSettlement(sr, userId, tradeIntentId, `poll-${brokerOrderId}`);
+      if (!fillClaim.claimed) return { status: 'already_settled', intentId: intentRecord.id, trade_intent_id: tradeIntentId, reason: fillClaim.reason };
+      await sr.entities.TradeIntent.update(fillClaim.intent.id, { settlement_state: 'projected' });
+      return await settleFromFills(sr, userId, fillClaim.intent, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, cumulativeFilled, cumulativeAvgPrice, executionMode, venue, accumulatedRealizedPnl);
     }
 
     if (isTerminalFailure(status)) {
@@ -635,7 +640,11 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
           broker_terminal_status: status,
           unfilled_quantity: Math.max(0, intentRecord.requested_quantity - cumulativeFilled),
         });
-        return await settleFromFills(sr, userId, intentRecord, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, cumulativeFilled, cumulativeAvgPrice, executionMode, venue, accumulatedRealizedPnl);
+        // Atomically claim the settlement — prevents double-settlement.
+        const partialClaim = await claimSettlement(sr, userId, tradeIntentId, `poll-${brokerOrderId}`);
+        if (!partialClaim.claimed) return { status: 'already_settled', intentId: intentRecord.id, trade_intent_id: tradeIntentId, reason: partialClaim.reason };
+        await sr.entities.TradeIntent.update(partialClaim.intent.id, { settlement_state: 'projected' });
+        return await settleFromFills(sr, userId, partialClaim.intent, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, cumulativeFilled, cumulativeAvgPrice, executionMode, venue, accumulatedRealizedPnl);
       }
       // No fill at all — reject.
       await sr.entities.TradeIntent.update(intentRecord.id, {
@@ -694,6 +703,13 @@ async function resumeBrokerOrder(sr, userId, intentRecord, input, brokerCred) {
 // Final settlement — create the Trade record, AITradeDecision (if AI-driven), and settle the intent.
 // This is called once the order reaches a terminal state. The fills are already recorded.
 export async function settleFromFills(sr, userId, intentRecord, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, filledQty, filledPrice, executionMode, venue, realizedPnl = null) {
+  // Defense-in-depth: verify settlement was claimed before proceeding.
+  // This catches any code path that somehow reaches settleFromFills without
+  // going through the atomic claimSettlement gate.
+  if (intentRecord.settlement_state && !['claimed', 'projected', 'settled'].includes(intentRecord.settlement_state)) {
+    return { status: 'rejected', error: 'SETTLEMENT_NOT_CLAIMED', intentId: intentRecord.id, trade_intent_id: tradeIntentId };
+  }
+
   const symbol = intentRecord.symbol;
   const side = intentRecord.side;
   const totalValue = filledQty * filledPrice;
@@ -791,6 +807,15 @@ export async function settleFromFills(sr, userId, intentRecord, input, brokerOrd
 async function settleFill(sr, userId, params) {
   const { fillId, brokerOrderId, clientOrderId, tradeIntentId, symbol, side, filledQty, filledPrice, venue, executionMode, strategyId, decisionId, input, intentRecord } = params;
 
+  // Atomically claim the settlement — prevents double-settlement if a
+  // concurrent worker or reconciliation worker observes the same state.
+  const workerId = `exec-${clientOrderId}`;
+  const claim = await claimSettlement(sr, userId, tradeIntentId, workerId);
+  if (!claim.claimed) {
+    return { duplicate: true, settlement_applied: false, reason: claim.reason, trade_intent_id: tradeIntentId, symbol, side };
+  }
+  const claimedIntent = claim.intent;
+
   // Idempotent fill insertion — only project if we won the dedup race.
   const inserted = await recordFill(sr, {
     user_id: userId,
@@ -830,8 +855,14 @@ async function settleFill(sr, userId, params) {
   // Project the holding and capture realized P&L from lot-based accounting.
   const realizedPnl = await projectHolding(sr, userId, symbol, side, filledQty, filledPrice, { ...input, fill_id: fillId });
 
+  // Mark as projected — lot projection complete, about to create Trade.
+  // A crash here can be recovered: settleFromFills is idempotent (checks
+  // existing Trade by client_order_id), and rebuildPositionsFromFills can
+  // replay the lot ledger from the Fill source of truth.
+  await sr.entities.TradeIntent.update(claimedIntent.id, { settlement_state: 'projected' });
+
   // Final settlement — pass realized P&L from lot accounting.
-  return await settleFromFills(sr, userId, intentRecord, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, filledQty, filledPrice, executionMode, venue, realizedPnl);
+  return await settleFromFills(sr, userId, claimedIntent, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, filledQty, filledPrice, executionMode, venue, realizedPnl);
 }
 
 // Backward-compatible wrapper.
