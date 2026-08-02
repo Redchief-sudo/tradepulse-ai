@@ -33,7 +33,7 @@ function isTerminal(status) {
   return ['filled', 'done_for_day', ...['rejected', 'canceled', 'expired', 'replaced']].includes(status);
 }
 function nowIso() { return new Date().toISOString(); }
-function genId(prefix) { return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`; }
+function genId(prefix) { return `${prefix}-${crypto.randomUUID()}`; }
 
 // Derive a stable idempotency key from the input. The caller may provide one directly,
 // or we derive it from decision_id + signal_timestamp + symbol + side. This ensures
@@ -241,8 +241,30 @@ export async function executeIntent(base44, user, input) {
     }
   }
 
+  // 1c. Fetch real account equity for risk sizing (broker_paper/live only).
+  // FAIL-CLOSED: if account is unreachable or has no equity, reject before risk
+  // evaluation — no order is submitted. The equity is passed to buildPortfolioSnapshot
+  // so position/sector caps are computed against the real capital base, not stale
+  // holding cache drift.
+  let accountEquity = null;
+  if (executionMode === 'live' || executionMode === 'broker_paper') {
+    try {
+      const acct = await getAlpacaAccount({ apiKey: brokerCred.api_key, secretKey: brokerCred.api_secret, mode: brokerCred.mode });
+      if (!acct || Number(acct.equity) <= 0) {
+        await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: 'BROKER_ACCOUNT_INVALID: no equity' });
+        return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: 'Broker account invalid', symbol, side, requestedQty };
+      }
+      accountEquity = Number(acct.equity);
+    } catch (e) {
+      await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: `BROKER_UNREACHABLE: ${e.message}` });
+      return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: `Broker unreachable: ${e.message}`, symbol, side, requestedQty };
+    }
+  }
+
   // 2. RISK evaluation — deterministic, veto authority. DENIED ⇒ zero order, zero mutation.
-  const snapshot = await buildPortfolioSnapshot(sr, userId);
+  // Uses real broker account equity when available (broker_paper/live), falls back to
+  // holdings-based equity for internal_paper mode.
+  const snapshot = await buildPortfolioSnapshot(sr, userId, accountEquity);
   const limits = riskLimitsForProfile(user.trade_profile || 'balanced');
   const risk = evaluateRisk(
     { symbol, side, requested_quantity: requestedQty, limit_price: refPrice, price: refPrice, sector: input.sector, confidence: input.confidence },
@@ -323,25 +345,19 @@ export async function executeIntent(base44, user, input) {
   const creds = { apiKey: brokerCred.api_key, secretKey: brokerCred.api_secret, mode: brokerCred.mode };
   const alpacaMode = executionMode === 'live' ? 'live' : 'paper';
 
-  // 3a. FAIL-CLOSED: For broker_paper/live, verify account is reachable before ordering.
-  try {
-    const acct = await getAlpacaAccount(creds);
-    if (!acct || Number(acct.equity) <= 0) {
-      await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: 'BROKER_ACCOUNT_INVALID: no equity' });
-      return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: 'Broker account invalid', symbol, side, requestedQty: approvedQty };
-    }
-  } catch (e) {
-    // Fail-closed: cannot confirm account state → no order.
-    await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: `BROKER_UNREACHABLE: ${e.message}` });
-    return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: `Broker unreachable: ${e.message}`, symbol, side, requestedQty: approvedQty };
-  }
-
   // 3b. Submit the order (only if not already submitted — resume case).
+  // Account was already verified and equity fetched in step 1c above.
   let brokerOrderId = intentRecord.broker_order_id;
   if (!brokerOrderId) {
     try {
       await sr.entities.TradeIntent.update(intentRecord.id, { status: 'submitted', broker: brokerCred.broker });
-      const placed = await placeAlpacaOrder({ ...creds, mode: alpacaMode, symbol, qty: approvedQty, side, client_order_id: clientOrderId });
+      const placed = await placeAlpacaOrder({
+        ...creds, mode: alpacaMode, symbol, qty: approvedQty, side, client_order_id: clientOrderId,
+        order_type: intentRecord.order_type || 'market',
+        limit_price: intentRecord.limit_price,
+        stop_price: intentRecord.stop_price,
+        time_in_force: intentRecord.time_in_force || 'day',
+      });
       brokerOrderId = placed.id;
       await sr.entities.TradeIntent.update(intentRecord.id, { status: 'accepted', broker_order_id: brokerOrderId, client_order_id: clientOrderId });
     } catch (e) {

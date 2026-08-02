@@ -171,7 +171,7 @@ export default async function(req) {
       const fundamental = p.confidence ?? 50;
       const sentiment = 50;
       const ml_score = weightedComposite({ technical, fundamental, sentiment, momentum, risk }, weights);
-      return { ...p, ml_score: Math.round(ml_score * 10) / 10, ml_signal: signalFromComposite(ml_score), realFactors: f };
+      return { ...p, ml_score: Math.round(ml_score * 10) / 10, ml_signal: signalFromComposite(ml_score), realFactors: f, realPrice: ef?.realPrice };
     });
     let approved = scored.filter((p) => p.ml_score >= 45);
 

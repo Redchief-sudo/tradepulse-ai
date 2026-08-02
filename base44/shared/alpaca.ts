@@ -15,20 +15,28 @@ function headers(apiKey, secretKey) {
   };
 }
 
-// Submit a market order. Returns the Alpaca order object.
+// Submit an order. Respects order_type (market/limit/stop/stop_limit), limit_price,
+// stop_price, and time_in_force from the TradeIntent — no longer hardcodes market/day.
 // client_order_id provides idempotency so a retried submit cannot duplicate a fill.
-export async function placeAlpacaOrder({ apiKey, secretKey, mode, symbol, qty, side, client_order_id }) {
+export async function placeAlpacaOrder({ apiKey, secretKey, mode, symbol, qty, side, client_order_id, order_type = 'market', limit_price, stop_price, time_in_force = 'day' }) {
+  const body = {
+    symbol: String(symbol).toUpperCase(),
+    qty: String(qty),
+    side,
+    type: order_type,
+    time_in_force,
+    client_order_id,
+  };
+  if ((order_type === 'limit' || order_type === 'stop_limit') && limit_price != null) {
+    body.limit_price = String(limit_price);
+  }
+  if ((order_type === 'stop' || order_type === 'stop_limit') && stop_price != null) {
+    body.stop_price = String(stop_price);
+  }
   const res = await fetch(`${baseUrl(mode)}/orders`, {
     method: 'POST',
     headers: { ...headers(apiKey, secretKey), 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      symbol: String(symbol).toUpperCase(),
-      qty: String(qty),
-      side,
-      type: 'market',
-      time_in_force: 'day',
-      client_order_id,
-    }),
+    body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.message || data?.error || `Alpaca HTTP ${res.status}`);

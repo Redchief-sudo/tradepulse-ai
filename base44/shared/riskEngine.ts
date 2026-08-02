@@ -29,18 +29,25 @@ export function riskLimitsForProfile(profileId) {
 }
 
 // Build a user-scoped portfolio snapshot for risk evaluation.
-export async function buildPortfolioSnapshot(sr, userId) {
+// accountEquity: when provided (broker_paper/live), overrides holdings-based equity
+// with the real broker account equity so position/sector caps use the actual capital base.
+export async function buildPortfolioSnapshot(sr, userId, accountEquity = null) {
   const holdings = await sr.entities.Holding.filter({ user_id: userId });
-  const totalEquity = holdings.reduce(
+  const holdingsEquity = holdings.reduce(
     (s, h) => s + h.shares * (h.current_price || h.avg_price), 0
   );
+  const totalEquity = accountEquity && accountEquity > 0 ? accountEquity : holdingsEquity;
   const sectorMap = {};
   holdings.forEach((h) => {
     const sec = h.sector || 'Other';
     sectorMap[sec] = (sectorMap[sec] || 0) + h.shares * (h.current_price || h.avg_price);
   });
+  // Filter trades server-side by date to avoid fetching entire trade history on every risk check.
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
-  const recentTrades = await sr.entities.Trade.filter({ user_id: userId });
+  const recentTrades = await sr.entities.Trade.filter({
+    user_id: userId,
+    created_date: { $gte: startOfDay.toISOString() }
+  }, '-created_date', 100);
   const tradesToday = recentTrades.filter((t) => new Date(t.created_date) >= startOfDay);
   const dailyRealized = tradesToday
     .filter((t) => t.action === 'sell')
