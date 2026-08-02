@@ -36,12 +36,10 @@ export function beta(stockReturns, benchReturns) {
   return benchVar > 0 ? cov / benchVar : 0;
 }
 
-// Portfolio-level risk metrics from aligned daily return arrays + weights.
-export function computePortfolioRisk(assetReturns, weights, benchReturns) {
+// Weighted portfolio daily returns from aligned asset return arrays.
+export function portfolioDailyReturns(assetReturns, weights) {
   const n = assetReturns[0]?.length || 0;
-  if (n === 0) return null;
-
-  // Weighted portfolio daily returns
+  if (n === 0) return [];
   const portReturns = [];
   for (let i = 0; i < n; i++) {
     let r = 0;
@@ -50,6 +48,13 @@ export function computePortfolioRisk(assetReturns, weights, benchReturns) {
     }
     portReturns.push(r);
   }
+  return portReturns;
+}
+
+// Portfolio-level risk metrics from aligned daily return arrays + weights.
+export function computePortfolioRisk(assetReturns, weights, benchReturns) {
+  const portReturns = portfolioDailyReturns(assetReturns, weights);
+  if (portReturns.length === 0) return null;
 
   const dailyVol = std(portReturns);
   const annualVol = dailyVol * Math.sqrt(252);
@@ -103,4 +108,38 @@ export function computeCorrelationMatrix(assetReturns, symbols) {
     matrix.push(row);
   }
   return { symbols, matrix };
+}
+
+// Benchmark comparison: portfolio vs benchmark equity curves and performance metrics.
+export function computeBenchmarkComparison(portReturns, benchReturns) {
+  if (!portReturns.length || portReturns.length !== benchReturns.length) return null;
+
+  // Cumulative equity curves rebased to 100
+  const portEquity = [100 * (1 + portReturns[0])];
+  const benchEquity = [100 * (1 + benchReturns[0])];
+  for (let i = 1; i < portReturns.length; i++) {
+    portEquity.push(portEquity[i - 1] * (1 + portReturns[i]));
+    benchEquity.push(benchEquity[i - 1] * (1 + benchReturns[i]));
+  }
+
+  const portReturn = portEquity[portEquity.length - 1] / 100 - 1;
+  const benchReturn = benchEquity[benchEquity.length - 1] / 100 - 1;
+  const alpha = portReturn - benchReturn;
+
+  // Tracking error: annualized std of excess returns
+  const excessReturns = portReturns.map((r, i) => r - benchReturns[i]);
+  const trackingError = std(excessReturns) * Math.sqrt(252);
+
+  // Information ratio: annualized mean excess return / tracking error
+  const informationRatio = trackingError > 0 ? (mean(excessReturns) * 252) / trackingError : 0;
+
+  return {
+    portReturn,
+    benchReturn,
+    alpha,
+    trackingError,
+    informationRatio,
+    portEquity,
+    benchEquity,
+  };
 }
