@@ -67,7 +67,7 @@ export default async function(req) {
         ai_recommended: true,
         source: 'stoploss',
         notes: `Auto stop-loss @ -${dropPct.toFixed(1)}% (threshold ${threshold}%)`,
-        idempotency_key: `stoploss-${h.symbol}-${new Date().toISOString().slice(0, 13)}`,
+        idempotency_key: `stoploss-${h.portfolio_id || 'default'}-${h.id}-${h.symbol}-${new Date().toISOString().slice(0, 13)}`,
         signal_timestamp: new Date().toISOString(),
       });
       results.push({ symbol: h.symbol, shares: h.shares, price: live, dropPct, settlement: result });

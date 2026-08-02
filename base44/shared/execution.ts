@@ -85,9 +85,9 @@ function resolveExecutionMode(user, input, brokerCred) {
 // narrows the window: both create, both check, the earliest record wins and
 // the duplicate is deleted. This is the best available mitigation on a BaaS
 // platform without unique constraints.
-async function recordFill(sr, params) {
+export async function recordFill(sr, params) {
   const created = await sr.entities.Fill.create(params);
-  const all = await sr.entities.Fill.filter({ fill_id: params.fill_id });
+  const all = await sr.entities.Fill.filter({ user_id: params.user_id, fill_id: params.fill_id });
   if (all.length > 1) {
     // Duplicate detected — keep the earliest, delete the rest.
     const sorted = all.sort((a, b) => {
@@ -148,6 +148,14 @@ export async function projectHolding(sr, userId, symbol, side, filledQty, filled
   const openLots = lots
     .filter((l) => l.status === 'open' || l.status === 'partially_closed')
     .sort((a, b) => new Date(a.acquisition_timestamp) - new Date(b.acquisition_timestamp));
+
+  // HARD FAILURE: sell fill exceeds accounted position — do not partially
+  // project an otherwise larger confirmed fill. Record as a reconciliation
+  // exception and block settlement until the ledger discrepancy is resolved.
+  const availableQty = openLots.reduce((s, l) => s + l.quantity_remaining, 0);
+  if (filledQty > availableQty + 0.0001) {
+    throw new Error(`SELL_FILL_EXCEEDS_ACCOUNTED_POSITION: requested ${filledQty}, available ${availableQty} for ${symbol}`);
+  }
 
   let remainingQty = filledQty;
   let realizedPnl = 0;
@@ -236,6 +244,46 @@ async function audit(sr, userId, eventType, severity, details) {
       broker_api_latency_ms: details.broker_api_latency_ms || null,
     });
   } catch (e) { /* non-fatal — audit must never block execution */ }
+}
+
+// Atomic settlement claim — only one worker may transition pending → claimed.
+// Uses optimistic concurrency: update then re-read to verify ownership.
+// A stale claim (crashed worker) can be taken over after 5 minutes.
+// This prevents double-settlement when the execution poller and reconciliation
+// worker both observe the same terminal broker state.
+export async function claimSettlement(sr, userId, intentTradeId, workerId) {
+  const intents = await sr.entities.TradeIntent.filter({ user_id: userId, trade_intent_id: intentTradeId });
+  if (!intents || intents.length === 0) return { claimed: false, reason: 'INTENT_NOT_FOUND' };
+  const intent = intents[0];
+
+  if (intent.settlement_state === 'settled') {
+    return { claimed: false, reason: 'ALREADY_SETTLED', intent };
+  }
+
+  // Check if claimed by another worker
+  if (intent.settlement_state === 'claimed' && intent.settlement_owner && intent.settlement_owner !== workerId) {
+    const claimedAt = intent.settlement_claimed_at ? new Date(intent.settlement_claimed_at).getTime() : 0;
+    const STALE_CLAIM_MS = 5 * 60 * 1000; // 5 minutes
+    if (Date.now() - claimedAt < STALE_CLAIM_MS) {
+      return { claimed: false, reason: 'CLAIMED_BY_OTHER', intent };
+    }
+    // Claim is stale (crashed worker) — take over
+  }
+
+  // Try to claim
+  await sr.entities.TradeIntent.update(intent.id, {
+    settlement_state: 'claimed',
+    settlement_owner: workerId,
+    settlement_claimed_at: nowIso(),
+    settlement_version: (intent.settlement_version || 0) + 1,
+  });
+
+  // Re-read to verify we won the claim
+  const reloaded = await sr.entities.TradeIntent.filter({ user_id: userId, trade_intent_id: intentTradeId });
+  if (reloaded[0] && reloaded[0].settlement_owner === workerId) {
+    return { claimed: true, intent: reloaded[0] };
+  }
+  return { claimed: false, reason: 'LOST_RACE', intent: reloaded[0] };
 }
 
 // executeIntent — the canonical gateway.
@@ -645,7 +693,7 @@ async function resumeBrokerOrder(sr, userId, intentRecord, input, brokerCred) {
 
 // Final settlement — create the Trade record, AITradeDecision (if AI-driven), and settle the intent.
 // This is called once the order reaches a terminal state. The fills are already recorded.
-async function settleFromFills(sr, userId, intentRecord, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, filledQty, filledPrice, executionMode, venue, realizedPnl = null) {
+export async function settleFromFills(sr, userId, intentRecord, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, filledQty, filledPrice, executionMode, venue, realizedPnl = null) {
   const symbol = intentRecord.symbol;
   const side = intentRecord.side;
   const totalValue = filledQty * filledPrice;
@@ -713,6 +761,7 @@ async function settleFromFills(sr, userId, intentRecord, input, brokerOrderId, c
   await audit(sr, userId, 'settlement_completed', 'info', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Settled ${side} ${filledQty} ${symbol} @ $${filledPrice}`, details: { symbol, side, filled_qty: filledQty, filled_price: filledPrice, realized_pnl: realizedPnl } });
   await sr.entities.TradeIntent.update(intentRecord.id, {
     status: 'settled',
+    settlement_state: 'settled',
     filled_quantity: filledQty,
     filled_avg_price: filledPrice,
     commission: input.commission || 0,
@@ -742,8 +791,8 @@ async function settleFromFills(sr, userId, intentRecord, input, brokerOrderId, c
 async function settleFill(sr, userId, params) {
   const { fillId, brokerOrderId, clientOrderId, tradeIntentId, symbol, side, filledQty, filledPrice, venue, executionMode, strategyId, decisionId, input, intentRecord } = params;
 
-  // Idempotent fill insertion.
-  await recordFill(sr, {
+  // Idempotent fill insertion — only project if we won the dedup race.
+  const inserted = await recordFill(sr, {
     user_id: userId,
     fill_id: fillId,
     broker_order_id: brokerOrderId,
@@ -774,6 +823,10 @@ async function settleFill(sr, userId, params) {
     fill_latency_ms: null,
   });
 
+  if (!inserted) {
+    return { duplicate: true, settlement_applied: false, trade_intent_id: tradeIntentId, symbol, side };
+  }
+
   // Project the holding and capture realized P&L from lot-based accounting.
   const realizedPnl = await projectHolding(sr, userId, symbol, side, filledQty, filledPrice, { ...input, fill_id: fillId });
 
@@ -787,23 +840,99 @@ export async function settleTrade(base44, user, intent) {
 }
 
 // Reconstruct positions from the immutable Fill ledger (day-zero rebuild).
+// Replays all fills through the exact same lot-accounting algorithm used
+// during live settlement — NOT net cash flow. Substracting sale proceeds
+// from cost basis is incorrect; this fixes that by creating/closing lots.
 export async function rebuildPositionsFromFills(sr, userId) {
+  // Clear existing lots and holdings — we're rebuilding from the fill ledger
+  const existingLots = await sr.entities.PositionLot.filter({ user_id: userId });
+  for (const lot of existingLots) await sr.entities.PositionLot.delete(lot.id);
+  const existingHoldings = await sr.entities.Holding.filter({ user_id: userId });
+  for (const h of existingHoldings) await sr.entities.Holding.delete(h.id);
+
+  // Replay all fills through the lot-accounting algorithm in chronological order
   const fills = await sr.entities.Fill.filter({ user_id: userId });
-  const positions = {};
-  fills.forEach((f) => {
-    const sym = String(f.symbol).toUpperCase();
-    if (!positions[sym]) positions[sym] = { symbol: sym, shares: 0, cost: 0, fills: [] };
-    const p = positions[sym];
-    p.fills.push(f);
-    if (f.side === 'buy') {
-      p.shares += f.filled_quantity;
-      p.cost += f.filled_quantity * f.filled_price;
+  fills.sort((a, b) => new Date(a.timestamp || a.created_date) - new Date(b.timestamp || b.created_date));
+
+  for (const fill of fills) {
+    const sym = String(fill.symbol).toUpperCase();
+    const side = fill.side;
+    const qty = fill.filled_quantity;
+    const price = fill.filled_price;
+
+    if (side === 'buy') {
+      await sr.entities.PositionLot.create({
+        user_id: userId,
+        portfolio_id: fill.portfolio_id || null,
+        lot_id: genId('lot'),
+        symbol: sym,
+        company_name: fill.company_name || sym,
+        sector: fill.sector || '',
+        asset_class: fill.asset_class || 'stocks',
+        originating_fill_id: fill.fill_id,
+        quantity_opened: qty,
+        quantity_remaining: qty,
+        acquisition_price: price,
+        acquisition_timestamp: fill.timestamp || fill.created_date,
+        status: 'open',
+        realized_pnl: 0,
+        closure_fill_ids: '[]',
+        cost_basis_method: 'fifo',
+      });
     } else {
-      p.shares -= f.filled_quantity;
-      p.cost -= f.filled_quantity * f.filled_price;
+      // Close lots FIFO — same algorithm as live settlement
+      const lots = await sr.entities.PositionLot.filter({ user_id: userId, symbol: sym });
+      const openLots = lots
+        .filter((l) => l.status === 'open' || l.status === 'partially_closed')
+        .sort((a, b) => new Date(a.acquisition_timestamp) - new Date(b.acquisition_timestamp));
+
+      let remainingQty = qty;
+      for (const lot of openLots) {
+        if (remainingQty <= 0.0001) break;
+        const closeQty = Math.min(lot.quantity_remaining, remainingQty);
+        const newRemaining = lot.quantity_remaining - closeQty;
+        const closureIds = JSON.parse(lot.closure_fill_ids || '[]');
+        closureIds.push(fill.fill_id);
+        await sr.entities.PositionLot.update(lot.id, {
+          quantity_remaining: newRemaining,
+          status: newRemaining <= 0.0001 ? 'closed' : 'partially_closed',
+          realized_pnl: (lot.realized_pnl || 0) + (price - lot.acquisition_price) * closeQty,
+          closure_fill_ids: JSON.stringify(closureIds),
+        });
+        remainingQty -= closeQty;
+      }
     }
-  });
-  return Object.values(positions)
-    .filter((p) => p.shares > 0.0001)
-    .map((p) => ({ symbol: p.symbol, shares: p.shares, avg_price: p.cost / p.shares, fillCount: p.fills.length }));
+  }
+
+  // Derive holdings from open lots — correct cost basis from lot acquisition prices
+  const allLots = await sr.entities.PositionLot.filter({ user_id: userId });
+  const symbols = [...new Set(allLots.map((l) => l.symbol))];
+  const positions = [];
+
+  for (const symbol of symbols) {
+    const symLots = allLots.filter((l) => l.symbol === symbol);
+    const openLots = symLots.filter((l) => l.status === 'open' || l.status === 'partially_closed');
+    if (openLots.length === 0) continue;
+
+    const totalShares = openLots.reduce((s, l) => s + l.quantity_remaining, 0);
+    const totalCost = openLots.reduce((s, l) => s + l.quantity_remaining * l.acquisition_price, 0);
+    const avgPrice = totalShares > 0 ? totalCost / totalShares : 0;
+
+    await sr.entities.Holding.create({
+      user_id: userId,
+      portfolio_id: symLots[0].portfolio_id || null,
+      symbol,
+      company_name: symLots[0].company_name || symbol,
+      shares: totalShares,
+      avg_price: avgPrice,
+      current_price: avgPrice,
+      sector: symLots[0].sector || '',
+      day_change_percent: 0,
+      asset_class: symLots[0].asset_class || 'stocks',
+    });
+
+    positions.push({ symbol, shares: totalShares, avg_price: avgPrice, lotCount: openLots.length });
+  }
+
+  return positions;
 }

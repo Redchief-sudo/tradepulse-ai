@@ -1,14 +1,21 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { getAlpacaOrder } from '../../shared/alpaca.ts';
+import { recordFill, projectHolding, settleFromFills, claimSettlement } from '../../shared/execution.ts';
 
 // Continuous order reconciliation worker.
 // Finds all nonterminal TradeIntents, fetches broker order state, ingests
 // unrecorded fills, detects canceled/rejected/replaced orders, finalizes
 // settlement, and alerts on stale orders.
 //
-// This runs frequently (every 5 minutes during market hours) via a scheduled
-// workflow. Daily position reconciliation is a backstop — this is the primary
-// order recovery mechanism.
+// ARCHITECTURE: This function does NOT reimplement fill ingestion or
+// settlement accounting. It retrieves broker state and calls the SAME
+// canonical execution primitives used by the live execution gateway:
+//   - recordFill() for user-scoped, dedup-safe fill ingestion
+//   - projectHolding() for lot-based position projection
+//   - claimSettlement() for atomic settlement claim (prevents double-settlement)
+//   - settleFromFills() for final Trade/AITradeDecision/intent settlement
+//
+// This ensures financial accounting has exactly one implementation.
 export default async function(req) {
   try {
     const base44 = createClientFromRequest(req);
@@ -17,6 +24,7 @@ export default async function(req) {
 
     const sr = base44.asServiceRole;
     const runTs = new Date().toISOString();
+    const workerId = `recon-${crypto.randomUUID()}`;
 
     // Find all nonterminal intents that have been submitted to a broker.
     const nonterminalStatuses = ['submitted', 'accepted', 'partially_filled'];
@@ -54,10 +62,11 @@ export default async function(req) {
         const cumulativeFilled = Number(order.filled_qty) || 0;
         const cumulativeAvgPrice = Number(order.filled_avg_price) || 0;
 
-        // Ingest any unrecorded incremental fills
+        // Ingest any unrecorded incremental fills using the CANONICAL recordFill.
         let lastFilledQty = intent.filled_quantity || 0;
         let lastFilledPrice = intent.filled_avg_price || 0;
         let newFills = 0;
+        let accumulatedRealizedPnl = 0;
 
         if (cumulativeFilled > lastFilledQty) {
           const incrementalQty = cumulativeFilled - lastFilledQty;
@@ -69,34 +78,51 @@ export default async function(req) {
             : (cumulativeAvgPrice > 0 ? cumulativeAvgPrice : Number(intent.limit_price || 0));
 
           const fillId = `${intent.broker_order_id}:fill:${cumulativeFilled}`;
-          const existing = await sr.entities.Fill.filter({ user_id: user.id, fill_id: fillId });
-          if (!existing || existing.length === 0) {
-            await sr.entities.Fill.create({
-              user_id: user.id,
-              portfolio_id: intent.portfolio_id || null,
-              fill_id: fillId,
-              broker_order_id: intent.broker_order_id,
-              client_order_id: intent.client_order_id,
-              trade_intent_id: intent.trade_intent_id,
-              symbol: intent.symbol,
-              asset_id: intent.native_asset_id || intent.symbol,
-              side: intent.side,
-              filled_quantity: incrementalQty,
-              filled_price: incrementalPrice,
-              notional: incrementalQty * incrementalPrice,
-              commission: 0,
-              fees: 0,
-              slippage: 0,
-              timestamp: new Date().toISOString(),
-              venue: alpacaMode === 'live' ? 'alpaca' : 'alpaca_paper',
-              strategy_id: intent.strategy_id,
-              decision_id: intent.decision_id,
-              execution_mode: intent.execution_mode,
-              asset_class: intent.asset_class || 'stocks',
-            });
-            newFills++;
 
-            // Record audit event
+          // Use canonical recordFill — user-scoped, dedup-safe
+          const inserted = await recordFill(sr, {
+            user_id: user.id,
+            portfolio_id: intent.portfolio_id || null,
+            fill_id: fillId,
+            broker_order_id: intent.broker_order_id,
+            client_order_id: intent.client_order_id,
+            trade_intent_id: intent.trade_intent_id,
+            symbol: intent.symbol,
+            asset_id: intent.native_asset_id || intent.symbol,
+            side: intent.side,
+            filled_quantity: incrementalQty,
+            filled_price: incrementalPrice,
+            notional: incrementalQty * incrementalPrice,
+            commission: 0,
+            fees: 0,
+            slippage: 0,
+            timestamp: new Date().toISOString(),
+            venue: alpacaMode === 'live' ? 'alpaca' : 'alpaca_paper',
+            strategy_id: intent.strategy_id,
+            decision_id: intent.decision_id,
+            execution_mode: intent.execution_mode,
+            asset_class: intent.asset_class || 'stocks',
+            arrival_price: Number(intent.limit_price) || null,
+            decision_price: Number(intent.limit_price) || null,
+            submission_price: Number(intent.limit_price) || null,
+            first_fill_price: lastFilledQty === 0 ? incrementalPrice : null,
+            vwap_fill_price: cumulativeAvgPrice > 0 ? cumulativeAvgPrice : null,
+            implementation_shortfall: Number(intent.limit_price) && incrementalPrice ? Number(intent.limit_price) - incrementalPrice : null,
+            fill_latency_ms: null,
+          });
+
+          if (inserted) {
+            newFills++;
+            // Use canonical projectHolding — lot-based, sell-qty validated
+            const fillRealizedPnl = await projectHolding(sr, user.id, intent.symbol, intent.side, incrementalQty, incrementalPrice, {
+              portfolio_id: intent.portfolio_id,
+              company_name: intent.company_name,
+              sector: intent.sector,
+              asset_class: intent.asset_class,
+              fill_id: fillId,
+            });
+            if (fillRealizedPnl != null) accumulatedRealizedPnl += fillRealizedPnl;
+
             await sr.entities.AuditEvent.create({
               user_id: user.id,
               event_type: 'fill_recorded',
@@ -119,62 +145,51 @@ export default async function(req) {
           const isFailure = ['canceled', 'rejected', 'expired', 'replaced'].includes(status);
 
           if (cumulativeFilled > 0) {
-            // Settle the filled portion
-            await sr.entities.TradeIntent.update(intent.id, {
-              status: 'settled',
-              filled_quantity: cumulativeFilled,
-              filled_avg_price: cumulativeAvgPrice,
-              broker_terminal_status: status,
-              unfilled_quantity: unfilledQty,
-            });
+            // Atomically claim the settlement — prevents double-settlement
+            const claim = await claimSettlement(sr, user.id, intent.trade_intent_id, workerId);
+            if (claim.claimed) {
+              // Use canonical settleFromFills — creates Trade, AITradeDecision, settles intent
+              const venue = alpacaMode === 'live' ? 'alpaca' : 'alpaca_paper';
+              await settleFromFills(
+                sr, user.id, claim.intent,
+                {
+                  company_name: intent.company_name,
+                  sector: intent.sector,
+                  asset_class: intent.asset_class,
+                  confidence: intent.confidence,
+                  target_price: intent.target_price,
+                  stop_loss: intent.stop_loss,
+                  reasoning: intent.reasoning,
+                  ml_score: intent.ml_score,
+                  technical_score: intent.technical_score,
+                  momentum_score: intent.momentum_score,
+                  risk_score: intent.risk_score,
+                  regime: null,
+                  ai_recommended: intent.strategy_id !== 'manual',
+                  recordDecision: !!intent.decision_id,
+                  portfolio_id: intent.portfolio_id,
+                },
+                intent.broker_order_id, intent.client_order_id, intent.trade_intent_id, intent.strategy_id,
+                cumulativeFilled, cumulativeAvgPrice, intent.execution_mode, venue,
+                accumulatedRealizedPnl
+              );
 
-            // Create Trade record if not exists
-            const existingTrades = await sr.entities.Trade.filter({ user_id: user.id, client_order_id: intent.client_order_id });
-            if (!existingTrades || existingTrades.length === 0) {
-              let realizedPnl = null;
-              if (intent.side === 'sell') {
-                const lots = await sr.entities.PositionLot.filter({ user_id: user.id, symbol: intent.symbol });
-                const closedLots = lots.filter((l) => {
-                  const closureIds = JSON.parse(l.closure_fill_ids || '[]');
-                  return closureIds.some((fid) => fid.includes(intent.broker_order_id));
-                });
-                realizedPnl = closedLots.reduce((s, l) => s + (l.realized_pnl || 0), 0);
-              }
-
-              await sr.entities.Trade.create({
-                user_id: user.id,
-                portfolio_id: intent.portfolio_id || null,
-                symbol: intent.symbol,
-                company_name: intent.company_name || intent.symbol,
-                action: intent.side,
-                shares: cumulativeFilled,
-                price: cumulativeAvgPrice,
-                total_value: cumulativeFilled * cumulativeAvgPrice,
-                ai_recommended: intent.strategy_id !== 'manual',
-                broker_order_id: intent.broker_order_id,
-                client_order_id: intent.client_order_id,
-                filled_qty: cumulativeFilled,
-                filled_avg_price: cumulativeAvgPrice,
-                order_status: isFailure ? 'partially_filled_then_canceled' : 'filled',
-                source: intent.strategy_id,
-                realized_pnl: realizedPnl,
+              // Update terminal status fields
+              await sr.entities.TradeIntent.update(claim.intent.id, {
+                broker_terminal_status: status,
+                unfilled_quantity: unfilledQty,
               });
-            }
 
-            await sr.entities.AuditEvent.create({
-              user_id: user.id,
-              event_type: 'settlement_completed',
-              severity: 'info',
-              correlation_id: intent.trade_intent_id,
-              entity_type: 'TradeIntent',
-              entity_id: intent.id,
-              message: `Reconciliation settled order ${intent.broker_order_id}: ${cumulativeFilled}/${intent.requested_quantity} filled, broker status: ${status}`,
-              details: JSON.stringify({ filled_qty: cumulativeFilled, unfilled_qty: unfilledQty, broker_status: status }),
-            });
+              results.push({ intent_id: intent.trade_intent_id, symbol: intent.symbol, status: 'settled', broker_status: status, new_fills: newFills, filled_qty: cumulativeFilled });
+            } else {
+              // Another worker already claimed or settled — skip
+              results.push({ intent_id: intent.trade_intent_id, symbol: intent.symbol, status: 'already_claimed', reason: claim.reason, broker_status: status });
+            }
           } else if (isFailure) {
             // No fill at all — mark as canceled/rejected
             await sr.entities.TradeIntent.update(intent.id, {
               status: status === 'rejected' ? 'rejected' : 'canceled',
+              settlement_state: 'settled',
               rejection_reason: `BROKER_${status.toUpperCase()}`,
               broker_terminal_status: status,
               unfilled_quantity: intent.requested_quantity,
@@ -190,9 +205,9 @@ export default async function(req) {
               message: `Reconciliation detected ${status} order ${intent.broker_order_id} with zero fills`,
               details: JSON.stringify({ broker_status: status, requested_qty: intent.requested_quantity }),
             });
-          }
 
-          results.push({ intent_id: intent.trade_intent_id, symbol: intent.symbol, status: 'settled', broker_status: status, new_fills: newFills, filled_qty: cumulativeFilled });
+            results.push({ intent_id: intent.trade_intent_id, symbol: intent.symbol, status: 'canceled', broker_status: status, new_fills: 0 });
+          }
         } else {
           // Still pending — check for staleness
           const ageMinutes = (Date.now() - new Date(intent.created_date).getTime()) / 60000;
@@ -254,7 +269,9 @@ export default async function(req) {
       run_timestamp: runTs,
       checked: pending.length,
       settled: results.filter((r) => r.status === 'settled').length,
+      canceled: results.filter((r) => r.status === 'canceled').length,
       still_pending: results.filter((r) => r.status === 'still_pending').length,
+      already_claimed: results.filter((r) => r.status === 'already_claimed').length,
       stale_orders: staleOrders.length,
       errors: results.filter((r) => r.status === 'error').length,
       results,

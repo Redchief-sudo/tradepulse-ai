@@ -203,6 +203,12 @@ function boundWeights(champion, candidate) {
   }
   const sum = FACTOR_KEYS.reduce((s, k) => s + bounded[k], 0);
   if (sum > 0) for (const k of FACTOR_KEYS) bounded[k] = Math.round((bounded[k] / sum) * 100);
+  // Fix rounding residual — ensure weights sum to exactly 100
+  const total = FACTOR_KEYS.reduce((s, k) => s + bounded[k], 0);
+  if (total !== 100) {
+    const largestFactor = FACTOR_KEYS.reduce((max, k) => bounded[k] > bounded[max] ? k : max, FACTOR_KEYS[0]);
+    bounded[largestFactor] += 100 - total;
+  }
   return bounded;
 }
 

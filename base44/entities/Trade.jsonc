@@ -61,6 +61,27 @@
     },
     "realized_pnl": {
       "type": "number"
+    },
+    "record_type": {
+      "type": "string",
+      "enum": [
+        "order_summary",
+        "manual_trade"
+      ],
+      "default": "order_summary",
+      "description": "Labels this Trade as a derived order-level summary \u2014 the Fill ledger is the immutable execution record. Analytics should read individual fills for execution-quality metrics."
+    },
+    "fill_count": {
+      "type": "number",
+      "description": "Number of individual fills that comprise this order summary"
+    },
+    "first_fill_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "last_fill_at": {
+      "type": "string",
+      "format": "date-time"
     }
   },
   "required": [

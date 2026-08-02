@@ -111,6 +111,29 @@
       ],
       "default": "proposed"
     },
+    "settlement_state": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "claimed",
+        "projected",
+        "settled"
+      ],
+      "default": "pending",
+      "description": "Durable settlement state machine \u2014 only one worker may transition pending \u2192 claimed. Enables crash recovery and prevents double-settlement."
+    },
+    "settlement_owner": {
+      "type": "string",
+      "description": "Worker ID that claimed the settlement \u2014 used for atomic claim verification"
+    },
+    "settlement_claimed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "settlement_version": {
+      "type": "number",
+      "description": "Optimistic concurrency version \u2014 incremented on each state transition"
+    },
     "broker_terminal_status": {
       "type": "string",
       "description": "Broker's terminal disposition (filled, canceled, rejected, expired, replaced) \u2014 preserved separately from settlement status so partial fills + cancellations are both visible"
