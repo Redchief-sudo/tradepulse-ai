@@ -6,6 +6,10 @@
       "type": "string",
       "description": "Owner user id \u2014 every query must filter by this"
     },
+    "portfolio_id": {
+      "type": "string",
+      "description": "Portfolio identifier for multi-portfolio tenancy"
+    },
     "lot_id": {
       "type": "string",
       "description": "Unique lot identifier"

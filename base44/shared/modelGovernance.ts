@@ -123,8 +123,12 @@ export async function collectOutcomes(sr, userId, regime) {
     d.risk_score != null
   );
   if (!regime || regime === 'all') return allOutcomes;
-  const regimeOutcomes = allOutcomes.filter((d) => d.regime === regime);
-  return regimeOutcomes.length >= MIN_SAMPLE_PER_REGIME ? regimeOutcomes : allOutcomes;
+  // RESTRICTION: regime-specific validation must use ONLY regime-specific outcomes.
+  // Do NOT fall back to mixed-regime outcomes — that contaminates the regime-specific
+  // champion with outcomes from other regimes. If the regime-specific sample is too
+  // small, the governance cycle will skip promotion for this regime and fall back
+  // to the global champion at execution time.
+  return allOutcomes.filter((d) => d.regime === regime);
 }
 
 function computeMLScore(d, w) {

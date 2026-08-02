@@ -93,9 +93,22 @@ export default async function(req) {
           // Fetch recent fill activities to find the actual close transaction
           const sinceDate = new Date(h.created_date || Date.now() - 30 * 86400000).toISOString().slice(0, 10);
           const activities = await getAlpacaActivities({ apiKey: cred.api_key, secretKey: cred.api_secret, mode: cred.mode, sinceDate });
-          const closeActivity = activities.find(
-            (a) => String(a.symbol).toUpperCase() === sym && a.side === 'sell'
-          );
+          // Multi-criteria matching: match by order_id, client_order_id, or
+          // qty proximity — never just by symbol. When no exact match can be
+          // established, the system records an unresolved adjustment rather
+          // than inventing a price (fail-closed behavior preserved below).
+          const closeActivity = activities.find((a) => {
+            if (String(a.symbol).toUpperCase() !== sym) return false;
+            if (a.side !== 'sell') return false;
+            // Best: match by broker order ID
+            if (a.order_id && h.broker_order_id && a.order_id === h.broker_order_id) return true;
+            // Good: match by client order ID
+            if (a.order_client_id && h.client_order_id && a.order_client_id === h.client_order_id) return true;
+            // Fallback: match by qty proximity (within 0.01 shares)
+            if (a.qty && Math.abs(Number(a.qty) - h.shares) < 0.01) return true;
+            // No match — do NOT fall back to symbol-only match
+            return false;
+          });
           if (closeActivity) {
             exitPrice = Number(closeActivity.price);
             realizedPnl = (exitPrice - h.avg_price) * h.shares;

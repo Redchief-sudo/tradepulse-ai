@@ -79,17 +79,33 @@ function resolveExecutionMode(user, input, brokerCred) {
   return 'internal_paper';
 }
 
-// Check if a fill_id already exists — idempotent fill insertion.
-async function fillExists(sr, fillId) {
-  const existing = await sr.entities.Fill.filter({ fill_id: fillId });
-  return existing && existing.length > 0;
-}
-
-// Record a single fill increment idempotently. If the fill_id already exists, skip.
-// Returns true if a new fill was recorded, false if it was already present.
+// Record a single fill increment idempotently using CREATE-THEN-CHECK.
+// Without DB-level unique constraints, check-then-act has a race window where
+// two workers both see "no existing fill" and both create. Create-then-check
+// narrows the window: both create, both check, the earliest record wins and
+// the duplicate is deleted. This is the best available mitigation on a BaaS
+// platform without unique constraints.
 async function recordFill(sr, params) {
-  if (await fillExists(sr, params.fill_id)) return false;
-  await sr.entities.Fill.create(params);
+  const created = await sr.entities.Fill.create(params);
+  const all = await sr.entities.Fill.filter({ fill_id: params.fill_id });
+  if (all.length > 1) {
+    // Duplicate detected — keep the earliest, delete the rest.
+    const sorted = all.sort((a, b) => {
+      const da = new Date(a.created_date).getTime();
+      const db = new Date(b.created_date).getTime();
+      if (da !== db) return da - db;
+      return a.id < b.id ? -1 : 1; // deterministic tiebreaker
+    });
+    if (sorted[0].id !== created.id) {
+      // We lost the race — delete our duplicate.
+      await sr.entities.Fill.delete(created.id);
+      return false;
+    }
+    // We won — clean up any other duplicates.
+    for (let i = 1; i < sorted.length; i++) {
+      await sr.entities.Fill.delete(sorted[i].id);
+    }
+  }
   return true;
 }
 
@@ -100,13 +116,14 @@ async function recordFill(sr, params) {
 // Returns the realized P&L for sell fills (null for buys).
 // This fixes the sequencing defect where the holding was modified/deleted before
 // P&L was computed, and provides accurate per-lot cost basis for attribution.
-async function projectHolding(sr, userId, symbol, side, filledQty, filledPrice, input) {
+export async function projectHolding(sr, userId, symbol, side, filledQty, filledPrice, input) {
   const fillId = input.fill_id || null;
 
   if (side === 'buy') {
     // Create a new tax lot for this buy fill.
     await sr.entities.PositionLot.create({
       user_id: userId,
+      portfolio_id: input.portfolio_id || null,
       lot_id: genId('lot'),
       symbol,
       company_name: input.company_name || symbol,
@@ -188,6 +205,7 @@ async function updateHoldingProjection(sr, userId, symbol, currentPrice, input) 
   } else {
     await sr.entities.Holding.create({
       user_id: userId,
+      portfolio_id: input.portfolio_id || null,
       symbol,
       company_name: input.company_name || symbol,
       shares: totalShares,
@@ -200,6 +218,24 @@ async function updateHoldingProjection(sr, userId, symbol, currentPrice, input) 
       asset_class: input.asset_class || 'stocks',
     });
   }
+}
+
+// Structured audit logging — records every critical execution event to the
+// AuditEvent entity for observability, compliance, and incident investigation.
+async function audit(sr, userId, eventType, severity, details) {
+  try {
+    await sr.entities.AuditEvent.create({
+      user_id: userId,
+      event_type: eventType,
+      severity,
+      correlation_id: details.correlation_id || null,
+      entity_type: details.entity_type || null,
+      entity_id: details.entity_id || null,
+      message: details.message || '',
+      details: JSON.stringify(details),
+      broker_api_latency_ms: details.broker_api_latency_ms || null,
+    });
+  } catch (e) { /* non-fatal — audit must never block execution */ }
 }
 
 // executeIntent — the canonical gateway.
@@ -263,6 +299,7 @@ export async function executeIntent(base44, user, input) {
     idempotency_key: idempotencyKey,
     strategy_id: strategyId,
     decision_id: input.decision_id || intentRecord?.decision_id || null,
+    portfolio_id: input.portfolio_id || null,
     asset_class: input.asset_class || 'stocks',
     symbol,
     native_asset_id: input.native_asset_id || symbol,
@@ -347,6 +384,7 @@ export async function executeIntent(base44, user, input) {
       rejection_reason: risk.reasons.join('; '),
       risk_snapshot: JSON.stringify({ reasons: risk.reasons, limits, snapshot: { totalEquity: snapshot.totalEquity, openPositions: snapshot.openPositions, tradesToday: snapshot.tradesToday, dailyPnlPct: snapshot.dailyPnlPct } }),
     });
+    await audit(sr, userId, 'order_rejected', 'warning', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Risk rejected ${side} ${requestedQty} ${symbol}: ${risk.reasons.join('; ')}`, details: { symbol, side, qty: requestedQty, reasons: risk.reasons } });
     return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, reasons: risk.reasons, symbol, side, requestedQty };
   }
 
@@ -428,6 +466,7 @@ export async function executeIntent(base44, user, input) {
       });
       brokerOrderId = placed.id;
       await sr.entities.TradeIntent.update(intentRecord.id, { status: 'accepted', broker_order_id: brokerOrderId, client_order_id: clientOrderId });
+      await audit(sr, userId, 'order_submitted', 'info', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Order ${brokerOrderId} accepted: ${side} ${approvedQty} ${symbol}`, details: { symbol, side, qty: approvedQty, broker_order_id: brokerOrderId } });
     } catch (e) {
       await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: `BROKER_SUBMIT_ERROR: ${e.message}` });
       return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: e.message, symbol, side, requestedQty: approvedQty };
@@ -500,8 +539,16 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
         venue,
         strategy_id: strategyId,
         decision_id: input.decision_id || null,
+        portfolio_id: intentRecord.portfolio_id || input.portfolio_id || null,
         execution_mode: executionMode,
         asset_class: input.asset_class || 'stocks',
+        arrival_price: Number(input.arrival_price || input.price) || null,
+        decision_price: Number(input.decision_price || input.price) || null,
+        submission_price: Number(input.price) || null,
+        first_fill_price: lastFilledQty === 0 ? incrementalPrice : null,
+        vwap_fill_price: cumulativeAvgPrice > 0 ? cumulativeAvgPrice : null,
+        implementation_shortfall: Number(input.price) && incrementalPrice ? Number(input.price) - incrementalPrice : null,
+        fill_latency_ms: null,
       });
 
       if (recorded) {
@@ -613,6 +660,7 @@ async function settleFromFills(sr, userId, intentRecord, input, brokerOrderId, c
   if (!tradeId) {
     const trade = await sr.entities.Trade.create({
       user_id: userId,
+      portfolio_id: intentRecord.portfolio_id || input.portfolio_id || null,
       symbol,
       company_name: input.company_name || intentRecord.company_name || symbol,
       action: side,
@@ -638,6 +686,7 @@ async function settleFromFills(sr, userId, intentRecord, input, brokerOrderId, c
   if (input.recordDecision && !decisionId) {
     const d = await sr.entities.AITradeDecision.create({
       user_id: userId,
+      portfolio_id: intentRecord.portfolio_id || input.portfolio_id || null,
       symbol,
       company_name: input.company_name || intentRecord.company_name || symbol,
       sector: input.sector || intentRecord.sector || '',
@@ -661,6 +710,7 @@ async function settleFromFills(sr, userId, intentRecord, input, brokerOrderId, c
   }
 
   // Settle the intent.
+  await audit(sr, userId, 'settlement_completed', 'info', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Settled ${side} ${filledQty} ${symbol} @ $${filledPrice}`, details: { symbol, side, filled_qty: filledQty, filled_price: filledPrice, realized_pnl: realizedPnl } });
   await sr.entities.TradeIntent.update(intentRecord.id, {
     status: 'settled',
     filled_quantity: filledQty,
@@ -712,8 +762,16 @@ async function settleFill(sr, userId, params) {
     venue,
     strategy_id: strategyId,
     decision_id: decisionId,
+    portfolio_id: intentRecord.portfolio_id || input.portfolio_id || null,
     execution_mode: executionMode,
     asset_class: input.asset_class || 'stocks',
+    arrival_price: Number(input.arrival_price || input.price) || null,
+    decision_price: Number(input.decision_price || input.price) || null,
+    submission_price: Number(input.price) || null,
+    first_fill_price: filledPrice,
+    vwap_fill_price: filledPrice,
+    implementation_shortfall: Number(input.price) && filledPrice ? Number(input.price) - filledPrice : null,
+    fill_latency_ms: null,
   });
 
   // Project the holding and capture realized P&L from lot-based accounting.

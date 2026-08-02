@@ -1,0 +1,45 @@
+{
+  "description": "Continuously reconciles nonterminal broker orders \u2014 ingests unrecorded fills, detects canceled/rejected orders, finalizes settlement, and alerts on stale orders. Runs every 5 minutes during US market hours.",
+  "trigger": {
+    "condition": null,
+    "config": {
+      "trigger_type": "scheduled",
+      "events": [],
+      "schedule_mode": "recurring",
+      "cron_expression": "*/5 9-16 * * 1-5",
+      "one_time_date": null,
+      "timezone": "America/New_York",
+      "interval_value": null,
+      "interval_unit": null,
+      "interval_anchor": null,
+      "ends_type": "never",
+      "ends_on_date": null,
+      "ends_after_count": null
+    }
+  },
+  "name": "Order Reconciliation",
+  "definition": {
+    "document": {
+      "dsl": "1.0.0",
+      "name": "order_reconciliation",
+      "version": "1.0",
+      "namespace": "base44"
+    },
+    "do": [
+      {
+        "reconcile": {
+          "call": "invoke_backend_function",
+          "with": {
+            "function_name": "runOrderReconciliation",
+            "args": {}
+          },
+          "then": "end",
+          "x-base44": {
+            "title": "Reconcile pending orders",
+            "description": "Ingest fills, detect cancellations, settle stale orders"
+          }
+        }
+      }
+    ]
+  }
+}

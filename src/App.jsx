@@ -14,6 +14,7 @@ import Watchlist from '@/pages/Watchlist';
 import AutonomousTrader from '@/pages/AutonomousTrader';
 import Operations from '@/pages/Operations';
 import Settings from '@/pages/Settings';
+import StagedOperation from '@/pages/StagedOperation';
 import Login from '@/pages/Login';
 import Register from '@/pages/Register';
 import ForgotPassword from '@/pages/ForgotPassword';
@@ -56,6 +57,7 @@ const AuthenticatedApp = () => {
         <Route path="/autonomous" element={<AutonomousTrader />} />
         <Route path="/operations" element={<Operations />} />
         <Route path="/settings" element={<Settings />} />
+        <Route path="/staged-operation" element={<StagedOperation />} />
       </Route>
       <Route path="*" element={<PageNotFound />} />
     </Routes>

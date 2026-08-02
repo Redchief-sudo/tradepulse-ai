@@ -6,6 +6,10 @@
       "type": "string",
       "description": "Owner user id \u2014 every query must filter by this"
     },
+    "portfolio_id": {
+      "type": "string",
+      "description": "Portfolio identifier for multi-portfolio tenancy (e.g. alpaca_paper, alpaca_live, retirement)"
+    },
     "trade_intent_id": {
       "type": "string",
       "description": "Canonical idempotency key \u2014 stable across retries"

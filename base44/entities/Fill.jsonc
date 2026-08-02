@@ -6,6 +6,10 @@
       "type": "string",
       "description": "Owner user id \u2014 every query must filter by this"
     },
+    "portfolio_id": {
+      "type": "string",
+      "description": "Portfolio identifier for multi-portfolio tenancy (e.g. alpaca_paper, alpaca_live, retirement)"
+    },
     "fill_id": {
       "type": "string",
       "description": "Unique fill identifier \u2014 idempotency key for settlement"
@@ -75,6 +79,38 @@
     },
     "asset_class": {
       "type": "string"
+    },
+    "arrival_price": {
+      "type": "number",
+      "description": "Market price at signal generation time"
+    },
+    "decision_price": {
+      "type": "number",
+      "description": "Market price at order decision time"
+    },
+    "submission_price": {
+      "type": "number",
+      "description": "Market price at order submission time"
+    },
+    "first_fill_price": {
+      "type": "number",
+      "description": "Price of the first fill in this order"
+    },
+    "vwap_fill_price": {
+      "type": "number",
+      "description": "Volume-weighted average fill price across all fills for this order"
+    },
+    "implementation_shortfall": {
+      "type": "number",
+      "description": "Difference between decision price and actual fill price (per share)"
+    },
+    "spread_paid": {
+      "type": "number",
+      "description": "Half-spread cost paid on this fill"
+    },
+    "fill_latency_ms": {
+      "type": "number",
+      "description": "Milliseconds from order submission to first fill"
     }
   },
   "required": [
