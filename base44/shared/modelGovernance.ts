@@ -82,6 +82,19 @@ function pearson(x, y) {
 
 function spearman(x, y) { return pearson(rank(x), rank(y)); }
 
+// Mulberry32 — deterministic seeded PRNG for reproducible bootstrap validation.
+// Every governance run with the same seed produces identical bootstrap results,
+// so a future audit can rerun the promotion and obtain the same p-value.
+function seededRandom(seed) {
+  let s = seed >>> 0;
+  return function() {
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 // --- Core governance functions ---
 
 // Regime-specific champion lookup. Falls back to global ('all') champion.
@@ -125,7 +138,7 @@ function computeMLScore(d, w) {
 }
 
 // Walk-forward validation: temporal split (oldest 70% IS, newest 30% OOS).
-function validateCandidate(outcomes, championWeights, candidateWeights) {
+function validateCandidate(outcomes, championWeights, candidateWeights, seed = 42) {
   const sorted = [...outcomes].sort((a, b) => new Date(a.created_date) - new Date(b.created_date));
   const splitIdx = Math.floor(sorted.length * IS_RATIO);
   const outOfSample = sorted.slice(splitIdx);
@@ -141,11 +154,14 @@ function validateCandidate(outcomes, championWeights, candidateWeights) {
   const championCorr = spearman(champScores, oosReturns);
   const candidateCorr = spearman(candScores, oosReturns);
 
+  // Reproducible bootstrap: seeded PRNG ensures the same candidate + seed
+  // always produces the same p-value. The seed is persisted with the model.
+  const rng = seededRandom(seed);
   let candidateWins = 0;
   for (let b = 0; b < N_BOOTSTRAP; b++) {
     const sample = [];
     for (let i = 0; i < outOfSample.length; i++) {
-      sample.push(outOfSample[Math.floor(Math.random() * outOfSample.length)]);
+      sample.push(outOfSample[Math.floor(rng() * outOfSample.length)]);
     }
     const sChamp = sample.map((d) => computeMLScore(d, championWeights));
     const sCand = sample.map((d) => computeMLScore(d, candidateWeights));
@@ -242,15 +258,19 @@ Return a direction for each factor and a concise reasoning.`,
 function optimizeCandidateWeights(outcomes, championWeights, hypothesis) {
   const sorted = [...outcomes].sort((a, b) => new Date(a.created_date) - new Date(b.created_date));
   const splitIdx = Math.floor(sorted.length * IS_RATIO);
-  const oos = sorted.slice(splitIdx);
+  // OPTIMIZE ON IN-SAMPLE ONLY — never touch the OOS holdout.
+  // The validator (validateCandidate) evaluates on OOS. This prevents holdout
+  // contamination: the optimizer can no longer search weights using the same
+  // data that the promotion decision is made on.
+  const isSegment = sorted.slice(0, splitIdx);
 
-  if (oos.length < MIN_OOS_SIZE) {
+  if (isSegment.length < MIN_OOS_SIZE) {
     return { weights: championWeights, oosScore: 0, improvement: 0, iterations: 0, insufficient: true };
   }
 
   function objective(w) {
-    const scores = oos.map((d) => computeMLScore(d, w));
-    const returns = oos.map((d) => d.realized_return);
+    const scores = isSegment.map((d) => computeMLScore(d, w));
+    const returns = isSegment.map((d) => d.realized_return);
     return spearman(scores, returns);
   }
 
@@ -417,6 +437,7 @@ export async function runGovernanceCycle(sr, userId, user) {
       hypothesis,
       optimization: { oosScore: optimization.oosScore, improvement: optimization.improvement, iterations: optimization.iterations },
       sampleSize: outcomes.length,
+      validationSeed,
     }),
     sample_size: outcomes.length,
     created_at: new Date().toISOString(),
@@ -424,8 +445,9 @@ export async function runGovernanceCycle(sr, userId, user) {
     rollback_path: `${champion.rollback_path || champion.version} → ${newVersion}`,
   });
 
-  // 3. Walk-forward validate
-  const validation = validateCandidate(outcomes, champion.weights, optimization.weights);
+  // 3. Walk-forward validate (reproducible — seed persisted for audit)
+  const validationSeed = 42;
+  const validation = validateCandidate(outcomes, champion.weights, optimization.weights, validationSeed);
 
   await sr.entities.StrategyModel.update(challenger.id, {
     out_of_sample_metrics: JSON.stringify(validation),

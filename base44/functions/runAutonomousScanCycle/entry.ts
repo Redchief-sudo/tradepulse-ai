@@ -59,6 +59,9 @@ export default async function(req) {
 
     const sr = base44.asServiceRole;
     const key = secrets.get('FINNHUB_API_KEY');
+    // Run-level identifier for stable idempotency keys — all trades in this
+    // scan cycle share the same runId, so retries resume the same intents.
+    const runId = crypto.randomUUID();
     // USER-SCOPED: only this user's holdings
     const holdings = await sr.entities.Holding.filter({ user_id: user.id });
     const pp = profileParams(user.trade_profile || 'balanced');
@@ -224,13 +227,24 @@ export default async function(req) {
 
     // Authoritative capital base: use broker account equity when connected.
     // Credentials are read from the secure BrokerCredential entity, NOT the User object.
-    let accountEquity = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
+    // FAIL-CLOSED: for broker-connected users, real account equity is a prerequisite.
+    // If the broker account is unreachable, the cycle must NOT proceed with buy orders
+    // — sizing from a stale holdings-derived capital base is fail-open behavior.
     const brokerCreds = await sr.entities.BrokerCredential.filter({ user_id: user.id, status: 'active' });
+    let accountEquity;
     if (brokerCreds[0] && brokerCreds[0].broker === 'alpaca') {
       try {
         const acct = await getAlpacaAccount({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode });
-        if (acct && Number(acct.equity) > 0) accountEquity = Number(acct.equity);
-      } catch (e) { /* fall back to securities market value */ }
+        if (!acct || Number(acct.equity) <= 0) {
+          return Response.json({ ok: false, error: 'BROKER_ACCOUNT_UNAVAILABLE: cannot size positions without real account equity' }, { status: 503 });
+        }
+        accountEquity = Number(acct.equity);
+      } catch (e) {
+        return Response.json({ ok: false, error: `BROKER_UNREACHABLE: ${e.message}` }, { status: 503 });
+      }
+    } else {
+      // No broker connected — internal_paper mode, use holdings-based equity.
+      accountEquity = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
     }
 
     const executed = [];
@@ -262,8 +276,10 @@ export default async function(req) {
         technical_score: f.technical_score, momentum_score: f.momentum_score, risk_score: f.risk_score,
         recordDecision: true,
         regime: regime.market_regime,
-        // STABLE IDEMPOTENCY: derive from signal identity so retries don't duplicate
-        idempotency_key: `autonomous-${pr.symbol}-${pr.action}-${new Date().toISOString().slice(0, 13)}`,
+        // STABLE IDEMPOTENCY: per-run + per-signal identity. The runId is generated
+        // once per scan cycle, so retries of the same run reuse the same key (no
+        // duplicate orders). Different signals within the same run get distinct keys.
+        idempotency_key: `autonomous-${runId}-${pr.symbol}-${pr.action}`,
         signal_timestamp: new Date().toISOString(),
       });
       executed.push({ symbol: pr.symbol, action: pr.action, qty: shares, price, ml_score: pr.ml_score, settlement: result });

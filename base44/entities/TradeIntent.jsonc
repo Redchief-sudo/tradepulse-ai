@@ -107,6 +107,14 @@
       ],
       "default": "proposed"
     },
+    "broker_terminal_status": {
+      "type": "string",
+      "description": "Broker's terminal disposition (filled, canceled, rejected, expired, replaced) \u2014 preserved separately from settlement status so partial fills + cancellations are both visible"
+    },
+    "unfilled_quantity": {
+      "type": "number",
+      "description": "Requested quantity minus filled quantity at terminal state \u2014 the portion not filled (canceled/rejected remainder)"
+    },
     "risk_snapshot": {
       "type": "string"
     },

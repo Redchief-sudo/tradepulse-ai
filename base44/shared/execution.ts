@@ -93,44 +93,112 @@ async function recordFill(sr, params) {
   return true;
 }
 
-// Project a holding from a fill — the Holding is a cache of the Fill ledger.
+// Project a holding from a fill using LOT-BASED accounting.
+// On buy: creates a PositionLot and updates the Holding projection.
+// On sell: closes lots FIFO, computes realized P&L from lot cost basis BEFORE
+// modifying the holding, then updates the Holding projection.
+// Returns the realized P&L for sell fills (null for buys).
+// This fixes the sequencing defect where the holding was modified/deleted before
+// P&L was computed, and provides accurate per-lot cost basis for attribution.
 async function projectHolding(sr, userId, symbol, side, filledQty, filledPrice, input) {
-  const holdings = await sr.entities.Holding.filter({ user_id: userId });
-  const existing = holdings.find((h) => String(h.symbol).toUpperCase() === symbol);
-  const totalValue = filledQty * filledPrice;
+  const fillId = input.fill_id || null;
 
   if (side === 'buy') {
-    if (existing) {
-      const ts = existing.shares + filledQty;
-      const tc = existing.shares * existing.avg_price + totalValue;
-      await sr.entities.Holding.update(existing.id, {
-        shares: ts,
-        avg_price: tc / ts,
-        current_price: filledPrice,
-        stop_loss: input.stop_loss ?? existing.stop_loss,
-        target_price: input.target_price ?? existing.target_price,
-      });
-    } else {
-      await sr.entities.Holding.create({
-        user_id: userId,
-        symbol,
-        company_name: input.company_name || symbol,
-        shares: filledQty,
-        avg_price: filledPrice,
-        current_price: filledPrice,
-        sector: input.sector || '',
-        day_change_percent: 0,
-        stop_loss: input.stop_loss,
-        target_price: input.target_price,
-        asset_class: input.asset_class || 'stocks',
-      });
-    }
+    // Create a new tax lot for this buy fill.
+    await sr.entities.PositionLot.create({
+      user_id: userId,
+      lot_id: genId('lot'),
+      symbol,
+      company_name: input.company_name || symbol,
+      sector: input.sector || '',
+      asset_class: input.asset_class || 'stocks',
+      originating_fill_id: fillId,
+      quantity_opened: filledQty,
+      quantity_remaining: filledQty,
+      acquisition_price: filledPrice,
+      acquisition_timestamp: nowIso(),
+      status: 'open',
+      realized_pnl: 0,
+      closure_fill_ids: '[]',
+      cost_basis_method: 'fifo',
+    });
+    await updateHoldingProjection(sr, userId, symbol, filledPrice, input);
+    return null;
+  }
+
+  // Sell: close lots FIFO, compute realized P&L from lot cost basis.
+  const lots = await sr.entities.PositionLot.filter({ user_id: userId, symbol });
+  const openLots = lots
+    .filter((l) => l.status === 'open' || l.status === 'partially_closed')
+    .sort((a, b) => new Date(a.acquisition_timestamp) - new Date(b.acquisition_timestamp));
+
+  let remainingQty = filledQty;
+  let realizedPnl = 0;
+
+  for (const lot of openLots) {
+    if (remainingQty <= 0.0001) break;
+    const closeQty = Math.min(lot.quantity_remaining, remainingQty);
+    const lotPnl = (filledPrice - lot.acquisition_price) * closeQty;
+    realizedPnl += lotPnl;
+
+    const newRemaining = lot.quantity_remaining - closeQty;
+    const closureIds = JSON.parse(lot.closure_fill_ids || '[]');
+    if (fillId) closureIds.push(fillId);
+
+    await sr.entities.PositionLot.update(lot.id, {
+      quantity_remaining: newRemaining,
+      status: newRemaining <= 0.0001 ? 'closed' : 'partially_closed',
+      realized_pnl: (lot.realized_pnl || 0) + lotPnl,
+      closure_fill_ids: JSON.stringify(closureIds),
+    });
+
+    remainingQty -= closeQty;
+  }
+
+  await updateHoldingProjection(sr, userId, symbol, filledPrice, input);
+  return realizedPnl;
+}
+
+// Update the Holding entity as a derived projection from open PositionLots.
+// The Holding is a cache — the PositionLot ledger is the source of truth.
+async function updateHoldingProjection(sr, userId, symbol, currentPrice, input) {
+  const lots = await sr.entities.PositionLot.filter({ user_id: userId, symbol });
+  const openLots = lots.filter((l) => l.status === 'open' || l.status === 'partially_closed');
+
+  const holdings = await sr.entities.Holding.filter({ user_id: userId });
+  const existing = holdings.find((h) => String(h.symbol).toUpperCase() === symbol);
+
+  if (openLots.length === 0) {
+    if (existing) await sr.entities.Holding.delete(existing.id);
+    return;
+  }
+
+  const totalShares = openLots.reduce((s, l) => s + l.quantity_remaining, 0);
+  const totalCost = openLots.reduce((s, l) => s + l.quantity_remaining * l.acquisition_price, 0);
+  const avgPrice = totalShares > 0 ? totalCost / totalShares : 0;
+
+  if (existing) {
+    await sr.entities.Holding.update(existing.id, {
+      shares: totalShares,
+      avg_price: avgPrice,
+      current_price: currentPrice,
+      stop_loss: input.stop_loss ?? existing.stop_loss,
+      target_price: input.target_price ?? existing.target_price,
+    });
   } else {
-    if (existing) {
-      const newShares = existing.shares - filledQty;
-      if (newShares <= 0.0001) await sr.entities.Holding.delete(existing.id);
-      else await sr.entities.Holding.update(existing.id, { shares: newShares, current_price: filledPrice });
-    }
+    await sr.entities.Holding.create({
+      user_id: userId,
+      symbol,
+      company_name: input.company_name || symbol,
+      shares: totalShares,
+      avg_price: avgPrice,
+      current_price: currentPrice,
+      sector: input.sector || '',
+      day_change_percent: 0,
+      stop_loss: input.stop_loss,
+      target_price: input.target_price,
+      asset_class: input.asset_class || 'stocks',
+    });
   }
 }
 
@@ -380,6 +448,7 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
   let lastFilledQty = intentRecord.filled_quantity || 0;
   let lastFilledPrice = intentRecord.filled_avg_price || 0;
   const venue = executionMode === 'live' ? 'alpaca' : 'alpaca_paper';
+  let accumulatedRealizedPnl = 0;
 
   const start = Date.now();
   while (Date.now() - start < FILL_TIMEOUT_MS) {
@@ -398,9 +467,19 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
     // Record incremental fill if new shares have been filled.
     if (cumulativeFilled > lastFilledQty) {
       const incrementalQty = cumulativeFilled - lastFilledQty;
-      // Alpaca's filled_avg_price is the VWAP of ALL fills so far. We record the
-      // incremental qty at the cumulative VWAP — the fill_id encodes the cumulative
-      // qty so it's idempotent.
+      // Derive the INCREMENTAL fill price from cumulative quantities and VWAPs.
+      // Alpaca's filled_avg_price is the VWAP of ALL fills so far. Using it directly
+      // for each increment corrupts the fill ledger (second fill gets cumulative avg,
+      // not its own price). The correct incremental price is:
+      //   incremental_notional = new_cum_qty × new_avg − prev_cum_qty × prev_avg
+      //   incremental_price = incremental_notional / incremental_qty
+      const prevNotional = lastFilledQty * (lastFilledPrice || 0);
+      const currNotional = cumulativeFilled * cumulativeAvgPrice;
+      const incrementalNotional = currNotional - prevNotional;
+      const incrementalPrice = incrementalQty > 0 && incrementalNotional > 0
+        ? incrementalNotional / incrementalQty
+        : (cumulativeAvgPrice > 0 ? cumulativeAvgPrice : Number(input.price));
+
       const fillId = `${brokerOrderId}:fill:${cumulativeFilled}`;
       const recorded = await recordFill(sr, {
         user_id: userId,
@@ -412,8 +491,8 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
         asset_id: input.native_asset_id || symbol,
         side,
         filled_quantity: incrementalQty,
-        filled_price: cumulativeAvgPrice > 0 ? cumulativeAvgPrice : Number(input.price),
-        notional: incrementalQty * (cumulativeAvgPrice > 0 ? cumulativeAvgPrice : Number(input.price)),
+        filled_price: incrementalPrice,
+        notional: incrementalQty * incrementalPrice,
         commission: input.commission || 0,
         fees: input.fees || 0,
         slippage: 0,
@@ -426,8 +505,9 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
       });
 
       if (recorded) {
-        // Project the holding for this incremental fill.
-        await projectHolding(sr, userId, symbol, side, incrementalQty, cumulativeAvgPrice > 0 ? cumulativeAvgPrice : Number(input.price), input);
+        // Project the holding for this incremental fill and capture realized P&L.
+        const fillRealizedPnl = await projectHolding(sr, userId, symbol, side, incrementalQty, incrementalPrice, { ...input, fill_id: fillId });
+        if (fillRealizedPnl != null) accumulatedRealizedPnl += fillRealizedPnl;
       }
 
       lastFilledQty = cumulativeFilled;
@@ -437,28 +517,37 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
     // Check for terminal state.
     if (status === 'filled' || status === 'done_for_day') {
       // Final settlement — record the Trade, AITradeDecision, and settle the intent.
+      // Preserve both settlement status and broker terminal disposition.
       await sr.entities.TradeIntent.update(intentRecord.id, {
         status: 'filled',
         filled_quantity: cumulativeFilled,
         filled_avg_price: cumulativeAvgPrice,
+        broker_terminal_status: status,
+        unfilled_quantity: Math.max(0, intentRecord.requested_quantity - cumulativeFilled),
       });
-      return await settleFromFills(sr, userId, intentRecord, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, cumulativeFilled, cumulativeAvgPrice, executionMode, venue);
+      return await settleFromFills(sr, userId, intentRecord, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, cumulativeFilled, cumulativeAvgPrice, executionMode, venue, accumulatedRealizedPnl);
     }
 
     if (isTerminalFailure(status)) {
       // Order terminated with partial or no fill. Settle what was filled (if anything).
+      // Preserve the broker's terminal disposition (canceled/rejected/expired/replaced)
+      // alongside the filled quantity so both facts are visible: e.g. 25 filled + 75 canceled.
       if (cumulativeFilled > 0) {
         await sr.entities.TradeIntent.update(intentRecord.id, {
-          status: cumulativeFilled < intentRecord.requested_quantity ? 'partially_filled' : 'filled',
+          status: 'partially_filled',
           filled_quantity: cumulativeFilled,
           filled_avg_price: cumulativeAvgPrice,
+          broker_terminal_status: status,
+          unfilled_quantity: Math.max(0, intentRecord.requested_quantity - cumulativeFilled),
         });
-        return await settleFromFills(sr, userId, intentRecord, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, cumulativeFilled, cumulativeAvgPrice, executionMode, venue);
+        return await settleFromFills(sr, userId, intentRecord, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, cumulativeFilled, cumulativeAvgPrice, executionMode, venue, accumulatedRealizedPnl);
       }
       // No fill at all — reject.
       await sr.entities.TradeIntent.update(intentRecord.id, {
         status: status === 'rejected' ? 'rejected' : 'canceled',
         rejection_reason: `BROKER_${status.toUpperCase()}`,
+        broker_terminal_status: status,
+        unfilled_quantity: intentRecord.requested_quantity,
       });
       return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, orderStatus: status, brokerOrderId, symbol, side, requestedQty: intentRecord.requested_quantity };
     }
@@ -509,20 +598,14 @@ async function resumeBrokerOrder(sr, userId, intentRecord, input, brokerCred) {
 
 // Final settlement — create the Trade record, AITradeDecision (if AI-driven), and settle the intent.
 // This is called once the order reaches a terminal state. The fills are already recorded.
-async function settleFromFills(sr, userId, intentRecord, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, filledQty, filledPrice, executionMode, venue) {
+async function settleFromFills(sr, userId, intentRecord, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, filledQty, filledPrice, executionMode, venue, realizedPnl = null) {
   const symbol = intentRecord.symbol;
   const side = intentRecord.side;
   const totalValue = filledQty * filledPrice;
 
-  // Realized P&L for sells.
-  let realizedPnl = null;
-  if (side === 'sell') {
-    const holdings = await sr.entities.Holding.filter({ user_id: userId });
-    const existing = holdings.find((h) => String(h.symbol).toUpperCase() === symbol);
-    if (existing && existing.avg_price) {
-      realizedPnl = (filledPrice - existing.avg_price) * filledQty;
-    }
-  }
+  // Realized P&L — from lot-based accounting (passed in from projectHolding),
+  // NOT from a post-sale holding lookup (which is stale or deleted after the sell).
+  // This fixes the sequencing defect where the holding was modified before P&L computation.
 
   // Trade record (idempotent: check if a trade with this client_order_id already exists).
   const existingTrades = await sr.entities.Trade.filter({ user_id: userId, client_order_id: clientOrderId });
@@ -633,11 +716,11 @@ async function settleFill(sr, userId, params) {
     asset_class: input.asset_class || 'stocks',
   });
 
-  // Project the holding.
-  await projectHolding(sr, userId, symbol, side, filledQty, filledPrice, input);
+  // Project the holding and capture realized P&L from lot-based accounting.
+  const realizedPnl = await projectHolding(sr, userId, symbol, side, filledQty, filledPrice, { ...input, fill_id: fillId });
 
-  // Final settlement.
-  return await settleFromFills(sr, userId, intentRecord, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, filledQty, filledPrice, executionMode, venue);
+  // Final settlement — pass realized P&L from lot accounting.
+  return await settleFromFills(sr, userId, intentRecord, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, filledQty, filledPrice, executionMode, venue, realizedPnl);
 }
 
 // Backward-compatible wrapper.
