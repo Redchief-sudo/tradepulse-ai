@@ -16,6 +16,7 @@ import {
   Activity,
   Cpu,
   Layers,
+  Play,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import TradePerformance from '@/components/TradePerformance';
@@ -63,6 +64,7 @@ export default function AutonomousTrader() {
   const [scanning, setScanning] = useState(false);
   const [scanStageIndex, setScanStageIndex] = useState(-1);
   const [executing, setExecuting] = useState(false);
+  const [fullCycle, setFullCycle] = useState(false);
   const [marketSummary, setMarketSummary] = useState('');
   const [riskAssessment, setRiskAssessment] = useState('');
   const [candidates, setCandidates] = useState([]);
@@ -179,12 +181,16 @@ export default function AutonomousTrader() {
       }));
       const vetoed = merged.filter((p) => p.adversarial_verdict === 'vetoed');
       setVetoedCount(vetoed.length);
-      setProposals(merged.filter((p) => p.adversarial_verdict !== 'vetoed'));
+      const finalProposals = merged.filter((p) => p.adversarial_verdict !== 'vetoed');
+      setProposals(finalProposals);
+      return finalProposals;
     } catch (e) {
       console.error(e);
+      return [];
+    } finally {
+      setScanStageIndex(-1);
+      setScanning(false);
     }
-    setScanStageIndex(-1);
-    setScanning(false);
   };
 
   const executeProposal = async (proposal, index) => {
@@ -242,15 +248,30 @@ export default function AutonomousTrader() {
     }
   };
 
-  const executeAll = async () => {
+  const executeAll = async (proposalList) => {
+    const list = proposalList || proposals;
     setExecuting(true);
-    for (let i = 0; i < proposals.length; i++) {
+    for (let i = 0; i < list.length; i++) {
       if (!executedIds.has(i)) {
-        await executeProposal(proposals[i], i);
+        await executeProposal(list[i], i);
       }
     }
     await loadData();
     setExecuting(false);
+  };
+
+  // Start Trader — runs the full autonomous cycle in one click:
+  // 5-pass AI scan → auto-execute all approved proposals → refresh portfolio.
+  const startFullCycle = async () => {
+    setFullCycle(true);
+    try {
+      const scannedProposals = await runScan();
+      if (scannedProposals && scannedProposals.length > 0) {
+        await executeAll(scannedProposals);
+      }
+    } finally {
+      setFullCycle(false);
+    }
   };
 
   const pendingCount = proposals.filter((_, i) => !executedIds.has(i)).length;
@@ -279,7 +300,7 @@ export default function AutonomousTrader() {
             <Layers className="w-4 h-4" />
             {showArchitecture ? 'Hide' : 'Architecture'}
           </Button>
-          {proposals.length > 0 && pendingCount > 0 && (
+          {proposals.length > 0 && pendingCount > 0 && !fullCycle && (
             <Button
               onClick={executeAll}
               disabled={executing}
@@ -290,8 +311,16 @@ export default function AutonomousTrader() {
             </Button>
           )}
           <Button
+            onClick={startFullCycle}
+            disabled={fullCycle || scanning || executing}
+            className="gap-2 bg-gradient-to-r from-primary to-accent"
+          >
+            {fullCycle ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+            {fullCycle ? 'Trading...' : 'Start Trader'}
+          </Button>
+          <Button
             onClick={runScan}
-            disabled={scanning}
+            disabled={scanning || fullCycle}
             variant={scanning ? 'secondary' : 'default'}
             className="gap-2"
           >
@@ -473,9 +502,9 @@ export default function AutonomousTrader() {
             then a multi-factor ML engine scores each trade across technical, fundamental,
             sentiment, momentum, and risk factors.
           </p>
-          <Button onClick={runScan} className="gap-2 bg-gradient-to-r from-primary to-accent">
-            <Brain className="w-4 h-4" />
-            Run First Scan
+          <Button onClick={startFullCycle} disabled={fullCycle} className="gap-2 bg-gradient-to-r from-primary to-accent">
+            {fullCycle ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+            {fullCycle ? 'Starting...' : 'Start Trader'}
           </Button>
         </motion.div>
       )}
