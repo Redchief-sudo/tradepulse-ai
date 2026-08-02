@@ -15,6 +15,10 @@ import {
   Link2,
   Unlink,
   Rocket,
+  FlaskConical,
+  UserCheck,
+  Zap,
+  GitBranch,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -88,6 +92,7 @@ export default function Settings() {
     broker_api_secret: '',
     broker_mode: 'paper',
     trade_profile: 'balanced',
+    promotion_mode: 'automatic',
   });
 
   const loadUser = useCallback(async () => {
@@ -103,6 +108,7 @@ export default function Settings() {
         broker_api_secret: '',
         broker_mode: status?.broker_mode || me.broker_mode || 'paper',
         trade_profile: me.trade_profile || 'balanced',
+        promotion_mode: me.promotion_mode || 'automatic',
       });
     } catch (e) {
       console.error(e);
@@ -117,8 +123,8 @@ export default function Settings() {
   const save = async () => {
     setSaving(true);
     try {
-      // Save trade profile via auth.updateMe (non-sensitive)
-      await base44.auth.updateMe({ trade_profile: form.trade_profile });
+      // Save trade profile and promotion mode via auth.updateMe (non-sensitive)
+      await base44.auth.updateMe({ trade_profile: form.trade_profile, promotion_mode: form.promotion_mode });
 
       // Save broker credentials via the secure backend function
       // (validates against the broker, stores in BrokerCredential entity, never on User)
@@ -229,6 +235,44 @@ export default function Settings() {
           value={form.trade_profile}
           onChange={(id) => setForm({ ...form, trade_profile: id })}
         />
+      </div>
+
+      {/* Model Governance Promotion Mode */}
+      <div className="mb-6">
+        <div className="rounded-2xl border border-border bg-card p-5 space-y-4">
+          <div className="flex items-center gap-2">
+            <GitBranch className="w-4 h-4 text-accent" />
+            <h2 className="font-semibold">Model Governance Promotion Mode</h2>
+          </div>
+          <p className="text-xs text-muted-foreground leading-relaxed">
+            Controls how the AI's self-learning factor weights are promoted from candidate to champion.
+            The governance cycle always runs offline (weekly) — it never interferes with live execution.
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            {[
+              { id: 'research', label: 'Research', icon: FlaskConical, desc: 'Validate candidates only — never promote. Safest while proving the system.' },
+              { id: 'manual_approval', label: 'Manual Approval', icon: UserCheck, desc: 'Generate and validate candidates. You approve each promotion by hand.' },
+              { id: 'automatic', label: 'Automatic', icon: Zap, desc: 'Auto-promote candidates that pass all statistical gates. Full self-evolution.' },
+            ].map((m) => (
+              <button
+                key={m.id}
+                onClick={() => setForm({ ...form, promotion_mode: m.id })}
+                className={cn(
+                  'text-left rounded-xl border p-3 transition-all',
+                  form.promotion_mode === m.id
+                    ? 'border-primary bg-primary/10'
+                    : 'border-border hover:border-primary/40'
+                )}
+              >
+                <div className="flex items-center gap-2 mb-1">
+                  <m.icon className="w-4 h-4 text-primary" />
+                  <div className="font-medium text-sm">{m.label}</div>
+                </div>
+                <div className="text-xs text-muted-foreground leading-relaxed">{m.desc}</div>
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
 
       {/* Broker connection card */}

@@ -556,6 +556,7 @@ async function settleFromFills(sr, userId, intentRecord, input, brokerOrderId, c
       technical_score: input.technical_score,
       momentum_score: input.momentum_score,
       risk_score: input.risk_score,
+      regime: input.regime || null,
     });
     decisionId = d.id;
   }

@@ -63,17 +63,17 @@ export default async function(req) {
     const holdings = await sr.entities.Holding.filter({ user_id: user.id });
     const pp = profileParams(user.trade_profile || 'balanced');
 
-    // CHAMPION MODEL: use the versioned champion's weights, not raw user.ml_weights.
+    // Deterministic market regime (computed first so we can select the regime-specific champion)
+    const regime = await classifyRegimeFromSnapshots(sr);
+
+    // CHAMPION MODEL: use the regime-specific champion's weights.
     // The governance workflow promotes challengers; this cycle always uses the champion.
-    const champion = await getChampion(sr, user.id);
+    const champion = await getChampion(sr, user.id, regime.market_regime);
     const weights = champion?.weights || user.ml_weights || { technical: 25, fundamental: 25, sentiment: 20, momentum: 15, risk: 15 };
 
     const pCtx = portfolioContext(holdings);
     const sec = sectorExposure(holdings);
     const secCtx = sec.sectors.length ? sec.sectors.map((s) => `${s.sector}: ${s.percent.toFixed(1)}% ($${s.value.toFixed(0)})`).join(', ') : 'No sector exposure yet.';
-
-    // Deterministic market regime
-    const regime = await classifyRegimeFromSnapshots(sr);
 
     // PASS 1 — Multi-asset deep market scan (Gemini 3.1 Pro, web search)
     const p1 = await sr.integrations.Core.InvokeLLM({
@@ -261,6 +261,7 @@ export default async function(req) {
         source: 'autonomous', reasoning: pr.reasoning, ml_score: pr.ml_score,
         technical_score: f.technical_score, momentum_score: f.momentum_score, risk_score: f.risk_score,
         recordDecision: true,
+        regime: regime.market_regime,
         // STABLE IDEMPOTENCY: derive from signal identity so retries don't duplicate
         idempotency_key: `autonomous-${pr.symbol}-${pr.action}-${new Date().toISOString().slice(0, 13)}`,
         signal_timestamp: new Date().toISOString(),

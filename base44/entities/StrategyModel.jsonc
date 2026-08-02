@@ -61,7 +61,7 @@
     },
     "in_sample_metrics": {
       "type": "string",
-      "description": "JSON: reasoning, sampleSize, factor analysis"
+      "description": "JSON: reasoning, hypothesis, optimizer trace, sampleSize, factor analysis"
     },
     "out_of_sample_metrics": {
       "type": "string",
@@ -100,7 +100,15 @@
     },
     "regime": {
       "type": "string",
-      "description": "Market regime when validated"
+      "description": "Market regime this model is champion for ('all' = global, or specific regime like 'low_vol_bull', 'high_vol_bear', etc.)"
+    },
+    "approved_by": {
+      "type": "string",
+      "description": "User id who approved the promotion (null for auto_promoted, user.id for manual approval)"
+    },
+    "rollback_path": {
+      "type": "string",
+      "description": "Immutable audit trail: version lineage chain (e.g. '1.0.0 \u2192 1.1.0 \u2192 1.2.0')"
     }
   },
   "required": [

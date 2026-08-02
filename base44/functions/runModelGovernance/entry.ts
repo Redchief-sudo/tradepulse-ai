@@ -11,7 +11,7 @@ export default async function(req) {
     const user = await base44.auth.me();
     if (!user || user.role !== 'admin') return Response.json({ error: 'Admin only' }, { status: 403 });
 
-    const result = await runGovernanceCycle(base44.asServiceRole, user.id);
+    const result = await runGovernanceCycle(base44.asServiceRole, user.id, user);
     return Response.json({ ok: true, ...result });
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });

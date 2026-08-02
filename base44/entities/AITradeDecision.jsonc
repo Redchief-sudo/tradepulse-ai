@@ -26,6 +26,10 @@
       ],
       "default": "stocks"
     },
+    "regime": {
+      "type": "string",
+      "description": "Market regime at execution time (low_vol_bull, high_vol_bear, range_bound_choppy, liquidity_crisis, transition) \u2014 used for regime-specific champion governance"
+    },
     "action": {
       "type": "string",
       "enum": [

@@ -38,9 +38,19 @@
       ],
       "description": "AI trading risk profile governing position limits and confidence thresholds"
     },
+    "promotion_mode": {
+      "type": "string",
+      "enum": [
+        "research",
+        "manual_approval",
+        "automatic"
+      ],
+      "default": "automatic",
+      "description": "Model governance promotion mode: research (validate only, never promote), manual_approval (human approves proven candidates), automatic (auto-promote if proven)"
+    },
     "ml_weights": {
       "type": "object",
-      "description": "Self-learning adjusted 5-factor weights",
+      "description": "Self-learning adjusted 5-factor weights (cached from global champion)",
       "properties": {
         "technical": {
           "type": "number"
