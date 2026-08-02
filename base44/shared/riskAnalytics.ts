@@ -143,3 +143,128 @@ export function computeBenchmarkComparison(portReturns, benchReturns) {
     benchEquity,
   };
 }
+
+// --- Matrix operations for portfolio optimization (Markowitz) ---
+
+// Gaussian elimination with partial pivoting. Returns null for singular matrices.
+export function matrixInverse(M) {
+  const n = M.length;
+  if (n === 0) return null;
+  const aug = M.map((row, i) => {
+    const identity = Array(n).fill(0);
+    identity[i] = 1;
+    return [...row, ...identity];
+  });
+  for (let i = 0; i < n; i++) {
+    let maxRow = i;
+    for (let k = i + 1; k < n; k++) {
+      if (Math.abs(aug[k][i]) > Math.abs(aug[maxRow][i])) maxRow = k;
+    }
+    [aug[i], aug[maxRow]] = [aug[maxRow], aug[i]];
+    if (Math.abs(aug[i][i]) < 1e-12) return null;
+    for (let k = i + 1; k < n; k++) {
+      const factor = aug[k][i] / aug[i][i];
+      for (let j = i; j < 2 * n; j++) aug[k][j] -= factor * aug[i][j];
+    }
+  }
+  for (let i = n - 1; i >= 0; i--) {
+    const pivot = aug[i][i];
+    for (let j = i; j < 2 * n; j++) aug[i][j] /= pivot;
+    for (let k = i - 1; k >= 0; k--) {
+      const factor = aug[k][i];
+      for (let j = i; j < 2 * n; j++) aug[k][j] -= factor * aug[i][j];
+    }
+  }
+  return aug.map((row) => row.slice(n));
+}
+
+export function matVec(M, v) {
+  return M.map((row) => row.reduce((sum, m, i) => sum + m * v[i], 0));
+}
+
+// Sample covariance matrix from aligned daily return arrays.
+export function covarianceMatrix(assetReturns) {
+  const n = assetReturns.length;
+  const t = assetReturns[0]?.length || 0;
+  if (t < 2) return null;
+  const means = assetReturns.map((r) => mean(r));
+  const cov = Array(n).fill(0).map(() => Array(n).fill(0));
+  for (let i = 0; i < n; i++) {
+    for (let j = i; j < n; j++) {
+      let sum = 0;
+      for (let k = 0; k < t; k++) {
+        sum += (assetReturns[i][k] - means[i]) * (assetReturns[j][k] - means[j]);
+      }
+      cov[i][j] = sum / (t - 1);
+      cov[j][i] = cov[i][j];
+    }
+  }
+  return cov;
+}
+
+export function portfolioVariance(weights, covMatrix) {
+  let variance = 0;
+  for (let i = 0; i < weights.length; i++) {
+    for (let j = 0; j < weights.length; j++) {
+      variance += weights[i] * weights[j] * covMatrix[i][j];
+    }
+  }
+  return Math.max(0, variance);
+}
+
+export function portfolioReturn(weights, mu) {
+  return weights.reduce((s, w, i) => s + w * mu[i], 0);
+}
+
+// Max Sharpe (tangency) portfolio, risk-free rate = 0.
+// Unconstrained: w = Sigma^{-1} * mu, normalized to sum to 1.
+export function maxSharpeWeights(mu, covMatrix) {
+  const invCov = matrixInverse(covMatrix);
+  if (!invCov) return null;
+  const w = matVec(invCov, mu);
+  const sum = w.reduce((a, b) => a + b, 0);
+  if (Math.abs(sum) < 1e-10) return null;
+  return w.map((x) => x / sum);
+}
+
+// Long-only approximation: clip negative weights and renormalize iteratively.
+export function maxSharpeWeightsLongOnly(mu, covMatrix) {
+  let w = maxSharpeWeights(mu, covMatrix);
+  if (!w) return null;
+  for (let iter = 0; iter < 10; iter++) {
+    if (!w.some((x) => x < -1e-6)) break;
+    w = w.map((x) => Math.max(0, x));
+    const sum = w.reduce((a, b) => a + b, 0);
+    if (sum < 1e-10) return null;
+    w = w.map((x) => x / sum);
+  }
+  return w;
+}
+
+// Markowitz efficient frontier (unconstrained, risk-free rate = 0).
+export function efficientFrontier(mu, covMatrix, nPoints = 40) {
+  const invCov = matrixInverse(covMatrix);
+  if (!invCov) return null;
+  const n = mu.length;
+  const ones = Array(n).fill(1);
+  const invCovMu = matVec(invCov, mu);
+  const invCovOnes = matVec(invCov, ones);
+  const A = ones.reduce((s, _, i) => s + invCovMu[i], 0);
+  const B = mu.reduce((s, m, i) => s + m * invCovMu[i], 0);
+  const C = ones.reduce((s, _, i) => s + invCovOnes[i], 0);
+  const D = B * C - A * A;
+  if (Math.abs(D) < 1e-10) return null;
+
+  const minReturn = A / C;
+  const maxReturn = Math.max(...mu) * 1.2;
+  const frontier = [];
+  for (let i = 0; i < nPoints; i++) {
+    const r = minReturn + (maxReturn - minReturn) * (i / (nPoints - 1));
+    const variance = (C * r * r - 2 * A * r + B) / D;
+    frontier.push({
+      return: r,
+      volatility: Math.sqrt(Math.max(0, variance)),
+    });
+  }
+  return frontier;
+}

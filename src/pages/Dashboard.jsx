@@ -22,6 +22,7 @@ import RealPnlChart from '@/components/RealPnlChart';
 import PerformanceAttribution from '@/components/PerformanceAttribution';
 import RiskAnalytics from '@/components/RiskAnalytics';
 import BenchmarkComparison from '@/components/BenchmarkComparison';
+import PortfolioOptimization from '@/components/PortfolioOptimization';
 import { Button } from '@/components/ui/button';
 
 const COLORS = ['#10b981', '#8b5cf6', '#3b82f6', '#f59e0b', '#ec4899', '#06b6d4', '#84cc16', '#f97316'];
@@ -207,6 +208,8 @@ export default function Dashboard() {
       <RiskAnalytics holdings={holdings} />
 
       <BenchmarkComparison holdings={holdings} />
+
+      <PortfolioOptimization holdings={holdings} />
 
       <ExitAlerts holdings={holdings} onExit={handleExitPosition} />
 
