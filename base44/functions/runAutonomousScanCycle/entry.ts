@@ -43,6 +43,13 @@ function portfolioContext(holdings) {
 // Weight evolution is handled by the separate Model Governance workflow —
 // this cycle only executes trades, it does not mutate the model.
 export default async function(req) {
+  // Scan run state — declared outside the try block so the catch handler can
+  // finalize a failed scan run. (Fixes Rev.9 defect #1: finishRun was declared
+  // inside the try, so the catch's call to it threw a ReferenceError that was
+  // silently swallowed — leaving crashed scans permanently marked "running".)
+  let scanRunId = null;
+  let srRef = null;
+
   try {
     const base44 = createClientFromRequest(req);
     const user = await base44.auth.me();
@@ -57,25 +64,51 @@ export default async function(req) {
     }
 
     const sr = base44.asServiceRole;
+    srRef = sr;
     const key = secrets.get('FINNHUB_API_KEY');
-    // Run-level identifier for stable idempotency keys — all trades in this
-    // scan cycle share the same runId, so retries resume the same intents.
-    // Derive run ID from scheduled occurrence (UTC date+hour) so retries of
-    // the same scheduled scan reuse the same ID — preventing duplicate orders
-    // across workflow retries. Different hours get different IDs.
+
+    // Trigger source — passed from the caller (dashboard/manual) or defaults
+    // to 'scheduled' for workflow-triggered runs. (Fixes Rev.9 defect #17:
+    // every ScanRun was hardcoded as 'scheduled' even for manual/dashboard runs.)
+    const body = await req.json().catch(() => ({}));
+    const triggerSource = body.trigger_source || 'scheduled';
+
+    // Run-level identifier — includes the 15-minute occurrence slot so scans
+    // within the same hour get distinct IDs. (Fixes Rev.9 defect #2: four scans
+    // per hour shared one hourly ID, causing cross-scan idempotency collisions
+    // and duplicate ScanRun records.) Retries of the same 15-min slot reuse
+    // the same ID; the next slot gets a new one.
     const now = new Date();
-    const runId = `scan-${now.getUTCFullYear()}${String(now.getUTCMonth()+1).padStart(2,'0')}${String(now.getUTCDate()).padStart(2,'0')}-${String(now.getUTCHours()).padStart(2,'0')}`;
+    const minuteSlot = Math.floor(now.getUTCMinutes() / 15) * 15;
+    const runId = `scan-${now.getUTCFullYear()}${String(now.getUTCMonth()+1).padStart(2,'0')}${String(now.getUTCDate()).padStart(2,'0')}-${String(now.getUTCHours()).padStart(2,'0')}${String(minuteSlot).padStart(2,'0')}`;
+
+    // ATOMIC SCAN LOCK — prevent overlapping scans. If a scan is already
+    // running (e.g., a scheduled scan fired while a manual Start scan is still
+    // in progress), skip this run. A scan is considered stale after 5 minutes
+    // (scans typically complete in ~2 min) — a stale scan is marked failed and
+    // this run proceeds. (Fixes Rev.9 defect #3: no overlap check existed.)
+    const existingRuns = await sr.entities.ScanRun.filter({ user_id: user.id, status: 'running' });
+    if (existingRuns.length > 0) {
+      const startedAt = new Date(existingRuns[0].started_at).getTime();
+      const STALE_SCAN_MS = 5 * 60 * 1000;
+      if (Date.now() - startedAt < STALE_SCAN_MS) {
+        return Response.json({ ok: true, skipped: true, reason: 'Another scan is already running' });
+      }
+      try { await sr.entities.ScanRun.update(existingRuns[0].id, { status: 'failed', error: 'STALE_SCAN_TIMEOUT', completed_at: new Date().toISOString() }); } catch (e) {}
+    }
+
     // Persist an authoritative ScanRun record so the Dashboard can display
     // scan state from durable data rather than transient page state.
     const scanRun = await sr.entities.ScanRun.create({
       user_id: user.id,
       scan_run_id: runId,
       started_at: now.toISOString(),
-      trigger_source: 'scheduled',
+      trigger_source: triggerSource,
       status: 'running',
       candidates_found: 0, proposals_created: 0, proposals_vetoed: 0,
       trades_attempted: 0, trades_filled: 0, trades_rejected: 0,
     });
+    scanRunId = scanRun.id;
     const finishRun = async (patch) => {
       try { await sr.entities.ScanRun.update(scanRun.id, { completed_at: new Date().toISOString(), ...patch }); } catch (e) {}
     };
@@ -274,7 +307,10 @@ export default async function(req) {
       });
       const consensusMap = {};
       (committee.debates || []).forEach((d) => { consensusMap[d.symbol.toUpperCase()] = d.consensus; });
-      proposals = proposals.filter((p) => consensusMap[p.symbol.toUpperCase()] !== false);
+      // FAIL-CLOSED: only pass proposals with explicit consensus (true).
+      // Missing/undefined reviews are rejected, not passed. (Fixes Rev.9
+      // defect #4: the old `!== false` let undefined pass as approved.)
+      proposals = proposals.filter((p) => consensusMap[p.symbol.toUpperCase()] === true);
     }
 
     // PASS 3b — Deterministic ML multi-factor scoring (CHAMPION weights)
@@ -312,7 +348,10 @@ export default async function(req) {
       });
       const vetoMap = {};
       (p4.reviews || []).forEach((r) => { vetoMap[r.symbol.toUpperCase()] = r.verdict; });
-      approved = approved.filter((p) => (vetoMap[p.symbol.toUpperCase()] || 'approved') !== 'vetoed');
+      // FAIL-CLOSED: only pass proposals with an explicit "approved" verdict.
+      // Missing/undefined reviews are rejected. (Fixes Rev.9 defect #4: the
+      // old `|| 'approved'` let absent reviews pass as approved.)
+      approved = approved.filter((p) => vetoMap[p.symbol.toUpperCase()] === 'approved');
     }
 
     // PASS 5 — Causal Contagion
@@ -358,7 +397,25 @@ export default async function(req) {
     const proposalsBeforeVeto = proposals.length;
     const executed = [];
     let tradesRejected = 0;
+
+    // EXECUTION CAPABILITY GATE — verify the asset class is supported by the
+    // connected broker before attempting execution. Unsupported candidates
+    // (e.g. forex/commodities/fixed_income on Alpaca) are skipped. (Fixes
+    // Rev.9 defect #5: scan could analyze an asset then attempt to execute
+    // an unsupported broker symbol.)
+    const brokerName = brokerCreds[0]?.broker;
+    const isAssetClassSupported = (ac) => {
+      if (!brokerName || brokerName === 'internal') return true; // internal paper
+      if (brokerName === 'alpaca') return ['stocks', 'crypto'].includes(ac);
+      return true; // unknown broker — fail-open
+    };
+
     for (const pr of approved) {
+      // Capability gate — skip unsupported asset classes (research-only)
+      if (!isAssetClassSupported(pr.asset_class || 'stocks')) {
+        tradesRejected++;
+        continue;
+      }
       // Circuit breaker — block new buys, allow sells (risk management always runs)
       if (pr.action === 'buy' && circuitBreakerTripped) continue;
       const price = pr.realPrice || pr.current_price;
@@ -404,30 +461,37 @@ export default async function(req) {
     // Model Governance workflow (runModelGovernance). This cycle only executes
     // trades using the champion model's weights — it does NOT mutate the model.
 
-    // Email alert
-    if (executed.length) {
+    // Only count and notify about actually FILLED trades — not pending or
+    // rejected attempts. (Fixes Rev.9 defects #15 + #16: persisted fill count
+    // was inflated by counting non-rejected as filled; notifications mislabeled
+    // attempts as executions.)
+    const filledTrades = executed.filter((e) => {
+      const s = e.settlement?.status;
+      return s === 'filled' || s === 'paper_filled';
+    });
+
+    if (filledTrades.length) {
       try {
         await sr.integrations.Core.SendEmail({
           to: user.email,
-          subject: `TradePulse: Autonomous AI executed ${executed.length} trade(s)`,
-          body: executed.map((e) => `${e.action.toUpperCase()} ${e.qty} ${e.symbol} @ $${e.price.toFixed(2)} (ML score ${e.ml_score})`).join('\n'),
+          subject: `TradePulse: Autonomous AI executed ${filledTrades.length} trade(s)`,
+          body: filledTrades.map((e) => `${e.action.toUpperCase()} ${e.qty} ${e.symbol} @ $${e.price.toFixed(2)} (ML score ${e.ml_score})`).join('\n'),
         });
-      } catch (e) {}
-    }
-
-    // Telegram alert
-    if (executed.length && user.telegram_chat_id && user.telegram_notifications_enabled) {
-      try {
-        const botToken = secrets.get('TELEGRAM_BOT_TOKEN');
-        if (botToken) {
-          const lines = executed.map((e) => `${e.action.toUpperCase()} ${e.qty} ${e.symbol} @ $${e.price.toFixed(2)} (ML ${e.ml_score})`);
-          await sendTelegramMessage(
-            botToken,
-            String(user.telegram_chat_id),
-            `🤖 <b>TradePulse AI</b> executed ${executed.length} trade(s):\n${lines.join('\n')}`
-          );
-        }
       } catch (e) { /* non-fatal */ }
+
+      if (user.telegram_chat_id && user.telegram_notifications_enabled) {
+        try {
+          const botToken = secrets.get('TELEGRAM_BOT_TOKEN');
+          if (botToken) {
+            const lines = filledTrades.map((e) => `${e.action.toUpperCase()} ${e.qty} ${e.symbol} @ $${e.price.toFixed(2)} (ML ${e.ml_score})`);
+            await sendTelegramMessage(
+              botToken,
+              String(user.telegram_chat_id),
+              `🤖 <b>TradePulse AI</b> executed ${filledTrades.length} trade(s):\n${lines.join('\n')}`
+            );
+          }
+        } catch (e) { /* non-fatal */ }
+      }
     }
 
     await finishRun({
@@ -439,7 +503,7 @@ export default async function(req) {
       proposals_created: proposalsBeforeVeto,
       proposals_vetoed: Math.max(0, proposalsBeforeVeto - approved.length),
       trades_attempted: executed.length,
-      trades_filled: executed.length - tradesRejected,
+      trades_filled: filledTrades.length,
       trades_rejected: tradesRejected,
     });
 
@@ -457,7 +521,11 @@ export default async function(req) {
       ml_weights: weights,
     });
   } catch (error) {
-    try { await finishRun({ status: 'failed', error: error.message }); } catch (e) {}
+    // Finalize the scan run as failed. scanRunId and srRef are at the function
+    // scope so this catch block can access them. (Fixes Rev.9 defect #1.)
+    if (scanRunId && srRef) {
+      try { await srRef.entities.ScanRun.update(scanRunId, { completed_at: new Date().toISOString(), status: 'failed', error: error.message }); } catch (e) {}
+    }
     return Response.json({ error: error.message }, { status: 500 });
   }
 }

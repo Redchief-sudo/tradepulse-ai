@@ -22,7 +22,7 @@ export function useStartTrader() {
     setStageLabel('Running full AI scan + auto-execution');
 
     try {
-      const res = await base44.functions.invoke('runAutonomousScanCycle', {});
+      const res = await base44.functions.invoke('runAutonomousScanCycle', { trigger_source: 'dashboard' });
       const data = res?.data || res;
 
       if (!data || data.ok === false || data.error) {

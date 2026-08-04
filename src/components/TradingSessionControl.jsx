@@ -22,15 +22,23 @@ function formatCurrency(n) {
 export default function TradingSessionControl({ onComplete, onStart }) {
   const [active, setActive] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [summary, setSummary] = useState(null);
+  const [summaryError, setSummaryError] = useState(false);
   const trader = useStartTrader();
 
   const loadStatus = useCallback(async () => {
     try {
       const me = await base44.auth.me();
       setActive(!!me.trading_active);
-    } catch (e) { /* ignore */ }
+      setLoadError(false);
+    } catch (e) {
+      // Show an error state instead of silently defaulting to inactive.
+      // (Fixes Rev.9 defect #10: auth/backend failure was presented as
+      // "Trading Inactive" rather than "Unable to determine trading state".)
+      setLoadError(true);
+    }
     setLoading(false);
   }, []);
 
@@ -53,14 +61,28 @@ export default function TradingSessionControl({ onComplete, onStart }) {
 
   const handleStop = async () => {
     setStopping(true);
+    setSummaryError(false);
+    // Stop trading first — this is the critical action and must not be
+    // blocked by a summary failure.
     try {
       await base44.auth.updateMe({ trading_active: false });
       setActive(false);
-      const res = await base44.functions.invoke('sendDailySummary', {});
-      const data = res?.data || res;
-      if (data?.ok) setSummary(data.summary);
     } catch (e) {
       console.error(e);
+    }
+    // Fetch summary separately so a summary failure doesn't undo the stop.
+    // (Fixes Rev.9 defect #11: stop success + summary failure were combined
+    // into one apparent failure with only a console error.)
+    try {
+      const res = await base44.functions.invoke('sendDailySummary', {});
+      const data = res?.data || res;
+      if (data?.ok) {
+        setSummary(data.summary);
+      } else {
+        setSummaryError(true);
+      }
+    } catch (e) {
+      setSummaryError(true);
     }
     setStopping(false);
   };
@@ -87,12 +109,20 @@ export default function TradingSessionControl({ onComplete, onStart }) {
             )} />
             <div>
               <h3 className="font-semibold text-sm">
-                {active ? 'Autonomous Trading Active' : 'Trading Inactive'}
+                {loadError
+                  ? 'Unable to determine trading state'
+                  : active
+                    ? 'Autonomous Trading Enabled'
+                    : 'Trading Inactive'}
               </h3>
               <p className="text-xs text-muted-foreground">
-                {active
-                  ? 'AI is scanning, buying, selling, and managing risk — check back anytime'
-                  : 'Press Start and the AI trades for you all day. Press Stop for your P&L.'}
+                {loadError
+                  ? 'Check your connection and reload the page'
+                  : active
+                    ? trader.isRunning
+                      ? 'AI is actively scanning and executing trades'
+                      : 'AI will scan every 15 minutes during market hours'
+                    : 'Press Start and the AI trades for you all day. Press Stop for your P&L.'}
               </p>
             </div>
           </div>
@@ -186,6 +216,17 @@ export default function TradingSessionControl({ onComplete, onStart }) {
             </div>
             <p className="text-xs text-muted-foreground mt-3">
               Summary sent to your email{summary && ' and Telegram'}.
+            </p>
+          </motion.div>
+        )}
+        {summaryError && !active && (
+          <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 mt-3"
+          >
+            <p className="text-xs text-amber-500">
+              Trading stopped successfully, but the daily summary failed to generate.
             </p>
           </motion.div>
         )}
