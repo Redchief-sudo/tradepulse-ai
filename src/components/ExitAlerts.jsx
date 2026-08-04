@@ -21,12 +21,18 @@ export default function ExitAlerts({ holdings, onExit }) {
       animate={{ opacity: 1, y: 0 }}
       className="rounded-2xl border border-amber-500/30 bg-amber-500/5 overflow-hidden mb-8"
     >
-      <div className="p-5 border-b border-amber-500/20 flex items-center gap-2">
-        <AlertTriangle className="w-4 h-4 text-amber-400" />
-        <h3 className="font-semibold">Exit Alerts</h3>
-        <span className="text-xs text-amber-400 ml-1">
-          {alerts.length} position{alerts.length > 1 ? 's' : ''} hit exit targets
-        </span>
+      <div className="p-5 border-b border-amber-500/20">
+        <div className="flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 text-amber-400" />
+          <h3 className="font-semibold">Exit Alerts</h3>
+          <span className="text-xs text-amber-400 ml-1">
+            {alerts.length} position{alerts.length > 1 ? 's' : ''} hit exit targets
+          </span>
+        </div>
+        <p className="text-xs text-muted-foreground mt-1.5">
+          The AI auto-exits these every 5 minutes during market hours — no action needed.
+          Use "Execute Exit" only for an immediate manual exit.
+        </p>
       </div>
       <div className="divide-y divide-amber-500/10">
         <AnimatePresence>

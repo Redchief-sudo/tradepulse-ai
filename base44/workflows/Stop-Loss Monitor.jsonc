@@ -1,5 +1,5 @@
 {
-  "description": "Every 5 minutes during US market hours (weekdays 9:00-16:59 ET): refreshes real prices and auto-exits any position down >= the stop-loss threshold. The backend independently verifies the regular session is open before submitting any broker order \u2014 a day order submitted after hours can queue and fill at a gapped next open.",
+  "description": "Every 5 minutes during US market hours (weekdays 9:00-16:59 ET): refreshes real prices and auto-exits any position that hit its stop-loss threshold (downside) OR its target price (take-profit). The backend independently verifies the regular session is open before submitting any broker order \u2014 a day order submitted after hours can queue and fill at a gapped next open.",
   "definition": {
     "document": {
       "dsl": "1.0.0",
@@ -16,8 +16,8 @@
           },
           "then": "end",
           "x-base44": {
-            "title": "Run stop-loss cycle",
-            "description": "Refresh prices & auto-exit triggered positions (market hours only)"
+            "title": "Run position exit cycle",
+            "description": "Refresh prices & auto-exit triggered positions (stop-loss + take-profit, market hours only)"
           }
         }
       }
