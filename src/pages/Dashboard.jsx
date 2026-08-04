@@ -45,6 +45,7 @@ export default function Dashboard() {
   const [trades, setTrades] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [analyticsTrigger, setAnalyticsTrigger] = useState(0);
 
   const loadData = useCallback(async () => {
     try {
@@ -146,7 +147,10 @@ export default function Dashboard() {
   const handleCycleComplete = async () => {
     await loadData();
     await refreshPrices();
+    setAnalyticsTrigger((n) => n + 1);
   };
+
+  const handleStart = () => setAnalyticsTrigger((n) => n + 1);
 
   const addHolding = async (data) => {
     await base44.entities.Holding.create(data);
@@ -246,7 +250,7 @@ export default function Dashboard() {
         </div>
       </div>
 
-      <TradingSessionControl onComplete={handleCycleComplete} />
+      <TradingSessionControl onComplete={handleCycleComplete} onStart={handleStart} />
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4 mb-8">
         <StatCard label="Portfolio Value" value={formatCurrency(totalValue)} icon={Wallet} accent />
@@ -273,11 +277,11 @@ export default function Dashboard() {
 
       <PerformanceAttribution />
 
-      <RiskAnalytics holdings={holdings} />
+      <RiskAnalytics holdings={holdings} autoTriggerKey={analyticsTrigger} />
 
-      <BenchmarkComparison holdings={holdings} />
+      <BenchmarkComparison holdings={holdings} autoTriggerKey={analyticsTrigger} />
 
-      <PortfolioOptimization holdings={holdings} />
+      <PortfolioOptimization holdings={holdings} autoTriggerKey={analyticsTrigger} />
 
       <ExitAlerts holdings={holdings} onExit={handleExitPosition} />
 

@@ -19,7 +19,7 @@ function formatCurrency(n) {
 // Start: activates the AI (trading_active flag) + runs an immediate scan.
 // Stop: deactivates the AI + fetches a daily P&L summary.
 // The scheduled workflows handle everything in between.
-export default function TradingSessionControl({ onComplete }) {
+export default function TradingSessionControl({ onComplete, onStart }) {
   const [active, setActive] = useState(false);
   const [loading, setLoading] = useState(true);
   const [stopping, setStopping] = useState(false);
@@ -43,6 +43,7 @@ export default function TradingSessionControl({ onComplete }) {
     try {
       await base44.auth.updateMe({ trading_active: true });
       setActive(true);
+      if (onStart) onStart();
       // Run an immediate scan so the user doesn't wait for the next scheduled one
       trader.startTrader({ onComplete });
     } catch (e) {

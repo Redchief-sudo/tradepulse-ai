@@ -35,7 +35,7 @@ function StatCard({ label, value, sub, tone }) {
   );
 }
 
-export default function RiskAnalytics({ holdings }) {
+export default function RiskAnalytics({ holdings, autoTriggerKey }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -61,6 +61,11 @@ export default function RiskAnalytics({ holdings }) {
     }
     setLoading(false);
   }, [holdings]);
+
+  useEffect(() => {
+    if (autoTriggerKey > 0) load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoTriggerKey]);
 
   if (!holdings || holdings.length === 0) return null;
 

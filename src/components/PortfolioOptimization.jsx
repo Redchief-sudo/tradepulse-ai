@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { base44 } from '@/api/base44Client';
 import { motion } from 'framer-motion';
 import {
@@ -48,7 +48,7 @@ function ComparisonStat({ label, currentValue, optimalValue, format = 'pct' }) {
   );
 }
 
-export default function PortfolioOptimization({ holdings }) {
+export default function PortfolioOptimization({ holdings, autoTriggerKey }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -69,6 +69,11 @@ export default function PortfolioOptimization({ holdings }) {
     }
     setLoading(false);
   }, [holdings]);
+
+  useEffect(() => {
+    if (autoTriggerKey > 0) load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoTriggerKey]);
 
   if (!holdings || holdings.length < 2) return null;
 

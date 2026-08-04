@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { base44 } from '@/api/base44Client';
 import { motion } from 'framer-motion';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
@@ -32,7 +32,7 @@ function StatPill({ label, value, tone }) {
   );
 }
 
-export default function BenchmarkComparison({ holdings }) {
+export default function BenchmarkComparison({ holdings, autoTriggerKey }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -54,6 +54,11 @@ export default function BenchmarkComparison({ holdings }) {
     }
     setLoading(false);
   }, [holdings]);
+
+  useEffect(() => {
+    if (autoTriggerKey > 0) load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoTriggerKey]);
 
   if (!holdings || holdings.length === 0) return null;
 
