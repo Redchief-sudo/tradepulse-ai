@@ -48,6 +48,14 @@ export default async function(req) {
     const user = await base44.auth.me();
     if (!user || user.role !== 'admin') return Response.json({ error: 'Admin only' }, { status: 403 });
 
+    // AUTONOMY GATE: only trade when the user has activated the session.
+    // The scheduled workflows still call this function, but it no-ops until
+    // the user presses "Start Trading" on the Dashboard. Stop-loss/take-profit
+    // protection (runStopLossCycle) is NOT gated — it always protects positions.
+    if (!user.trading_active) {
+      return Response.json({ ok: true, skipped: true, reason: 'Trading not active — press Start to begin' });
+    }
+
     const sr = base44.asServiceRole;
     const key = secrets.get('FINNHUB_API_KEY');
     // Run-level identifier for stable idempotency keys — all trades in this

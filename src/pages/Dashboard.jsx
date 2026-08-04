@@ -26,9 +26,8 @@ import PortfolioOptimization from '@/components/PortfolioOptimization';
 import BalanceVerification from '@/components/BalanceVerification';
 import ScanRunStatus from '@/components/ScanRunStatus';
 import AssetClassBreakdown from '@/components/AssetClassBreakdown';
-import { useStartTrader } from '@/hooks/useStartTrader';
+import TradingSessionControl from '@/components/TradingSessionControl';
 import { Button } from '@/components/ui/button';
-import { Play, AlertTriangle, CheckCircle2 } from 'lucide-react';
 
 const COLORS = ['#10b981', '#8b5cf6', '#3b82f6', '#f59e0b', '#ec4899', '#06b6d4', '#84cc16', '#f97316'];
 
@@ -46,7 +45,6 @@ export default function Dashboard() {
   const [trades, setTrades] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const trader = useStartTrader();
 
   const loadData = useCallback(async () => {
     try {
@@ -236,17 +234,9 @@ export default function Dashboard() {
         </div>
         <div className="flex gap-2 flex-wrap">
           <Button
-            onClick={() => trader.startTrader({ holdings, tradeProfile: 'balanced', onComplete: handleCycleComplete })}
-            disabled={trader.isRunning}
-            className="gap-2 bg-gradient-to-r from-primary to-accent"
-          >
-            {trader.isRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-            {trader.isRunning ? 'Trading...' : 'Start Trader'}
-          </Button>
-          <Button
             variant="secondary"
             onClick={refreshPrices}
-            disabled={refreshing || holdings.length === 0 || trader.isRunning}
+            disabled={refreshing || holdings.length === 0}
             className="gap-2"
           >
             {refreshing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
@@ -256,69 +246,7 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* Start Trader progress + feedback */}
-      {trader.isRunning && trader.stageLabel && (
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="rounded-2xl border border-accent/30 bg-gradient-to-br from-accent/10 to-primary/5 p-5 mb-6"
-        >
-          <div className="flex items-center gap-3">
-            <Loader2 className="w-5 h-5 animate-spin text-accent" />
-            <div>
-              <h3 className="font-semibold text-sm">{trader.stageLabel}</h3>
-              <p className="text-xs text-muted-foreground">Running full 5-pass AI scan + auto-execution</p>
-            </div>
-          </div>
-        </motion.div>
-      )}
-      {!trader.isRunning && trader.error && (
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="rounded-2xl border border-red-500/30 bg-red-500/10 p-5 mb-6"
-        >
-          <div className="flex items-start gap-3">
-            <AlertTriangle className="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" />
-            <div>
-              <h3 className="font-semibold text-red-500 mb-1">Scan failed</h3>
-              <p className="text-sm text-muted-foreground break-words">{trader.error}</p>
-            </div>
-          </div>
-        </motion.div>
-      )}
-      {!trader.isRunning && trader.result && !trader.error && (
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          className={`rounded-2xl border p-5 mb-6 ${
-            trader.result.executed > 0
-              ? 'border-emerald-500/30 bg-emerald-500/10'
-              : 'border-amber-500/30 bg-amber-500/10'
-          }`}
-        >
-          <div className="flex items-start gap-3">
-            {trader.result.executed > 0 ? (
-              <CheckCircle2 className="w-5 h-5 text-emerald-500 flex-shrink-0 mt-0.5" />
-            ) : (
-              <AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
-            )}
-            <div className="min-w-0">
-              <h3 className={`font-semibold text-sm ${trader.result.executed > 0 ? 'text-emerald-500' : 'text-amber-500'}`}>
-                Cycle complete — {trader.result.executed} trade{trader.result.executed === 1 ? '' : 's'} executed
-              </h3>
-              <p className="text-xs text-muted-foreground">
-                {trader.result.proposals.length} proposal{trader.result.proposals.length === 1 ? '' : 's'} approved by the AI committee.
-              </p>
-              {trader.result.attempted > trader.result.executed && (
-                <p className="text-xs text-amber-500 mt-1">
-                  {trader.result.attempted - trader.result.executed} trade(s) were rejected — likely market closed (US session is 9:30 AM – 4:00 PM ET). Try again during market hours.
-                </p>
-              )}
-            </div>
-          </div>
-        </motion.div>
-      )}
+      <TradingSessionControl onComplete={handleCycleComplete} />
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4 mb-8">
         <StatCard label="Portfolio Value" value={formatCurrency(totalValue)} icon={Wallet} accent />

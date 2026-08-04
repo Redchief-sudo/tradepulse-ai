@@ -1,0 +1,44 @@
+{
+  "description": "At US market close (4:00 PM ET weekdays): sends a daily P&L summary via email and Telegram so you know exactly how much you made today. Runs automatically \u2014 no action needed.",
+  "definition": {
+    "document": {
+      "dsl": "1.0.0",
+      "name": "daily_summary",
+      "version": "1.0",
+      "namespace": "base44"
+    },
+    "do": [
+      {
+        "summary": {
+          "call": "invoke_backend_function",
+          "with": {
+            "function_name": "sendDailySummary"
+          },
+          "then": "end",
+          "x-base44": {
+            "title": "Send daily P&L summary",
+            "description": "Email + Telegram summary of today's performance at market close"
+          }
+        }
+      }
+    ]
+  },
+  "name": "Daily Summary",
+  "trigger": {
+    "condition": null,
+    "config": {
+      "trigger_type": "scheduled",
+      "events": [],
+      "schedule_mode": "recurring",
+      "cron_expression": "0 16 * * 1-5",
+      "one_time_date": null,
+      "timezone": "America/New_York",
+      "interval_value": null,
+      "interval_unit": null,
+      "interval_anchor": null,
+      "ends_type": "never",
+      "ends_on_date": null,
+      "ends_after_count": null
+    }
+  }
+}
