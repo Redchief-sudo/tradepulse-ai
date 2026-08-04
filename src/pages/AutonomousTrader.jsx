@@ -17,6 +17,7 @@ import {
   Cpu,
   Layers,
   Play,
+  AlertTriangle,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import TradePerformance from '@/components/TradePerformance';
@@ -82,6 +83,7 @@ export default function AutonomousTrader() {
   const [assetClasses, setAssetClasses] = useState([]);
   const [mlWeights, setMlWeights] = useState(null);
   const [broker, setBroker] = useState(null);
+  const [scanError, setScanError] = useState(null);
 
   const loadData = useCallback(async () => {
     try {
@@ -122,6 +124,7 @@ export default function AutonomousTrader() {
     setExecutedIds(new Set());
     setMarketRegime(null);
     setVetoedCount(0);
+    setScanError(null);
 
     try {
       setScanStageIndex(0);
@@ -186,6 +189,7 @@ export default function AutonomousTrader() {
       return finalProposals;
     } catch (e) {
       console.error(e);
+      setScanError(e?.message || String(e) || 'Scan failed');
       return [];
     } finally {
       setScanStageIndex(-1);
@@ -329,6 +333,30 @@ export default function AutonomousTrader() {
           </Button>
         </div>
       </div>
+
+      {/* Scan error feedback — surfaces why Start Trader produced nothing */}
+      {!scanning && scanError && (
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="rounded-2xl border border-red-500/30 bg-red-500/10 p-5 mb-6"
+        >
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <h3 className="font-semibold text-red-500 mb-1">Scan failed to complete</h3>
+              <p className="text-sm text-muted-foreground break-words">
+                {scanError}
+              </p>
+              <p className="text-xs text-muted-foreground mt-2">
+                This is usually a credit limit, network, or LLM service issue. Check the browser
+                console for details, then try again. If you just connected Alpaca, the scan runs
+                AI passes first — broker keys are only used when executing the resulting trades.
+              </p>
+            </div>
+          </div>
+        </motion.div>
+      )}
 
       <AssetClassSelector value={assetClasses} onChange={setAssetClasses} />
 
