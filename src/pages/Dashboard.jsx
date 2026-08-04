@@ -200,7 +200,7 @@ export default function Dashboard() {
         <StatCard label="Today's Change" value={formatCurrency(dayPL)} icon={TrendingUp} />
       </div>
 
-      <BalanceVerification holdings={holdings} />
+      <BalanceVerification holdings={holdings} onSynced={loadData} />
 
       <RealDataPipeline />
 

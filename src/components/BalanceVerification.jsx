@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { base44 } from '@/api/base44Client';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ShieldCheck, Loader2, RefreshCw, AlertTriangle, CheckCircle2, XCircle, ArrowRight } from 'lucide-react';
+import { ShieldCheck, Loader2, RefreshCw, AlertTriangle, CheckCircle2, XCircle, ArrowRight, Zap } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
 function formatCurrency(n) {
@@ -13,7 +13,7 @@ function formatCurrency(n) {
   }).format(n || 0);
 }
 
-export default function BalanceVerification({ holdings }) {
+export default function BalanceVerification({ holdings, onSynced }) {
   const [verifying, setVerifying] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
@@ -40,6 +40,8 @@ export default function BalanceVerification({ holdings }) {
       const res = await base44.functions.invoke('syncBrokerPositions', {});
       setResult(res.data || res);
       await loadEvents();
+      // Refresh parent holdings so the dashboard reflects the fixed positions.
+      if (onSynced) await onSynced();
     } catch (e) {
       setError(e.message || 'Verification failed');
     }
@@ -72,14 +74,15 @@ export default function BalanceVerification({ holdings }) {
           variant={verifying ? 'secondary' : 'default'}
           className="gap-2"
         >
-          {verifying ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-          {verifying ? 'Verifying...' : 'Verify Balance'}
+          {verifying ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
+          {verifying ? 'Syncing...' : 'Force Sync & Fix'}
         </Button>
       </div>
 
       <p className="text-sm text-muted-foreground mb-4">
-        Compares your app holdings against your actual Alpaca broker positions. Any quantity or price
-        drift is flagged for review, and externally closed positions are synced automatically.
+        Pulls your live Alpaca positions and forces a full reconciliation — it fixes quantity drift,
+        updates stale prices, imports missing positions, and removes externally closed ones so your
+        portfolio balance matches the broker's records.
       </p>
 
       {/* App-side summary always visible */}
@@ -143,7 +146,7 @@ export default function BalanceVerification({ holdings }) {
               )}
               <div>
                 <div className={`text-sm font-medium ${allMatch ? 'text-emerald-500' : 'text-amber-500'}`}>
-                  {allMatch ? 'All positions match broker' : 'Drift detected — positions adjusted'}
+                  {allMatch ? 'All positions match broker — no fixes needed' : 'Discrepancies found and fixed'}
                 </div>
                 <div className="text-xs text-muted-foreground mt-0.5">
                   {summary.matched || 0} matched · {summary.qty_drift || 0} qty drift ·{' '}
