@@ -177,15 +177,43 @@ export default async function(req) {
               cost_basis_method: 'fifo',
             });
           } else if (diff < 0) {
-            // Broker has less than app — close lots FIFO for the difference at the
-            // broker current price. The exact exit fill should ideally be found via
-            // activities, but qty drift without a discrete close is treated as a
-            // partial reconciliation close at the current broker price.
+            // Broker has less than app — locate the ACTUAL broker sell fill for
+            // the quantity difference. Only close lots at the real exit price.
+            // If no matching fill is found, flag for review — do NOT fabricate
+            // P&L from the current market price. (Fixes Rev.9 defect #6: partial
+            // reconciliation used current_price as exit price, fabricating P&L,
+            // exit price, and outcome attribution.)
+            let partialExitPrice = null;
             try {
-              await closeLotsFifo(sr, user.id, sym, Math.abs(diff), bp.current_price, existing);
+              const sinceDate = new Date(existing.created_date || Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+              const activities = await getAlpacaActivities({ apiKey: cred.api_key, secretKey: cred.api_secret, mode: cred.mode, sinceDate });
+              // Match sell fills for this symbol with the exact quantity difference.
+              // Only auto-settle if there's exactly one match — multiple matches are
+              // ambiguous and flagged for manual review.
+              const sellFills = activities.filter((a) =>
+                String(a.symbol).toUpperCase() === sym &&
+                a.side === 'sell' &&
+                Math.abs(Number(a.qty) - Math.abs(diff)) < 0.0001
+              );
+              if (sellFills.length === 1) {
+                partialExitPrice = Number(sellFills[0].price);
+              }
             } catch (e) {
+              // Activities unreachable — will flag for review below
+            }
+
+            if (partialExitPrice && partialExitPrice > 0) {
+              try {
+                await closeLotsFifo(sr, user.id, sym, Math.abs(diff), partialExitPrice, existing);
+              } catch (e) {
+                blocked.push(sym);
+                events.push({ event_type: 'reconciliation_adjustment', symbol: sym, app_qty: existing.shares, broker_qty: bp.shares, action_taken: 'flagged_for_review_lot_close_failed', details: e.message });
+                continue;
+              }
+            } else {
+              // No authoritative fill found — flag for review, don't fabricate P&L
               blocked.push(sym);
-              events.push({ event_type: 'reconciliation_adjustment', symbol: sym, app_qty: existing.shares, broker_qty: bp.shares, action_taken: 'flagged_for_review_lot_close_failed', details: e.message });
+              events.push({ event_type: 'reconciliation_adjustment', symbol: sym, app_qty: existing.shares, broker_qty: bp.shares, action_taken: 'flagged_for_review_no_exit_fill', details: `Partial qty decrease of ${Math.abs(diff)}: no matching broker sell fill found` });
               continue;
             }
           }

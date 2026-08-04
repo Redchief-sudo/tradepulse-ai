@@ -1,6 +1,7 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { secrets } from 'base44:runtime';
 import { sendTelegramMessage } from '../../shared/telegram.ts';
+import { getAlpacaAccount } from '../../shared/alpaca.ts';
 
 // Sends a daily P&L summary via email + Telegram.
 // Called when the user presses "Stop" or automatically at market close (4 PM ET).
@@ -18,7 +19,11 @@ export default async function(req) {
     const trades = await sr.entities.Trade.filter({ user_id: user.id });
     const scanRuns = await sr.entities.ScanRun.filter({ user_id: user.id });
 
-    // Portfolio metrics
+    // Portfolio metrics — app-portfolio estimate from holdings × current price.
+    // For broker-connected users, also fetch the authoritative broker equity.
+    // (Fixes Rev.9 defect #18: daily summary was calculated only from holdings,
+    // which can diverge from actual broker equity due to stale prices, cash,
+    // fees, and unreconciled fills.)
     const portfolioValue = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
     const costBasis = holdings.reduce((s, h) => s + h.shares * h.avg_price, 0);
     const totalPL = portfolioValue - costBasis;
@@ -26,6 +31,20 @@ export default async function(req) {
     const dayPL = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price) * ((h.day_change_percent || 0) / 100), 0);
     const prevValue = portfolioValue - dayPL;
     const dayPLPct = prevValue > 0 ? (dayPL / prevValue) * 100 : 0;
+
+    // Authoritative broker equity (when available)
+    let brokerEquity = null;
+    let brokerEquityLabel = 'Application portfolio estimate (not reconciled to broker)';
+    const brokerCreds = await sr.entities.BrokerCredential.filter({ user_id: user.id, status: 'active' });
+    if (brokerCreds[0] && brokerCreds[0].broker === 'alpaca') {
+      try {
+        const acct = await getAlpacaAccount({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode });
+        brokerEquity = Number(acct.equity);
+        brokerEquityLabel = 'Broker-authoritative equity (Alpaca)';
+      } catch (e) {
+        brokerEquityLabel = 'Application portfolio estimate (broker unreachable)';
+      }
+    }
 
     // Today's activity
     const todayStart = new Date();
@@ -42,6 +61,8 @@ export default async function(req) {
 
     const summary = {
       portfolioValue,
+      brokerEquity,
+      brokerEquityLabel,
       costBasis,
       totalPL,
       totalPLPct,
@@ -61,7 +82,8 @@ export default async function(req) {
     const emailLines = [
       `TradePulse Daily Summary`,
       `${'='.repeat(40)}`,
-      `Portfolio Value: ${fmt(portfolioValue)}`,
+      brokerEquity != null ? `Broker Equity: ${fmt(brokerEquity)} (${brokerEquityLabel})` : `Portfolio Value: ${fmt(portfolioValue)} (${brokerEquityLabel})`,
+      `App Portfolio Estimate: ${fmt(portfolioValue)}`,
       `Day's P&L: ${dayPL >= 0 ? '+' : ''}${fmt(dayPL)} (${fmtPct(dayPLPct)})`,
       `All-Time P&L: ${totalPL >= 0 ? '+' : ''}${fmt(totalPL)} (${fmtPct(totalPLPct)})`,
       `Trades Today: ${todayTrades.length}`,
@@ -88,7 +110,8 @@ export default async function(req) {
           const tgLines = [
             `📊 <b>TradePulse Daily Summary</b>`,
             `━━━━━━━━━━━━━━━━━━━`,
-            `Portfolio: <b>${fmt(portfolioValue)}</b>`,
+            brokerEquity != null ? `Broker Equity: <b>${fmt(brokerEquity)}</b>` : `Portfolio: <b>${fmt(portfolioValue)}</b>`,
+            `App Estimate: ${fmt(portfolioValue)}`,
             `Day P&L: ${dayPL >= 0 ? '🟢 +' : '🔴 '}${fmt(dayPL)} (${fmtPct(dayPLPct)})`,
             `All-Time: ${totalPL >= 0 ? '+' : ''}${fmt(totalPL)} (${fmtPct(totalPLPct)})`,
             `Trades Today: ${todayTrades.length}`,

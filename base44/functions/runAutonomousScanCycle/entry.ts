@@ -131,6 +131,7 @@ export default async function(req) {
     // a prerequisite — sizing from a stale holdings cache is fail-open behavior.
     const brokerCreds = await sr.entities.BrokerCredential.filter({ user_id: user.id, status: 'active' });
     let accountEquity;
+    let startOfDayEquity = null;
     if (brokerCreds[0] && brokerCreds[0].broker === 'alpaca') {
       try {
         const acct = await getAlpacaAccount({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode });
@@ -139,6 +140,10 @@ export default async function(req) {
           return Response.json({ ok: false, error: 'BROKER_ACCOUNT_UNAVAILABLE: cannot size positions without real account equity' }, { status: 503 });
         }
         accountEquity = Number(acct.equity);
+        // Alpaca's last_equity is the equity at the last market close —
+        // effectively the start-of-day equity. Used for the daily loss
+        // circuit breaker. (Fixes Rev.9 defect #13.)
+        startOfDayEquity = Number(acct.last_equity) || accountEquity;
       } catch (e) {
         await finishRun({ status: 'broker_unavailable', error: `BROKER_UNREACHABLE: ${e.message}`, market_regime: regime.market_regime, model_version: champion?.version || 'default' });
         return Response.json({ ok: false, error: `BROKER_UNREACHABLE: ${e.message}` }, { status: 503 });
@@ -380,19 +385,34 @@ export default async function(req) {
     // Broker account equity was fetched early (before Pass 2) so the AI could
     // size proposals against real capital. accountEquity is already defined.
 
-    // DAILY LOSS CIRCUIT BREAKER — block new buys after 3 losing exits or 2%
-    // portfolio drawdown today. Sells still go through (risk management always runs).
-    // This caps daily losses without reducing aggressiveness on good days.
-    const dayStart = new Date();
-    dayStart.setHours(0, 0, 0, 0);
-    const recentTrades = await sr.entities.Trade.filter({ user_id: user.id });
-    const todayLosses = recentTrades.filter((t) =>
-      t.action === 'sell' && (t.realized_pnl || 0) < 0 && new Date(t.created_date) >= dayStart
-    );
-    const lossCount = todayLosses.length;
-    const totalLossAmount = todayLosses.reduce((s, t) => s + (t.realized_pnl || 0), 0);
-    const dailyLossPct = accountEquity > 0 ? (Math.abs(totalLossAmount) / accountEquity) * 100 : 0;
-    const circuitBreakerTripped = lossCount >= 3 || dailyLossPct >= 2;
+    // DAILY LOSS CIRCUIT BREAKER — for broker-connected users, compare current
+    // broker equity against start-of-day equity (Alpaca's last_equity). This
+    // captures unrealized losses, broker-side trades, and real account-equity
+    // decline — not just app-recorded realized losses. For internal paper mode,
+    // fall back to app-recorded realized losses. Sells always go through.
+    // (Fixes Rev.9 defect #13: daily loss was calculated only from app trade
+    // records, which don't capture unrealized losses or broker-side activity.)
+    let circuitBreakerTripped = false;
+    if (startOfDayEquity && accountEquity) {
+      const equityDeclinePct = startOfDayEquity > 0
+        ? ((startOfDayEquity - accountEquity) / startOfDayEquity) * 100
+        : 0;
+      circuitBreakerTripped = equityDeclinePct >= 2;
+    }
+    if (!circuitBreakerTripped) {
+      // Fallback: app-recorded realized losses (internal paper mode or broker
+      // equity unavailable)
+      const dayStart = new Date();
+      dayStart.setHours(0, 0, 0, 0);
+      const recentTrades = await sr.entities.Trade.filter({ user_id: user.id });
+      const todayLosses = recentTrades.filter((t) =>
+        t.action === 'sell' && (t.realized_pnl || 0) < 0 && new Date(t.created_date) >= dayStart
+      );
+      const lossCount = todayLosses.length;
+      const totalLossAmount = todayLosses.reduce((s, t) => s + (t.realized_pnl || 0), 0);
+      const dailyLossPct = accountEquity > 0 ? (Math.abs(totalLossAmount) / accountEquity) * 100 : 0;
+      circuitBreakerTripped = lossCount >= 3 || dailyLossPct >= 2;
+    }
 
     const proposalsBeforeVeto = proposals.length;
     const executed = [];
