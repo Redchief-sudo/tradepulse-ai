@@ -81,8 +81,8 @@ export default function Dashboard() {
   // Fetches fresh holdings internally (not from closure state) so it works
   // correctly when called as a post-cycle completion callback, when the local
   // holdings state is still stale.
-  const refreshPrices = async () => {
-    setRefreshing(true);
+  const refreshPrices = useCallback(async (silent = false) => {
+    if (!silent) setRefreshing(true);
     try {
       const fresh = await base44.entities.Holding.list();
       if (!fresh || fresh.length === 0) {
@@ -110,8 +110,37 @@ export default function Dashboard() {
     } catch (e) {
       console.error(e);
     }
-    setRefreshing(false);
-  };
+    if (!silent) setRefreshing(false);
+  }, []);
+
+  // Auto-refresh prices every 60s (silent — no spinner flash). Quotes are
+  // fetched and holdings are bulk-updated; the real-time subscription below
+  // patches local state instantly from the update events.
+  useEffect(() => {
+    const priceTimer = setInterval(() => { refreshPrices(true); }, 60000);
+    return () => clearInterval(priceTimer);
+  }, [refreshPrices]);
+
+  // Real-time subscription — patches holdings instantly on create/update/delete
+  // (e.g. when a scan executes a trade or reconciliation adjusts a position),
+  // without waiting for the next poll.
+  useEffect(() => {
+    const unsubscribe = base44.entities.Holding.subscribe((event) => {
+      setHoldings((prev) => {
+        if (event.type === 'create') {
+          return prev.some((h) => h.id === event.data.id) ? prev : [...prev, event.data];
+        }
+        if (event.type === 'update') {
+          return prev.map((h) => (h.id === event.data.id ? { ...h, ...event.data } : h));
+        }
+        if (event.type === 'delete') {
+          return prev.filter((h) => h.id !== event.data.id);
+        }
+        return prev;
+      });
+    });
+    return unsubscribe;
+  }, []);
 
   // Called after a Start Trader cycle completes: reload holdings/trades, then
   // refresh all holding prices so portfolio totals reflect the new state.
