@@ -25,6 +25,7 @@ import BenchmarkComparison from '@/components/BenchmarkComparison';
 import PortfolioOptimization from '@/components/PortfolioOptimization';
 import BalanceVerification from '@/components/BalanceVerification';
 import ScanRunStatus from '@/components/ScanRunStatus';
+import AssetClassBreakdown from '@/components/AssetClassBreakdown';
 import { useStartTrader } from '@/hooks/useStartTrader';
 import { Button } from '@/components/ui/button';
 import { Play, AlertTriangle, CheckCircle2 } from 'lucide-react';
@@ -331,6 +332,8 @@ export default function Dashboard() {
         />
         <StatCard label="Today's Change" value={formatCurrency(dayPL)} icon={TrendingUp} />
       </div>
+
+      <AssetClassBreakdown holdings={holdings} />
 
       <BalanceVerification holdings={holdings} onSynced={loadData} />
 

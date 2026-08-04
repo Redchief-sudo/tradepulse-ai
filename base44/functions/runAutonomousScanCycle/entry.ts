@@ -6,6 +6,7 @@ import { classifyRegimeFromSnapshots } from '../../shared/regime.ts';
 import { netEdge } from '../../shared/costModel.ts';
 import { getChampion } from '../../shared/modelGovernance.ts';
 import { getAlpacaAccount } from '../../shared/alpaca.ts';
+import { fetchCandles as fetchMultiAssetCandles } from '../../shared/marketDataAdapter.ts';
 
 const PROFILES = {
   aggressive: { max_position_pct: 15, max_sector_pct: 40, min_confidence: 70, max_daily_trades: 8, stop_loss_pct: 12 },
@@ -33,19 +34,8 @@ function portfolioContext(holdings) {
   return holdings.map((h) => `${h.symbol} (${h.company_name || h.symbol}, ${h.shares} shares, $${h.avg_price} avg, $${h.current_price || h.avg_price} current, sector: ${h.sector || 'Other'})`).join('\n');
 }
 
-const FINNHUB_CANDLE = 'https://finnhub.io/api/v1/stock/candle';
-async function fetchCandles(symbol, key) {
-  try {
-    const to = Math.floor(Date.now() / 1000);
-    const from = to - 220 * 86400;
-    const res = await fetch(`${FINNHUB_CANDLE}?symbol=${encodeURIComponent(symbol)}&resolution=D&from=${from}&to=${to}&token=${key}`);
-    const d = await res.json();
-    if (!d || d.s !== 'ok' || !d.c || d.c.length < 30) return null;
-    return d.t.map((t, i) => ({ t, open: d.o[i], high: d.h[i], low: d.l[i], close: d.c[i], volume: d.v[i] }));
-  } catch (e) {
-    return null;
-  }
-}
+// Multi-asset candle fetching is handled by marketDataAdapter.ts
+// (stocks via Yahoo Finance, crypto via Coinbase — no key required for either).
 
 // Full 5-pass autonomous AI trading cycle.
 // Uses CHAMPION model weights from the versioned StrategyModel registry.
@@ -122,7 +112,7 @@ export default async function(req) {
 
     // PASS 1 — Multi-asset deep market scan (Gemini 3.1 Pro, web search)
     const p1 = await sr.integrations.Core.InvokeLLM({
-      prompt: `You are AlphaTrade AI. PASS 1 — Multi-asset deep market scan.\nCurrent portfolio:\n${pCtx}\n\nSector exposure:\n${secCtx}\n\nScan today's real-time US equity market and identify 5-7 high-potential candidates. For each: symbol, company_name, sector, current_price, recommendation (STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL), confidence (0-100), target_price, stop_loss, fundamentals (P/E, revenue growth, margins), news_catalysts, and a one-line summary. Flag weak current holdings as sells. Prioritize setups that improve diversification.`,
+      prompt: `You are AlphaTrade AI. PASS 1 — Multi-asset deep market scan.\nCurrent portfolio:\n${pCtx}\n\nSector exposure:\n${secCtx}\n\nScan today's real-time markets across ALL asset classes — US equities, cryptocurrency, forex, commodities, and fixed income — and identify 7-10 high-potential candidates. Use proper symbols for each class (AAPL for stocks, BTC-USD for crypto, EURUSD=X for forex, GC=F for gold futures, TLT for bond ETFs). For each: asset_class (stocks/crypto/forex/commodities/fixed_income), symbol, company_name, sector, current_price, recommendation (STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL), confidence (0-100), target_price, stop_loss, fundamentals (P/E and revenue growth for stocks; on-chain metrics for crypto; interest rate sensitivity for bonds; supply/demand for commodities), news_catalysts, and a one-line summary. Flag weak current holdings as sells. Prioritize setups that improve cross-asset diversification.`,
       add_context_from_internet: true,
       model: 'gemini_3_1_pro',
       response_json_schema: {
@@ -134,7 +124,7 @@ export default async function(req) {
             items: {
               type: 'object',
               properties: {
-                symbol: { type: 'string' }, company_name: { type: 'string' }, sector: { type: 'string' },
+                asset_class: { type: 'string', enum: ['stocks', 'crypto', 'forex', 'commodities', 'fixed_income'] }, symbol: { type: 'string' }, company_name: { type: 'string' }, sector: { type: 'string' },
                 current_price: { type: 'number' }, recommendation: { type: 'string', enum: ['STRONG_BUY', 'BUY', 'HOLD', 'SELL', 'STRONG_SELL'] },
                 confidence: { type: 'number' }, target_price: { type: 'number' }, stop_loss: { type: 'number' },
                 fundamentals: { type: 'string' }, news_catalysts: { type: 'string' }, summary: { type: 'string' },
@@ -153,10 +143,13 @@ export default async function(req) {
 
     // Enrich each candidate with REAL indicators
     const enriched = [];
+    const candleTo = Math.floor(Date.now() / 1000);
+    const candleFrom = candleTo - 220 * 86400;
     for (const c of candidates) {
-      const candles = key ? await fetchCandles(c.symbol, key) : null;
+      const ac = (c.asset_class || 'stocks').toLowerCase();
+      const candles = await fetchMultiAssetCandles(c.symbol, ac, candleFrom, candleTo, key);
       const factors = candles ? computeRealFactors(candles) : null;
-      enriched.push({ ...c, realFactors: factors, realPrice: factors?.price || c.current_price });
+      enriched.push({ ...c, asset_class: ac, realFactors: factors, realPrice: factors?.price || c.current_price });
     }
 
     // PASS 2 — Portfolio fit & risk-aware sizing (Claude Sonnet 5)
@@ -199,6 +192,7 @@ export default async function(req) {
         symbol: e.symbol,
         company_name: e.company_name || e.symbol,
         sector: e.sector || 'Other',
+        asset_class: e.asset_class || 'stocks',
         action: 'buy',
         current_price: price,
         confidence: e.confidence || pp.min_confidence,
@@ -218,6 +212,7 @@ export default async function(req) {
         symbol: e.symbol,
         company_name: e.company_name || e.symbol,
         sector: e.sector || 'Other',
+        asset_class: e.asset_class || 'stocks',
         action: 'sell',
         current_price: e.realPrice || e.current_price || 0,
         confidence: e.confidence || pp.min_confidence,
@@ -343,7 +338,7 @@ export default async function(req) {
       const f = pr.realFactors || {};
       const result = await settleTrade(base44, user, {
         symbol: pr.symbol, action: pr.action, qty: shares, price,
-        company_name: pr.company_name, sector: pr.sector, confidence: pr.confidence,
+        company_name: pr.company_name, sector: pr.sector, asset_class: pr.asset_class || 'stocks', confidence: pr.confidence,
         target_price: pr.target_price, stop_loss: pr.stop_loss, ai_recommended: true,
         source: 'autonomous', reasoning: pr.reasoning, ml_score: pr.ml_score,
         technical_score: f.technical_score, momentum_score: f.momentum_score, risk_score: f.risk_score,
