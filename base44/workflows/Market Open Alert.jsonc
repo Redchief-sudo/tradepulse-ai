@@ -1,0 +1,44 @@
+{
+  "name": "Market Open Alert",
+  "description": "Sends a Telegram notification with portfolio summary at US market open (9:30 AM ET / 6:30 AM Pacific, weekdays).",
+  "definition": {
+    "document": {
+      "dsl": "1.0.0",
+      "name": "market_open_alert",
+      "version": "1.0",
+      "namespace": "base44"
+    },
+    "do": [
+      {
+        "send_alert": {
+          "call": "invoke_backend_function",
+          "with": {
+            "function_name": "sendMarketOpenAlert"
+          },
+          "then": "end",
+          "x-base44": {
+            "title": "Send market open alert",
+            "description": "Telegram notification at 9:30 AM ET"
+          }
+        }
+      }
+    ]
+  },
+  "trigger": {
+    "condition": null,
+    "config": {
+      "trigger_type": "scheduled",
+      "events": [],
+      "schedule_mode": "recurring",
+      "cron_expression": "30 6 * * 1-5",
+      "one_time_date": null,
+      "timezone": "America/Los_Angeles",
+      "interval_value": null,
+      "interval_unit": null,
+      "interval_anchor": null,
+      "ends_type": "never",
+      "ends_on_date": null,
+      "ends_after_count": null
+    }
+  }
+}
