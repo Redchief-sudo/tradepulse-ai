@@ -48,12 +48,36 @@ export default async function(req) {
       }));
     if (updates.length) await sr.entities.Holding.bulkUpdate(updates);
 
-    // Detect triggered positions — both stop-loss AND take-profit
+    // TRAILING STOP — ratchet the stop_loss up as a position gains, locking in
+    // profits so a winner never turns into a loser. Only moves the stop UP.
+    //   +5% gain → stop to breakeven (no loss)
+    //  +10% gain → stop to +5% (lock in 5%)
+    //  +15% gain → stop to +10% (lock in 10%)
+    const trailingUpdates = [];
+    for (const h of holdings) {
+      const live = priceMap[h.symbol] || h.current_price || h.avg_price;
+      const gainPct = h.avg_price > 0 ? ((live - h.avg_price) / h.avg_price) * 100 : 0;
+      if (gainPct < 5) continue;
+      let trailStop = h.stop_loss || 0;
+      if (gainPct >= 15) trailStop = Math.max(trailStop, h.avg_price * 1.10);
+      else if (gainPct >= 10) trailStop = Math.max(trailStop, h.avg_price * 1.05);
+      else if (gainPct >= 5) trailStop = Math.max(trailStop, h.avg_price * 1.00);
+      trailStop = Math.round(trailStop * 100) / 100;
+      if (trailStop > (h.stop_loss || 0)) {
+        trailingUpdates.push({ id: h.id, stop_loss: trailStop });
+        h.stop_loss = trailStop; // update in-memory for trigger detection below
+      }
+    }
+    if (trailingUpdates.length) await sr.entities.Holding.bulkUpdate(trailingUpdates);
+
+    // Detect triggered positions — both stop-loss AND take-profit.
+    // Uses the ATR-based stop_loss/target_price stored on the Holding (set by the
+    // scan cycle), falling back to the fixed % threshold if not set.
     const triggered = holdings.filter((h) => {
       const live = priceMap[h.symbol] || h.current_price || h.avg_price;
       const drop = h.avg_price > 0 ? ((h.avg_price - live) / h.avg_price) * 100 : 0;
       const hitTarget = h.target_price && live > 0 && live >= h.target_price;
-      const hitStop = drop >= stopThreshold;
+      const hitStop = h.stop_loss > 0 ? live <= h.stop_loss : drop >= stopThreshold;
       return hitStop || hitTarget;
     });
 
@@ -71,7 +95,9 @@ export default async function(req) {
       const isTakeProfit = h.target_price && live >= h.target_price;
       const exitReason = isTakeProfit
         ? `take-profit @ +${gainPct.toFixed(1)}% (target $${h.target_price})`
-        : `stop-loss @ -${dropPct.toFixed(1)}% (threshold ${stopThreshold}%)`;
+        : h.stop_loss > 0
+          ? `stop-loss @ $${h.stop_loss} (price $${live.toFixed(2)}, ${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(1)}%)`
+          : `stop-loss @ -${dropPct.toFixed(1)}% (threshold ${stopThreshold}%)`;
 
       if (!marketOpen) {
         results.push({ symbol: h.symbol, shares: h.shares, price: live, dropPct, gainPct, exitReason, skipped: true, reason: `MARKET_CLOSED (${session})` });

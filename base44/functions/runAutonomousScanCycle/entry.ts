@@ -185,6 +185,15 @@ export default async function(req) {
     const heldSymbols = new Set(holdings.map((h) => h.symbol.toUpperCase()));
     const buyCandidates = enriched
       .filter((e) => ['STRONG_BUY', 'BUY'].includes(e.recommendation) && (e.confidence || 0) >= pp.min_confidence)
+      .filter((e) => {
+        const f = e.realFactors;
+        if (!f) return true;
+        // SMARTER ENTRIES — don't chase overbought or overextended stocks
+        if (f.rsi != null && f.rsi > 72) return false;              // RSI > 72 = overbought, wait for pullback
+        if (f.ma50 != null && f.price > f.ma50 * 1.07) return false; // > 7% above SMA50 = chasing
+        if (f.technical_score < 52) return false;                    // require technical confirmation
+        return true;
+      })
       .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
     const sellCandidates = enriched
       .filter((e) => ['STRONG_SELL', 'SELL'].includes(e.recommendation) && heldSymbols.has(String(e.symbol).toUpperCase()));
@@ -197,6 +206,16 @@ export default async function(req) {
       // Confidence-weighted position sizing: scale from 50% to 100% of max
       // position pct based on confidence (min_confidence → 50%, 100% → 100%).
       const confRatio = Math.min(1, Math.max(0.5, (e.confidence || pp.min_confidence) / 100));
+      // ATR-based risk levels — adapt to each stock's actual volatility.
+      // Stop = 1.5x ATR below entry (tighter in calm markets, wider in volatile ones).
+      // Target = 2.5x ATR above entry (realistic take-profit based on volatility).
+      const atrVal = e.realFactors?.atr;
+      const stopLoss = (atrVal && atrVal > 0)
+        ? Math.round((price - 1.5 * atrVal) * 100) / 100
+        : (e.stop_loss || price * (1 - pp.stop_loss_pct / 100));
+      const targetPrice = (atrVal && atrVal > 0)
+        ? Math.round((price + 2.5 * atrVal) * 100) / 100
+        : (e.target_price || price * 1.15);
       proposals.push({
         symbol: e.symbol,
         company_name: e.company_name || e.symbol,
@@ -205,8 +224,8 @@ export default async function(req) {
         action: 'buy',
         current_price: price,
         confidence: e.confidence || pp.min_confidence,
-        target_price: e.target_price || price * 1.15,
-        stop_loss: e.stop_loss || price * (1 - pp.stop_loss_pct / 100),
+        target_price: targetPrice,
+        stop_loss: stopLoss,
         suggested_position_pct: Math.round(pp.max_position_pct * confRatio * 10) / 10,
         reasoning: e.summary || `${e.symbol} buy signal at ${e.confidence}% confidence`,
         realFactors: e.realFactors,
@@ -322,10 +341,26 @@ export default async function(req) {
     // Broker account equity was fetched early (before Pass 2) so the AI could
     // size proposals against real capital. accountEquity is already defined.
 
+    // DAILY LOSS CIRCUIT BREAKER — block new buys after 3 losing exits or 2%
+    // portfolio drawdown today. Sells still go through (risk management always runs).
+    // This caps daily losses without reducing aggressiveness on good days.
+    const dayStart = new Date();
+    dayStart.setHours(0, 0, 0, 0);
+    const recentTrades = await sr.entities.Trade.filter({ user_id: user.id });
+    const todayLosses = recentTrades.filter((t) =>
+      t.action === 'sell' && (t.realized_pnl || 0) < 0 && new Date(t.created_date) >= dayStart
+    );
+    const lossCount = todayLosses.length;
+    const totalLossAmount = todayLosses.reduce((s, t) => s + (t.realized_pnl || 0), 0);
+    const dailyLossPct = accountEquity > 0 ? (Math.abs(totalLossAmount) / accountEquity) * 100 : 0;
+    const circuitBreakerTripped = lossCount >= 3 || dailyLossPct >= 2;
+
     const proposalsBeforeVeto = proposals.length;
     const executed = [];
     let tradesRejected = 0;
     for (const pr of approved) {
+      // Circuit breaker — block new buys, allow sells (risk management always runs)
+      if (pr.action === 'buy' && circuitBreakerTripped) continue;
       const price = pr.realPrice || pr.current_price;
       let shares;
       if (pr.action === 'buy') {
