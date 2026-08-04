@@ -92,6 +92,30 @@ export default async function(req) {
     const champion = await getChampion(sr, user.id, regime.market_regime);
     const weights = champion?.weights || user.ml_weights || { technical: 25, fundamental: 25, sentiment: 20, momentum: 15, risk: 15 };
 
+    // Authoritative capital base: fetch broker account equity EARLY so the AI
+    // passes (especially Pass 2 portfolio fit) can size proposals against real
+    // capital, not a stale holdings-derived value ($0 when the portfolio is
+    // empty). FAIL-CLOSED: for broker-connected users, real account equity is
+    // a prerequisite — sizing from a stale holdings cache is fail-open behavior.
+    const brokerCreds = await sr.entities.BrokerCredential.filter({ user_id: user.id, status: 'active' });
+    let accountEquity;
+    if (brokerCreds[0] && brokerCreds[0].broker === 'alpaca') {
+      try {
+        const acct = await getAlpacaAccount({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode });
+        if (!acct || Number(acct.equity) <= 0) {
+          await finishRun({ status: 'broker_unavailable', error: 'BROKER_ACCOUNT_UNAVAILABLE', market_regime: regime.market_regime, model_version: champion?.version || 'default' });
+          return Response.json({ ok: false, error: 'BROKER_ACCOUNT_UNAVAILABLE: cannot size positions without real account equity' }, { status: 503 });
+        }
+        accountEquity = Number(acct.equity);
+      } catch (e) {
+        await finishRun({ status: 'broker_unavailable', error: `BROKER_UNREACHABLE: ${e.message}`, market_regime: regime.market_regime, model_version: champion?.version || 'default' });
+        return Response.json({ ok: false, error: `BROKER_UNREACHABLE: ${e.message}` }, { status: 503 });
+      }
+    } else {
+      // No broker connected — internal_paper mode, use holdings-based equity.
+      accountEquity = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
+    }
+
     const pCtx = portfolioContext(holdings);
     const sec = sectorExposure(holdings);
     const secCtx = sec.sectors.length ? sec.sectors.map((s) => `${s.sector}: ${s.percent.toFixed(1)}% ($${s.value.toFixed(0)})`).join(', ') : 'No sector exposure yet.';
@@ -136,30 +160,75 @@ export default async function(req) {
     }
 
     // PASS 2 — Portfolio fit & risk-aware sizing (Claude Sonnet 5)
+    // The LLM provides a risk assessment; proposals are constructed DETERMINISTICALLY
+    // from the Pass 1 candidates. The LLM's structured-array output is unreliable
+    // (it consistently returns empty arrays for nested object arrays), so we build
+    // proposals from candidate data directly — the candidates already carry
+    // confidence, target_price, stop_loss, and recommendation from Pass 1.
     const p2 = await sr.integrations.Core.InvokeLLM({
       model: 'claude-sonnet-5',
-      prompt: `You are AlphaTrade AI. PASS 2 — Portfolio fit & risk-aware selection.\nCurrent portfolio:\n${pCtx}\n\nSector exposure:\n${secCtx}\nTotal value: $${sec.total.toFixed(0)}\n\nCandidates (with REAL computed indicators where available):\n${JSON.stringify(enriched.map((e) => ({ symbol: e.symbol, sector: e.sector, current_price: e.realPrice, recommendation: e.recommendation, confidence: e.confidence, target_price: e.target_price, stop_loss: e.stop_loss, rsi: e.realFactors?.rsi, macd_hist: e.realFactors?.macd?.histogram, ma50: e.realFactors?.ma50, ma200: e.realFactors?.ma200, technical_score: e.realFactors?.technical_score, momentum_score: e.realFactors?.momentum_score, risk_score: e.realFactors?.risk_score, summary: e.summary })), null, 2)}\n\nSelect the best trades to execute NOW. Risk limits: max position ${pp.max_position_pct}% of portfolio, max sector ${pp.max_sector_pct}%, min confidence ${pp.min_confidence}%, max ${pp.max_daily_trades} trades, stop-loss ${pp.stop_loss_pct}% below entry. For each proposal: symbol, company_name, sector, action (buy/sell), current_price (use the real price), confidence, target_price, stop_loss, suggested_position_pct (0-${pp.max_position_pct}), reasoning. Only sell stocks currently held. Do not exceed ${pp.max_daily_trades} trades.`,
+      prompt: `You are AlphaTrade AI. PASS 2 — Portfolio fit & risk assessment.\nCurrent portfolio:\n${pCtx}\n\nSector exposure:\n${secCtx}\nTotal portfolio value: $${accountEquity.toFixed(0)} (available capital)\n\nCandidates:\n${JSON.stringify(enriched.map((e) => ({ symbol: e.symbol, sector: e.sector, current_price: e.realPrice, recommendation: e.recommendation, confidence: e.confidence, summary: e.summary })), null, 2)}\n\nProvide a BRIEF risk assessment (2-3 sentences) of these candidates for a ${user.trade_profile || 'balanced'} risk profile. Which are strongest? Any concentration or correlation concerns?`,
       response_json_schema: {
         type: 'object',
         properties: {
           risk_assessment: { type: 'string' },
-          proposals: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                symbol: { type: 'string' }, company_name: { type: 'string' }, sector: { type: 'string' },
-                action: { type: 'string', enum: ['buy', 'sell'] }, current_price: { type: 'number' },
-                confidence: { type: 'number' }, target_price: { type: 'number' }, stop_loss: { type: 'number' },
-                suggested_position_pct: { type: 'number' }, reasoning: { type: 'string' },
-              },
-            },
-          },
         },
-        required: ['risk_assessment', 'proposals'],
+        required: ['risk_assessment'],
       },
     });
-    let proposals = (p2.proposals || []).filter((pr) => (pr.confidence || 0) >= pp.min_confidence).slice(0, pp.max_daily_trades);
+
+    // Construct proposals deterministically from candidates.
+    // BUY candidates: STRONG_BUY/BUY with confidence >= min_confidence, sorted by confidence.
+    // SELL candidates: SELL/STRONG_SELL for symbols currently held.
+    const heldSymbols = new Set(holdings.map((h) => h.symbol.toUpperCase()));
+    const buyCandidates = enriched
+      .filter((e) => ['STRONG_BUY', 'BUY'].includes(e.recommendation) && (e.confidence || 0) >= pp.min_confidence)
+      .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+    const sellCandidates = enriched
+      .filter((e) => ['STRONG_SELL', 'SELL'].includes(e.recommendation) && heldSymbols.has(String(e.symbol).toUpperCase()));
+
+    let proposals = [];
+    for (const e of buyCandidates) {
+      if (proposals.length >= pp.max_daily_trades) break;
+      const price = e.realPrice || e.current_price || 0;
+      if (price <= 0) continue;
+      // Confidence-weighted position sizing: scale from 50% to 100% of max
+      // position pct based on confidence (min_confidence → 50%, 100% → 100%).
+      const confRatio = Math.min(1, Math.max(0.5, (e.confidence || pp.min_confidence) / 100));
+      proposals.push({
+        symbol: e.symbol,
+        company_name: e.company_name || e.symbol,
+        sector: e.sector || 'Other',
+        action: 'buy',
+        current_price: price,
+        confidence: e.confidence || pp.min_confidence,
+        target_price: e.target_price || price * 1.15,
+        stop_loss: e.stop_loss || price * (1 - pp.stop_loss_pct / 100),
+        suggested_position_pct: Math.round(pp.max_position_pct * confRatio * 10) / 10,
+        reasoning: e.summary || `${e.symbol} buy signal at ${e.confidence}% confidence`,
+        realFactors: e.realFactors,
+        realPrice: e.realPrice,
+      });
+    }
+    for (const e of sellCandidates) {
+      if (proposals.length >= pp.max_daily_trades) break;
+      const existing = holdings.find((h) => h.symbol === e.symbol);
+      if (!existing) continue;
+      proposals.push({
+        symbol: e.symbol,
+        company_name: e.company_name || e.symbol,
+        sector: e.sector || 'Other',
+        action: 'sell',
+        current_price: e.realPrice || e.current_price || 0,
+        confidence: e.confidence || pp.min_confidence,
+        target_price: e.target_price,
+        stop_loss: e.stop_loss,
+        suggested_position_pct: 0,
+        reasoning: e.summary || `${e.symbol} sell signal`,
+        realFactors: e.realFactors,
+        realPrice: e.realPrice,
+      });
+    }
 
     // PASS 3a — Investment Committee Debate
     if (proposals.length) {
@@ -246,29 +315,8 @@ export default async function(req) {
       approved = approved.filter((p) => (crMap[p.symbol.toUpperCase()] || 0) < 80);
     }
 
-    // Authoritative capital base: use broker account equity when connected.
-    // Credentials are read from the secure BrokerCredential entity, NOT the User object.
-    // FAIL-CLOSED: for broker-connected users, real account equity is a prerequisite.
-    // If the broker account is unreachable, the cycle must NOT proceed with buy orders
-    // — sizing from a stale holdings-derived capital base is fail-open behavior.
-    const brokerCreds = await sr.entities.BrokerCredential.filter({ user_id: user.id, status: 'active' });
-    let accountEquity;
-    if (brokerCreds[0] && brokerCreds[0].broker === 'alpaca') {
-      try {
-        const acct = await getAlpacaAccount({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode });
-        if (!acct || Number(acct.equity) <= 0) {
-          await finishRun({ status: 'broker_unavailable', error: 'BROKER_ACCOUNT_UNAVAILABLE', market_regime: regime.market_regime, model_version: champion?.version || 'default', candidates_found: candidates.length, proposals_created: proposals.length });
-          return Response.json({ ok: false, error: 'BROKER_ACCOUNT_UNAVAILABLE: cannot size positions without real account equity' }, { status: 503 });
-        }
-        accountEquity = Number(acct.equity);
-      } catch (e) {
-        await finishRun({ status: 'broker_unavailable', error: `BROKER_UNREACHABLE: ${e.message}`, market_regime: regime.market_regime, model_version: champion?.version || 'default', candidates_found: candidates.length, proposals_created: proposals.length });
-        return Response.json({ ok: false, error: `BROKER_UNREACHABLE: ${e.message}` }, { status: 503 });
-      }
-    } else {
-      // No broker connected — internal_paper mode, use holdings-based equity.
-      accountEquity = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
-    }
+    // Broker account equity was fetched early (before Pass 2) so the AI could
+    // size proposals against real capital. accountEquity is already defined.
 
     const proposalsBeforeVeto = proposals.length;
     const executed = [];
@@ -348,7 +396,7 @@ export default async function(req) {
       regime,
       champion_version: champion?.version || 'default',
       candidates_scanned: candidates.length,
-      proposals_after_fit: (p2.proposals || []).length,
+      proposals_after_fit: proposals.length,
       proposals_after_committee: proposals.length,
       proposals_after_veto: approved.length,
       executed,

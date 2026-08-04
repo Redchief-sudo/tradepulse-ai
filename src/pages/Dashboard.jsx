@@ -290,17 +290,30 @@ export default function Dashboard() {
         <motion.div
           initial={{ opacity: 0, y: 10 }}
           animate={{ opacity: 1, y: 0 }}
-          className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-5 mb-6"
+          className={`rounded-2xl border p-5 mb-6 ${
+            trader.result.executed > 0
+              ? 'border-emerald-500/30 bg-emerald-500/10'
+              : 'border-amber-500/30 bg-amber-500/10'
+          }`}
         >
-          <div className="flex items-center gap-3">
-            <CheckCircle2 className="w-5 h-5 text-emerald-500 flex-shrink-0" />
-            <div>
-              <h3 className="font-semibold text-emerald-500 text-sm">
+          <div className="flex items-start gap-3">
+            {trader.result.executed > 0 ? (
+              <CheckCircle2 className="w-5 h-5 text-emerald-500 flex-shrink-0 mt-0.5" />
+            ) : (
+              <AlertTriangle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
+            )}
+            <div className="min-w-0">
+              <h3 className={`font-semibold text-sm ${trader.result.executed > 0 ? 'text-emerald-500' : 'text-amber-500'}`}>
                 Cycle complete — {trader.result.executed} trade{trader.result.executed === 1 ? '' : 's'} executed
               </h3>
               <p className="text-xs text-muted-foreground">
                 {trader.result.proposals.length} proposal{trader.result.proposals.length === 1 ? '' : 's'} approved by the AI committee.
               </p>
+              {trader.result.attempted > trader.result.executed && (
+                <p className="text-xs text-amber-500 mt-1">
+                  {trader.result.attempted - trader.result.executed} trade(s) were rejected — likely market closed (US session is 9:30 AM – 4:00 PM ET). Try again during market hours.
+                </p>
+              )}
             </div>
           </div>
         </motion.div>
