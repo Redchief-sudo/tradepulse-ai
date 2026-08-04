@@ -1,0 +1,44 @@
+{
+  "name": "Intraday AI Scan",
+  "description": "Every 15 minutes during US market hours (6:30 AM\u20131:00 PM Pacific, weekdays): runs the full 5-pass AI scan cycle and auto-executes approved trades. The backend function's per-hour idempotency key prevents duplicate orders across scans within the same hour.",
+  "definition": {
+    "document": {
+      "dsl": "1.0.0",
+      "name": "intraday_ai_scan",
+      "version": "1.0",
+      "namespace": "base44"
+    },
+    "do": [
+      {
+        "scan": {
+          "call": "invoke_backend_function",
+          "with": {
+            "function_name": "runAutonomousScanCycle"
+          },
+          "then": "end",
+          "x-base44": {
+            "title": "Run intraday AI scan",
+            "description": "5-pass scan + auto-execute during market hours"
+          }
+        }
+      }
+    ]
+  },
+  "trigger": {
+    "condition": null,
+    "config": {
+      "trigger_type": "scheduled",
+      "events": [],
+      "schedule_mode": "recurring",
+      "cron_expression": "*/15 6-13 * * 1-5",
+      "one_time_date": null,
+      "timezone": "America/Los_Angeles",
+      "interval_value": null,
+      "interval_unit": null,
+      "interval_anchor": null,
+      "ends_type": "never",
+      "ends_on_date": null,
+      "ends_after_count": null
+    }
+  }
+}

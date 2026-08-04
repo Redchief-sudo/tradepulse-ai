@@ -66,6 +66,20 @@ export default async function(req) {
     // across workflow retries. Different hours get different IDs.
     const now = new Date();
     const runId = `scan-${now.getUTCFullYear()}${String(now.getUTCMonth()+1).padStart(2,'0')}${String(now.getUTCDate()).padStart(2,'0')}-${String(now.getUTCHours()).padStart(2,'0')}`;
+    // Persist an authoritative ScanRun record so the Dashboard can display
+    // scan state from durable data rather than transient page state.
+    const scanRun = await sr.entities.ScanRun.create({
+      user_id: user.id,
+      scan_run_id: runId,
+      started_at: now.toISOString(),
+      trigger_source: 'scheduled',
+      status: 'running',
+      candidates_found: 0, proposals_created: 0, proposals_vetoed: 0,
+      trades_attempted: 0, trades_filled: 0, trades_rejected: 0,
+    });
+    const finishRun = async (patch) => {
+      try { await sr.entities.ScanRun.update(scanRun.id, { completed_at: new Date().toISOString(), ...patch }); } catch (e) {}
+    };
     // USER-SCOPED: only this user's holdings
     const holdings = await sr.entities.Holding.filter({ user_id: user.id });
     const pp = profileParams(user.trade_profile || 'balanced');
@@ -108,7 +122,10 @@ export default async function(req) {
       },
     });
     const candidates = p1.candidates || [];
-    if (!candidates.length) return Response.json({ ok: true, message: 'No candidates', market_summary: p1.market_summary, champion_version: champion?.version });
+    if (!candidates.length) {
+      await finishRun({ status: 'no_candidates', market_summary: p1.market_summary, market_regime: regime.market_regime, model_version: champion?.version || 'default' });
+      return Response.json({ ok: true, message: 'No candidates', market_summary: p1.market_summary, champion_version: champion?.version });
+    }
 
     // Enrich each candidate with REAL indicators
     const enriched = [];
@@ -240,10 +257,12 @@ export default async function(req) {
       try {
         const acct = await getAlpacaAccount({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode });
         if (!acct || Number(acct.equity) <= 0) {
+          await finishRun({ status: 'broker_unavailable', error: 'BROKER_ACCOUNT_UNAVAILABLE', market_regime: regime.market_regime, model_version: champion?.version || 'default', candidates_found: candidates.length, proposals_created: proposals.length });
           return Response.json({ ok: false, error: 'BROKER_ACCOUNT_UNAVAILABLE: cannot size positions without real account equity' }, { status: 503 });
         }
         accountEquity = Number(acct.equity);
       } catch (e) {
+        await finishRun({ status: 'broker_unavailable', error: `BROKER_UNREACHABLE: ${e.message}`, market_regime: regime.market_regime, model_version: champion?.version || 'default', candidates_found: candidates.length, proposals_created: proposals.length });
         return Response.json({ ok: false, error: `BROKER_UNREACHABLE: ${e.message}` }, { status: 503 });
       }
     } else {
@@ -251,7 +270,9 @@ export default async function(req) {
       accountEquity = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
     }
 
+    const proposalsBeforeVeto = proposals.length;
     const executed = [];
+    let tradesRejected = 0;
     for (const pr of approved) {
       const price = pr.realPrice || pr.current_price;
       let shares;
@@ -286,6 +307,8 @@ export default async function(req) {
         idempotency_key: `autonomous-${runId}-${pr.symbol}-${pr.action}`,
         signal_timestamp: new Date().toISOString(),
       });
+      const rStatus = result?.status || result?.settlement?.status;
+      if (rStatus === 'rejected' || rStatus === 'failed' || rStatus === 'canceled') tradesRejected++;
       executed.push({ symbol: pr.symbol, action: pr.action, qty: shares, price, ml_score: pr.ml_score, settlement: result });
     }
 
@@ -304,6 +327,19 @@ export default async function(req) {
       } catch (e) {}
     }
 
+    await finishRun({
+      status: 'completed',
+      market_summary: p1.market_summary,
+      market_regime: regime.market_regime,
+      model_version: champion?.version || 'default',
+      candidates_found: candidates.length,
+      proposals_created: proposalsBeforeVeto,
+      proposals_vetoed: Math.max(0, proposalsBeforeVeto - approved.length),
+      trades_attempted: executed.length,
+      trades_filled: executed.length - tradesRejected,
+      trades_rejected: tradesRejected,
+    });
+
     return Response.json({
       ok: true,
       market_summary: p1.market_summary,
@@ -318,6 +354,7 @@ export default async function(req) {
       ml_weights: weights,
     });
   } catch (error) {
+    try { await finishRun({ status: 'failed', error: error.message }); } catch (e) {}
     return Response.json({ error: error.message }, { status: 500 });
   }
 }

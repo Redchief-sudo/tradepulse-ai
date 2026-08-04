@@ -32,7 +32,7 @@ export function useStartTrader() {
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
 
-  const startTrader = useCallback(async ({ holdings, assetClasses, tradeProfile, mlWeights }) => {
+  const startTrader = useCallback(async ({ holdings, assetClasses, tradeProfile, mlWeights, onComplete }) => {
     setIsRunning(true);
     setError(null);
     setResult(null);
@@ -149,6 +149,9 @@ export function useStartTrader() {
 
       setStageIndex(-1);
       setResult({ proposals: finalProposals, executed, marketSummary: p1.market_summary });
+      if (onComplete) {
+        try { await onComplete({ proposals: finalProposals, executed }); } catch (e) { console.error(e); }
+      }
       return { proposals: finalProposals, executed };
     } catch (e) {
       console.error(e);

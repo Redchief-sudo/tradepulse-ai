@@ -24,6 +24,7 @@ import RiskAnalytics from '@/components/RiskAnalytics';
 import BenchmarkComparison from '@/components/BenchmarkComparison';
 import PortfolioOptimization from '@/components/PortfolioOptimization';
 import BalanceVerification from '@/components/BalanceVerification';
+import ScanRunStatus from '@/components/ScanRunStatus';
 import { useStartTrader } from '@/hooks/useStartTrader';
 import { Button } from '@/components/ui/button';
 import { Play, AlertTriangle, CheckCircle2 } from 'lucide-react';
@@ -62,20 +63,40 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadData();
+    // Poll every 45s so the Dashboard reflects scheduled scans and broker
+    // reconciliation that happen while the page is open.
+    const timer = setInterval(loadData, 45000);
+    // Refresh when the tab becomes visible again (covers scheduled scans
+    // that ran while the user was away).
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') loadData();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [loadData]);
 
+  // Fetches fresh holdings internally (not from closure state) so it works
+  // correctly when called as a post-cycle completion callback, when the local
+  // holdings state is still stale.
   const refreshPrices = async () => {
-    if (holdings.length === 0) return;
     setRefreshing(true);
     try {
-      const symbols = holdings.map((h) => h.symbol);
+      const fresh = await base44.entities.Holding.list();
+      if (!fresh || fresh.length === 0) {
+        setRefreshing(false);
+        return;
+      }
+      const symbols = fresh.map((h) => h.symbol);
       const result = await base44.functions.invoke('marketData', { symbols });
       const quotes = (result.data?.quotes || []).filter((q) => !q.error);
       const stockData = quotes.reduce((acc, q) => {
         acc[q.symbol.toUpperCase()] = q;
         return acc;
       }, {});
-      const updates = holdings
+      const updates = fresh
         .filter((h) => stockData[h.symbol])
         .map((h) => ({
           id: h.id,
@@ -84,12 +105,19 @@ export default function Dashboard() {
         }));
       if (updates.length > 0) {
         await base44.entities.Holding.bulkUpdate(updates);
-        await loadData();
       }
+      await loadData();
     } catch (e) {
       console.error(e);
     }
     setRefreshing(false);
+  };
+
+  // Called after a Start Trader cycle completes: reload holdings/trades, then
+  // refresh all holding prices so portfolio totals reflect the new state.
+  const handleCycleComplete = async () => {
+    await loadData();
+    await refreshPrices();
   };
 
   const addHolding = async (data) => {
@@ -178,7 +206,7 @@ export default function Dashboard() {
         </div>
         <div className="flex gap-2 flex-wrap">
           <Button
-            onClick={() => trader.startTrader({ holdings, tradeProfile: 'balanced' })}
+            onClick={() => trader.startTrader({ holdings, tradeProfile: 'balanced', onComplete: handleCycleComplete })}
             disabled={trader.isRunning}
             className="gap-2 bg-gradient-to-r from-primary to-accent"
           >
@@ -264,6 +292,8 @@ export default function Dashboard() {
 
       <BalanceVerification holdings={holdings} onSynced={loadData} />
 
+      <ScanRunStatus />
+
       <RealDataPipeline />
 
       <RealPnlChart />
@@ -299,10 +329,14 @@ export default function Dashboard() {
               animate={{ opacity: 1, y: 0 }}
               className="lg:col-span-2 rounded-2xl border border-border bg-card p-5"
             >
-              <h3 className="font-semibold mb-4 flex items-center gap-2">
+              <h3 className="font-semibold mb-1 flex items-center gap-2">
                 <TrendingUp className="w-4 h-4 text-primary" />
                 Portfolio Performance
               </h3>
+              <p className="text-xs text-muted-foreground mb-3">
+                Projected trend (interpolated from cost basis to current value) —
+                not actual historical equity. Daily snapshots are not yet recorded.
+              </p>
               <ResponsiveContainer width="100%" height={250}>
                 <AreaChart data={perfData}>
                   <defs>

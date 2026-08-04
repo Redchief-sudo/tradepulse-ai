@@ -1,0 +1,119 @@
+{
+  "name": "ScanRun",
+  "type": "object",
+  "properties": {
+    "user_id": {
+      "type": "string",
+      "description": "Owner user id \u2014 every query must filter by this"
+    },
+    "scan_run_id": {
+      "type": "string",
+      "description": "Canonical scan-cycle identifier (stable across retries)"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "completed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "trigger_source": {
+      "type": "string",
+      "enum": [
+        "scheduled",
+        "dashboard",
+        "autonomous_page",
+        "manual"
+      ],
+      "default": "scheduled"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "running",
+        "completed",
+        "failed",
+        "no_candidates",
+        "broker_unavailable"
+      ],
+      "default": "running"
+    },
+    "candidates_found": {
+      "type": "number",
+      "default": 0
+    },
+    "proposals_created": {
+      "type": "number",
+      "default": 0
+    },
+    "proposals_vetoed": {
+      "type": "number",
+      "default": 0
+    },
+    "trades_attempted": {
+      "type": "number",
+      "default": 0
+    },
+    "trades_filled": {
+      "type": "number",
+      "default": 0
+    },
+    "trades_rejected": {
+      "type": "number",
+      "default": 0
+    },
+    "market_regime": {
+      "type": "string"
+    },
+    "model_version": {
+      "type": "string"
+    },
+    "market_summary": {
+      "type": "string"
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "user_id",
+    "scan_run_id",
+    "started_at",
+    "trigger_source",
+    "status"
+  ],
+  "rls": {
+    "read": {
+      "$or": [
+        {
+          "created_by_id": "{{user.id}}"
+        },
+        {
+          "data.user_id": "{{user.id}}"
+        }
+      ]
+    },
+    "create": {},
+    "update": {
+      "$or": [
+        {
+          "created_by_id": "{{user.id}}"
+        },
+        {
+          "data.user_id": "{{user.id}}"
+        }
+      ]
+    },
+    "delete": {
+      "$or": [
+        {
+          "created_by_id": "{{user.id}}"
+        },
+        {
+          "data.user_id": "{{user.id}}"
+        }
+      ]
+    }
+  }
+}
