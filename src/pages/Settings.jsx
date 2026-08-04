@@ -19,6 +19,7 @@ import {
   UserCheck,
   Zap,
   GitBranch,
+  Send,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -90,6 +91,8 @@ export default function Settings() {
   const [testResult, setTestResult] = useState(null);
   const [showKey, setShowKey] = useState(false);
   const [showSecret, setShowSecret] = useState(false);
+  const [testingTelegram, setTestingTelegram] = useState(false);
+  const [telegramTestResult, setTelegramTestResult] = useState(null);
   const [form, setForm] = useState({
     broker: '',
     broker_api_key: '',
@@ -97,6 +100,8 @@ export default function Settings() {
     broker_mode: 'paper',
     trade_profile: 'balanced',
     promotion_mode: 'automatic',
+    telegram_chat_id: '',
+    telegram_notifications_enabled: false,
   });
 
   const loadUser = useCallback(async () => {
@@ -113,6 +118,8 @@ export default function Settings() {
         broker_mode: status?.broker_mode || me.broker_mode || 'paper',
         trade_profile: me.trade_profile || 'balanced',
         promotion_mode: me.promotion_mode || 'automatic',
+        telegram_chat_id: me.telegram_chat_id || '',
+        telegram_notifications_enabled: me.telegram_notifications_enabled || false,
       });
     } catch (e) {
       console.error(e);
@@ -128,7 +135,12 @@ export default function Settings() {
     setSaving(true);
     try {
       // Save trade profile and promotion mode via auth.updateMe (non-sensitive)
-      await base44.auth.updateMe({ trade_profile: form.trade_profile, promotion_mode: form.promotion_mode });
+      await base44.auth.updateMe({
+        trade_profile: form.trade_profile,
+        promotion_mode: form.promotion_mode,
+        telegram_chat_id: form.telegram_chat_id,
+        telegram_notifications_enabled: form.telegram_notifications_enabled,
+      });
 
       // Save broker credentials via the secure backend function
       // (validates against the broker, stores in BrokerCredential entity, never on User)
@@ -180,6 +192,25 @@ export default function Settings() {
       console.error(e);
     }
     setSaving(false);
+  };
+
+  const testTelegram = async () => {
+    setTestingTelegram(true);
+    setTelegramTestResult(null);
+    try {
+      // Save first so the chat ID is persisted before testing
+      await base44.auth.updateMe({
+        telegram_chat_id: form.telegram_chat_id,
+        telegram_notifications_enabled: form.telegram_notifications_enabled,
+      });
+      const result = await base44.functions.invoke('sendTelegramAlert', {
+        message: '🧪 TradePulse test notification — Telegram alerts are working!',
+      });
+      setTelegramTestResult(result);
+    } catch (e) {
+      setTelegramTestResult({ ok: false, error: e.message || 'Failed to send test message.' });
+    }
+    setTestingTelegram(false);
   };
 
   const isConnected = !!brokerStatus?.connected;
@@ -276,6 +307,84 @@ export default function Settings() {
               </button>
             ))}
           </div>
+        </div>
+      </div>
+
+      {/* Telegram Notifications */}
+      <div className="mb-6">
+        <div className="rounded-2xl border border-border bg-card p-5 space-y-4">
+          <div className="flex items-center gap-2">
+            <Send className="w-4 h-4 text-primary" />
+            <h2 className="font-semibold">Telegram Trade Notifications</h2>
+          </div>
+          <p className="text-xs text-muted-foreground leading-relaxed">
+            Get instant Telegram messages when the autonomous AI executes trades. Create a bot via
+            <span className="text-primary"> @BotFather </span>
+            on Telegram, start a chat with your bot, then enter your chat ID below.
+          </p>
+          <div>
+            <Label className="mb-1.5 block">Telegram Chat ID</Label>
+            <Input
+              value={form.telegram_chat_id}
+              onChange={(e) => setForm({ ...form, telegram_chat_id: e.target.value })}
+              placeholder="e.g. 123456789"
+              className="font-mono"
+            />
+            <p className="text-xs text-muted-foreground mt-1.5">
+              Tip: message your bot, then open{' '}
+              <span className="font-mono text-foreground/70">api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</span>{' '}
+              to find your chat ID.
+            </p>
+          </div>
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="font-medium text-sm">Enable Telegram Alerts</div>
+              <div className="text-xs text-muted-foreground">Send a message when trades execute</div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setForm({ ...form, telegram_notifications_enabled: !form.telegram_notifications_enabled })}
+              className={cn(
+                'relative w-11 h-6 rounded-full transition-colors',
+                form.telegram_notifications_enabled ? 'bg-primary' : 'bg-muted'
+              )}
+            >
+              <span className={cn(
+                'absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform',
+                form.telegram_notifications_enabled && 'translate-x-5'
+              )} />
+            </button>
+          </div>
+          {telegramTestResult && (
+            <div
+              className={cn(
+                'rounded-lg p-3 text-sm flex items-start gap-2',
+                telegramTestResult.ok
+                  ? 'bg-emerald-500/10 text-emerald-500'
+                  : 'bg-red-500/10 text-red-500'
+              )}
+            >
+              {telegramTestResult.ok ? (
+                <CheckCircle2 className="w-4 h-4 flex-shrink-0 mt-0.5" />
+              ) : (
+                <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+              )}
+              <span className="text-xs leading-relaxed">
+                {telegramTestResult.ok
+                  ? 'Test message sent to your Telegram.'
+                  : telegramTestResult.error || 'Failed to send test message.'}
+              </span>
+            </div>
+          )}
+          <Button
+            onClick={testTelegram}
+            disabled={testingTelegram || !form.telegram_chat_id}
+            variant="secondary"
+            className="gap-2 w-full"
+          >
+            {testingTelegram ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+            Send Test Message
+          </Button>
         </div>
       </div>
 

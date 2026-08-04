@@ -7,6 +7,7 @@ import { netEdge } from '../../shared/costModel.ts';
 import { getChampion } from '../../shared/modelGovernance.ts';
 import { getAlpacaAccount } from '../../shared/alpaca.ts';
 import { fetchCandles as fetchMultiAssetCandles } from '../../shared/marketDataAdapter.ts';
+import { sendTelegramMessage } from '../../shared/telegram.ts';
 
 const PROFILES = {
   aggressive: { max_position_pct: 15, max_sector_pct: 40, min_confidence: 70, max_daily_trades: 8, stop_loss_pct: 12 },
@@ -369,6 +370,21 @@ export default async function(req) {
           body: executed.map((e) => `${e.action.toUpperCase()} ${e.qty} ${e.symbol} @ $${e.price.toFixed(2)} (ML score ${e.ml_score})`).join('\n'),
         });
       } catch (e) {}
+    }
+
+    // Telegram alert
+    if (executed.length && user.telegram_chat_id && user.telegram_notifications_enabled) {
+      try {
+        const botToken = secrets.get('TELEGRAM_BOT_TOKEN');
+        if (botToken) {
+          const lines = executed.map((e) => `${e.action.toUpperCase()} ${e.qty} ${e.symbol} @ $${e.price.toFixed(2)} (ML ${e.ml_score})`);
+          await sendTelegramMessage(
+            botToken,
+            String(user.telegram_chat_id),
+            `🤖 <b>TradePulse AI</b> executed ${executed.length} trade(s):\n${lines.join('\n')}`
+          );
+        }
+      } catch (e) { /* non-fatal */ }
     }
 
     await finishRun({
