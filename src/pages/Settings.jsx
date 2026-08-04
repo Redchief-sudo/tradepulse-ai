@@ -206,7 +206,7 @@ export default function Settings() {
       const result = await base44.functions.invoke('sendTelegramAlert', {
         message: '🧪 TradePulse test notification — Telegram alerts are working!',
       });
-      setTelegramTestResult(result);
+      setTelegramTestResult(result.data || result);
     } catch (e) {
       setTelegramTestResult({ ok: false, error: e.message || 'Failed to send test message.' });
     }
