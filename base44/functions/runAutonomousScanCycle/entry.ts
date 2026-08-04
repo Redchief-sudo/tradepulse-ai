@@ -306,6 +306,7 @@ export default async function(req) {
         // duplicate orders). Different signals within the same run get distinct keys.
         idempotency_key: `autonomous-${runId}-${pr.symbol}-${pr.action}`,
         signal_timestamp: new Date().toISOString(),
+        finnhub_key: key,
       });
       const rStatus = result?.status || result?.settlement?.status;
       if (rStatus === 'rejected' || rStatus === 'failed' || rStatus === 'canceled') tradesRejected++;

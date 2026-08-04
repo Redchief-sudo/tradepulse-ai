@@ -22,6 +22,8 @@
 
 import { placeAlpacaOrder, getAlpacaOrder, getAlpacaAccount } from './alpaca.ts';
 import { evaluateRisk, riskLimitsForProfile, buildPortfolioSnapshot, checkDataFreshness } from './riskEngine.ts';
+import { fetchQuote } from './marketDataAdapter.ts';
+import { isUsMarketOpen, usMarketSession } from './marketHours.ts';
 
 const FILL_TIMEOUT_MS = 20000;
 const POLL_INTERVAL_MS = 1000;
@@ -34,6 +36,40 @@ function isTerminal(status) {
 }
 function nowIso() { return new Date().toISOString(); }
 function genId(prefix) { return `${prefix}-${crypto.randomUUID()}`; }
+
+// Fetch the authoritative executable quote for a symbol and persist it as a
+// PriceSnapshot. The execution gateway does NOT trust the frontend/LLM price —
+// it fetches the live quote itself and uses that same price for risk sizing,
+// order metadata, and freshness validation. This eliminates the dependency on
+// a separate snapshot workflow having already captured a newly-discovered
+// symbol (the #1 blocker for first-time autonomous buys).
+//
+// The snapshot records the provider's observation timestamp (not the insertion
+// time) so an after-hours close fetched at 9pm is not mistaken for fresh.
+async function fetchAuthoritativeQuote(sr, symbol, assetClass, finnhubKey) {
+  const key = finnhubKey;
+  const ac = assetClass || 'stocks';
+  const q = await fetchQuote(symbol, ac, key);
+  if (!q || q.error || !q.price || q.price <= 0) {
+    return { ok: false, reason: 'NO_LIVE_QUOTE', price: null };
+  }
+  const providerTs = q.quote_timestamp
+    ? new Date(q.quote_timestamp * 1000).toISOString()
+    : nowIso();
+  const session = usMarketSession(new Date(providerTs));
+  try {
+    await sr.entities.PriceSnapshot.create({
+      symbol: String(symbol).toUpperCase(),
+      price: q.price,
+      timestamp: nowIso(),
+      provider_timestamp: providerTs,
+      market_session: session,
+      is_market_open: session === 'regular',
+      source: ac === 'crypto' ? 'binance' : 'finnhub',
+    });
+  } catch (e) { /* non-fatal — snapshot is for freshness checks, not execution */ }
+  return { ok: true, price: q.price, provider_timestamp: providerTs, market_session: session };
+}
 
 // Derive a stable idempotency key from the input. The caller may provide one directly,
 // or we derive it from decision_id + signal_timestamp + symbol + side. This ensures
@@ -296,7 +332,7 @@ export async function executeIntent(base44, user, input) {
   if (!symbol || (side !== 'buy' && side !== 'sell') || !requestedQty || requestedQty <= 0) {
     return { status: 'invalid', error: 'symbol, side, and positive qty are required' };
   }
-  const refPrice = Number(input.price) || 0;
+  let refPrice = Number(input.price) || 0;
   if (!refPrice || refPrice <= 0) {
     return { status: 'invalid', error: 'a reference price is required' };
   }
@@ -382,16 +418,48 @@ export async function executeIntent(base44, user, input) {
     intentRecord = await sr.entities.TradeIntent.create(intentData);
   }
 
-  // 1b. Market-data freshness guard (broker_paper and live). Stale prices ⇒ stale risk ⇒ reject.
+  // 1b. MARKET HOURS GATE (broker_paper and live). The backend independently
+  // verifies the US regular session is open before submitting a broker order.
+  // Cron timing alone is insufficient — the gateway is the authoritative gate.
+  // A day order submitted after hours can queue and fill at a gapped next open.
+  // Checked before the quote fetch so we don't burn a provider call when the
+  // session is closed.
   if (executionMode === 'live' || executionMode === 'broker_paper') {
-    const freshness = await checkDataFreshness(sr, symbol, 5);
-    if (!freshness.fresh) {
+    if (!isUsMarketOpen()) {
+      const session = usMarketSession();
       await sr.entities.TradeIntent.update(intentRecord.id, {
         status: 'rejected',
-        rejection_reason: `${freshness.reason} (age ${freshness.ageMinutes}m)`,
+        rejection_reason: `MARKET_CLOSED (${session})`,
       });
-      return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, reasons: [`${freshness.reason} (age ${freshness.ageMinutes}m)`], symbol, side, requestedQty };
+      await audit(sr, userId, 'stale_data_block', 'warning', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Rejected ${side} ${requestedQty} ${symbol}: market closed (${session})`, details: { symbol, side, session } });
+      return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, reasons: [`MARKET_CLOSED (${session})`], symbol, side, requestedQty };
     }
+  }
+
+  // 1b.5. AUTHORITATIVE QUOTE (broker_paper and live). The gateway fetches the
+  // live executable quote itself and uses THAT price — not the frontend/LLM
+  // price — for risk sizing and order metadata. This is the single source of
+  // truth for the execution reference price. It also persists a fresh
+  // PriceSnapshot (with the provider's observation timestamp) so subsequent
+  // freshness checks and outcome labeling have an authoritative record, and
+  // so newly-discovered symbols are never rejected for a missing snapshot.
+  if (executionMode === 'live' || executionMode === 'broker_paper') {
+    const quote = await fetchAuthoritativeQuote(sr, symbol, input.asset_class, input.finnhub_key);
+    if (!quote.ok) {
+      await sr.entities.TradeIntent.update(intentRecord.id, {
+        status: 'rejected',
+        rejection_reason: `${quote.reason}: no fresh executable quote for ${symbol}`,
+      });
+      await audit(sr, userId, 'stale_data_block', 'warning', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Rejected ${side} ${requestedQty} ${symbol}: ${quote.reason}`, details: { symbol, side, reason: quote.reason } });
+      return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, reasons: [`${quote.reason}: ${symbol}`], symbol, side, requestedQty };
+    }
+    // Override the reference price with the authoritative quote. All downstream
+    // sizing, risk caps, and order metadata use this price.
+    refPrice = quote.price;
+    await sr.entities.TradeIntent.update(intentRecord.id, {
+      requested_notional: requestedQty * refPrice,
+      limit_price: (intentRecord.order_type === 'limit' || input.order_type === 'limit') ? refPrice : null,
+    });
   }
 
   // 1c. Fetch real account equity for risk sizing (broker_paper/live only).

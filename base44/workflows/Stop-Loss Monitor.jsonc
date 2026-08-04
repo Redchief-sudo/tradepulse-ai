@@ -1,5 +1,5 @@
 {
-  "description": "Every 5 minutes: refreshes real prices from Finnhub and auto-exits any position down >= the stop-loss threshold, then emails a summary.",
+  "description": "Every 5 minutes during US market hours (weekdays 9:00-16:59 ET): refreshes real prices and auto-exits any position down >= the stop-loss threshold. The backend independently verifies the regular session is open before submitting any broker order \u2014 a day order submitted after hours can queue and fill at a gapped next open.",
   "definition": {
     "document": {
       "dsl": "1.0.0",
@@ -17,7 +17,7 @@
           "then": "end",
           "x-base44": {
             "title": "Run stop-loss cycle",
-            "description": "Refresh prices & auto-exit triggered positions"
+            "description": "Refresh prices & auto-exit triggered positions (market hours only)"
           }
         }
       }
@@ -30,9 +30,9 @@
       "trigger_type": "scheduled",
       "events": [],
       "schedule_mode": "recurring",
-      "cron_expression": "*/5 * * * *",
+      "cron_expression": "*/5 9-16 * * 1-5",
       "one_time_date": null,
-      "timezone": "America/Los_Angeles",
+      "timezone": "America/New_York",
       "interval_value": null,
       "interval_unit": null,
       "interval_anchor": null,

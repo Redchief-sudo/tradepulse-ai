@@ -18,6 +18,7 @@ export interface Quote {
   asset_class: string;
   price: number;
   day_change_percent: number;
+  quote_timestamp?: number; // unix seconds — provider's authoritative observation time
   error?: string;
 }
 
@@ -58,7 +59,7 @@ export async function fetchQuote(symbol: string, assetClass: string, finnhubKey?
       const open = safeNum(d.open);
       if (last <= 0) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: 'no price' };
       const dayChange = open > 0 ? ((last - open) / open) * 100 : 0;
-      return { symbol: sym, asset_class: ac, price: last, day_change_percent: dayChange };
+      return { symbol: sym, asset_class: ac, price: last, day_change_percent: dayChange, quote_timestamp: Math.floor(Date.now() / 1000) };
     } catch (e: any) {
       return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: e.message };
     }
@@ -71,7 +72,7 @@ export async function fetchQuote(symbol: string, assetClass: string, finnhubKey?
     if (!res.ok) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: `Finnhub HTTP ${res.status}` };
     const d = await res.json();
     if (!d || typeof d.c !== 'number' || d.c === 0) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: 'no data' };
-    return { symbol: sym, asset_class: ac, price: d.c, day_change_percent: typeof d.dp === 'number' ? d.dp : 0 };
+    return { symbol: sym, asset_class: ac, price: d.c, day_change_percent: typeof d.dp === 'number' ? d.dp : 0, quote_timestamp: typeof d.t === 'number' && d.t > 0 ? d.t : Math.floor(Date.now() / 1000) };
   } catch (e: any) {
     return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: e.message };
   }

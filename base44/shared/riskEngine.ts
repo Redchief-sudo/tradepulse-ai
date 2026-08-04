@@ -124,12 +124,18 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
 }
 
 // Market-data freshness guard (shared market data — not user-scoped).
+// Freshness is based on the PROVIDER's observation timestamp when available,
+// not the database insertion timestamp — so an after-hours close fetched at
+// 9pm is not mistaken for a fresh quote. Note: the execution gateway now
+// fetches the authoritative quote directly and does not depend on this check
+// for new candidates; this remains for secondary/defensive freshness validation.
 export async function checkDataFreshness(sr, symbol, maxAgeMinutes = 5) {
   const snaps = await sr.entities.PriceSnapshot.list('-timestamp', 200);
   const sym = String(symbol).toUpperCase();
   const latest = snaps.find((s) => String(s.symbol).toUpperCase() === sym);
   if (!latest) return { fresh: false, reason: 'NO_PRICE_SNAPSHOT', ageMinutes: null };
-  const ageMinutes = (Date.now() - new Date(latest.timestamp).getTime()) / 60000;
+  const ts = latest.provider_timestamp || latest.timestamp;
+  const ageMinutes = (Date.now() - new Date(ts).getTime()) / 60000;
   if (ageMinutes > maxAgeMinutes) {
     return { fresh: false, reason: 'STALE_MARKET_DATA', ageMinutes: Math.round(ageMinutes) };
   }

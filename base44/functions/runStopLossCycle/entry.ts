@@ -2,6 +2,7 @@ import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { secrets } from 'base44:runtime';
 import { settleTrade } from '../../shared/execution.ts';
 import { fetchQuotes as fetchMultiAssetQuotes } from '../../shared/marketDataAdapter.ts';
+import { isUsMarketOpen, usMarketSession } from '../../shared/marketHours.ts';
 
 // Admin / scheduled autonomous stop-loss monitor.
 // USER-SCOPED: all queries filter by user_id.
@@ -52,10 +53,24 @@ export default async function(req) {
       return drop >= threshold;
     });
 
+    // MARKET HOURS GATE: only submit broker orders during the US regular session.
+      // A day market order submitted after hours can queue and fill at a gapped
+      // next open. We still refresh prices and detect triggers outside market
+      // hours (so the dashboard and alerts stay current), but we do NOT route
+      // sell orders to the broker when the session is closed. The execution
+      // gateway independently re-checks this, but we short-circuit here too so
+      // the intent is never created with a stale after-hours trigger price.
+    const marketOpen = isUsMarketOpen();
+    const session = usMarketSession();
     const results = [];
     for (const h of triggered) {
       const live = priceMap[h.symbol] || h.current_price || h.avg_price;
       const dropPct = h.avg_price > 0 ? ((h.avg_price - live) / h.avg_price) * 100 : 0;
+
+      if (!marketOpen) {
+        results.push({ symbol: h.symbol, shares: h.shares, price: live, dropPct, skipped: true, reason: `MARKET_CLOSED (${session})` });
+        continue;
+      }
 
       // Route through the canonical execution boundary.
       const result = await settleTrade(base44, user, {
@@ -69,6 +84,7 @@ export default async function(req) {
         notes: `Auto stop-loss @ -${dropPct.toFixed(1)}% (threshold ${threshold}%)`,
         idempotency_key: `stoploss-${h.portfolio_id || 'default'}-${h.id}-${h.symbol}-${new Date().toISOString().slice(0, 13)}`,
         signal_timestamp: new Date().toISOString(),
+        finnhub_key: key,
       });
       results.push({ symbol: h.symbol, shares: h.shares, price: live, dropPct, settlement: result });
     }

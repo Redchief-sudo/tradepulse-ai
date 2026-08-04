@@ -3,9 +3,76 @@ import { getAlpacaActivities } from '../../shared/alpaca.ts';
 
 // Broker-authoritative reconciliation. The broker is the source of truth for positions.
 // USER-SCOPED: all queries filter by user_id. Credentials read from BrokerCredential.
-// ACTUAL CLOSE PRICES: for externally closed positions, fetch Alpaca fill activities
-// to find the real exit price — never invent one. If no activity is found, record as
-// reconciliation_adjustment with unknown exit price rather than fabricating one.
+//
+// LOT-CONSISTENT: every broker-derived Holding is backed by a PositionLot so the
+// lot ledger (the source of truth) and the holding projection never diverge.
+// Without this, a later sell fill would see zero available lots and fail with
+// SELL_FILL_EXCEEDS_ACCOUNTED_POSITION.
+//
+// FAIL-CLOSED: when a position disappears at the broker but no authoritative exit
+// fill can be identified, the holding is NOT deleted and the lots are NOT closed.
+// The position is flagged for review — the accounting lifecycle is never finalized
+// without closure evidence. This prevents stale lots from resurrecting a closed
+// position and prevents wrong P&L attribution from a guessed exit price.
+
+function nowIso() { return new Date().toISOString(); }
+function genId(prefix) { return `${prefix}-${crypto.randomUUID()}`; }
+
+// Close open lots FIFO for a symbol at the given exit price. Returns realized P&L.
+// If no lots exist but a holding does (legacy pre-lot state), backfills a lot from
+// the holding first so the close can proceed.
+async function closeLotsFifo(sr, userId, sym, exitQty, exitPrice, holding) {
+  let lots = await sr.entities.PositionLot.filter({ user_id: userId, symbol: sym });
+  let openLots = lots
+    .filter((l) => l.status === 'open' || l.status === 'partially_closed')
+    .sort((a, b) => new Date(a.acquisition_timestamp) - new Date(b.acquisition_timestamp));
+
+  // Backfill: if there are no open lots but a holding exists, create a lot from
+  // the holding so the ledger is consistent before closing.
+  if (openLots.length === 0 && holding && holding.shares > 0) {
+    const lot = await sr.entities.PositionLot.create({
+      user_id: userId,
+      lot_id: genId('lot'),
+      symbol: sym,
+      company_name: holding.company_name || sym,
+      sector: holding.sector || '',
+      asset_class: holding.asset_class || 'stocks',
+      originating_fill_id: null,
+      quantity_opened: holding.shares,
+      quantity_remaining: holding.shares,
+      acquisition_price: holding.avg_price,
+      acquisition_timestamp: holding.created_date || nowIso(),
+      status: 'open',
+      realized_pnl: 0,
+      closure_fill_ids: '[]',
+      cost_basis_method: 'fifo',
+    });
+    openLots = [lot];
+  }
+
+  const availableQty = openLots.reduce((s, l) => s + l.quantity_remaining, 0);
+  if (exitQty > availableQty + 0.0001) {
+    throw new Error(`RECONCILIATION_CLOSE_EXCEEDS_LOTS: ${sym} exit ${exitQty} > available ${availableQty}`);
+  }
+
+  let remaining = exitQty;
+  let realizedPnl = 0;
+  for (const lot of openLots) {
+    if (remaining <= 0.0001) break;
+    const closeQty = Math.min(lot.quantity_remaining, remaining);
+    const lotPnl = (exitPrice - lot.acquisition_price) * closeQty;
+    realizedPnl += lotPnl;
+    const newRemaining = lot.quantity_remaining - closeQty;
+    await sr.entities.PositionLot.update(lot.id, {
+      quantity_remaining: newRemaining,
+      status: newRemaining <= 0.0001 ? 'closed' : 'partially_closed',
+      realized_pnl: (lot.realized_pnl || 0) + lotPnl,
+    });
+    remaining -= closeQty;
+  }
+  return realizedPnl;
+}
+
 export default async function(req) {
   try {
     const base44 = createClientFromRequest(req);
@@ -13,7 +80,7 @@ export default async function(req) {
     if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 });
 
     const sr = base44.asServiceRole;
-    const runTs = new Date().toISOString();
+    const runTs = nowIso();
 
     // Read credentials from the secure BrokerCredential entity
     const creds = await sr.entities.BrokerCredential.filter({ user_id: user.id, status: 'active' });
@@ -52,25 +119,79 @@ export default async function(req) {
     appHoldings.forEach((h) => { appMap[String(h.symbol).toUpperCase()] = h; });
 
     const events = [];
-    const created = [], updated = [], removed = [];
+    const created = [], updated = [], removed = [], blocked = [];
 
-    // broker -> app
+    // broker -> app — create lot + holding for new broker positions, adjust on drift.
     for (const [sym, bp] of Object.entries(brokerMap)) {
       const existing = appMap[sym];
       if (!existing) {
+        // Create a PositionLot for the broker-derived position so the lot ledger
+        // stays consistent with the holding projection. Without this, a later
+        // sell fill would see zero available lots.
+        await sr.entities.PositionLot.create({
+          user_id: user.id,
+          lot_id: genId('lot'),
+          symbol: bp.symbol,
+          company_name: bp.symbol,
+          sector: '',
+          asset_class: 'stocks',
+          originating_fill_id: null,
+          quantity_opened: bp.shares,
+          quantity_remaining: bp.shares,
+          acquisition_price: bp.avg_price,
+          acquisition_timestamp: nowIso(),
+          status: 'open',
+          realized_pnl: 0,
+          closure_fill_ids: '[]',
+          cost_basis_method: 'fifo',
+        });
         await sr.entities.Holding.create({
           user_id: user.id, symbol: bp.symbol, company_name: bp.symbol, shares: bp.shares, avg_price: bp.avg_price,
           current_price: bp.current_price, sector: '', day_change_percent: 0,
         });
         created.push(sym);
-        events.push({ event_type: 'new_from_broker', symbol: sym, broker_qty: bp.shares, broker_avg_price: bp.avg_price, action_taken: 'created_holding' });
+        events.push({ event_type: 'new_from_broker', symbol: sym, broker_qty: bp.shares, broker_avg_price: bp.avg_price, action_taken: 'created_lot_and_holding' });
       } else {
         const qtyDrift = Math.abs((existing.shares || 0) - bp.shares) > 0.0001;
         const priceDrift = existing.current_price && Math.abs(existing.current_price - bp.current_price) > 0.01;
         if (qtyDrift) {
+          // Reconcile the lot ledger to match the broker-authoritative quantity.
+          const diff = bp.shares - (existing.shares || 0);
+          if (diff > 0) {
+            // Broker has more than app — open a reconciliation lot for the difference.
+            await sr.entities.PositionLot.create({
+              user_id: user.id,
+              lot_id: genId('lot'),
+              symbol: bp.symbol,
+              company_name: existing.company_name || bp.symbol,
+              sector: existing.sector || '',
+              asset_class: existing.asset_class || 'stocks',
+              originating_fill_id: null,
+              quantity_opened: diff,
+              quantity_remaining: diff,
+              acquisition_price: bp.avg_price,
+              acquisition_timestamp: nowIso(),
+              status: 'open',
+              realized_pnl: 0,
+              closure_fill_ids: '[]',
+              cost_basis_method: 'fifo',
+            });
+          } else if (diff < 0) {
+            // Broker has less than app — close lots FIFO for the difference at the
+            // broker current price. The exact exit fill should ideally be found via
+            // activities, but qty drift without a discrete close is treated as a
+            // partial reconciliation close at the current broker price.
+            try {
+              await closeLotsFifo(sr, user.id, sym, Math.abs(diff), bp.current_price, existing);
+            } catch (e) {
+              blocked.push(sym);
+              events.push({ event_type: 'reconciliation_adjustment', symbol: sym, app_qty: existing.shares, broker_qty: bp.shares, action_taken: 'flagged_for_review_lot_close_failed', details: e.message });
+              continue;
+            }
+          }
           await sr.entities.Holding.update(existing.id, { shares: bp.shares, avg_price: bp.avg_price, current_price: bp.current_price });
           updated.push({ symbol: sym, from: existing.shares, to: bp.shares });
-          events.push({ event_type: 'qty_drift', symbol: sym, app_qty: existing.shares, broker_qty: bp.shares, app_avg_price: existing.avg_price, broker_avg_price: bp.avg_price, action_taken: 'updated_holding' });
+          events.push({ event_type: 'qty_drift', symbol: sym, app_qty: existing.shares, broker_qty: bp.shares, app_avg_price: existing.avg_price, broker_avg_price: bp.avg_price, action_taken: 'reconciled_lots_and_holding' });
         } else if (priceDrift) {
           await sr.entities.Holding.update(existing.id, { current_price: bp.current_price });
           events.push({ event_type: 'price_drift', symbol: sym, app_current_price: existing.current_price, broker_current_price: bp.current_price, action_taken: 'updated_holding' });
@@ -80,61 +201,67 @@ export default async function(req) {
       }
     }
 
-    // app -> broker (externally closed) — fetch ACTUAL close price from Alpaca activities.
-    // If no fill activity is found, record as reconciliation_adjustment with unknown exit.
+    // app -> broker (externally closed) — ingest the actual broker fill through the
+    // lot path. If no authoritative exit fill can be identified, do NOT delete the
+    // holding or close the lots — flag for review (fail-closed).
     for (const [sym, h] of Object.entries(appMap)) {
       if (!brokerMap[sym]) {
         let exitPrice = null;
         let realizedPnl = null;
-        let actionTaken = 'recorded_sell_and_removed';
+        let actionTaken = 'closed_lots_and_removed';
         let eventType = 'externally_closed';
+        let matchedActivity = null;
 
         try {
-          // Fetch recent fill activities to find the actual close transaction
           const sinceDate = new Date(h.created_date || Date.now() - 30 * 86400000).toISOString().slice(0, 10);
           const activities = await getAlpacaActivities({ apiKey: cred.api_key, secretKey: cred.api_secret, mode: cred.mode, sinceDate });
-          // Multi-criteria matching: match by order_id, client_order_id, or
-          // qty proximity — never just by symbol. When no exact match can be
-          // established, the system records an unresolved adjustment rather
-          // than inventing a price (fail-closed behavior preserved below).
-          const closeActivity = activities.find((a) => {
+          // Match by broker order ID or client order ID — NEVER by quantity alone.
+          // Quantity matching can select the wrong transaction for frequently-traded
+          // symbols; it only generates a candidate for manual review, never auto-settle.
+          matchedActivity = activities.find((a) => {
             if (String(a.symbol).toUpperCase() !== sym) return false;
             if (a.side !== 'sell') return false;
-            // Best: match by broker order ID
             if (a.order_id && h.broker_order_id && a.order_id === h.broker_order_id) return true;
-            // Good: match by client order ID
             if (a.order_client_id && h.client_order_id && a.order_client_id === h.client_order_id) return true;
-            // Fallback: match by qty proximity (within 0.01 shares)
-            if (a.qty && Math.abs(Number(a.qty) - h.shares) < 0.01) return true;
-            // No match — do NOT fall back to symbol-only match
             return false;
           });
-          if (closeActivity) {
-            exitPrice = Number(closeActivity.price);
-            realizedPnl = (exitPrice - h.avg_price) * h.shares;
+          if (matchedActivity) {
+            exitPrice = Number(matchedActivity.price);
           } else {
-            // No fill activity found — do NOT invent a price. Record as adjustment.
+            // No authoritative close fill found — fail-closed: retain the position.
             eventType = 'reconciliation_adjustment';
             actionTaken = 'flagged_for_review_no_exit_price';
           }
         } catch (e) {
-          // Activities fetch failed — do NOT invent a price. Record as adjustment.
           eventType = 'reconciliation_adjustment';
           actionTaken = 'flagged_for_review_activities_unreachable';
         }
 
-        if (exitPrice) {
+        if (exitPrice && exitPrice > 0) {
+          // Authoritative close — close lots FIFO at the real exit price.
+          try {
+            realizedPnl = await closeLotsFifo(sr, user.id, sym, h.shares, exitPrice, h);
+          } catch (e) {
+            // Lot close failed (e.g. insufficient lots) — do NOT delete the holding.
+            blocked.push(sym);
+            events.push({ event_type: 'reconciliation_adjustment', symbol: sym, app_qty: h.shares, app_avg_price: h.avg_price, action_taken: 'flagged_for_review_lot_close_failed', details: e.message });
+            continue;
+          }
           await sr.entities.Trade.create({
             user_id: user.id, symbol: h.symbol, company_name: h.company_name || h.symbol, action: 'sell', shares: h.shares,
             price: exitPrice, total_value: h.shares * exitPrice,
             notes: 'Reconciliation: position no longer held at broker (externally closed)',
             ai_recommended: false, order_status: 'reconciled_external', source: 'reconciliation', realized_pnl: realizedPnl,
           });
+          await sr.entities.Holding.delete(h.id);
+          removed.push(sym);
+          events.push({ event_type: eventType, symbol: sym, app_qty: h.shares, app_avg_price: h.avg_price, action_taken: actionTaken, realized_pnl: realizedPnl, details: `Exit price from broker fill: $${exitPrice.toFixed(2)}` });
+        } else {
+          // FAIL-CLOSED: no authoritative exit fill. Retain the holding and lots.
+          // Surface a review alert — do not finalize the accounting lifecycle.
+          blocked.push(sym);
+          events.push({ event_type: eventType, symbol: sym, app_qty: h.shares, app_avg_price: h.avg_price, action_taken: actionTaken, details: 'No broker fill activity found — exit price unknown, position retained for review' });
         }
-
-        await sr.entities.Holding.delete(h.id);
-        removed.push(sym);
-        events.push({ event_type: eventType, symbol: sym, app_qty: h.shares, app_avg_price: h.avg_price, action_taken: actionTaken, realized_pnl: realizedPnl, details: exitPrice ? `Exit price from broker fill: $${exitPrice.toFixed(2)}` : 'No broker fill activity found — exit price unknown' });
       }
     }
 
@@ -150,9 +277,10 @@ export default async function(req) {
       new_from_broker: created.length,
       externally_closed: removed.length,
       adjustments: events.filter((e) => e.event_type === 'reconciliation_adjustment').length,
+      blocked_for_review: blocked.length,
     };
 
-    return Response.json({ ok: true, run_timestamp: runTs, broker_positions: brokerPositions.length, created: created.length, updated: updated.length, removed, events: events.length, summary });
+    return Response.json({ ok: true, run_timestamp: runTs, broker_positions: brokerPositions.length, created: created.length, updated: updated.length, removed, blocked, events: events.length, summary });
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });
   }

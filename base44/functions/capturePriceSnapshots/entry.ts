@@ -1,6 +1,7 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { secrets } from 'base44:runtime';
 import { fetchQuotes } from '../../shared/marketDataAdapter.ts';
+import { usMarketSession, isUsMarketOpen } from '../../shared/marketHours.ts';
 
 // Scheduled price-snapshot capture. Records a point-in-time price for every
 // symbol that has an open AI buy decision (plus current holdings + SPY benchmark),
@@ -35,12 +36,22 @@ export default async function(req) {
     const symbols = [...openSyms].slice(0, 40);
     const items = symbols.map((s) => ({ symbol: s, asset_class: assetClassBySym[s] || 'stocks' }));
     const now = new Date().toISOString();
+    const session = usMarketSession();
+    const marketOpen = isUsMarketOpen();
     const quotes = await fetchQuotes(items, key);
     let captured = 0;
     await Promise.all(quotes.filter((q) => !q.error && q.price > 0).map(async (q) => {
       try {
+        // Record the provider's authoritative observation time, not the database
+        // insertion time. An after-hours close fetched at 9pm must not appear fresh.
+        const providerTs = q.quote_timestamp
+          ? new Date(q.quote_timestamp * 1000).toISOString()
+          : now;
         await sr.entities.PriceSnapshot.create({
           symbol: q.symbol, price: q.price, timestamp: now,
+          provider_timestamp: providerTs,
+          market_session: session,
+          is_market_open: marketOpen,
           source: q.asset_class === 'crypto' ? 'binance' : 'finnhub',
         });
         captured++;

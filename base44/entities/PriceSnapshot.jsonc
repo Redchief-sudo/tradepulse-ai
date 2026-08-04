@@ -10,7 +10,28 @@
     },
     "timestamp": {
       "type": "string",
-      "format": "date-time"
+      "format": "date-time",
+      "description": "Database insertion time (when this snapshot was stored)"
+    },
+    "provider_timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "The provider's authoritative quote observation time. Freshness must be based on this, not the insertion timestamp, so an after-hours close fetched at 9pm is not mistaken for a fresh quote."
+    },
+    "market_session": {
+      "type": "string",
+      "enum": [
+        "regular",
+        "premarket",
+        "after_hours",
+        "weekend",
+        "closed"
+      ],
+      "description": "US equity market session at observation time"
+    },
+    "is_market_open": {
+      "type": "boolean",
+      "description": "Whether the US regular session was open at the provider's quote time"
     },
     "source": {
       "type": "string",

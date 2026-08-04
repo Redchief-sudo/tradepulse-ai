@@ -1,12 +1,12 @@
 {
-  "description": "Continuously reconciles nonterminal broker orders \u2014 ingests unrecorded fills, detects canceled/rejected orders, finalizes settlement, and alerts on stale orders. Runs every 5 minutes during US market hours.",
+  "description": "Continuously reconciles nonterminal broker orders \u2014 ingests unrecorded fills, detects canceled/rejected orders, finalizes settlement, and alerts on stale orders. Runs every 5 minutes during US market hours and the immediate after-hours window (weekdays 9:00-17:59 ET) to catch late broker updates and extended-hours fill reports.",
   "trigger": {
     "condition": null,
     "config": {
       "trigger_type": "scheduled",
       "events": [],
       "schedule_mode": "recurring",
-      "cron_expression": "*/5 9-16 * * 1-5",
+      "cron_expression": "*/5 9-17 * * 1-5",
       "one_time_date": null,
       "timezone": "America/New_York",
       "interval_value": null,

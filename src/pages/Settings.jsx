@@ -39,6 +39,7 @@ const BROKERS = [
       'Unlimited paper trading accounts (Sandbox) for simulated testing',
     ],
     api: 'Modern REST API + WebSockets, or Python TWS API gateway (IBKR Client Portal Web API / TWS API)',
+    enabled: false,
   },
   {
     id: 'alpaca',
@@ -52,6 +53,7 @@ const BROKERS = [
       'Built specifically for automated trading bots and programmatic execution',
     ],
     api: 'Cloud REST API + WebSockets',
+    enabled: true,
   },
   {
     id: 'tradestation',
@@ -65,6 +67,7 @@ const BROKERS = [
       'Real-time streaming capabilities',
     ],
     api: 'REST API with real-time streaming',
+    enabled: false,
   },
   {
     id: 'custom',
@@ -74,6 +77,7 @@ const BROKERS = [
     assets: 'Any asset class supported by your endpoint',
     why: ['Use your own broker or proprietary execution venue', 'Flexible REST integration'],
     api: 'Custom REST endpoint',
+    enabled: false,
   },
 ];
 
@@ -293,15 +297,24 @@ export default function Settings() {
             {BROKERS.map((b) => (
               <button
                 key={b.id}
-                onClick={() => setForm({ ...form, broker: b.id })}
+                disabled={!b.enabled}
+                onClick={() => b.enabled && setForm({ ...form, broker: b.id })}
                 className={cn(
                   'text-left rounded-xl border p-3 transition-all',
-                  form.broker === b.id
+                  !b.enabled && 'opacity-50 cursor-not-allowed',
+                  form.broker === b.id && b.enabled
                     ? 'border-primary bg-primary/10'
                     : 'border-border hover:border-primary/40'
                 )}
               >
-                <div className="font-medium text-sm">{b.name}</div>
+                <div className="font-medium text-sm flex items-center gap-2">
+                  {b.name}
+                  {!b.enabled && (
+                    <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
+                      Coming soon
+                    </span>
+                  )}
+                </div>
                 <div className="text-xs text-muted-foreground mt-0.5">{b.tagline}</div>
               </button>
             ))}

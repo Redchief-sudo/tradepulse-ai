@@ -1,4 +1,5 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
+import { secrets } from 'base44:runtime';
 import { settleTrade } from '../../shared/execution.ts';
 
 // Canonical trade execution endpoint — the single entry point every trading
@@ -12,6 +13,10 @@ export default async function(req) {
     if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 });
 
     const intent = await req.json().catch(() => ({}));
+    // Inject the server-side Finnhub key so the execution gateway can fetch the
+    // authoritative quote without depending on a pre-existing snapshot. The key
+    // never leaves the server.
+    intent.finnhub_key = secrets.get('FINNHUB_API_KEY');
     const result = await settleTrade(base44, user, intent);
 
     const code = result.status === 'rejected' || result.status === 'invalid'
