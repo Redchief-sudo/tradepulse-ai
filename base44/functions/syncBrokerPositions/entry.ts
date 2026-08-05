@@ -46,6 +46,8 @@ async function closeLotsFifo(sr, userId, sym, exitQty, exitPrice, holding) {
       realized_pnl: 0,
       closure_fill_ids: '[]',
       cost_basis_method: 'fifo',
+      provenance_source: 'broker_import',
+      provenance_quality: 'ambiguous',
     });
     openLots = [lot];
   }
@@ -144,6 +146,8 @@ export default async function(req) {
           realized_pnl: 0,
           closure_fill_ids: '[]',
           cost_basis_method: 'fifo',
+          provenance_source: 'broker_import',
+          provenance_quality: 'unverified',
         });
         await sr.entities.Holding.create({
           user_id: user.id, symbol: bp.symbol, company_name: bp.symbol, shares: bp.shares, avg_price: bp.avg_price,
@@ -175,6 +179,8 @@ export default async function(req) {
               realized_pnl: 0,
               closure_fill_ids: '[]',
               cost_basis_method: 'fifo',
+              provenance_source: 'broker_import',
+              provenance_quality: 'unverified',
             });
           } else if (diff < 0) {
             // Broker has less than app — locate the ACTUAL broker sell fill.
@@ -220,6 +226,7 @@ export default async function(req) {
               try {
                 await closeLotsFifo(sr, user.id, sym, Math.abs(diff), partialExitPrice, existing);
               } catch (e) {
+                await sr.entities.Holding.update(existing.id, { reconciliation_blocked: true, reconciliation_blocked_reason: 'LOT_CLOSE_FAILED', reconciliation_blocked_at: nowIso() });
                 blocked.push(sym);
                 events.push({ event_type: 'reconciliation_adjustment', symbol: sym, app_qty: existing.shares, broker_qty: bp.shares, action_taken: 'flagged_for_review_lot_close_failed', details: e.message });
                 continue;
@@ -227,6 +234,7 @@ export default async function(req) {
             } else {
               // No authoritative fill found — flag for review, don't fabricate P&L.
               // Preserve the reason: activity error vs no ID match vs quantity-only.
+              await sr.entities.Holding.update(existing.id, { reconciliation_blocked: true, reconciliation_blocked_reason: 'NO_AUTHORITATIVE_FILL', reconciliation_blocked_at: nowIso() });
               blocked.push(sym);
               const reason = activityError
                 ? `Activities unreachable: ${activityError.message} (at ${activityError.timestamp})`
@@ -298,6 +306,7 @@ export default async function(req) {
             realizedPnl = await closeLotsFifo(sr, user.id, sym, h.shares, exitPrice, h);
           } catch (e) {
             // Lot close failed (e.g. insufficient lots) — do NOT delete the holding.
+            await sr.entities.Holding.update(h.id, { reconciliation_blocked: true, reconciliation_blocked_reason: 'LOT_CLOSE_FAILED', reconciliation_blocked_at: nowIso() });
             blocked.push(sym);
             events.push({ event_type: 'reconciliation_adjustment', symbol: sym, app_qty: h.shares, app_avg_price: h.avg_price, action_taken: 'flagged_for_review_lot_close_failed', details: e.message });
             continue;
@@ -314,6 +323,7 @@ export default async function(req) {
         } else {
           // FAIL-CLOSED: no authoritative exit fill. Retain the holding and lots.
           // Surface a review alert — do not finalize the accounting lifecycle.
+          await sr.entities.Holding.update(h.id, { reconciliation_blocked: true, reconciliation_blocked_reason: 'NO_EXIT_PRICE', reconciliation_blocked_at: nowIso() });
           blocked.push(sym);
           events.push({ event_type: eventType, symbol: sym, app_qty: h.shares, app_avg_price: h.avg_price, action_taken: actionTaken, details: 'No broker fill activity found — exit price unknown, position retained for review' });
         }

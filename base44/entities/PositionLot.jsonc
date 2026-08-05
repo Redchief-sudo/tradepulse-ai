@@ -76,6 +76,27 @@
         "specific_id"
       ],
       "default": "fifo"
+    },
+    "provenance_source": {
+      "type": "string",
+      "enum": [
+        "app_fill",
+        "broker_import",
+        "manual_entry",
+        "backtest"
+      ],
+      "default": "app_fill",
+      "description": "How this lot was created: app_fill (from an executed TradeIntent), broker_import (synced from broker without a matching fill), manual_entry (user added), backtest (replay)"
+    },
+    "provenance_quality": {
+      "type": "string",
+      "enum": [
+        "verified",
+        "unverified",
+        "ambiguous"
+      ],
+      "default": "verified",
+      "description": "verified = matched to a fill record, unverified = broker-imported without fill evidence, ambiguous = could not be definitively matched"
     }
   },
   "required": [

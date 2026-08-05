@@ -24,6 +24,8 @@ import { placeAlpacaOrder, getAlpacaOrder, getAlpacaAccount } from './alpaca.ts'
 import { evaluateRisk, riskLimitsForProfile, buildPortfolioSnapshot, checkDataFreshness } from './riskEngine.ts';
 import { fetchQuote } from './marketDataAdapter.ts';
 import { isUsMarketOpen, usMarketSession } from './marketHours.ts';
+import { AlpacaError } from './alpacaErrors.ts';
+import { recordBuySettlement, recordSellSettlement } from './cashLedger.ts';
 
 const FILL_TIMEOUT_MS = 20000;
 const POLL_INTERVAL_MS = 1000;
@@ -174,6 +176,8 @@ export async function projectHolding(sr, userId, symbol, side, filledQty, filled
       realized_pnl: 0,
       closure_fill_ids: '[]',
       cost_basis_method: 'fifo',
+      provenance_source: 'app_fill',
+      provenance_quality: 'verified',
     });
     await updateHoldingProjection(sr, userId, symbol, filledPrice, input);
     return null;
@@ -584,7 +588,9 @@ export async function executeIntent(base44, user, input) {
       await sr.entities.TradeIntent.update(intentRecord.id, { status: 'accepted', broker_order_id: brokerOrderId, client_order_id: clientOrderId });
       await audit(sr, userId, 'order_submitted', 'info', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Order ${brokerOrderId} accepted: ${side} ${approvedQty} ${symbol}`, details: { symbol, side, qty: approvedQty, broker_order_id: brokerOrderId } });
     } catch (e) {
+      const errorDetail = e instanceof AlpacaError ? e.toAuditDetail() : { message: e.message };
       await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: `BROKER_SUBMIT_ERROR: ${e.message}` });
+      await audit(sr, userId, 'order_rejected', 'error', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Broker submit error: ${e.message}`, details: { ...errorDetail, symbol, side, qty: approvedQty } });
       return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: e.message, symbol, side, requestedQty: approvedQty };
     }
   }
@@ -922,6 +928,19 @@ async function settleFill(sr, userId, params) {
 
   // Project the holding and capture realized P&L from lot-based accounting.
   const realizedPnl = await projectHolding(sr, userId, symbol, side, filledQty, filledPrice, { ...input, fill_id: fillId });
+
+  // Record cash entry for internal paper mode (simulated cash ledger).
+  // For broker_paper/live, the broker's account endpoint is authoritative.
+  if (executionMode === 'internal_paper' || executionMode === 'shadow_live') {
+    try {
+      const notional = filledQty * filledPrice;
+      if (side === 'buy') {
+        await recordBuySettlement(sr, userId, { symbol, notional, commission: input.commission || 0, fees: input.fees || 0, trade_intent_id: tradeIntentId, fill_id: fillId, portfolio_id: input.portfolio_id });
+      } else {
+        await recordSellSettlement(sr, userId, { symbol, notional, commission: input.commission || 0, fees: input.fees || 0, trade_intent_id: tradeIntentId, fill_id: fillId, portfolio_id: input.portfolio_id });
+      }
+    } catch (e) { /* non-fatal — cash ledger is best-effort */ }
+  }
 
   // Mark as projected — lot projection complete, about to create Trade.
   // A crash here can be recovered: settleFromFills is idempotent (checks

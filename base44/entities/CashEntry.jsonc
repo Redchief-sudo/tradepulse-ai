@@ -1,0 +1,87 @@
+{
+  "name": "CashEntry",
+  "type": "object",
+  "properties": {
+    "user_id": {
+      "type": "string",
+      "description": "Owner user id \u2014 every query must filter by this"
+    },
+    "portfolio_id": {
+      "type": "string",
+      "description": "Portfolio identifier for multi-portfolio tenancy"
+    },
+    "entry_type": {
+      "type": "string",
+      "enum": [
+        "deposit",
+        "withdrawal",
+        "buy",
+        "sell",
+        "commission",
+        "fee",
+        "adjustment",
+        "dividend"
+      ],
+      "description": "Type of cash flow entry"
+    },
+    "amount": {
+      "type": "number",
+      "description": "Positive for credit (cash in), negative for debit (cash out)"
+    },
+    "balance_after": {
+      "type": "number",
+      "description": "Cash balance after this entry was applied"
+    },
+    "symbol": {
+      "type": "string",
+      "description": "Symbol for trade-related entries (null for deposits/adjustments)"
+    },
+    "trade_intent_id": {
+      "type": "string"
+    },
+    "fill_id": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "user_id",
+    "entry_type",
+    "amount"
+  ],
+  "rls": {
+    "read": {
+      "$or": [
+        {
+          "created_by_id": "{{user.id}}"
+        },
+        {
+          "data.user_id": "{{user.id}}"
+        }
+      ]
+    },
+    "create": {},
+    "update": {
+      "$or": [
+        {
+          "created_by_id": "{{user.id}}"
+        },
+        {
+          "data.user_id": "{{user.id}}"
+        }
+      ]
+    },
+    "delete": {
+      "$or": [
+        {
+          "created_by_id": "{{user.id}}"
+        },
+        {
+          "data.user_id": "{{user.id}}"
+        }
+      ]
+    }
+  }
+}

@@ -1,5 +1,6 @@
 // Shared Alpaca adapter — order placement, fill polling, account state, and activities.
 // Used by the canonical execution engine and reconciliation.
+import { throwAlpacaError, extractRequestId } from './alpacaErrors.ts';
 
 const PAPER_BASE = 'https://paper-api.alpaca.markets/v2';
 const LIVE_BASE = 'https://api.alpaca.markets/v2';
@@ -38,8 +39,9 @@ export async function placeAlpacaOrder({ apiKey, secretKey, mode, symbol, qty, s
     headers: { ...headers(apiKey, secretKey), 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+  if (!res.ok) await throwAlpacaError(res, 'placeOrder');
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.message || data?.error || `Alpaca HTTP ${res.status}`);
+  data._request_id = extractRequestId(res);
   return data;
 }
 
@@ -48,8 +50,8 @@ export async function getAlpacaOrder({ apiKey, secretKey, mode }, orderId) {
   const res = await fetch(`${baseUrl(mode)}/orders/${orderId}`, {
     headers: headers(apiKey, secretKey),
   });
+  if (!res.ok) await throwAlpacaError(res, 'getOrder');
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.message || `Alpaca HTTP ${res.status}`);
   return data;
 }
 
@@ -58,8 +60,8 @@ export async function getAlpacaAccount({ apiKey, secretKey, mode }) {
   const res = await fetch(`${baseUrl(mode)}/account`, {
     headers: headers(apiKey, secretKey),
   });
+  if (!res.ok) await throwAlpacaError(res, 'getAccount');
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.message || `Alpaca HTTP ${res.status}`);
   return data;
 }
 
@@ -71,8 +73,8 @@ export async function getAlpacaClock({ apiKey, secretKey, mode }) {
   const res = await fetch(`${baseUrl(mode)}/clock`, {
     headers: headers(apiKey, secretKey),
   });
+  if (!res.ok) await throwAlpacaError(res, 'getClock');
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.message || `Alpaca HTTP ${res.status}`);
   return data;
 }
 
@@ -82,10 +84,7 @@ export async function cancelAlpacaOrder({ apiKey, secretKey, mode }, orderId) {
     method: 'DELETE',
     headers: headers(apiKey, secretKey),
   });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error(data?.message || `Alpaca HTTP ${res.status}`);
-  }
+  if (!res.ok) await throwAlpacaError(res, 'cancelOrder');
   return { canceled: true, orderId };
 }
 
@@ -98,7 +97,7 @@ export async function getAlpacaActivities({ apiKey, secretKey, mode, activityTyp
   const res = await fetch(`${baseUrl(mode)}/account/activities?${params.toString()}`, {
     headers: headers(apiKey, secretKey),
   });
+  if (!res.ok) await throwAlpacaError(res, 'getActivities');
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.message || `Alpaca HTTP ${res.status}`);
   return Array.isArray(data) ? data : [];
 }

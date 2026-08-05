@@ -47,6 +47,19 @@
         "fixed_income"
       ],
       "default": "stocks"
+    },
+    "reconciliation_blocked": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, automated changes are frozen for this symbol \u2014 reconciliation could not match the broker position to app fills. Requires manual review to unblock."
+    },
+    "reconciliation_blocked_reason": {
+      "type": "string",
+      "description": "Why reconciliation blocked this position (e.g. EXTERNALLY_CLOSED_NO_MATCH, QTY_DRIFT_UNRESOLVED)"
+    },
+    "reconciliation_blocked_at": {
+      "type": "string",
+      "format": "date-time"
     }
   },
   "required": [
