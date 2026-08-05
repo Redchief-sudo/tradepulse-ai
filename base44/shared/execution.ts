@@ -576,7 +576,7 @@ export async function executeIntent(base44, user, input) {
   let brokerOrderId = intentRecord.broker_order_id;
   if (!brokerOrderId) {
     try {
-      await sr.entities.TradeIntent.update(intentRecord.id, { status: 'submitted', broker: brokerCred.broker });
+      await sr.entities.TradeIntent.update(intentRecord.id, { status: 'submitted', broker: brokerCred.broker, submitted_at: nowIso() });
       const placed = await placeAlpacaOrder({
         ...creds, mode: alpacaMode, symbol, qty: approvedQty, side, client_order_id: clientOrderId,
         order_type: intentRecord.order_type || 'market',
@@ -585,7 +585,7 @@ export async function executeIntent(base44, user, input) {
         time_in_force: intentRecord.time_in_force || 'day',
       });
       brokerOrderId = placed.id;
-      await sr.entities.TradeIntent.update(intentRecord.id, { status: 'accepted', broker_order_id: brokerOrderId, client_order_id: clientOrderId });
+      await sr.entities.TradeIntent.update(intentRecord.id, { status: 'accepted', broker_order_id: brokerOrderId, client_order_id: clientOrderId, accepted_at: nowIso(), last_broker_update_at: nowIso() });
       await audit(sr, userId, 'order_submitted', 'info', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Order ${brokerOrderId} accepted: ${side} ${approvedQty} ${symbol}`, details: { symbol, side, qty: approvedQty, broker_order_id: brokerOrderId } });
     } catch (e) {
       const errorDetail = e instanceof AlpacaError ? e.toAuditDetail() : { message: e.message };
@@ -616,6 +616,9 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
     let order;
     try {
       order = await getAlpacaOrder(creds, brokerOrderId);
+      // Update last_broker_update_at so the health check can use it for
+      // pending-order age calculations. (Fixes Rev.12 #22.)
+      try { await sr.entities.TradeIntent.update(intentRecord.id, { last_broker_update_at: nowIso() }); } catch (e) {}
     } catch (e) {
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
       continue;
@@ -930,16 +933,18 @@ async function settleFill(sr, userId, params) {
   const realizedPnl = await projectHolding(sr, userId, symbol, side, filledQty, filledPrice, { ...input, fill_id: fillId });
 
   // Record cash entry for internal paper mode (simulated cash ledger).
-  // For broker_paper/live, the broker's account endpoint is authoritative.
+  // Cash settlement is MANDATORY, not best-effort — a failed cash write means
+  // the accounting ledger diverges from positions. (Fixes Rev.12 #5: the old
+  // code caught and swallowed cash errors, allowing positions to settle while
+  // cash remained unchanged.) The cashLedger module is idempotent by fill_id,
+  // so retries will not double-apply. (Fixes Rev.12 #6.)
   if (executionMode === 'internal_paper' || executionMode === 'shadow_live') {
-    try {
-      const notional = filledQty * filledPrice;
-      if (side === 'buy') {
-        await recordBuySettlement(sr, userId, { symbol, notional, commission: input.commission || 0, fees: input.fees || 0, trade_intent_id: tradeIntentId, fill_id: fillId, portfolio_id: input.portfolio_id });
-      } else {
-        await recordSellSettlement(sr, userId, { symbol, notional, commission: input.commission || 0, fees: input.fees || 0, trade_intent_id: tradeIntentId, fill_id: fillId, portfolio_id: input.portfolio_id });
-      }
-    } catch (e) { /* non-fatal — cash ledger is best-effort */ }
+    const notional = filledQty * filledPrice;
+    if (side === 'buy') {
+      await recordBuySettlement(sr, userId, { symbol, notional, commission: input.commission || 0, fees: input.fees || 0, trade_intent_id: tradeIntentId, fill_id: fillId, portfolio_id: input.portfolio_id });
+    } else {
+      await recordSellSettlement(sr, userId, { symbol, notional, commission: input.commission || 0, fees: input.fees || 0, trade_intent_id: tradeIntentId, fill_id: fillId, portfolio_id: input.portfolio_id });
+    }
   }
 
   // Mark as projected — lot projection complete, about to create Trade.

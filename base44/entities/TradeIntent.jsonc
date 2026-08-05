@@ -138,6 +138,21 @@
       "type": "string",
       "description": "Broker's terminal disposition (filled, canceled, rejected, expired, replaced) \u2014 preserved separately from settlement status so partial fills + cancellations are both visible"
     },
+    "submitted_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the order was submitted to the broker \u2014 used for pending-order age calculations (not decision_timestamp which precedes AI/risk processing)"
+    },
+    "accepted_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the broker accepted the order"
+    },
+    "last_broker_update_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Last time the broker status was polled or updated \u2014 used for staleness detection"
+    },
     "unfilled_quantity": {
       "type": "number",
       "description": "Requested quantity minus filled quantity at terminal state \u2014 the portion not filled (canceled/rejected remainder)"

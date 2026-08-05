@@ -12,6 +12,12 @@
 // The kill switch (risk_stopped) requires manual reset — the system does NOT
 // auto-re-enable on the same day. The user must acknowledge the stop and
 // explicitly restart.
+//
+// FAIL-CLOSED: state persistence errors are NOT swallowed. If the database
+// update fails, the caller receives an exception and must handle it. This
+// prevents a kill-switch failure from being silently ignored while trading
+// continues. (Fixes Rev.12 audit defect #25: session-state persistence could
+// fail silently, leaving trading_active true after a kill switch.)
 
 export const SESSION_STATES = {
   DISABLED: 'disabled',
@@ -25,6 +31,7 @@ export const SESSION_STATES = {
 
 // Update the user's session state. Called by the scan cycle, stop-loss cycle,
 // and the UI. Persists the state and optional reason/timestamp.
+// THROWS on failure — callers must catch and handle appropriately.
 export async function updateSessionState(sr, userId, newState, reason = null) {
   const patch = { trading_session_state: newState };
   if (newState === SESSION_STATES.RISK_STOPPED) {
@@ -43,11 +50,10 @@ export async function updateSessionState(sr, userId, newState, reason = null) {
     patch.kill_switch_at = null;
     patch.trading_active = true;
   }
-  try {
-    await sr.entities.User.update(userId, patch);
-  } catch (e) {
-    // Non-fatal — the state is also reflected in trading_active
-  }
+  // FAIL-CLOSED: throw on persistence failure. The caller must handle the
+  // error — for risk_stopped, a failed update means the kill switch may not
+  // be active, which is a critical safety failure. (Fixes Rev.12 #25.)
+  await sr.entities.User.update(userId, patch);
 }
 
 // Check if the session is in a tradeable state.

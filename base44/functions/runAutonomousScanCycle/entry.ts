@@ -9,14 +9,16 @@ import { getAlpacaAccount, getAlpacaClock, cancelAlpacaOrder } from '../../share
 import { fetchCandles as fetchMultiAssetCandles } from '../../shared/marketDataAdapter.ts';
 import { sendTelegramMessage } from '../../shared/telegram.ts';
 import { isExecutable } from '../../shared/executableUniverse.ts';
+import { riskLimitsForProfile } from '../../shared/riskEngine.ts';
+import { getPaperEquity } from '../../shared/cashLedger.ts';
 import { updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
 
-const PROFILES = {
-  aggressive: { max_position_pct: 15, max_sector_pct: 40, min_confidence: 70, max_daily_trades: 8, stop_loss_pct: 12, max_daily_loss_pct: 5 },
-  balanced: { max_position_pct: 10, max_sector_pct: 25, min_confidence: 80, max_daily_trades: 5, stop_loss_pct: 8, max_daily_loss_pct: 3 },
-  conservative: { max_position_pct: 5, max_sector_pct: 15, min_confidence: 88, max_daily_trades: 3, stop_loss_pct: 5, max_daily_loss_pct: 1.5 },
-};
-function profileParams(id) { return PROFILES[id] || PROFILES.balanced; }
+// Risk limits are defined in ONE place: riskEngine.ts. The scan cycle, execution
+// gateway, and risk engine all use riskLimitsForProfile() so they never disagree.
+// (Fixes Rev.12 #10: scan and execution had inconsistent risk profiles — the
+// scan cycle allowed 3% daily loss for balanced while the risk engine blocked
+// at 1%. Now both layers use the same authoritative limits.)
+function profileParams(id) { return riskLimitsForProfile(id); }
 
 function sectorExposure(holdings) {
   const sectors = {};
@@ -51,6 +53,8 @@ export default async function(req) {
   // silently swallowed — leaving crashed scans permanently marked "running".)
   let scanRunId = null;
   let srRef = null;
+  let lockOwnerToken = null;
+  let userIdRef = null;
 
   try {
     const base44 = createClientFromRequest(req);
@@ -67,6 +71,7 @@ export default async function(req) {
 
     const sr = base44.asServiceRole;
     srRef = sr;
+    userIdRef = user.id;
     const key = secrets.get('FINNHUB_API_KEY');
 
     // Trigger source — passed from the caller (dashboard/manual) or defaults
@@ -84,29 +89,47 @@ export default async function(req) {
     const minuteSlot = Math.floor(now.getUTCMinutes() / 15) * 15;
     const runId = `scan-${now.getUTCFullYear()}${String(now.getUTCMonth()+1).padStart(2,'0')}${String(now.getUTCDate()).padStart(2,'0')}-${String(now.getUTCHours()).padStart(2,'0')}${String(minuteSlot).padStart(2,'0')}`;
 
-    // SCAN LOCK — prevent overlapping scans using heartbeat-based staleness
-    // and post-create race detection. (Fixes Rev.10 defects #1 + #2: the old
-    // filter+create was not atomic — two workers could both pass the filter
-    // and both create. The 5-minute staleness based on started_at could declare
-    // a long-running scan dead while it was still active.)
+    // SCAN LOCK — dedicated ScanLock entity with owner token. (Fixes Rev.12 #1:
+    // the old filter+create on ScanRun was not truly atomic — two workers could
+    // both pass the filter and both create. The ScanLock approach narrows the
+    // race to the create round-trip and resolves by earliest acquired_at.)
     //
-    // 1) Check for existing running scans using last_heartbeat_at (not
-    //    started_at) — a scan is stale only when its heartbeat stops advancing.
-    // 2) Create our ScanRun with last_heartbeat_at set.
-    // 3) Post-create verification: re-check for duplicate running scans — if
-    //    another appeared, we lost the race; delete ours and abort.
-    const HEARTBEAT_STALE_MS = 3 * 60 * 1000;
-    const existingRuns = await sr.entities.ScanRun.filter({ user_id: user.id, status: 'running' });
-    if (existingRuns.length > 0) {
-      const existing = existingRuns[0];
-      const heartbeatTime = existing.last_heartbeat_at
-        ? new Date(existing.last_heartbeat_at).getTime()
-        : new Date(existing.started_at).getTime();
-      const isStale = Date.now() - heartbeatTime > HEARTBEAT_STALE_MS;
-      if (!isStale) {
-        return Response.json({ ok: true, skipped: true, reason: 'Another scan is already running' });
+    // 1) Create a ScanLock with a unique owner_token.
+    // 2) Query all active (non-expired) ScanLocks for this lock_key.
+    // 3) If our lock has the earliest acquired_at, we won — proceed.
+    // 4) If another lock is older, we lost — delete ours and abort.
+    // 5) Clean up stale expired locks from previous runs.
+    lockOwnerToken = crypto.randomUUID();
+    const lockKey = `scan-${user.id}-${runId}`;
+    const lockExpiry = new Date(Date.now() + 3 * 60 * 1000).toISOString(); // 3 min TTL
+    await sr.entities.ScanLock.create({
+      user_id: user.id,
+      lock_key: lockKey,
+      owner_token: lockOwnerToken,
+      acquired_at: now.toISOString(),
+      expires_at: lockExpiry,
+      heartbeat_at: now.toISOString(),
+    });
+
+    // Check for competing locks — the earliest acquired_at wins
+    const competingLocks = await sr.entities.ScanLock.filter({ user_id: user.id, lock_key: lockKey });
+    const activeLocks = competingLocks.filter((l) => new Date(l.expires_at).getTime() > Date.now());
+    if (activeLocks.length > 1) {
+      const sorted = activeLocks.sort((a, b) => new Date(a.acquired_at) - new Date(b.acquired_at));
+      const winner = sorted[0];
+      if (winner.owner_token !== lockOwnerToken) {
+        // We lost the race — delete our lock and abort
+        const ourLock = activeLocks.find((l) => l.owner_token === lockOwnerToken);
+        if (ourLock) try { await sr.entities.ScanLock.delete(ourLock.id); } catch (e) {}
+        return Response.json({ ok: true, skipped: true, reason: 'Lost scan lock race — another scan claimed this slot' });
       }
-      try { await sr.entities.ScanRun.update(existing.id, { status: 'failed', error: 'STALE_HEARTBEAT_TIMEOUT', completed_at: new Date().toISOString() }); } catch (e) {}
+    }
+
+    // Clean up stale expired locks from previous runs
+    const allLocks = await sr.entities.ScanLock.filter({ user_id: user.id });
+    const staleLocks = allLocks.filter((l) => new Date(l.expires_at).getTime() <= Date.now());
+    for (const sl of staleLocks) {
+      try { await sr.entities.ScanLock.delete(sl.id); } catch (e) {}
     }
 
     // Persist an authoritative ScanRun record so the Dashboard can display
@@ -123,20 +146,33 @@ export default async function(req) {
     });
     scanRunId = scanRun.id;
 
-    // POST-CREATE RACE DETECTION — if another scan with the same scan_run_id
-    // appeared between our filter and our create, we lost the race. Delete our
-    // scan and abort. This narrows the filter+create race window to the create
-    // round-trip latency. (Fixes Rev.10 defect #1.)
-    const concurrentRuns = await sr.entities.ScanRun.filter({ user_id: user.id, scan_run_id: runId, status: 'running' });
-    if (concurrentRuns.length > 1) {
-      try { await sr.entities.ScanRun.delete(scanRun.id); } catch (e) {}
-      return Response.json({ ok: true, skipped: true, reason: 'Lost scan lock race — another scan claimed this slot' });
-    }
-
-    // Heartbeat helper — updates last_heartbeat_at so the scan is not declared
-    // stale while it is still active. Called after each major AI pass.
+    // Heartbeat — updates both ScanRun and ScanLock. Counts failures and
+    // stops after 3 consecutive failures, transitioning to system_degraded.
+    // (Fixes Rev.12 #3: heartbeat failures were silently ignored, allowing a
+    // scan to continue while appearing stale to other workers.)
+    let heartbeatFailures = 0;
     const heartbeat = async () => {
-      try { await sr.entities.ScanRun.update(scanRun.id, { last_heartbeat_at: new Date().toISOString() }); } catch (e) {}
+      try {
+        await sr.entities.ScanRun.update(scanRun.id, { last_heartbeat_at: new Date().toISOString() });
+        // Also renew the ScanLock heartbeat and expiry
+        const ourLocks = await sr.entities.ScanLock.filter({ user_id: user.id, owner_token: lockOwnerToken });
+        if (ourLocks[0]) {
+          await sr.entities.ScanLock.update(ourLocks[0].id, {
+            heartbeat_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 3 * 60 * 1000).toISOString(),
+          });
+        }
+        heartbeatFailures = 0;
+      } catch (e) {
+        heartbeatFailures++;
+        try {
+          await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'heartbeat_failure', severity: 'warning', message: `Heartbeat persistence failed (${heartbeatFailures}/3): ${e.message}` });
+        } catch (ae) {}
+        if (heartbeatFailures >= 3) {
+          try { await updateSessionState(sr, user.id, SESSION_STATES.SYSTEM_DEGRADED, `Heartbeat persistence failed ${heartbeatFailures} times`); } catch (se) {}
+          throw new Error('HEARTBEAT_PERSISTENCE_FAILED: scan cannot continue without reliable heartbeats');
+        }
+      }
     };
 
     // Finish run — if the update fails, record an AuditEvent instead of
@@ -150,6 +186,11 @@ export default async function(req) {
           await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'scan_finalization_failed', severity: 'error', entity_type: 'ScanRun', entity_id: scanRun.id, message: `ScanRun update failed: ${e.message}` });
         } catch (e2) { /* audit itself failed */ }
       }
+      // Release the scan lock
+      try {
+        const ourLocks = await sr.entities.ScanLock.filter({ user_id: user.id, owner_token: lockOwnerToken });
+        for (const l of ourLocks) try { await sr.entities.ScanLock.delete(l.id); } catch (e) {}
+      } catch (e) { /* non-fatal */ }
     };
     // USER-SCOPED: only this user's holdings
     const holdings = await sr.entities.Holding.filter({ user_id: user.id });
@@ -198,8 +239,12 @@ export default async function(req) {
         return Response.json({ ok: false, error: `BROKER_UNREACHABLE: ${e.message}` }, { status: 503 });
       }
     } else {
-      // No broker connected — internal_paper mode, use holdings-based equity.
-      accountEquity = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
+      // No broker connected — internal_paper mode, use cash + holdings equity.
+      // (Fixes Rev.12 #8: the old code used only holdings value, so an empty
+      // paper account had $0 capital for sizing even though the cash ledger
+      // defaults to $100,000. Now equity = cash balance + position market value.)
+      const holdingsValue = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
+      accountEquity = await getPaperEquity(sr, user.id, holdingsValue);
     }
 
     const pCtx = portfolioContext(holdings);
@@ -485,7 +530,21 @@ export default async function(req) {
     // unfilled entry orders, continue protective sells only, mark session
     // risk-stopped, send alert, require manual reset.)
     if (circuitBreakerTripped) {
-      await updateSessionState(sr, user.id, SESSION_STATES.RISK_STOPPED, `DAILY_LOSS_LIMIT: ${pp.max_daily_loss_pct}% drawdown reached`);
+      // FAIL-CLOSED: try to persist the kill switch state. If the update fails,
+      // try a direct User update as fallback. If both fail, throw to abort the
+      // scan — never continue with an unpersisted kill switch. (Fixes Rev.12 #25:
+      // session-state persistence could fail silently, leaving trading_active
+      // true after a kill switch.)
+      try {
+        await updateSessionState(sr, user.id, SESSION_STATES.RISK_STOPPED, `DAILY_LOSS_LIMIT: ${pp.max_daily_loss_pct}% drawdown reached`);
+      } catch (e) {
+        try {
+          await sr.entities.User.update(user.id, { trading_active: false, kill_switch_reset_required: true, kill_switch_reason: `DAILY_LOSS_LIMIT: ${pp.max_daily_loss_pct}%`, kill_switch_at: new Date().toISOString() });
+        } catch (e2) {
+          try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'kill_switch_persistence_failed', severity: 'critical', message: `Both state update and fallback failed: ${e.message}; ${e2.message}` }); } catch (ae) {}
+          throw new Error(`KILL_SWITCH_PERSISTENCE_FAILED: ${e.message}`);
+        }
+      }
       try {
         await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'daily_loss_breach', severity: 'critical', message: `Daily loss limit reached (${pp.max_daily_loss_pct}%). Kill switch activated — new buys blocked, pending orders canceled.` });
       } catch (e) {}
@@ -656,6 +715,13 @@ export default async function(req) {
     // scope so this catch block can access them. (Fixes Rev.9 defect #1.)
     if (scanRunId && srRef) {
       try { await srRef.entities.ScanRun.update(scanRunId, { completed_at: new Date().toISOString(), status: 'failed', error: error.message }); } catch (e) {}
+    }
+    // Release the scan lock on failure
+    if (lockOwnerToken && userIdRef && srRef) {
+      try {
+        const locks = await srRef.entities.ScanLock.filter({ user_id: userIdRef, owner_token: lockOwnerToken });
+        for (const l of locks) try { await srRef.entities.ScanLock.delete(l.id); } catch (e) {}
+      } catch (e) {}
     }
     return Response.json({ error: error.message }, { status: 500 });
   }

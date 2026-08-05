@@ -43,19 +43,26 @@ export default async function(req) {
       }
     }
 
-    // 2. PENDING ORDERS — TradeIntents stuck in submitted/accepted for > 2 minutes
+    // 2. PENDING ORDERS — TradeIntents stuck in submitted/accepted for > 5 minutes.
+    // Uses submitted_at (broker submission time), not decision_timestamp (which
+    // precedes AI/risk processing and can make orders appear older than they are).
+    // (Fixes Rev.12 #22: health check used decision_timestamp for order age.)
     const intents = await sr.entities.TradeIntent.filter({ user_id: user.id });
-    const PENDING_TIMEOUT_MS = 2 * 60 * 1000;
-    const pendingIntents = intents.filter((i) =>
-      ['submitted', 'accepted'].includes(i.status) &&
-      i.decision_timestamp &&
-      Date.now() - new Date(i.decision_timestamp).getTime() > PENDING_TIMEOUT_MS
-    );
+    const PENDING_TIMEOUT_MS = 5 * 60 * 1000;
+    const pendingIntents = intents.filter((i) => {
+      if (!['submitted', 'accepted'].includes(i.status)) return false;
+      // Use submitted_at if available, fall back to last_broker_update_at, then created_date
+      const ageRef = i.submitted_at || i.last_broker_update_at || i.created_date;
+      if (!ageRef) return false;
+      return Date.now() - new Date(ageRef).getTime() > PENDING_TIMEOUT_MS;
+    });
     for (const intent of pendingIntents) {
+      const ageRef = intent.submitted_at || intent.last_broker_update_at || intent.created_date;
+      const ageSec = Math.round((Date.now() - new Date(ageRef).getTime()) / 1000);
       issues.push({
         severity: 'warning',
         check: 'pending_order_timeout',
-        message: `Order for ${intent.symbol} ${intent.side} pending for ${Math.round((Date.now() - new Date(intent.decision_timestamp).getTime()) / 1000)}s`,
+        message: `Order for ${intent.symbol} ${intent.side} pending for ${ageSec}s (status: ${intent.status})`,
         symbol: intent.symbol,
         trade_intent_id: intent.trade_intent_id,
       });
@@ -116,14 +123,16 @@ export default async function(req) {
       } catch (e) {}
     }
 
-    // Send alert if there are critical issues
-    const criticalIssues = issues.filter((i) => i.severity === 'critical');
-    if (criticalIssues.length > 0) {
-      const alertBody = criticalIssues.map((i) => `[${i.check}] ${i.message}`).join('\n');
+    // Send alert if there are critical OR warning issues — warnings like
+    // reconciliation-blocked positions and pending-order timeouts are
+    // operationally important enough to alert immediately. (Fixes Rev.12 #24.)
+    const alertableIssues = issues.filter((i) => i.severity === 'critical' || i.severity === 'warning');
+    if (alertableIssues.length > 0) {
+      const alertBody = alertableIssues.map((i) => `[${i.severity.toUpperCase()}] ${i.check}: ${i.message}`).join('\n');
       try {
         await sr.integrations.Core.SendEmail({
           to: user.email,
-          subject: `TradePulse Health Alert: ${criticalIssues.length} critical issue(s)`,
+          subject: `TradePulse Health Alert: ${alertableIssues.length} issue(s)`,
           body: alertBody,
         });
       } catch (e) {
@@ -137,7 +146,7 @@ export default async function(req) {
             await sendTelegramMessage(
               botToken,
               String(user.telegram_chat_id),
-              `🚨 <b>TradePulse Health Alert</b>\n${criticalIssues.length} critical issue(s):\n${criticalIssues.map((i) => `• ${i.check}: ${i.message}`).join('\n')}`
+              `🚨 <b>TradePulse Health Alert</b>\n${alertableIssues.length} issue(s):\n${alertableIssues.map((i) => `• [${i.severity.toUpperCase()}] ${i.check}: ${i.message}`).join('\n')}`
             );
           }
         } catch (e) {
@@ -148,10 +157,10 @@ export default async function(req) {
 
     return Response.json({
       ok: true,
-      healthy: criticalIssues.length === 0,
+      healthy: alertableIssues.length === 0,
       issues,
       summary: {
-        critical: criticalIssues.length,
+        critical: issues.filter((i) => i.severity === 'critical').length,
         warnings: issues.filter((i) => i.severity === 'warning').length,
         info: issues.filter((i) => i.severity === 'info').length,
         total: issues.length,
