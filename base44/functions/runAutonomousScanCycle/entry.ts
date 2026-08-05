@@ -5,9 +5,11 @@ import { computeRealFactors, weightedComposite, signalFromComposite } from '../.
 import { classifyRegimeFromSnapshots } from '../../shared/regime.ts';
 import { netEdge } from '../../shared/costModel.ts';
 import { getChampion } from '../../shared/modelGovernance.ts';
-import { getAlpacaAccount } from '../../shared/alpaca.ts';
+import { getAlpacaAccount, getAlpacaClock, cancelAlpacaOrder } from '../../shared/alpaca.ts';
 import { fetchCandles as fetchMultiAssetCandles } from '../../shared/marketDataAdapter.ts';
 import { sendTelegramMessage } from '../../shared/telegram.ts';
+import { isExecutable } from '../../shared/executableUniverse.ts';
+import { updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
 
 const PROFILES = {
   aggressive: { max_position_pct: 15, max_sector_pct: 40, min_confidence: 70, max_daily_trades: 8, stop_loss_pct: 12, max_daily_loss_pct: 5 },
@@ -181,6 +183,16 @@ export default async function(req) {
         // effectively the start-of-day equity. Used for the daily loss
         // circuit breaker. (Fixes Rev.9 defect #13.)
         startOfDayEquity = Number(acct.last_equity) || accountEquity;
+        // Fetch the Alpaca market clock — authoritative market session state.
+        // Used to set the session state to market_closed when the market is
+        // closed, rather than relying on local time. (Per the audit: use
+        // Alpaca's clock endpoint as the authority for stock-market session.)
+        try {
+          const clock = await getAlpacaClock({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode });
+          if (clock && !clock.is_open) {
+            await updateSessionState(sr, user.id, SESSION_STATES.MARKET_CLOSED, 'Alpaca clock reports market closed');
+          }
+        } catch (e) { /* non-fatal — fall back to local time gate in execution */ }
       } catch (e) {
         await finishRun({ status: 'broker_unavailable', error: `BROKER_UNREACHABLE: ${e.message}`, market_regime: regime.market_regime, model_version: champion?.version || 'default' });
         return Response.json({ ok: false, error: `BROKER_UNREACHABLE: ${e.message}` }, { status: 503 });
@@ -220,7 +232,13 @@ export default async function(req) {
       },
     });
     await heartbeat();
-    const candidates = p1.candidates || [];
+    // EXECUTABLE UNIVERSE FILTER — only execute trades for symbols in the
+    // fixed liquid universe. Candidates outside the universe are research-
+    // only: they can be analyzed but never auto-executed. (Per the audit:
+    // restrict execution to a small liquid stock universe to reduce
+    // spread/slippage risk and make failures easier to diagnose.)
+    const allCandidates = p1.candidates || [];
+    const candidates = allCandidates.filter((c) => isExecutable(c.symbol));
     if (!candidates.length) {
       await finishRun({ status: 'no_candidates', market_summary: p1.market_summary, market_regime: regime.market_regime, model_version: champion?.version || 'default' });
       return Response.json({ ok: true, message: 'No candidates', market_summary: p1.market_summary, champion_version: champion?.version });
@@ -458,6 +476,44 @@ export default async function(req) {
       const totalLossAmount = todayLosses.reduce((s, t) => s + (t.realized_pnl || 0), 0);
       const dailyLossPct = accountEquity > 0 ? (Math.abs(totalLossAmount) / accountEquity) * 100 : 0;
       circuitBreakerTripped = lossCount >= 3 || dailyLossPct >= pp.max_daily_loss_pct;
+    }
+
+    // KILL SWITCH — when the daily loss circuit breaker trips, cancel all
+    // unfilled entry orders, set the session state to risk_stopped, persist
+    // the reason, and send an alert. The system does NOT auto-re-enable —
+    // the user must manually reset. (Per the audit: block new buys, cancel
+    // unfilled entry orders, continue protective sells only, mark session
+    // risk-stopped, send alert, require manual reset.)
+    if (circuitBreakerTripped) {
+      await updateSessionState(sr, user.id, SESSION_STATES.RISK_STOPPED, `DAILY_LOSS_LIMIT: ${pp.max_daily_loss_pct}% drawdown reached`);
+      try {
+        await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'daily_loss_breach', severity: 'critical', message: `Daily loss limit reached (${pp.max_daily_loss_pct}%). Kill switch activated — new buys blocked, pending orders canceled.` });
+      } catch (e) {}
+      // Cancel unfilled entry (buy) orders via Alpaca
+      if (brokerCreds[0]?.broker === 'alpaca') {
+        try {
+          const pendingIntents = await sr.entities.TradeIntent.filter({ user_id: user.id, side: 'buy' });
+          const pending = pendingIntents.filter((i) => ['submitted', 'accepted'].includes(i.status));
+          for (const intent of pending) {
+            if (intent.broker_order_id) {
+              try {
+                await cancelAlpacaOrder({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode }, intent.broker_order_id);
+                await sr.entities.TradeIntent.update(intent.id, { status: 'canceled', rejection_reason: 'KILL_SWITCH_CANCELED', broker_terminal_status: 'canceled' });
+              } catch (e) { /* order may already be terminal */ }
+            }
+          }
+        } catch (e) { /* non-fatal */ }
+      }
+      // Send alert
+      try {
+        await sr.integrations.Core.SendEmail({
+          to: user.email,
+          subject: 'TradePulse KILL SWITCH: Daily loss limit reached',
+          body: `The daily loss circuit breaker has tripped. All new buys are blocked and pending orders have been canceled.\n\nDaily loss limit: ${pp.max_daily_loss_pct}%\n\nTrading will remain stopped until you manually reset it from the dashboard.`,
+        });
+      } catch (e) {
+        try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'notification_failed', severity: 'warning', message: `Kill switch email failed: ${e.message}` }); } catch (ae) {}
+      }
     }
 
     const proposalsBeforeVeto = proposals.length;

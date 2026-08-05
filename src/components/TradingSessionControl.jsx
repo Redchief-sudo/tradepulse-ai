@@ -26,12 +26,18 @@ export default function TradingSessionControl({ onComplete, onStart }) {
   const [stopping, setStopping] = useState(false);
   const [summary, setSummary] = useState(null);
   const [summaryError, setSummaryError] = useState(false);
+  const [sessionState, setSessionState] = useState('disabled');
+  const [killSwitchResetRequired, setKillSwitchResetRequired] = useState(false);
+  const [killSwitchReason, setKillSwitchReason] = useState(null);
   const trader = useStartTrader();
 
   const loadStatus = useCallback(async () => {
     try {
       const me = await base44.auth.me();
       setActive(!!me.trading_active);
+      setSessionState(me.trading_session_state || 'disabled');
+      setKillSwitchResetRequired(!!me.kill_switch_reset_required);
+      setKillSwitchReason(me.kill_switch_reason || null);
       setLoadError(false);
     } catch (e) {
       // Show an error state instead of silently defaulting to inactive.
@@ -49,8 +55,17 @@ export default function TradingSessionControl({ onComplete, onStart }) {
   const handleStart = async () => {
     setSummary(null);
     try {
-      await base44.auth.updateMe({ trading_active: true });
+      await base44.auth.updateMe({
+        trading_active: true,
+        trading_session_state: 'active',
+        kill_switch_reset_required: false,
+        kill_switch_reason: null,
+        kill_switch_at: null,
+      });
       setActive(true);
+      setSessionState('active');
+      setKillSwitchResetRequired(false);
+      setKillSwitchReason(null);
       if (onStart) onStart();
       // Run an immediate scan so the user doesn't wait for the next scheduled one
       trader.startTrader({ onComplete });
@@ -65,8 +80,9 @@ export default function TradingSessionControl({ onComplete, onStart }) {
     // Stop trading first — this is the critical action and must not be
     // blocked by a summary failure.
     try {
-      await base44.auth.updateMe({ trading_active: false });
+      await base44.auth.updateMe({ trading_active: false, trading_session_state: 'manually_stopped' });
       setActive(false);
+      setSessionState('manually_stopped');
     } catch (e) {
       console.error(e);
     }
@@ -85,6 +101,24 @@ export default function TradingSessionControl({ onComplete, onStart }) {
       setSummaryError(true);
     }
     setStopping(false);
+  };
+
+  const handleResetKillSwitch = async () => {
+    try {
+      await base44.auth.updateMe({
+        kill_switch_reset_required: false,
+        kill_switch_reason: null,
+        kill_switch_at: null,
+        trading_session_state: 'disabled',
+        trading_active: false,
+      });
+      setKillSwitchResetRequired(false);
+      setKillSwitchReason(null);
+      setSessionState('disabled');
+      setActive(false);
+    } catch (e) {
+      console.error(e);
+    }
   };
 
   if (loading) return null;
@@ -111,26 +145,47 @@ export default function TradingSessionControl({ onComplete, onStart }) {
               <h3 className="font-semibold text-sm">
                 {loadError
                   ? 'Unable to determine trading state'
-                  : active
-                    ? 'Autonomous Trading Enabled'
-                    : 'Trading Inactive'}
+                  : killSwitchResetRequired
+                    ? 'Kill Switch Active — Trading Stopped'
+                    : sessionState === 'risk_stopped'
+                      ? 'Risk Stopped — Manual Reset Required'
+                      : sessionState === 'broker_unavailable'
+                        ? 'Broker Unavailable'
+                        : sessionState === 'system_degraded'
+                          ? 'System Degraded'
+                          : sessionState === 'market_closed'
+                            ? 'Market Closed'
+                            : active
+                              ? 'Autonomous Trading Enabled'
+                              : 'Trading Inactive'}
               </h3>
               <p className="text-xs text-muted-foreground">
                 {loadError
                   ? 'Check your connection and reload the page'
-                  : active
-                    ? trader.isRunning
-                      ? 'AI is actively scanning and executing trades'
-                      : 'AI will scan every 15 minutes during market hours'
-                    : 'Press Start and the AI trades for you all day. Press Stop for your P&L.'}
+                  : killSwitchReason
+                    ? `Reason: ${killSwitchReason}`
+                    : active
+                      ? trader.isRunning
+                        ? 'AI is actively scanning and executing trades'
+                        : 'AI will scan every 15 minutes during market hours'
+                      : 'Press Start and the AI trades for you all day. Press Stop for your P&L.'}
               </p>
             </div>
           </div>
           <div className="flex gap-2">
+            {killSwitchResetRequired && (
+              <Button
+                onClick={handleResetKillSwitch}
+                variant="outline"
+                className="gap-2 border-amber-500/50 text-amber-500 hover:bg-amber-500/10"
+              >
+                Reset Kill Switch
+              </Button>
+            )}
             {!active ? (
               <Button
                 onClick={handleStart}
-                disabled={trader.isRunning}
+                disabled={trader.isRunning || killSwitchResetRequired}
                 className="gap-2 bg-gradient-to-r from-primary to-accent"
               >
                 {trader.isRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
@@ -150,6 +205,23 @@ export default function TradingSessionControl({ onComplete, onStart }) {
           </div>
         </div>
       </motion.div>
+
+      {/* Kill switch alert */}
+      {killSwitchResetRequired && (
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="rounded-2xl border border-red-500/30 bg-red-500/10 p-4 mt-3"
+        >
+          <p className="text-xs text-red-500 font-semibold">
+            ⚠ Kill Switch Active
+          </p>
+          <p className="text-xs text-red-500/80 mt-1">
+            {killSwitchReason || 'Daily loss limit reached'}. All new buys are blocked and pending orders were canceled.
+            Press "Reset Kill Switch" to acknowledge and resume.
+          </p>
+        </motion.div>
+      )}
 
       {/* Scan progress */}
       {trader.isRunning && trader.stageLabel && (

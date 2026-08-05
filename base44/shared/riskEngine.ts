@@ -3,24 +3,31 @@
 // The risk engine has veto authority over every strategy and AI signal.
 // All queries are user-scoped — no cross-user data leakage.
 
+// Conservative engineering defaults — per the risk containment audit.
+// max_risk_per_trade_pct: max loss per position as % of equity (risk-based sizing)
+// max_total_exposure_pct: max total invested exposure as % of equity
+// max_simultaneous_orders: max outstanding (non-terminal) orders at once
 const RISK_LIMITS = {
   aggressive: {
     max_position_pct: 15, max_sector_pct: 40, min_confidence: 70, max_daily_trades: 8,
     stop_loss_pct: 12, max_drawdown_pct: 25,
     max_open_positions: 12, max_daily_loss_pct: 5, max_outstanding_orders: 20,
     spread_limit_pct: 2, slippage_limit_pct: 1.5,
+    max_risk_per_trade_pct: 0.50, max_total_exposure_pct: 60, max_simultaneous_orders: 5,
   },
   balanced: {
-    max_position_pct: 10, max_sector_pct: 25, min_confidence: 80, max_daily_trades: 5,
+    max_position_pct: 7, max_sector_pct: 20, min_confidence: 80, max_daily_trades: 3,
     stop_loss_pct: 8, max_drawdown_pct: 15,
-    max_open_positions: 8, max_daily_loss_pct: 3, max_outstanding_orders: 12,
+    max_open_positions: 5, max_daily_loss_pct: 1.0, max_outstanding_orders: 4,
     spread_limit_pct: 1.5, slippage_limit_pct: 1,
+    max_risk_per_trade_pct: 0.30, max_total_exposure_pct: 40, max_simultaneous_orders: 2,
   },
   conservative: {
-    max_position_pct: 5, max_sector_pct: 15, min_confidence: 88, max_daily_trades: 3,
+    max_position_pct: 5, max_sector_pct: 15, min_confidence: 88, max_daily_trades: 2,
     stop_loss_pct: 5, max_drawdown_pct: 8,
-    max_open_positions: 5, max_daily_loss_pct: 1.5, max_outstanding_orders: 8,
+    max_open_positions: 3, max_daily_loss_pct: 0.5, max_outstanding_orders: 2,
     spread_limit_pct: 1, slippage_limit_pct: 0.5,
+    max_risk_per_trade_pct: 0.25, max_total_exposure_pct: 30, max_simultaneous_orders: 2,
   },
 };
 
@@ -53,7 +60,12 @@ export async function buildPortfolioSnapshot(sr, userId, accountEquity = null) {
     .filter((t) => t.action === 'sell')
     .reduce((s, t) => s + (t.realized_pnl || 0), 0);
   const dailyPnlPct = totalEquity > 0 ? (dailyRealized / totalEquity) * 100 : 0;
-  return { holdings, totalEquity, sectorMap, openPositions: holdings.length, tradesToday: tradesToday.length, dailyPnlPct };
+  // Total invested exposure and outstanding orders — for the new risk controls.
+  const totalExposure = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
+  const totalExposurePct = totalEquity > 0 ? (totalExposure / totalEquity) * 100 : 0;
+  const allIntents = await sr.entities.TradeIntent.filter({ user_id: userId });
+  const outstandingOrders = allIntents.filter((i) => ['submitted', 'accepted', 'partially_filled'].includes(i.status)).length;
+  return { holdings, totalEquity, sectorMap, openPositions: holdings.length, tradesToday: tradesToday.length, dailyPnlPct, totalExposure, totalExposurePct, outstandingOrders };
 }
 
 // evaluateRisk → { approved, approvedQuantity, reasons, snapshot }
@@ -90,14 +102,42 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
   if (dailyPnlPct <= -limits.max_daily_loss_pct) {
     reasons.push(`MAX_DAILY_LOSS_EXCEEDED (${dailyPnlPct.toFixed(2)}% <= -${limits.max_daily_loss_pct}%)`);
   }
+  // Total exposure check — reject if adding this position would exceed the max
+  if (limits.max_total_exposure_pct && snapshot.totalExposurePct != null && totalEquity > 0) {
+    const newExposurePct = snapshot.totalExposurePct + (qty * price / totalEquity) * 100;
+    if (newExposurePct > limits.max_total_exposure_pct) {
+      reasons.push(`MAX_TOTAL_EXPOSURE_EXCEEDED (${newExposurePct.toFixed(1)}% > ${limits.max_total_exposure_pct}%)`);
+    }
+  }
+  // Outstanding orders check — reject if too many simultaneous open orders
+  if (limits.max_simultaneous_orders && snapshot.outstandingOrders != null) {
+    if (snapshot.outstandingOrders >= limits.max_simultaneous_orders) {
+      reasons.push(`MAX_SIMULTANEOUS_ORDERS_REACHED (${snapshot.outstandingOrders}/${limits.max_simultaneous_orders})`);
+    }
+  }
   if (reasons.length) {
     return { approved: false, approvedQuantity: 0, reasons, snapshot };
   }
 
   let approvedQty = qty;
   if (totalEquity > 0 && price > 0) {
+    // RISK-BASED SIZING — size from risk budget / (entry - stop), not from
+    // a blind position percentage. This limits loss by stop distance.
+    // (Per the audit: shares = risk_budget / risk_per_share, then cap by
+    // max_position_pct, max_sector_pct, and total exposure.)
+    if (side === 'buy' && intent.stop_loss > 0 && limits.max_risk_per_trade_pct) {
+      const riskBudget = (limits.max_risk_per_trade_pct / 100) * totalEquity;
+      const riskPerShare = price - intent.stop_loss;
+      if (riskPerShare > 0) {
+        const riskBasedQty = Math.floor(riskBudget / riskPerShare);
+        if (riskBasedQty < approvedQty) {
+          approvedQty = riskBasedQty;
+          reasons.push(`POSITION_CAPPED_TO_${approvedQty}_BY_RISK_BASED_SIZING`);
+        }
+      }
+    }
     const maxPositionNotional = (limits.max_position_pct / 100) * totalEquity;
-    if (qty * price > maxPositionNotional) {
+    if (approvedQty * price > maxPositionNotional) {
       approvedQty = Math.floor(maxPositionNotional / price);
       reasons.push(`POSITION_CAPPED_TO_${approvedQty}_BY_MAX_POSITION_PCT`);
     }
@@ -110,6 +150,17 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
       if (cappedBySector < approvedQty) {
         approvedQty = cappedBySector;
         reasons.push(`POSITION_CAPPED_TO_${approvedQty}_BY_MAX_SECTOR_PCT`);
+      }
+    }
+    // Total exposure cap — don't exceed the max total invested exposure
+    if (limits.max_total_exposure_pct && snapshot.totalExposurePct != null) {
+      const remainingExposure = ((limits.max_total_exposure_pct / 100) * totalEquity) - (snapshot.totalExposure || 0);
+      if (approvedQty * price > remainingExposure) {
+        const cappedByExposure = price > 0 ? Math.floor(remainingExposure / price) : 0;
+        if (cappedByExposure < approvedQty) {
+          approvedQty = cappedByExposure;
+          reasons.push(`POSITION_CAPPED_TO_${approvedQty}_BY_MAX_TOTAL_EXPOSURE`);
+        }
       }
     }
   }

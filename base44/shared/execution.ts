@@ -488,10 +488,10 @@ export async function executeIntent(base44, user, input) {
   const snapshot = await buildPortfolioSnapshot(sr, userId, accountEquity);
   const limits = riskLimitsForProfile(user.trade_profile || 'balanced');
   const risk = evaluateRisk(
-    { symbol, side, requested_quantity: requestedQty, limit_price: refPrice, price: refPrice, sector: input.sector, confidence: input.confidence },
+    { symbol, side, requested_quantity: requestedQty, limit_price: refPrice, price: refPrice, sector: input.sector, confidence: input.confidence, stop_loss: input.stop_loss },
     snapshot,
     limits,
-    { killSwitch: !!user.kill_switch }
+    { killSwitch: !!user.kill_switch_reset_required || user.trading_session_state === 'risk_stopped' }
   );
 
   if (!risk.approved) {

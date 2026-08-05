@@ -15,6 +15,9 @@ export const TRADE_PROFILES = {
     stop_loss_pct: 12,
     max_drawdown_pct: 25,
     max_daily_loss_pct: 5,
+    max_risk_per_trade_pct: 0.50,
+    max_total_exposure_pct: 60,
+    max_simultaneous_orders: 5,
   },
   balanced: {
     id: 'balanced',
@@ -22,13 +25,16 @@ export const TRADE_PROFILES = {
     description:
       'Moderate risk with diversified exposure. Standard institutional position sizes and sector limits with a solid confidence floor.',
     risk_level: 'Medium',
-    max_position_pct: 10,
-    max_sector_pct: 25,
+    max_position_pct: 7,
+    max_sector_pct: 20,
     min_confidence: 80,
-    max_daily_trades: 5,
+    max_daily_trades: 3,
     stop_loss_pct: 8,
     max_drawdown_pct: 15,
-    max_daily_loss_pct: 3,
+    max_daily_loss_pct: 1.0,
+    max_risk_per_trade_pct: 0.30,
+    max_total_exposure_pct: 40,
+    max_simultaneous_orders: 2,
   },
   conservative: {
     id: 'conservative',
@@ -39,10 +45,13 @@ export const TRADE_PROFILES = {
     max_position_pct: 5,
     max_sector_pct: 15,
     min_confidence: 88,
-    max_daily_trades: 3,
+    max_daily_trades: 2,
     stop_loss_pct: 5,
     max_drawdown_pct: 8,
-    max_daily_loss_pct: 1.5,
+    max_daily_loss_pct: 0.5,
+    max_risk_per_trade_pct: 0.25,
+    max_total_exposure_pct: 30,
+    max_simultaneous_orders: 2,
   },
 };
 
@@ -62,5 +71,8 @@ export function profileParams(id) {
     stop_loss_pct: p.stop_loss_pct,
     max_drawdown_pct: p.max_drawdown_pct,
     max_daily_loss_pct: p.max_daily_loss_pct,
+    max_risk_per_trade_pct: p.max_risk_per_trade_pct,
+    max_total_exposure_pct: p.max_total_exposure_pct,
+    max_simultaneous_orders: p.max_simultaneous_orders,
   };
 }

@@ -63,6 +63,32 @@ export async function getAlpacaAccount({ apiKey, secretKey, mode }) {
   return data;
 }
 
+// Get Alpaca market clock — authoritative market session state.
+// Returns { is_open, next_open, next_close, timestamp, session }.
+// This is the authoritative source for whether the US regular session is open,
+// rather than relying on local time or cron schedules.
+export async function getAlpacaClock({ apiKey, secretKey, mode }) {
+  const res = await fetch(`${baseUrl(mode)}/clock`, {
+    headers: headers(apiKey, secretKey),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.message || `Alpaca HTTP ${res.status}`);
+  return data;
+}
+
+// Cancel an open order — used by the kill switch to cancel unfilled entry orders.
+export async function cancelAlpacaOrder({ apiKey, secretKey, mode }, orderId) {
+  const res = await fetch(`${baseUrl(mode)}/orders/${orderId}`, {
+    method: 'DELETE',
+    headers: headers(apiKey, secretKey),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data?.message || `Alpaca HTTP ${res.status}`);
+  }
+  return { canceled: true, orderId };
+}
+
 // Fetch account activities (trade fills) — used by reconciliation to find the ACTUAL
 // close price of a position that was externally closed, rather than inventing one.
 // Returns an array of activity objects with { activity_type, symbol, qty, price, side, date }

@@ -77,6 +77,39 @@
           "type": "number"
         }
       }
+    },
+    "trading_active": {
+      "type": "boolean",
+      "default": false,
+      "description": "User toggle \u2014 whether autonomous scanning is enabled. The authoritative state is trading_session_state."
+    },
+    "trading_session_state": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "active",
+        "risk_stopped",
+        "system_degraded",
+        "broker_unavailable",
+        "market_closed",
+        "manually_stopped"
+      ],
+      "default": "disabled",
+      "description": "Hard session state machine \u2014 the authoritative trading state. Not just active/inactive: includes risk_stopped (kill switch tripped), system_degraded (scan/data failure), broker_unavailable, market_closed, manually_stopped."
+    },
+    "kill_switch_reason": {
+      "type": "string",
+      "description": "Why the kill switch tripped (e.g. DAILY_LOSS_LIMIT, BROKER_UNAVAILABLE, SYSTEM_DEGRADED)"
+    },
+    "kill_switch_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the kill switch tripped"
+    },
+    "kill_switch_reset_required": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, the user must manually reset before trading can resume \u2014 prevents auto-re-enable on the same day"
     }
   },
   "required": [
