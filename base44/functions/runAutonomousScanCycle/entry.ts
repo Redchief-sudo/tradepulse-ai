@@ -328,10 +328,13 @@ export default async function(req) {
       .filter((e) => {
         const f = e.realFactors;
         if (!f) return true;
-        // SMARTER ENTRIES — don't chase overbought or overextended stocks
+        // SELECTIVE ENTRIES — multi-factor quality gate. Only act on setups
+        // with strong technical confirmation AND momentum alignment.
         if (f.rsi != null && f.rsi > 72) return false;              // RSI > 72 = overbought, wait for pullback
+        if (f.rsi != null && f.rsi < 30) return false;              // RSI < 30 = catching falling knife
         if (f.ma50 != null && f.price > f.ma50 * 1.07) return false; // > 7% above SMA50 = chasing
-        if (f.technical_score < 52) return false;                    // require technical confirmation
+        if (f.technical_score < 55) return false;                    // require strong technical confirmation
+        if (f.momentum_score != null && f.momentum_score < 50) return false; // require momentum alignment
         return true;
       })
       .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
@@ -434,7 +437,7 @@ export default async function(req) {
       return { ...p, ml_score: Math.round(ml_score * 10) / 10, ml_signal: signalFromComposite(ml_score), realFactors: f, realPrice: ef?.realPrice };
     });
     await heartbeat();
-    let approved = scored.filter((p) => p.ml_score >= 45);
+    let approved = scored.filter((p) => p.ml_score >= 55);
 
     // PASS 4 — Adversarial Risk Officer veto
     if (approved.length) {
@@ -575,6 +578,15 @@ export default async function(req) {
       }
     }
 
+    // DYNAMIC SIZING — compute recent win rate from the last 20 sell trades.
+    // Position size scales with conviction AND recent performance: bet bigger
+    // on high-conviction A+ setups when recent trades are winning, smaller
+    // when the system is cold. (Per user request: smarter dynamic sizing.)
+    const recentSells = await sr.entities.Trade.filter({ user_id: user.id, action: 'sell' }, '-created_date', 20);
+    const recentWinRate = recentSells.length > 0
+      ? recentSells.filter((t) => (t.realized_pnl || 0) > 0).length / recentSells.length
+      : 0.5; // default 50% when no history — neutral starting point
+
     const proposalsBeforeVeto = proposals.length;
     const executed = [];
     let tradesRejected = 0;
@@ -613,9 +625,18 @@ export default async function(req) {
         const maxPos = (pp.max_position_pct / 100) * accountEquity;
         const sectorVal = sec.sectors.find((s) => s.sector === (pr.sector || 'Other'))?.value || 0;
         const sectorCap = Math.max(0, (pp.max_sector_pct / 100) * accountEquity - sectorVal);
-        const aiVal = ((pr.suggested_position_pct || 5) / 100) * accountEquity;
+        // DYNAMIC SIZING — scale position by conviction AND recent win rate.
+        // conviction_factor: 0.5 at min_confidence → 1.0 at 100% confidence.
+        // win_rate_factor: 0.7 when cold → 1.0 when hot. Combined, an A+
+        // setup during a hot streak gets full size; a marginal setup when
+        // cold gets ~35% of base size.
+        const convictionFactor = 0.5 + 0.5 * Math.min(1, Math.max(0, (pr.confidence - pp.min_confidence) / Math.max(1, 100 - pp.min_confidence)));
+        const winRateFactor = 0.7 + 0.3 * recentWinRate;
+        const aiVal = ((pr.suggested_position_pct || 5) / 100) * accountEquity * convictionFactor * winRateFactor;
         const positionValue = Math.min(aiVal, maxPos, sectorCap) * regime.position_multiplier;
-        shares = price > 0 && positionValue >= price ? Math.floor(positionValue / price) : 0;
+        // FRACTIONAL SHARES — round to 0.001 so a $100 account can buy 0.035
+        // shares of a $200 stock. Alpaca accepts fractional quantities.
+        shares = price > 0 && positionValue > 0 ? Math.round((positionValue / price) * 1000) / 1000 : 0;
       } else {
         const existing = holdings.find((h) => h.symbol === pr.symbol);
         shares = existing ? existing.shares : 0;

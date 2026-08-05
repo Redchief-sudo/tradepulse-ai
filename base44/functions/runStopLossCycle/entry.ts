@@ -93,8 +93,22 @@ export default async function(req) {
       const dropPct = h.avg_price > 0 ? ((h.avg_price - live) / h.avg_price) * 100 : 0;
       const gainPct = h.avg_price > 0 ? ((live - h.avg_price) / h.avg_price) * 100 : 0;
       const isTakeProfit = h.target_price && live >= h.target_price;
+
+      // ADAPTIVE EXITS — partial profit-taking with trailing stops.
+      // On take-profit: sell 50% of the position, raise stop to breakeven
+      // on the rest, and set a higher target for the remaining shares.
+      // On stop-loss: sell all remaining (full exit).
+      // (Per user request: smarter adaptive exits with scale-outs.)
+      let exitQty = h.shares;
+      let partialExit = false;
+      if (isTakeProfit && h.shares > 1) {
+        exitQty = Math.round((h.shares * 0.5) * 1000) / 1000;
+        partialExit = true;
+        if (exitQty < 0.001) { exitQty = h.shares; partialExit = false; }
+      }
+
       const exitReason = isTakeProfit
-        ? `take-profit @ +${gainPct.toFixed(1)}% (target $${h.target_price})`
+        ? `take-profit @ +${gainPct.toFixed(1)}% (target $${h.target_price})${partialExit ? ' — partial 50% exit' : ''}`
         : h.stop_loss > 0
           ? `stop-loss @ $${h.stop_loss} (price $${live.toFixed(2)}, ${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(1)}%)`
           : `stop-loss @ -${dropPct.toFixed(1)}% (threshold ${stopThreshold}%)`;
@@ -107,7 +121,7 @@ export default async function(req) {
       const assetClass = (h.asset_class || 'stocks').toLowerCase();
       const isCrypto = assetClass === 'crypto';
       if (!marketOpen && !isCrypto) {
-        results.push({ symbol: h.symbol, shares: h.shares, price: live, dropPct, gainPct, exitReason, status: 'skipped_market_closed', reason: `MARKET_CLOSED (${session})` });
+        results.push({ symbol: h.symbol, shares: exitQty, price: live, dropPct, gainPct, exitReason, status: 'skipped_market_closed', reason: `MARKET_CLOSED (${session})` });
         continue;
       }
 
@@ -115,7 +129,7 @@ export default async function(req) {
       const result = await settleTrade(base44, user, {
         symbol: h.symbol,
         action: 'sell',
-        qty: h.shares,
+        qty: exitQty,
         price: live,
         company_name: h.company_name || h.symbol,
         ai_recommended: true,
@@ -125,17 +139,29 @@ export default async function(req) {
         signal_timestamp: new Date().toISOString(),
         finnhub_key: key,
       });
-      // Classify the result status — only confirmed fills are "sold".
-      // (Fixes Rev.10 defect #11: notifications said "SOLD" for skipped,
-      // pending, and rejected orders.)
+      // ADAPTIVE EXIT — after a partial take-profit, update the remaining
+      // holding: raise stop to breakeven, set a higher target for the rest.
       const rStatus = result?.status || result?.settlement?.status;
+      if (partialExit && (rStatus === 'filled' || rStatus === 'paper_filled')) {
+        const remainingShares = Math.round((h.shares - exitQty) * 1000) / 1000;
+        const targetDistance = h.target_price - h.avg_price;
+        const newTarget = h.target_price + targetDistance;
+        try {
+          await sr.entities.Holding.update(h.id, {
+            shares: remainingShares,
+            stop_loss: h.avg_price,
+            target_price: newTarget,
+          });
+        } catch (e) { /* non-fatal — next cycle will retry */ }
+      }
+      // Classify the result status — only confirmed fills are "sold".
       let status = 'submitted';
       if (rStatus === 'filled' || rStatus === 'paper_filled') status = 'filled';
       else if (rStatus === 'rejected' || rStatus === 'failed') status = 'rejected';
       else if (rStatus === 'canceled' || rStatus === 'expired') status = 'canceled';
       else if (rStatus === 'partially_filled') status = 'partially_filled';
       else if (rStatus === 'pending' || rStatus === 'submitted' || rStatus === 'accepted') status = 'pending';
-      results.push({ symbol: h.symbol, shares: h.shares, price: live, dropPct, gainPct, exitReason, status, settlement: result });
+      results.push({ symbol: h.symbol, shares: exitQty, price: live, dropPct, gainPct, exitReason, status, settlement: result });
     }
 
     // Email + Telegram alert

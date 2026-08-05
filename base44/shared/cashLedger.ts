@@ -11,7 +11,7 @@
 // INITIAL DEPOSIT: the first call initializes the account with $100k. A
 // description-based check prevents duplicate initial deposits. (Fixes Rev.12 #7.)
 
-const PAPER_INITIAL_CASH = 100000; // $100,000 default paper account
+const PAPER_INITIAL_CASH = 1000; // $1,000 default — optimized for small accounts ($100-$10k)
 const INITIAL_DEPOSIT_DESC = 'Initial paper account deposit';
 
 // Get the current cash balance for a user (internal paper mode).

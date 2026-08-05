@@ -29,6 +29,13 @@ const RISK_LIMITS = {
     spread_limit_pct: 1, slippage_limit_pct: 0.5,
     max_risk_per_trade_pct: 0.25, max_total_exposure_pct: 30, max_simultaneous_orders: 2,
   },
+  micro: {
+    max_position_pct: 20, max_sector_pct: 50, min_confidence: 82, max_daily_trades: 2,
+    stop_loss_pct: 6, max_drawdown_pct: 10,
+    max_open_positions: 3, max_daily_loss_pct: 2, max_outstanding_orders: 2,
+    spread_limit_pct: 2, slippage_limit_pct: 1,
+    max_risk_per_trade_pct: 1.0, max_total_exposure_pct: 70, max_simultaneous_orders: 2,
+  },
 };
 
 export function riskLimitsForProfile(profileId) {
@@ -66,6 +73,13 @@ export async function buildPortfolioSnapshot(sr, userId, accountEquity = null) {
   const allIntents = await sr.entities.TradeIntent.filter({ user_id: userId });
   const outstandingOrders = allIntents.filter((i) => ['submitted', 'accepted', 'partially_filled'].includes(i.status)).length;
   return { holdings, totalEquity, sectorMap, openPositions: holdings.length, tradesToday: tradesToday.length, dailyPnlPct, totalExposure, totalExposurePct, outstandingOrders };
+}
+
+// Round to 3 decimal places for fractional share support. Alpaca accepts
+// fractional quantities (e.g. 0.035 shares of AAPL), so a $100 account can
+// buy a $200 stock. Rounds to 0.001 — the smallest practical fraction.
+function roundQty(q) {
+  return Math.round(q * 1000) / 1000;
 }
 
 // evaluateRisk → { approved, approvedQuantity, reasons, snapshot }
@@ -129,7 +143,7 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
       const riskBudget = (limits.max_risk_per_trade_pct / 100) * totalEquity;
       const riskPerShare = price - intent.stop_loss;
       if (riskPerShare > 0) {
-        const riskBasedQty = Math.floor(riskBudget / riskPerShare);
+        const riskBasedQty = roundQty(riskBudget / riskPerShare);
         if (riskBasedQty < approvedQty) {
           approvedQty = riskBasedQty;
           reasons.push(`POSITION_CAPPED_TO_${approvedQty}_BY_RISK_BASED_SIZING`);
@@ -138,7 +152,7 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
     }
     const maxPositionNotional = (limits.max_position_pct / 100) * totalEquity;
     if (approvedQty * price > maxPositionNotional) {
-      approvedQty = Math.floor(maxPositionNotional / price);
+      approvedQty = roundQty(maxPositionNotional / price);
       reasons.push(`POSITION_CAPPED_TO_${approvedQty}_BY_MAX_POSITION_PCT`);
     }
     const sector = intent.sector || 'Other';
@@ -146,7 +160,7 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
     const maxSectorNotional = (limits.max_sector_pct / 100) * totalEquity;
     const remainingSector = maxSectorNotional - currentSector;
     if (approvedQty * price > remainingSector) {
-      const cappedBySector = price > 0 ? Math.floor(remainingSector / price) : 0;
+      const cappedBySector = price > 0 ? roundQty(remainingSector / price) : 0;
       if (cappedBySector < approvedQty) {
         approvedQty = cappedBySector;
         reasons.push(`POSITION_CAPPED_TO_${approvedQty}_BY_MAX_SECTOR_PCT`);
@@ -156,7 +170,7 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
     if (limits.max_total_exposure_pct && snapshot.totalExposurePct != null) {
       const remainingExposure = ((limits.max_total_exposure_pct / 100) * totalEquity) - (snapshot.totalExposure || 0);
       if (approvedQty * price > remainingExposure) {
-        const cappedByExposure = price > 0 ? Math.floor(remainingExposure / price) : 0;
+        const cappedByExposure = price > 0 ? roundQty(remainingExposure / price) : 0;
         if (cappedByExposure < approvedQty) {
           approvedQty = cappedByExposure;
           reasons.push(`POSITION_CAPPED_TO_${approvedQty}_BY_MAX_TOTAL_EXPOSURE`);
@@ -165,7 +179,7 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
     }
   }
 
-  if (approvedQty < 1) {
+  if (approvedQty < 0.001) {
     reasons.push('INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT');
     return { approved: false, approvedQuantity: 0, reasons, snapshot };
   }

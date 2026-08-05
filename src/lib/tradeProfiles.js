@@ -53,6 +53,23 @@ export const TRADE_PROFILES = {
     max_total_exposure_pct: 30,
     max_simultaneous_orders: 2,
   },
+  micro: {
+    id: 'micro',
+    name: 'Micro',
+    description:
+      'Optimized for small accounts ($100-$2,000). Concentrated positions with fractional shares, tight risk per trade, and a high confidence floor. Fewer but better trades.',
+    risk_level: 'Medium',
+    max_position_pct: 20,
+    max_sector_pct: 50,
+    min_confidence: 82,
+    max_daily_trades: 2,
+    stop_loss_pct: 6,
+    max_drawdown_pct: 10,
+    max_daily_loss_pct: 2,
+    max_risk_per_trade_pct: 1.0,
+    max_total_exposure_pct: 70,
+    max_simultaneous_orders: 2,
+  },
 };
 
 export const DEFAULT_PROFILE = 'balanced';
