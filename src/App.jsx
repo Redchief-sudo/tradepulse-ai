@@ -13,6 +13,7 @@ import AIAssistant from '@/pages/AIAssistant';
 import Watchlist from '@/pages/Watchlist';
 import AutonomousTrader from '@/pages/AutonomousTrader';
 import Operations from '@/pages/Operations';
+import TradingJournal from '@/pages/TradingJournal';
 import Settings from '@/pages/Settings';
 import StagedOperation from '@/pages/StagedOperation';
 import Login from '@/pages/Login';
@@ -56,6 +57,7 @@ const AuthenticatedApp = () => {
         <Route path="/watchlist" element={<Watchlist />} />
         <Route path="/autonomous" element={<AutonomousTrader />} />
         <Route path="/operations" element={<Operations />} />
+        <Route path="/journal" element={<TradingJournal />} />
         <Route path="/settings" element={<Settings />} />
         <Route path="/staged-operation" element={<StagedOperation />} />
       </Route>

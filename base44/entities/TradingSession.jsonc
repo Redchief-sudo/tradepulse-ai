@@ -1,0 +1,205 @@
+{
+  "name": "TradingSession",
+  "type": "object",
+  "properties": {
+    "user_id": {
+      "type": "string",
+      "description": "Owner user id \u2014 every query must filter by this"
+    },
+    "session_date": {
+      "type": "string",
+      "format": "date",
+      "description": "The trading date (YYYY-MM-DD)"
+    },
+    "session_id": {
+      "type": "string",
+      "description": "Canonical session identifier (session-YYYY-MM-DD) \u2014 idempotency key"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "open",
+        "closed"
+      ],
+      "default": "open",
+      "description": "open = market still in session or report generated mid-day; closed = end-of-day final report"
+    },
+    "starting_equity": {
+      "type": "number",
+      "description": "Equity at the start of the session (broker last_equity or app estimate)"
+    },
+    "ending_equity": {
+      "type": "number",
+      "description": "Equity at the end of the session"
+    },
+    "broker_equity": {
+      "type": "number",
+      "description": "Authoritative broker equity at report time (null for internal paper)"
+    },
+    "broker_prev_close_equity": {
+      "type": "number",
+      "description": "Broker equity at previous market close (Alpaca last_equity)"
+    },
+    "app_equity": {
+      "type": "number",
+      "description": "App-estimated equity (holdings value + cash)"
+    },
+    "daily_return_pct": {
+      "type": "number",
+      "description": "Daily return percentage based on starting vs ending equity"
+    },
+    "realized_pnl": {
+      "type": "number",
+      "description": "Total realized P&L from sell trades executed during the session"
+    },
+    "unrealized_pnl": {
+      "type": "number",
+      "description": "Unrealized P&L across all open positions at session end"
+    },
+    "fees_total": {
+      "type": "number",
+      "description": "Total fees paid during the session"
+    },
+    "commissions_total": {
+      "type": "number",
+      "description": "Total commissions paid during the session"
+    },
+    "buying_power": {
+      "type": "number",
+      "description": "Buying power at session end"
+    },
+    "cash_balance": {
+      "type": "number",
+      "description": "Cash balance at session end (internal paper mode)"
+    },
+    "max_drawdown_pct": {
+      "type": "number",
+      "description": "Maximum intraday drawdown percentage"
+    },
+    "num_scans": {
+      "type": "number",
+      "description": "Number of scan runs during the session"
+    },
+    "num_ai_decisions": {
+      "type": "number",
+      "description": "Number of AI trade decisions recorded during the session"
+    },
+    "trades_submitted": {
+      "type": "number",
+      "description": "Number of trade intents submitted during the session"
+    },
+    "trades_filled": {
+      "type": "number",
+      "description": "Number of trade intents filled during the session"
+    },
+    "trades_rejected": {
+      "type": "number",
+      "description": "Number of trade intents rejected during the session"
+    },
+    "trades_canceled": {
+      "type": "number",
+      "description": "Number of trade intents canceled during the session"
+    },
+    "win_rate_pct": {
+      "type": "number",
+      "description": "Win rate percentage (winning sells / total closed positions)"
+    },
+    "num_winners": {
+      "type": "number"
+    },
+    "num_losers": {
+      "type": "number"
+    },
+    "avg_winner": {
+      "type": "number",
+      "description": "Average P&L of winning trades"
+    },
+    "avg_loser": {
+      "type": "number",
+      "description": "Average P&L of losing trades"
+    },
+    "largest_winner": {
+      "type": "number"
+    },
+    "largest_loser": {
+      "type": "number"
+    },
+    "num_risk_events": {
+      "type": "number",
+      "description": "Number of risk-related audit events (daily_loss_breach, kill_switch, stale_order, etc.)"
+    },
+    "num_kill_switch_events": {
+      "type": "number"
+    },
+    "reconciliation_status": {
+      "type": "string",
+      "description": "Summary of reconciliation state (clean / N blocked positions)"
+    },
+    "model_version": {
+      "type": "string",
+      "description": "Champion model version used during the session"
+    },
+    "market_regime": {
+      "type": "string",
+      "description": "Market regime classification during the session"
+    },
+    "sector_exposure": {
+      "type": "string",
+      "description": "JSON string of sector exposure breakdown at session end"
+    },
+    "open_positions": {
+      "type": "number",
+      "description": "Number of open positions at session end"
+    },
+    "trade_ids": {
+      "type": "string",
+      "description": "JSON array of Trade record IDs executed during the session"
+    },
+    "scan_run_ids": {
+      "type": "string",
+      "description": "JSON array of ScanRun IDs executed during the session"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "required": [
+    "user_id",
+    "session_date",
+    "session_id"
+  ],
+  "rls": {
+    "read": {
+      "$or": [
+        {
+          "created_by_id": "{{user.id}}"
+        },
+        {
+          "data.user_id": "{{user.id}}"
+        }
+      ]
+    },
+    "create": {},
+    "update": {
+      "$or": [
+        {
+          "created_by_id": "{{user.id}}"
+        },
+        {
+          "data.user_id": "{{user.id}}"
+        }
+      ]
+    },
+    "delete": {
+      "$or": [
+        {
+          "created_by_id": "{{user.id}}"
+        },
+        {
+          "data.user_id": "{{user.id}}"
+        }
+      ]
+    }
+  }
+}
