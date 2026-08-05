@@ -40,6 +40,8 @@ export default async function(req) {
     const marketOpen = isUsMarketOpen();
     const quotes = await fetchQuotes(items, key);
     let captured = 0;
+    let failed = 0;
+    const failures = [];
     await Promise.all(quotes.filter((q) => !q.error && q.price > 0).map(async (q) => {
       try {
         // Record the provider's authoritative observation time, not the database
@@ -55,10 +57,29 @@ export default async function(req) {
           source: q.asset_class === 'crypto' ? 'binance' : 'finnhub',
         });
         captured++;
-      } catch (e) { /* skip */ }
+      } catch (e) {
+        // Persist the failure instead of silently skipping — operations needs
+        // to know which symbols failed and why. (Fixes Rev.10 defect #19.)
+        failed++;
+        failures.push({ symbol: q.symbol, error: e.message });
+      }
     }));
 
-    return Response.json({ ok: true, captured, symbols: symbols.length });
+    // Record snapshot capture failures as audit events so they're visible.
+    if (failures.length) {
+      try {
+        await sr.entities.AuditEvent.create({
+          user_id: user.id,
+          event_type: 'snapshot_capture_failed',
+          severity: 'warning',
+          entity_type: 'PriceSnapshot',
+          message: `${failed}/${quotes.filter((q) => !q.error && q.price > 0).length} snapshots failed`,
+          details: JSON.stringify(failures.slice(0, 10)),
+        });
+      } catch (e) { /* audit itself failed — nothing more we can do */ }
+    }
+
+    return Response.json({ ok: true, captured, failed, symbols: symbols.length });
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });
   }

@@ -14,6 +14,7 @@ export const TRADE_PROFILES = {
     max_daily_trades: 8,
     stop_loss_pct: 12,
     max_drawdown_pct: 25,
+    max_daily_loss_pct: 5,
   },
   balanced: {
     id: 'balanced',
@@ -27,6 +28,7 @@ export const TRADE_PROFILES = {
     max_daily_trades: 5,
     stop_loss_pct: 8,
     max_drawdown_pct: 15,
+    max_daily_loss_pct: 3,
   },
   conservative: {
     id: 'conservative',
@@ -40,6 +42,7 @@ export const TRADE_PROFILES = {
     max_daily_trades: 3,
     stop_loss_pct: 5,
     max_drawdown_pct: 8,
+    max_daily_loss_pct: 1.5,
   },
 };
 
@@ -58,5 +61,6 @@ export function profileParams(id) {
     max_daily_trades: p.max_daily_trades,
     stop_loss_pct: p.stop_loss_pct,
     max_drawdown_pct: p.max_drawdown_pct,
+    max_daily_loss_pct: p.max_daily_loss_pct,
   };
 }

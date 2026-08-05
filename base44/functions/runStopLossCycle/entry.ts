@@ -99,8 +99,15 @@ export default async function(req) {
           ? `stop-loss @ $${h.stop_loss} (price $${live.toFixed(2)}, ${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(1)}%)`
           : `stop-loss @ -${dropPct.toFixed(1)}% (threshold ${stopThreshold}%)`;
 
-      if (!marketOpen) {
-        results.push({ symbol: h.symbol, shares: h.shares, price: live, dropPct, gainPct, exitReason, skipped: true, reason: `MARKET_CLOSED (${session})` });
+      // ASSET-CLASS-AWARE MARKET HOURS GATE — crypto trades 24/7, so only
+      // stock positions are gated by the US regular session. Crypto positions
+      // can be exited at any time. (Fixes Rev.10 defects #8 + #13: the old
+      // code applied the US equity market-hours gate to all asset classes,
+      // blocking valid crypto exits outside 9:30 AM–4:00 PM ET.)
+      const assetClass = (h.asset_class || 'stocks').toLowerCase();
+      const isCrypto = assetClass === 'crypto';
+      if (!marketOpen && !isCrypto) {
+        results.push({ symbol: h.symbol, shares: h.shares, price: live, dropPct, gainPct, exitReason, status: 'skipped_market_closed', reason: `MARKET_CLOSED (${session})` });
         continue;
       }
 
@@ -118,13 +125,36 @@ export default async function(req) {
         signal_timestamp: new Date().toISOString(),
         finnhub_key: key,
       });
-      results.push({ symbol: h.symbol, shares: h.shares, price: live, dropPct, gainPct, exitReason, settlement: result });
+      // Classify the result status — only confirmed fills are "sold".
+      // (Fixes Rev.10 defect #11: notifications said "SOLD" for skipped,
+      // pending, and rejected orders.)
+      const rStatus = result?.status || result?.settlement?.status;
+      let status = 'submitted';
+      if (rStatus === 'filled' || rStatus === 'paper_filled') status = 'filled';
+      else if (rStatus === 'rejected' || rStatus === 'failed') status = 'rejected';
+      else if (rStatus === 'canceled' || rStatus === 'expired') status = 'canceled';
+      else if (rStatus === 'partially_filled') status = 'partially_filled';
+      else if (rStatus === 'pending' || rStatus === 'submitted' || rStatus === 'accepted') status = 'pending';
+      results.push({ symbol: h.symbol, shares: h.shares, price: live, dropPct, gainPct, exitReason, status, settlement: result });
     }
 
     // Email + Telegram alert
     if (results.length) {
+      // Only confirmed fills are labeled "SOLD". Skipped, pending, rejected,
+      // and canceled results get accurate status labels. (Fixes Rev.10
+      // defect #11: notifications said "SOLD" for all results including
+      // skipped and pending orders.)
+      const statusLabel = (r) => {
+        if (r.status === 'filled') return 'SOLD';
+        if (r.status === 'skipped_market_closed') return 'SKIPPED (market closed)';
+        if (r.status === 'pending') return 'PENDING';
+        if (r.status === 'rejected') return 'REJECTED';
+        if (r.status === 'canceled') return 'CANCELED';
+        if (r.status === 'partially_filled') return 'PARTIALLY FILLED';
+        return 'SUBMITTED';
+      };
       const body = results
-        .map((r) => `SOLD ${r.shares} ${r.symbol} @ $${r.price.toFixed(2)} — ${r.exitReason}`)
+        .map((r) => `${statusLabel(r)} ${r.shares} ${r.symbol} @ $${r.price.toFixed(2)} — ${r.exitReason}`)
         .join('\n');
       try {
         await sr.integrations.Core.SendEmail({
@@ -141,7 +171,10 @@ export default async function(req) {
         try {
           const botToken = secrets.get('TELEGRAM_BOT_TOKEN');
           if (botToken) {
-            const lines = results.map((r) => `🔴 SOLD ${r.shares} ${r.symbol} @ $${r.price.toFixed(2)} — ${r.exitReason}`);
+            const lines = results.map((r) => {
+              const label = r.status === 'filled' ? '🔴 SOLD' : `⚠️ ${r.status.toUpperCase()}`;
+              return `${label} ${r.shares} ${r.symbol} @ $${r.price.toFixed(2)} — ${r.exitReason}`;
+            });
             await sendTelegramMessage(
               botToken,
               String(user.telegram_chat_id),

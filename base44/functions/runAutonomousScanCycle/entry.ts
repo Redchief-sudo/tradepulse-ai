@@ -10,9 +10,9 @@ import { fetchCandles as fetchMultiAssetCandles } from '../../shared/marketDataA
 import { sendTelegramMessage } from '../../shared/telegram.ts';
 
 const PROFILES = {
-  aggressive: { max_position_pct: 15, max_sector_pct: 40, min_confidence: 70, max_daily_trades: 8, stop_loss_pct: 12 },
-  balanced: { max_position_pct: 10, max_sector_pct: 25, min_confidence: 80, max_daily_trades: 5, stop_loss_pct: 8 },
-  conservative: { max_position_pct: 5, max_sector_pct: 15, min_confidence: 88, max_daily_trades: 3, stop_loss_pct: 5 },
+  aggressive: { max_position_pct: 15, max_sector_pct: 40, min_confidence: 70, max_daily_trades: 8, stop_loss_pct: 12, max_daily_loss_pct: 5 },
+  balanced: { max_position_pct: 10, max_sector_pct: 25, min_confidence: 80, max_daily_trades: 5, stop_loss_pct: 8, max_daily_loss_pct: 3 },
+  conservative: { max_position_pct: 5, max_sector_pct: 15, min_confidence: 88, max_daily_trades: 3, stop_loss_pct: 5, max_daily_loss_pct: 1.5 },
 };
 function profileParams(id) { return PROFILES[id] || PROFILES.balanced; }
 
@@ -82,19 +82,29 @@ export default async function(req) {
     const minuteSlot = Math.floor(now.getUTCMinutes() / 15) * 15;
     const runId = `scan-${now.getUTCFullYear()}${String(now.getUTCMonth()+1).padStart(2,'0')}${String(now.getUTCDate()).padStart(2,'0')}-${String(now.getUTCHours()).padStart(2,'0')}${String(minuteSlot).padStart(2,'0')}`;
 
-    // ATOMIC SCAN LOCK — prevent overlapping scans. If a scan is already
-    // running (e.g., a scheduled scan fired while a manual Start scan is still
-    // in progress), skip this run. A scan is considered stale after 5 minutes
-    // (scans typically complete in ~2 min) — a stale scan is marked failed and
-    // this run proceeds. (Fixes Rev.9 defect #3: no overlap check existed.)
+    // SCAN LOCK — prevent overlapping scans using heartbeat-based staleness
+    // and post-create race detection. (Fixes Rev.10 defects #1 + #2: the old
+    // filter+create was not atomic — two workers could both pass the filter
+    // and both create. The 5-minute staleness based on started_at could declare
+    // a long-running scan dead while it was still active.)
+    //
+    // 1) Check for existing running scans using last_heartbeat_at (not
+    //    started_at) — a scan is stale only when its heartbeat stops advancing.
+    // 2) Create our ScanRun with last_heartbeat_at set.
+    // 3) Post-create verification: re-check for duplicate running scans — if
+    //    another appeared, we lost the race; delete ours and abort.
+    const HEARTBEAT_STALE_MS = 3 * 60 * 1000;
     const existingRuns = await sr.entities.ScanRun.filter({ user_id: user.id, status: 'running' });
     if (existingRuns.length > 0) {
-      const startedAt = new Date(existingRuns[0].started_at).getTime();
-      const STALE_SCAN_MS = 5 * 60 * 1000;
-      if (Date.now() - startedAt < STALE_SCAN_MS) {
+      const existing = existingRuns[0];
+      const heartbeatTime = existing.last_heartbeat_at
+        ? new Date(existing.last_heartbeat_at).getTime()
+        : new Date(existing.started_at).getTime();
+      const isStale = Date.now() - heartbeatTime > HEARTBEAT_STALE_MS;
+      if (!isStale) {
         return Response.json({ ok: true, skipped: true, reason: 'Another scan is already running' });
       }
-      try { await sr.entities.ScanRun.update(existingRuns[0].id, { status: 'failed', error: 'STALE_SCAN_TIMEOUT', completed_at: new Date().toISOString() }); } catch (e) {}
+      try { await sr.entities.ScanRun.update(existing.id, { status: 'failed', error: 'STALE_HEARTBEAT_TIMEOUT', completed_at: new Date().toISOString() }); } catch (e) {}
     }
 
     // Persist an authoritative ScanRun record so the Dashboard can display
@@ -103,14 +113,41 @@ export default async function(req) {
       user_id: user.id,
       scan_run_id: runId,
       started_at: now.toISOString(),
+      last_heartbeat_at: now.toISOString(),
       trigger_source: triggerSource,
       status: 'running',
       candidates_found: 0, proposals_created: 0, proposals_vetoed: 0,
       trades_attempted: 0, trades_filled: 0, trades_rejected: 0,
     });
     scanRunId = scanRun.id;
+
+    // POST-CREATE RACE DETECTION — if another scan with the same scan_run_id
+    // appeared between our filter and our create, we lost the race. Delete our
+    // scan and abort. This narrows the filter+create race window to the create
+    // round-trip latency. (Fixes Rev.10 defect #1.)
+    const concurrentRuns = await sr.entities.ScanRun.filter({ user_id: user.id, scan_run_id: runId, status: 'running' });
+    if (concurrentRuns.length > 1) {
+      try { await sr.entities.ScanRun.delete(scanRun.id); } catch (e) {}
+      return Response.json({ ok: true, skipped: true, reason: 'Lost scan lock race — another scan claimed this slot' });
+    }
+
+    // Heartbeat helper — updates last_heartbeat_at so the scan is not declared
+    // stale while it is still active. Called after each major AI pass.
+    const heartbeat = async () => {
+      try { await sr.entities.ScanRun.update(scanRun.id, { last_heartbeat_at: new Date().toISOString() }); } catch (e) {}
+    };
+
+    // Finish run — if the update fails, record an AuditEvent instead of
+    // silently swallowing. (Fixes Rev.10 defect #3: finishRun silently
+    // swallowed update failures, leaving scans stuck as 'running'.)
     const finishRun = async (patch) => {
-      try { await sr.entities.ScanRun.update(scanRun.id, { completed_at: new Date().toISOString(), ...patch }); } catch (e) {}
+      try {
+        await sr.entities.ScanRun.update(scanRun.id, { completed_at: new Date().toISOString(), last_heartbeat_at: new Date().toISOString(), ...patch });
+      } catch (e) {
+        try {
+          await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'scan_finalization_failed', severity: 'error', entity_type: 'ScanRun', entity_id: scanRun.id, message: `ScanRun update failed: ${e.message}` });
+        } catch (e2) { /* audit itself failed */ }
+      }
     };
     // USER-SCOPED: only this user's holdings
     const holdings = await sr.entities.Holding.filter({ user_id: user.id });
@@ -182,6 +219,7 @@ export default async function(req) {
         required: ['market_summary', 'candidates'],
       },
     });
+    await heartbeat();
     const candidates = p1.candidates || [];
     if (!candidates.length) {
       await finishRun({ status: 'no_candidates', market_summary: p1.market_summary, market_regime: regime.market_regime, model_version: champion?.version || 'default' });
@@ -217,6 +255,7 @@ export default async function(req) {
       },
     });
 
+    await heartbeat();
     // Construct proposals deterministically from candidates.
     // BUY candidates: STRONG_BUY/BUY with confidence >= min_confidence, sorted by confidence.
     // SELL candidates: SELL/STRONG_SELL for symbols currently held.
@@ -317,6 +356,7 @@ export default async function(req) {
       // defect #4: the old `!== false` let undefined pass as approved.)
       proposals = proposals.filter((p) => consensusMap[p.symbol.toUpperCase()] === true);
     }
+    await heartbeat();
 
     // PASS 3b — Deterministic ML multi-factor scoring (CHAMPION weights)
     const scored = proposals.map((p) => {
@@ -330,6 +370,7 @@ export default async function(req) {
       const ml_score = weightedComposite({ technical, fundamental, sentiment, momentum, risk }, weights);
       return { ...p, ml_score: Math.round(ml_score * 10) / 10, ml_signal: signalFromComposite(ml_score), realFactors: f, realPrice: ef?.realPrice };
     });
+    await heartbeat();
     let approved = scored.filter((p) => p.ml_score >= 45);
 
     // PASS 4 — Adversarial Risk Officer veto
@@ -358,6 +399,7 @@ export default async function(req) {
       // old `|| 'approved'` let absent reviews pass as approved.)
       approved = approved.filter((p) => vetoMap[p.symbol.toUpperCase()] === 'approved');
     }
+    await heartbeat();
 
     // PASS 5 — Causal Contagion
     let contagion = null;
@@ -384,6 +426,7 @@ export default async function(req) {
       approved = approved.filter((p) => (crMap[p.symbol.toUpperCase()] || 0) < 80);
     }
 
+    await heartbeat();
     // Broker account equity was fetched early (before Pass 2) so the AI could
     // size proposals against real capital. accountEquity is already defined.
 
@@ -402,7 +445,7 @@ export default async function(req) {
       const equityDeclinePct = startOfDayEquity > 0
         ? ((startOfDayEquity - accountEquity) / startOfDayEquity) * 100
         : 0;
-      circuitBreakerTripped = equityDeclinePct >= 2;
+      circuitBreakerTripped = equityDeclinePct >= pp.max_daily_loss_pct;
     } else {
       // Internal paper mode: consecutive_loss_limit + realized_loss_limit only.
       const dayStart = new Date();
@@ -414,7 +457,7 @@ export default async function(req) {
       const lossCount = todayLosses.length;
       const totalLossAmount = todayLosses.reduce((s, t) => s + (t.realized_pnl || 0), 0);
       const dailyLossPct = accountEquity > 0 ? (Math.abs(totalLossAmount) / accountEquity) * 100 : 0;
-      circuitBreakerTripped = lossCount >= 3 || dailyLossPct >= 2;
+      circuitBreakerTripped = lossCount >= 3 || dailyLossPct >= pp.max_daily_loss_pct;
     }
 
     const proposalsBeforeVeto = proposals.length;
@@ -427,10 +470,15 @@ export default async function(req) {
     // Rev.9 defect #5: scan could analyze an asset then attempt to execute
     // an unsupported broker symbol.)
     const brokerName = brokerCreds[0]?.broker;
+    // FAIL-CLOSED: only Alpaca has an implemented execution adapter. Unknown
+    // or unimplemented brokers (IBKR, TradeStation, custom) reject all asset
+    // classes — candidates are research-only, never executed. (Fixes Rev.10
+    // defect #9: unknown brokers failed open, allowing candidates through the
+    // capability gate only to fail later or route incorrectly.)
     const isAssetClassSupported = (ac) => {
-      if (!brokerName || brokerName === 'internal') return true; // internal paper
+      if (!brokerName) return true; // no broker connected — internal paper mode
       if (brokerName === 'alpaca') return ['stocks', 'crypto'].includes(ac);
-      return true; // unknown broker — fail-open
+      return false; // IBKR, TradeStation, custom — not implemented
     };
 
     for (const pr of approved) {

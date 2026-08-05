@@ -264,11 +264,20 @@ export default async function(req) {
           // Match by broker order ID or client order ID — NEVER by quantity alone.
           // Quantity matching can select the wrong transaction for frequently-traded
           // symbols; it only generates a candidate for manual review, never auto-settle.
+          // Look up the app's Trade records for sells of this symbol to find
+          // known broker order IDs — the Holding entity does not carry broker
+          // order identity. (Fixes Rev.10 defect #4: the old code checked
+          // h.broker_order_id / h.client_order_id on the Holding, which has
+          // no such fields, so the match always failed and externally-closed
+          // positions were always retained for review.)
+          const symbolTrades = await sr.entities.Trade.filter({ user_id: user.id, symbol: sym, action: 'sell' });
+          const tradeOrderIds = symbolTrades.map((t) => t.broker_order_id).filter(Boolean);
+          const tradeClientOrderIds = symbolTrades.map((t) => t.client_order_id).filter(Boolean);
           matchedActivity = activities.find((a) => {
             if (String(a.symbol).toUpperCase() !== sym) return false;
             if (a.side !== 'sell') return false;
-            if (a.order_id && h.broker_order_id && a.order_id === h.broker_order_id) return true;
-            if (a.order_client_id && h.client_order_id && a.order_client_id === h.client_order_id) return true;
+            if (a.order_id && tradeOrderIds.includes(a.order_id)) return true;
+            if (a.order_client_id && tradeClientOrderIds.includes(a.order_client_id)) return true;
             return false;
           });
           if (matchedActivity) {

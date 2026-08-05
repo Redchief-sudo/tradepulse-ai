@@ -77,7 +77,7 @@ export default function TradingSessionControl({ onComplete, onStart }) {
       const res = await base44.functions.invoke('sendDailySummary', {});
       const data = res?.data || res;
       if (data?.ok) {
-        setSummary(data.summary);
+        setSummary({ ...data.summary, emailSent: data.emailSent, telegramSent: data.telegramSent });
       } else {
         setSummaryError(true);
       }
@@ -190,17 +190,21 @@ export default function TradingSessionControl({ onComplete, onStart }) {
               <h3 className="font-semibold text-sm">Today's Summary</h3>
             </div>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              {summary.brokerEquity != null && (
+                <div>
+                  <div className="text-xs text-muted-foreground">Alpaca Equity</div>
+                  <div className="text-lg font-bold text-primary">{formatCurrency(summary.brokerEquity)}</div>
+                </div>
+              )}
               <div>
-                <div className="text-xs text-muted-foreground">Portfolio Value</div>
+                <div className="text-xs text-muted-foreground">{summary.brokerEquity != null ? 'App Position Value' : 'Portfolio Value'}</div>
                 <div className="text-lg font-bold">{formatCurrency(summary.portfolioValue)}</div>
               </div>
               <div>
-                <div className="text-xs text-muted-foreground">Day's P&L</div>
-                <div className={cn('text-lg font-bold', summary.dayPL >= 0 ? 'text-emerald-500' : 'text-red-500')}>
-                  {summary.dayPL >= 0 ? '+' : ''}{formatCurrency(summary.dayPL)}
-                  <span className="text-xs block opacity-80">
-                    ({summary.dayPLPct >= 0 ? '+' : ''}{summary.dayPLPct.toFixed(2)}%)
-                  </span>
+                <div className="text-xs text-muted-foreground">{summary.brokerDayPL != null ? 'Alpaca Day P&L' : "Day's P&L"}</div>
+                <div className={cn('text-lg font-bold', (summary.brokerDayPL != null ? summary.brokerDayPL : summary.dayPL) >= 0 ? 'text-emerald-500' : 'text-red-500')}>
+                  {(summary.brokerDayPL != null ? summary.brokerDayPL : summary.dayPL) >= 0 ? '+' : ''}
+                  {formatCurrency(summary.brokerDayPL != null ? summary.brokerDayPL : summary.dayPL)}
                 </div>
               </div>
               <div>
@@ -214,8 +218,18 @@ export default function TradingSessionControl({ onComplete, onStart }) {
                 <div className="text-lg font-bold">{summary.tradesToday}</div>
               </div>
             </div>
+            {summary.reconciliationDiff != null && (
+              <div className="mt-3 p-3 rounded-lg bg-muted/30 border border-border">
+                <div className="text-xs text-muted-foreground">Reconciliation Difference (broker - app)</div>
+                <div className="text-sm font-semibold">{formatCurrency(summary.reconciliationDiff)}</div>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Includes cash, fees, and unreconciled fills not tracked in app positions.
+                </p>
+              </div>
+            )}
             <p className="text-xs text-muted-foreground mt-3">
-              Summary sent to your email{summary && ' and Telegram'}.
+              {summary.emailSent !== false ? '✓ Summary sent to email' : '✗ Email delivery failed'}
+              {summary.telegramSent ? ' and Telegram' : ''}
             </p>
           </motion.div>
         )}

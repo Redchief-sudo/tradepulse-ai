@@ -14,6 +14,11 @@
       "type": "string",
       "format": "date-time"
     },
+    "last_heartbeat_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Last heartbeat timestamp \u2014 updated periodically during the scan. A scan is considered stale only when this stops advancing, not simply because started_at is old. This prevents declaring a long-running scan dead while it is still active."
+    },
     "completed_at": {
       "type": "string",
       "format": "date-time"

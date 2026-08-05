@@ -119,15 +119,20 @@ export default async function(req) {
       `${'='.repeat(40)}`,
     ].filter(Boolean).join('\n');
 
+    let emailSent = false;
     try {
       await sr.integrations.Core.SendEmail({
         to: user.email,
         subject: `TradePulse Daily Summary: ${dayPL >= 0 ? '+' : ''}${fmt(dayPL)} (${fmtPct(dayPLPct)})`,
         body: emailLines,
       });
-    } catch (e) { /* non-fatal */ }
+      emailSent = true;
+    } catch (e) {
+      try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'notification_failed', severity: 'warning', entity_type: 'Trade', message: `Daily summary email failed: ${e.message}` }); } catch (ae) {}
+    }
 
     // Telegram
+    let telegramSent = false;
     if (user.telegram_chat_id && user.telegram_notifications_enabled) {
       try {
         const botToken = secrets.get('TELEGRAM_BOT_TOKEN');
@@ -146,11 +151,14 @@ export default async function(req) {
             worst ? `Worst: ${worst.symbol} ${fmtPct(worst.change)}` : '',
           ].filter(Boolean).join('\n');
           await sendTelegramMessage(botToken, String(user.telegram_chat_id), tgLines);
+          telegramSent = true;
         }
-      } catch (e) { /* non-fatal */ }
+      } catch (e) {
+        try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'notification_failed', severity: 'warning', entity_type: 'Trade', message: `Daily summary Telegram failed: ${e.message}` }); } catch (ae) {}
+      }
     }
 
-    return Response.json({ ok: true, summary });
+    return Response.json({ ok: true, summary, emailSent, telegramSent });
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });
   }
