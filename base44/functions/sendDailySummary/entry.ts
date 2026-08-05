@@ -34,12 +34,14 @@ export default async function(req) {
 
     // Authoritative broker equity (when available)
     let brokerEquity = null;
+    let brokerPrevCloseEquity = null;
     let brokerEquityLabel = 'Application portfolio estimate (not reconciled to broker)';
     const brokerCreds = await sr.entities.BrokerCredential.filter({ user_id: user.id, status: 'active' });
     if (brokerCreds[0] && brokerCreds[0].broker === 'alpaca') {
       try {
         const acct = await getAlpacaAccount({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode });
         brokerEquity = Number(acct.equity);
+        brokerPrevCloseEquity = Number(acct.last_equity) || null;
         brokerEquityLabel = 'Broker-authoritative equity (Alpaca)';
       } catch (e) {
         brokerEquityLabel = 'Application portfolio estimate (broker unreachable)';
@@ -59,11 +61,27 @@ export default async function(req) {
     const best = performers[0] || null;
     const worst = performers[performers.length - 1] || null;
 
+    // Separate broker and app P&L metrics — they measure different things and
+    // can diverge due to cash, fees, unreconciled fills, and stale prices.
+    // (Fixes Rev.9 defect #18: daily summary mixed broker and app P&L without
+    // distinguishing which is authoritative.)
+    const brokerDayPL = (brokerEquity != null && brokerPrevCloseEquity != null) ? brokerEquity - brokerPrevCloseEquity : null;
+    const appUnrealizedPL = totalPL;
+    const appRealizedPL = todayTrades
+      .filter((t) => t.action === 'sell')
+      .reduce((s, t) => s + (t.realized_pnl || 0), 0);
+    const reconciliationDiff = (brokerEquity != null) ? brokerEquity - portfolioValue : null;
+
     const summary = {
       portfolioValue,
       brokerEquity,
+      brokerPrevCloseEquity,
+      brokerDayPL,
       brokerEquityLabel,
       costBasis,
+      appUnrealizedPL,
+      appRealizedPL,
+      reconciliationDiff,
       totalPL,
       totalPLPct,
       dayPL,
@@ -82,10 +100,17 @@ export default async function(req) {
     const emailLines = [
       `TradePulse Daily Summary`,
       `${'='.repeat(40)}`,
-      brokerEquity != null ? `Broker Equity: ${fmt(brokerEquity)} (${brokerEquityLabel})` : `Portfolio Value: ${fmt(portfolioValue)} (${brokerEquityLabel})`,
-      `App Portfolio Estimate: ${fmt(portfolioValue)}`,
-      `Day's P&L: ${dayPL >= 0 ? '+' : ''}${fmt(dayPL)} (${fmtPct(dayPLPct)})`,
-      `All-Time P&L: ${totalPL >= 0 ? '+' : ''}${fmt(totalPL)} (${fmtPct(totalPLPct)})`,
+      `--- Broker (Authoritative) ---`,
+      brokerEquity != null ? `Alpaca Equity: ${fmt(brokerEquity)}` : `Alpaca: ${brokerEquityLabel}`,
+      brokerPrevCloseEquity != null ? `Alpaca Prev Close: ${fmt(brokerPrevCloseEquity)}` : '',
+      brokerDayPL != null ? `Alpaca Day P&L: ${brokerDayPL >= 0 ? '+' : ''}${fmt(brokerDayPL)}` : '',
+      `--- Application (Estimate) ---`,
+      `App Position Value: ${fmt(portfolioValue)}`,
+      `App Unrealized P&L: ${totalPL >= 0 ? '+' : ''}${fmt(totalPL)} (${fmtPct(totalPLPct)})`,
+      `App Realized P&L Today: ${appRealizedPL >= 0 ? '+' : ''}${fmt(appRealizedPL)}`,
+      `App Day P&L (est): ${dayPL >= 0 ? '+' : ''}${fmt(dayPL)} (${fmtPct(dayPLPct)})`,
+      reconciliationDiff != null ? `Reconciliation Diff: ${fmt(reconciliationDiff)} (broker - app)` : '',
+      `--- Activity ---`,
       `Trades Today: ${todayTrades.length}`,
       `Scans Today: ${todayScans.length}`,
       `Open Positions: ${holdings.length}`,
@@ -110,10 +135,12 @@ export default async function(req) {
           const tgLines = [
             `📊 <b>TradePulse Daily Summary</b>`,
             `━━━━━━━━━━━━━━━━━━━`,
-            brokerEquity != null ? `Broker Equity: <b>${fmt(brokerEquity)}</b>` : `Portfolio: <b>${fmt(portfolioValue)}</b>`,
-            `App Estimate: ${fmt(portfolioValue)}`,
-            `Day P&L: ${dayPL >= 0 ? '🟢 +' : '🔴 '}${fmt(dayPL)} (${fmtPct(dayPLPct)})`,
-            `All-Time: ${totalPL >= 0 ? '+' : ''}${fmt(totalPL)} (${fmtPct(totalPLPct)})`,
+            brokerEquity != null ? `<b>Broker Equity:</b> ${fmt(brokerEquity)}` : `<b>Portfolio:</b> ${fmt(portfolioValue)}`,
+            brokerDayPL != null ? `Broker Day P&L: ${brokerDayPL >= 0 ? '🟢 +' : '🔴 '}${fmt(brokerDayPL)}` : '',
+            `App Value: ${fmt(portfolioValue)}`,
+            `App Unrealized: ${totalPL >= 0 ? '+' : ''}${fmt(totalPL)}`,
+            `App Realized Today: ${appRealizedPL >= 0 ? '+' : ''}${fmt(appRealizedPL)}`,
+            reconciliationDiff != null ? `Recon Diff: ${fmt(reconciliationDiff)}` : '',
             `Trades Today: ${todayTrades.length}`,
             best ? `Best: ${best.symbol} ${fmtPct(best.change)}` : '',
             worst ? `Worst: ${worst.symbol} ${fmtPct(worst.change)}` : '',

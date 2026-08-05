@@ -177,32 +177,46 @@ export default async function(req) {
               cost_basis_method: 'fifo',
             });
           } else if (diff < 0) {
-            // Broker has less than app — locate the ACTUAL broker sell fill for
-            // the quantity difference. Only close lots at the real exit price.
-            // If no matching fill is found, flag for review — do NOT fabricate
-            // P&L from the current market price. (Fixes Rev.9 defect #6: partial
-            // reconciliation used current_price as exit price, fabricating P&L,
-            // exit price, and outcome attribution.)
+            // Broker has less than app — locate the ACTUAL broker sell fill.
+            // AUTHORITATIVE MATCH ONLY: auto-settle only when the fill can be
+            // bound to a broker order ID or client order ID from the app's Trade
+            // records for this symbol. Quantity-only matches are ambiguous
+            // (multiple sells of the same size on different days) and produce
+            // a REVIEW CANDIDATE, never automatic P&L settlement.
+            // (Fixes Rev.9 defect #6: partial reconciliation used quantity-only
+            // matching, which can select the wrong transaction for frequently-
+            // traded symbols. Also preserves the activity-fetch error reason
+            // instead of silently swallowing it.)
             let partialExitPrice = null;
+            let matchMethod = null;
+            let activityError = null;
             try {
               const sinceDate = new Date(existing.created_date || Date.now() - 30 * 86400000).toISOString().slice(0, 10);
               const activities = await getAlpacaActivities({ apiKey: cred.api_key, secretKey: cred.api_secret, mode: cred.mode, sinceDate });
-              // Match sell fills for this symbol with the exact quantity difference.
-              // Only auto-settle if there's exactly one match — multiple matches are
-              // ambiguous and flagged for manual review.
               const sellFills = activities.filter((a) =>
-                String(a.symbol).toUpperCase() === sym &&
-                a.side === 'sell' &&
-                Math.abs(Number(a.qty) - Math.abs(diff)) < 0.0001
+                String(a.symbol).toUpperCase() === sym && a.side === 'sell'
               );
-              if (sellFills.length === 1) {
-                partialExitPrice = Number(sellFills[0].price);
+              // Look up the app's Trade records for sells of this symbol to
+              // find known broker order IDs and client order IDs.
+              const symbolTrades = await sr.entities.Trade.filter({ user_id: user.id, symbol: sym, action: 'sell' });
+              const tradeOrderIds = symbolTrades.map((t) => t.broker_order_id).filter(Boolean);
+              const tradeClientOrderIds = symbolTrades.map((t) => t.client_order_id).filter(Boolean);
+              // Tier 1: match by broker order ID or client order ID — authoritative.
+              const idMatch = sellFills.find((a) =>
+                (a.order_id && tradeOrderIds.includes(a.order_id)) ||
+                (a.order_client_id && tradeClientOrderIds.includes(a.order_client_id))
+              );
+              if (idMatch && Math.abs(Number(idMatch.qty) - Math.abs(diff)) < 0.0001) {
+                partialExitPrice = Number(idMatch.price);
+                matchMethod = 'order_id';
               }
+              // Tier 2: quantity-only match — NOT authoritative. Do NOT auto-settle.
+              // The fill cannot be proven to correspond to this position transition.
             } catch (e) {
-              // Activities unreachable — will flag for review below
+              activityError = { message: e.message, timestamp: nowIso() };
             }
 
-            if (partialExitPrice && partialExitPrice > 0) {
+            if (partialExitPrice && partialExitPrice > 0 && matchMethod === 'order_id') {
               try {
                 await closeLotsFifo(sr, user.id, sym, Math.abs(diff), partialExitPrice, existing);
               } catch (e) {
@@ -211,9 +225,13 @@ export default async function(req) {
                 continue;
               }
             } else {
-              // No authoritative fill found — flag for review, don't fabricate P&L
+              // No authoritative fill found — flag for review, don't fabricate P&L.
+              // Preserve the reason: activity error vs no ID match vs quantity-only.
               blocked.push(sym);
-              events.push({ event_type: 'reconciliation_adjustment', symbol: sym, app_qty: existing.shares, broker_qty: bp.shares, action_taken: 'flagged_for_review_no_exit_fill', details: `Partial qty decrease of ${Math.abs(diff)}: no matching broker sell fill found` });
+              const reason = activityError
+                ? `Activities unreachable: ${activityError.message} (at ${activityError.timestamp})`
+                : `Partial qty decrease of ${Math.abs(diff)}: no broker order ID match from Trade records. Quantity-only match is ambiguous — flagged for manual review.`;
+              events.push({ event_type: 'reconciliation_adjustment', symbol: sym, app_qty: existing.shares, broker_qty: bp.shares, action_taken: 'flagged_for_review_no_authoritative_fill', details: reason });
               continue;
             }
           }

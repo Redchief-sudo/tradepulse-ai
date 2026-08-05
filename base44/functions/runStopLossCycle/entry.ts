@@ -132,7 +132,9 @@ export default async function(req) {
           subject: `TradePulse Alert: ${results.length} position(s) auto-exited`,
           body,
         });
-      } catch (e) { /* email failure shouldn't fail the cycle */ }
+      } catch (e) {
+        await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'notification_failed', severity: 'warning', entity_type: 'Holding', message: `Stop-loss email failed: ${e.message}` });
+      }
 
       // Telegram alert (if enabled)
       if (user.telegram_chat_id && user.telegram_notifications_enabled) {
@@ -146,7 +148,9 @@ export default async function(req) {
               `🤖 <b>TradePulse AI</b> auto-exited ${results.length} position(s):\n${lines.join('\n')}`
             );
           }
-        } catch (e) { /* non-fatal */ }
+        } catch (e) {
+          await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'notification_failed', severity: 'warning', entity_type: 'Holding', message: `Stop-loss Telegram failed: ${e.message}` });
+        }
       }
     }
 

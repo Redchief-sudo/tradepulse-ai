@@ -374,7 +374,9 @@ export default async function(req) {
             required: ['items'],
           },
         });
-      } catch (e) { /* non-fatal */ }
+      } catch (e) {
+        await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'contagion_pass_failed', severity: 'warning', message: `Causal contagion pass failed: ${e.message}` });
+      }
     }
     if (contagion?.items) {
       const crMap = {};
@@ -385,23 +387,24 @@ export default async function(req) {
     // Broker account equity was fetched early (before Pass 2) so the AI could
     // size proposals against real capital. accountEquity is already defined.
 
-    // DAILY LOSS CIRCUIT BREAKER — for broker-connected users, compare current
-    // broker equity against start-of-day equity (Alpaca's last_equity). This
-    // captures unrealized losses, broker-side trades, and real account-equity
-    // decline — not just app-recorded realized losses. For internal paper mode,
-    // fall back to app-recorded realized losses. Sells always go through.
-    // (Fixes Rev.9 defect #13: daily loss was calculated only from app trade
-    // records, which don't capture unrealized losses or broker-side activity.)
+    // DAILY LOSS CIRCUIT BREAKER — two deliberately separate policies, not
+    // layered OR conditions. For broker-connected users, ONLY broker equity
+    // drawdown is checked (authoritative — captures unrealized + broker-side).
+    // For internal paper mode, ONLY app-recorded realized losses are checked.
+    // A broker-connected user is never blocked by a stale app ledger; an
+    // internal-paper user is never blocked by a broker equity fetch they don't
+    // have. Sells always go through (risk management always runs).
+    // (Fixes Rev.9 defect #13: the old code ran BOTH checks for broker users,
+    // blocking on a stale app ledger even when broker equity was stable.)
     let circuitBreakerTripped = false;
     if (startOfDayEquity && accountEquity) {
+      // Broker-connected: broker_equity_drawdown_limit only.
       const equityDeclinePct = startOfDayEquity > 0
         ? ((startOfDayEquity - accountEquity) / startOfDayEquity) * 100
         : 0;
       circuitBreakerTripped = equityDeclinePct >= 2;
-    }
-    if (!circuitBreakerTripped) {
-      // Fallback: app-recorded realized losses (internal paper mode or broker
-      // equity unavailable)
+    } else {
+      // Internal paper mode: consecutive_loss_limit + realized_loss_limit only.
       const dayStart = new Date();
       dayStart.setHours(0, 0, 0, 0);
       const recentTrades = await sr.entities.Trade.filter({ user_id: user.id });
@@ -497,7 +500,9 @@ export default async function(req) {
           subject: `TradePulse: Autonomous AI executed ${filledTrades.length} trade(s)`,
           body: filledTrades.map((e) => `${e.action.toUpperCase()} ${e.qty} ${e.symbol} @ $${e.price.toFixed(2)} (ML score ${e.ml_score})`).join('\n'),
         });
-      } catch (e) { /* non-fatal */ }
+      } catch (e) {
+        await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'notification_failed', severity: 'warning', entity_type: 'Trade', message: `Trade email notification failed: ${e.message}` });
+      }
 
       if (user.telegram_chat_id && user.telegram_notifications_enabled) {
         try {
@@ -510,7 +515,9 @@ export default async function(req) {
               `🤖 <b>TradePulse AI</b> executed ${filledTrades.length} trade(s):\n${lines.join('\n')}`
             );
           }
-        } catch (e) { /* non-fatal */ }
+        } catch (e) {
+          await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'notification_failed', severity: 'warning', entity_type: 'Trade', message: `Trade Telegram notification failed: ${e.message}` });
+        }
       }
     }
 
