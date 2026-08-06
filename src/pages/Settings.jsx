@@ -102,6 +102,9 @@ export default function Settings() {
     promotion_mode: 'automatic',
     telegram_chat_id: '',
     telegram_notifications_enabled: false,
+    auto_promote_enabled: false,
+    auto_promote_min_trades: 20,
+    auto_promote_min_win_rate: 60,
   });
 
   const loadUser = useCallback(async () => {
@@ -120,6 +123,9 @@ export default function Settings() {
         promotion_mode: me.promotion_mode || 'automatic',
         telegram_chat_id: me.telegram_chat_id || '',
         telegram_notifications_enabled: me.telegram_notifications_enabled || false,
+        auto_promote_enabled: me.auto_promote_enabled || false,
+        auto_promote_min_trades: me.auto_promote_min_trades ?? 20,
+        auto_promote_min_win_rate: me.auto_promote_min_win_rate ?? 60,
       });
     } catch (e) {
       console.error(e);
@@ -140,6 +146,9 @@ export default function Settings() {
         promotion_mode: form.promotion_mode,
         telegram_chat_id: form.telegram_chat_id,
         telegram_notifications_enabled: form.telegram_notifications_enabled,
+        auto_promote_enabled: form.auto_promote_enabled,
+        auto_promote_min_trades: Number(form.auto_promote_min_trades) || 20,
+        auto_promote_min_win_rate: Number(form.auto_promote_min_win_rate) || 60,
       });
 
       // Save broker credentials via the secure backend function
@@ -307,6 +316,79 @@ export default function Settings() {
               </button>
             ))}
           </div>
+        </div>
+      </div>
+
+      {/* Auto-Promote Paper → Live */}
+      <div className="mb-6">
+        <div className="rounded-2xl border border-border bg-card p-5 space-y-4">
+          <div className="flex items-center gap-2">
+            <Rocket className="w-4 h-4 text-primary" />
+            <h2 className="font-semibold">Auto-Promote Paper → Live</h2>
+          </div>
+          <p className="text-xs text-muted-foreground leading-relaxed">
+            Automatically switch from paper to live trading once your paper performance proves itself.
+            The system counts closed positions (sells with a realized P&L) and promotes only when both
+            the minimum trade count <em>and</em> minimum win rate are met. Fires once — it never re-triggers.
+          </p>
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="font-medium text-sm">Enable Auto-Promotion</div>
+              <div className="text-xs text-muted-foreground">Switch to live when thresholds are met</div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setForm({ ...form, auto_promote_enabled: !form.auto_promote_enabled })}
+              className={cn(
+                'relative w-11 h-6 rounded-full transition-colors',
+                form.auto_promote_enabled ? 'bg-primary' : 'bg-muted'
+              )}
+            >
+              <span className={cn(
+                'absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform',
+                form.auto_promote_enabled && 'translate-x-5'
+              )} />
+            </button>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label className="mb-1.5 block">Min Closed Trades</Label>
+              <Input
+                type="number"
+                min="1"
+                value={form.auto_promote_min_trades}
+                onChange={(e) => setForm({ ...form, auto_promote_min_trades: e.target.value })}
+                className="font-mono"
+              />
+            </div>
+            <div>
+              <Label className="mb-1.5 block">Min Win Rate (%)</Label>
+              <Input
+                type="number"
+                min="0"
+                max="100"
+                value={form.auto_promote_min_win_rate}
+                onChange={(e) => setForm({ ...form, auto_promote_min_win_rate: e.target.value })}
+                className="font-mono"
+              />
+            </div>
+          </div>
+          {user?.auto_promote_triggered_at && (
+            <div className="rounded-lg p-3 text-sm flex items-start gap-2 bg-emerald-500/10 text-emerald-500">
+              <CheckCircle2 className="w-4 h-4 flex-shrink-0 mt-0.5" />
+              <span className="text-xs leading-relaxed">
+                Auto-promotion fired on {new Date(user.auto_promote_triggered_at).toLocaleString('en-US', {
+                  month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit',
+                })}. Your account is now in LIVE mode.
+              </span>
+            </div>
+          )}
+          {form.auto_promote_enabled && !user?.auto_promote_triggered_at && (
+            <p className="text-xs text-amber-400 flex items-center gap-1.5">
+              <AlertTriangle className="w-3 h-3" />
+              When both thresholds are met, your broker credentials will switch to LIVE and real orders will be placed.
+            </p>
+          )}
         </div>
       </div>
 

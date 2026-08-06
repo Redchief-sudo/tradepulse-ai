@@ -48,6 +48,26 @@
       "default": "automatic",
       "description": "Model governance promotion mode: research (validate only, never promote), manual_approval (human approves proven candidates), automatic (auto-promote if proven)"
     },
+    "auto_promote_enabled": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, the system auto-promotes from paper to live trading once the configured paper-trade count and win-rate thresholds are both met"
+    },
+    "auto_promote_min_trades": {
+      "type": "number",
+      "default": 20,
+      "description": "Minimum number of closed paper trades required before auto-promotion to live"
+    },
+    "auto_promote_min_win_rate": {
+      "type": "number",
+      "default": 60,
+      "description": "Minimum win-rate percentage (0-100) required before auto-promotion to live"
+    },
+    "auto_promote_triggered_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the auto-promotion from paper to live fired \u2014 set once, prevents re-triggering"
+    },
     "telegram_chat_id": {
       "type": "string",
       "description": "Telegram chat ID for trade notifications \u2014 non-sensitive"

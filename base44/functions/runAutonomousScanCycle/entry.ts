@@ -727,6 +727,13 @@ export default async function(req) {
       trades_rejected: tradesRejected,
     });
 
+    // AUTO-PROMOTION CHECK — after trades settle, evaluate paper performance
+    // and promote to live if the user's thresholds are met. Non-fatal — a
+    // failure here never affects the scan result.
+    try {
+      await base44.functions.invoke('checkAutoPromotion', {});
+    } catch (e) { /* non-fatal — promotion is best-effort */ }
+
     return Response.json({
       ok: true,
       market_summary: p1.market_summary,
