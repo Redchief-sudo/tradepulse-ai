@@ -587,6 +587,15 @@ export default async function(req) {
       ? recentSells.filter((t) => (t.realized_pnl || 0) > 0).length / recentSells.length
       : 0.5; // default 50% when no history — neutral starting point
 
+    // GROWTH SCALING — as revenue increases, the AI sizes positions larger to
+    // compound gains (anti-martingale). The multiplier scales from 0.8 (when
+    // down) to 1.3 (when up significantly), based on recent net realized P&L
+    // relative to account equity. (Per user request: bigger trades when
+    // revenue increases.)
+    const recentNetPnl = recentSells.reduce((s, t) => s + (t.realized_pnl || 0), 0);
+    const pnlPct = accountEquity > 0 ? (recentNetPnl / accountEquity) * 100 : 0;
+    const growthMultiplier = Math.max(0.8, Math.min(1.3, 1 + pnlPct * 0.02));
+
     const proposalsBeforeVeto = proposals.length;
     const executed = [];
     let tradesRejected = 0;
@@ -632,7 +641,7 @@ export default async function(req) {
         // cold gets ~35% of base size.
         const convictionFactor = 0.5 + 0.5 * Math.min(1, Math.max(0, (pr.confidence - pp.min_confidence) / Math.max(1, 100 - pp.min_confidence)));
         const winRateFactor = 0.7 + 0.3 * recentWinRate;
-        const aiVal = ((pr.suggested_position_pct || 5) / 100) * accountEquity * convictionFactor * winRateFactor;
+        const aiVal = ((pr.suggested_position_pct || 5) / 100) * accountEquity * convictionFactor * winRateFactor * growthMultiplier;
         const positionValue = Math.min(aiVal, maxPos, sectorCap) * regime.position_multiplier;
         // FRACTIONAL SHARES — round to 0.001 so a $100 account can buy 0.035
         // shares of a $200 stock. Alpaca accepts fractional quantities.
