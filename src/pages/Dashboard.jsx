@@ -498,6 +498,17 @@ export default function Dashboard() {
                         <div className="text-xs text-muted-foreground">
                           {t.shares} shares @ {formatCurrency(t.price)}
                         </div>
+                        {t.created_date && (
+                          <div className="text-xs text-muted-foreground/70 mt-0.5">
+                            {new Date(t.created_date).toLocaleString('en-US', {
+                              month: 'short',
+                              day: 'numeric',
+                              year: 'numeric',
+                              hour: 'numeric',
+                              minute: '2-digit',
+                            })}
+                          </div>
+                        )}
                       </div>
                     </div>
                     <div className="text-right">
