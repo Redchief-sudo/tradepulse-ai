@@ -9,7 +9,7 @@ import { getAlpacaAccount, getAlpacaClock, cancelAlpacaOrder } from '../../share
 import { fetchCandles as fetchMultiAssetCandles } from '../../shared/marketDataAdapter.ts';
 import { sendTelegramMessage } from '../../shared/telegram.ts';
 import { isExecutable } from '../../shared/executableUniverse.ts';
-import { riskLimitsForProfile } from '../../shared/riskEngine.ts';
+import { riskLimitsForProfile, checkMaxDrawdown } from '../../shared/riskEngine.ts';
 import { getPaperEquity } from '../../shared/cashLedger.ts';
 import { updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
 
@@ -55,6 +55,7 @@ export default async function(req) {
   let srRef = null;
   let lockOwnerToken = null;
   let userIdRef = null;
+  let heartbeatIntervalRef = null;
 
   try {
     const base44 = createClientFromRequest(req);
@@ -120,7 +121,10 @@ export default async function(req) {
       if (winner.owner_token !== lockOwnerToken) {
         // We lost the race — delete our lock and abort
         const ourLock = activeLocks.find((l) => l.owner_token === lockOwnerToken);
-        if (ourLock) try { await sr.entities.ScanLock.delete(ourLock.id); } catch (e) {}
+        if (ourLock) {
+          try { await sr.entities.ScanLock.delete(ourLock.id); }
+          catch (e) { try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'lock_cleanup_failed', severity: 'warning', message: `Failed to delete losing-race lock ${ourLock.id}: ${e.message}` }); } catch (ae) {} }
+        }
         return Response.json({ ok: true, skipped: true, reason: 'Lost scan lock race — another scan claimed this slot' });
       }
     }
@@ -129,7 +133,8 @@ export default async function(req) {
     const allLocks = await sr.entities.ScanLock.filter({ user_id: user.id });
     const staleLocks = allLocks.filter((l) => new Date(l.expires_at).getTime() <= Date.now());
     for (const sl of staleLocks) {
-      try { await sr.entities.ScanLock.delete(sl.id); } catch (e) {}
+      try { await sr.entities.ScanLock.delete(sl.id); }
+      catch (e) { try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'lock_cleanup_failed', severity: 'warning', message: `Failed to delete stale lock ${sl.id}: ${e.message}` }); } catch (ae) {} }
     }
 
     // Persist an authoritative ScanRun record so the Dashboard can display
@@ -145,6 +150,12 @@ export default async function(req) {
       trades_attempted: 0, trades_filled: 0, trades_rejected: 0,
     });
     scanRunId = scanRun.id;
+
+    // Periodic heartbeat interval — assigned to the function-scope ref so the
+    // catch block can clear it. (Fixes Rev.13 #2: heartbeats were only issued
+    // at stage boundaries, so a long LLM call could exceed the 3-minute lock
+    // TTL and let another scan start. This independent timer renews the lock
+    // every 30 seconds regardless of stage progress.)
 
     // Heartbeat — updates both ScanRun and ScanLock. Counts failures and
     // stops after 3 consecutive failures, transitioning to system_degraded.
@@ -186,12 +197,43 @@ export default async function(req) {
           await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'scan_finalization_failed', severity: 'error', entity_type: 'ScanRun', entity_id: scanRun.id, message: `ScanRun update failed: ${e.message}` });
         } catch (e2) { /* audit itself failed */ }
       }
-      // Release the scan lock
+      // Stop the periodic heartbeat
+      if (heartbeatIntervalRef) clearInterval(heartbeatIntervalRef);
+      // Release the scan lock — audit on failure instead of silently swallowing.
+      // (Fixes Rev.13 #3: lock cleanup errors were silently swallowed.)
       try {
         const ourLocks = await sr.entities.ScanLock.filter({ user_id: user.id, owner_token: lockOwnerToken });
-        for (const l of ourLocks) try { await sr.entities.ScanLock.delete(l.id); } catch (e) {}
-      } catch (e) { /* non-fatal */ }
+        for (const l of ourLocks) {
+          try { await sr.entities.ScanLock.delete(l.id); }
+          catch (e) {
+            try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'lock_cleanup_failed', severity: 'warning', message: `Failed to delete scan lock ${l.id}: ${e.message}` }); } catch (ae) {}
+          }
+        }
+      } catch (e) {
+        try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'lock_cleanup_failed', severity: 'warning', message: `Lock release query failed: ${e.message}` }); } catch (ae) {}
+      }
     };
+
+    // PERIODIC HEARTBEAT — independent of stage completion. Renews the ScanLock
+    // every 30 seconds so a long LLM call cannot let the lock expire and let
+    // another scan start. (Fixes Rev.13 #2.)
+    heartbeatIntervalRef = setInterval(async () => {
+      try { await heartbeat(); } catch (e) { /* heartbeat() already handles failures */ }
+    }, 30000);
+
+    // OWNERSHIP VERIFICATION — before every execution decision, verify we still
+    // hold the scan lock. If ownership was lost (lock expired, stolen by another
+    // worker, or deleted), abort immediately to prevent duplicate execution.
+    // (Fixes Rev.13 #2.)
+    const verifyOwnership = async () => {
+      const ourLocks = await sr.entities.ScanLock.filter({ user_id: user.id, owner_token: lockOwnerToken });
+      if (!ourLocks.length) throw new Error('SCAN_LOCK_LOST: ownership transferred or lock deleted');
+      const lock = ourLocks[0];
+      if (new Date(lock.expires_at).getTime() <= Date.now()) {
+        throw new Error('SCAN_LOCK_EXPIRED: lock TTL exceeded during scan');
+      }
+    };
+
     // USER-SCOPED: only this user's holdings
     const holdings = await sr.entities.Holding.filter({ user_id: user.id });
     const pp = profileParams(user.trade_profile || 'balanced');
@@ -578,6 +620,17 @@ export default async function(req) {
       }
     }
 
+    // MAX DRAWDOWN CHECK — block new buys if drawdown exceeds the profile limit.
+    // (Fixes Rev.13 #15: max_drawdown_pct was defined but never enforced pre-trade.)
+    let maxDrawdownBreached = false;
+    try {
+      const ddCheck = await checkMaxDrawdown(sr, user.id, accountEquity, pp);
+      if (ddCheck.breached) {
+        maxDrawdownBreached = true;
+        await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'max_drawdown_breach', severity: 'critical', message: `Max drawdown limit reached: ${ddCheck.drawdown_pct}% (limit ${ddCheck.limit}%, peak $${ddCheck.peak_equity.toFixed(0)})` });
+      }
+    } catch (e) { /* non-fatal — drawdown check is best-effort */ }
+
     // DYNAMIC SIZING — compute recent win rate from the last 20 sell trades.
     // Position size scales with conviction AND recent performance: bet bigger
     // on high-conviction A+ setups when recent trades are winning, smaller
@@ -617,6 +670,11 @@ export default async function(req) {
       return false; // IBKR, TradeStation, custom — not implemented
     };
 
+    // OWNERSHIP VERIFICATION — before executing any trades, verify we still
+    // hold the scan lock. If a long stage caused the lock to expire and another
+    // worker took over, abort to prevent duplicate execution. (Fixes Rev.13 #2.)
+    await verifyOwnership();
+
     for (const pr of approved) {
       // Capability gate — skip unsupported asset classes (research-only)
       if (!isAssetClassSupported(pr.asset_class || 'stocks')) {
@@ -625,6 +683,9 @@ export default async function(req) {
       }
       // Circuit breaker — block new buys, allow sells (risk management always runs)
       if (pr.action === 'buy' && circuitBreakerTripped) continue;
+      // MAX DRAWDOWN GATE — block new buys when drawdown exceeds the profile
+      // limit. (Fixes Rev.13 #15: max_drawdown_pct was defined but never enforced.)
+      if (pr.action === 'buy' && maxDrawdownBreached) continue;
       const price = pr.realPrice || pr.current_price;
       let shares;
       if (pr.action === 'buy') {
@@ -748,17 +809,30 @@ export default async function(req) {
       ml_weights: weights,
     });
   } catch (error) {
+    // Stop the periodic heartbeat
+    if (heartbeatIntervalRef) clearInterval(heartbeatIntervalRef);
     // Finalize the scan run as failed. scanRunId and srRef are at the function
     // scope so this catch block can access them. (Fixes Rev.9 defect #1.)
     if (scanRunId && srRef) {
-      try { await srRef.entities.ScanRun.update(scanRunId, { completed_at: new Date().toISOString(), status: 'failed', error: error.message }); } catch (e) {}
+      try { await srRef.entities.ScanRun.update(scanRunId, { completed_at: new Date().toISOString(), status: 'failed', error: error.message }); }
+      catch (e) {
+        try { await srRef.entities.AuditEvent.create({ user_id: userIdRef, event_type: 'scan_finalization_failed', severity: 'error', entity_type: 'ScanRun', entity_id: scanRunId, message: `Failed to mark scan as failed: ${e.message}` }); } catch (ae) {}
+      }
     }
-    // Release the scan lock on failure
+    // Release the scan lock on failure — audit on failure instead of swallowing.
+    // (Fixes Rev.13 #3.)
     if (lockOwnerToken && userIdRef && srRef) {
       try {
         const locks = await srRef.entities.ScanLock.filter({ user_id: userIdRef, owner_token: lockOwnerToken });
-        for (const l of locks) try { await srRef.entities.ScanLock.delete(l.id); } catch (e) {}
-      } catch (e) {}
+        for (const l of locks) {
+          try { await srRef.entities.ScanLock.delete(l.id); }
+          catch (e) {
+            try { await srRef.entities.AuditEvent.create({ user_id: userIdRef, event_type: 'lock_cleanup_failed', severity: 'warning', message: `Failed to delete scan lock ${l.id} on error: ${e.message}` }); } catch (ae) {}
+          }
+        }
+      } catch (e) {
+        try { await srRef.entities.AuditEvent.create({ user_id: userIdRef, event_type: 'lock_cleanup_failed', severity: 'warning', message: `Lock release query failed on error: ${e.message}` }); } catch (ae) {}
+      }
     }
     return Response.json({ error: error.message }, { status: 500 });
   }

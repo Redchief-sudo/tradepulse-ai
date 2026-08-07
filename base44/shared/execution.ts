@@ -618,7 +618,12 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
       order = await getAlpacaOrder(creds, brokerOrderId);
       // Update last_broker_update_at so the health check can use it for
       // pending-order age calculations. (Fixes Rev.12 #22.)
-      try { await sr.entities.TradeIntent.update(intentRecord.id, { last_broker_update_at: nowIso() }); } catch (e) {}
+      try { await sr.entities.TradeIntent.update(intentRecord.id, { last_broker_update_at: nowIso() }); }
+      catch (e) {
+        // Audit on failure — a stale last_broker_update_at can cause the health
+        // check to misclassify order age. (Fixes Rev.13 #14.)
+        await audit(sr, userId, 'broker_timestamp_update_failed', 'warning', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Failed to update last_broker_update_at: ${e.message}` });
+      }
     } catch (e) {
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
       continue;

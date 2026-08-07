@@ -2,16 +2,72 @@ import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { getAlpacaAccount } from '../../shared/alpaca.ts';
 import { getCashBalance } from '../../shared/cashLedger.ts';
 
-// Generates a comprehensive daily trading report — one immutable TradingSession
-// record per trading day that ties together trades, fills, scan runs, audit
-// events, and AI decisions into a single auditable journal entry.
+// Generates a comprehensive daily trading report — one TradingSession record
+// per trading day that ties together trades, fills, scan runs, audit events,
+// and AI decisions into a single auditable journal entry.
 //
-// Idempotent: calling with the same date updates the existing session record.
-// Can be called on-demand from the UI or automatically at market close via
-// the "Daily Trading Report" workflow.
-//
-// Returns the session summary + enriched per-trade log with computed fields
-// (outcome label, holding time, running daily P&L, etc.).
+// Rev.13 audit fixes:
+// 21. CLOSED SESSION IMUTABILITY: a 'closed' session is never overwritten.
+//     Only 'open' sessions are updatable; calling with final=true on an already
+//     closed session is a no-op.
+// 22. PARTIAL FILL SEPARATION: fully filled, partially filled, pending, and
+//     canceled remainder are counted separately — not lumped as "filled".
+// 23. LOT-BASED HOLDING TIME: derived from closed PositionLots linked to the
+//     sell fill, not from the latest prior buy timestamp.
+// 24. AI DECISION ATTRIBUTION BY ID: matched via the TradeIntent's decision_id,
+//     not just symbol+date — prevents wrong confidence/score attribution when
+//     multiple decisions exist for one symbol.
+// 25. ENTRY PRICE FROM LOTS: the weighted average acquisition cost of the
+//     closed PositionLots, not the sell fill's filled_avg_price.
+// 26. NEW YORK MARKET-SESSION DATES: the trading day is computed in
+//     America/New_York, not UTC — so an 8 PM ET trade belongs to the same day.
+// 27. BROKER-UNREACHABLE STATUS: when the broker is unreachable, the report
+//     marks broker_data_status = 'unavailable' so a degraded report is visible.
+// 28. CASH-BALANCE FAILURE: when cash balance can't be loaded, the report
+//     marks itself incomplete instead of proceeding with null cash.
+
+// Compute the New York market-session date for a given timestamp (or now).
+// The US equity trading day runs 9:30 AM – 4:00 PM ET with extended hours
+// until 8:00 PM ET. A trade at 7 PM ET belongs to the same session date.
+// After 8 PM ET, the next session date begins. (Fixes Rev.13 #26.)
+function nySessionDate(ts) {
+  const date = ts ? new Date(ts) : new Date();
+  // Format in America/New_York to get the local date components
+  const nyStr = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(date);
+  // Parse the NY components
+  const match = nyStr.match(/(\d{2})\/(\d{2})\/(\d{4}),\s*(\d{2}):(\d{2})/);
+  if (!match) return date.toISOString().slice(0, 10);
+  const [, month, day, year, hourStr] = match;
+  let hour = parseInt(hourStr, 10);
+  if (hour === 24) hour = 0; // midnight edge case
+  // If before 8 PM ET (20:00), it's the same session date
+  // If after 8 PM ET, it's still the same date (extended hours belong to the day)
+  // If after midnight but the market hasn't opened yet (before 4 AM), it's the
+  // previous day's extended session — but for simplicity, we use the NY date
+  // at the time of the report. The caller passes the desired date.
+  return `${year}-${month}-${day}`;
+}
+
+// Check if a timestamp falls within the NY market session day.
+// Uses America/New_York timezone so a 7 PM ET trade on Monday counts as Monday,
+// not Tuesday (UTC). (Fixes Rev.13 #26.)
+function inNySessionDay(ts, sessionDate) {
+  if (!ts) return false;
+  const nyStr = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date(ts));
+  const match = nyStr.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+  if (!match) return false;
+  const [, month, day, year] = match;
+  const tsDate = `${year}-${month}-${day}`;
+  return tsDate === sessionDate;
+}
+
 export default async function(req) {
   try {
     const base44 = createClientFromRequest(req);
@@ -20,21 +76,23 @@ export default async function(req) {
 
     const sr = base44.asServiceRole;
     const body = await req.json().catch(() => ({}));
-    const reportDate = body.date || new Date().toISOString().slice(0, 10);
+    // Use NY session date — the report date represents the US market trading day.
+    // (Fixes Rev.13 #26.)
+    const reportDate = body.date || nySessionDate();
     const sessionId = `session-${reportDate}`;
     const isFinal = body.final === true;
 
-    // Date range for the session
-    const dayStart = new Date(reportDate + 'T00:00:00.000Z');
-    const dayEnd = new Date(reportDate + 'T23:59:59.999Z');
-    const inRange = (d) => {
-      if (!d) return false;
-      const t = new Date(d).getTime();
-      return t >= dayStart.getTime() && t <= dayEnd.getTime();
-    };
+    // CLOSED SESSION IMUTABILITY: if the session is already closed, do not
+    // overwrite it. A closed report is immutable — corrections require a new
+    // amendment record. (Fixes Rev.13 #21.)
+    const existingSessions = await sr.entities.TradingSession.filter({ user_id: user.id, session_id: sessionId });
+    if (existingSessions.length > 0 && existingSessions[0].status === 'closed' && isFinal) {
+      return Response.json({ ok: true, skipped: true, reason: 'Session already closed — immutable', session: existingSessions[0] });
+    }
+    const isExistingOpen = existingSessions.length > 0 && existingSessions[0].status === 'open';
 
     // Fetch all user-scoped data
-    const [trades, intents, scanRuns, auditEvents, aiDecisions, fills, holdings] = await Promise.all([
+    const [trades, intents, scanRuns, auditEvents, aiDecisions, fills, holdings, positionLots] = await Promise.all([
       sr.entities.Trade.filter({ user_id: user.id }),
       sr.entities.TradeIntent.filter({ user_id: user.id }),
       sr.entities.ScanRun.filter({ user_id: user.id }),
@@ -42,15 +100,16 @@ export default async function(req) {
       sr.entities.AITradeDecision.filter({ user_id: user.id }),
       sr.entities.Fill.filter({ user_id: user.id }),
       sr.entities.Holding.filter({ user_id: user.id }),
+      sr.entities.PositionLot.filter({ user_id: user.id }),
     ]);
 
-    // Filter to the session day
-    const dayTrades = trades.filter((t) => inRange(t.created_date));
-    const dayIntents = intents.filter((i) => inRange(i.created_date));
-    const dayScans = scanRuns.filter((s) => inRange(s.started_at));
-    const dayAudit = auditEvents.filter((a) => inRange(a.created_date));
-    const dayDecisions = aiDecisions.filter((a) => inRange(a.created_date));
-    const dayFills = fills.filter((f) => inRange(f.timestamp || f.created_date));
+    // Filter to the NY session day (Fixes Rev.13 #26)
+    const dayTrades = trades.filter((t) => inNySessionDay(t.created_date, reportDate));
+    const dayIntents = intents.filter((i) => inNySessionDay(i.created_date, reportDate));
+    const dayScans = scanRuns.filter((s) => inNySessionDay(s.started_at, reportDate));
+    const dayAudit = auditEvents.filter((a) => inNySessionDay(a.created_date, reportDate));
+    const dayDecisions = aiDecisions.filter((a) => inNySessionDay(a.created_date, reportDate));
+    const dayFills = fills.filter((f) => inNySessionDay(f.timestamp || f.created_date, reportDate));
 
     // --- Equity calculations ---
     const appEquity = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
@@ -60,6 +119,7 @@ export default async function(req) {
     let brokerEquity = null;
     let brokerPrevCloseEquity = null;
     let buyingPower = null;
+    let brokerDataStatus = 'available';
     const brokerCreds = await sr.entities.BrokerCredential.filter({ user_id: user.id, status: 'active' });
     if (brokerCreds[0] && brokerCreds[0].broker === 'alpaca') {
       try {
@@ -67,13 +127,21 @@ export default async function(req) {
         brokerEquity = Number(acct.equity);
         brokerPrevCloseEquity = Number(acct.last_equity) || null;
         buyingPower = Number(acct.buying_power) || Number(acct.cash) || null;
-      } catch (e) { /* broker unreachable — use app estimate */ }
+      } catch (e) {
+        // BROKER-UNREACHABLE: mark the report as degraded so it's not mistaken
+        // for an authoritative broker-sourced report. (Fixes Rev.13 #27.)
+        brokerDataStatus = 'unavailable';
+      }
     }
 
-    // Cash balance (internal paper mode)
+    // Cash balance (internal paper mode) — fail visibly, not silently.
+    // (Fixes Rev.13 #28: cash balance loading failure was silently swallowed,
+    // proceeding with null cash and making equity look authoritative.)
     let cashBalance = null;
+    let cashDataStatus = 'available';
     if (!brokerCreds[0]) {
-      try { cashBalance = await getCashBalance(sr, user.id); } catch (e) {}
+      try { cashBalance = await getCashBalance(sr, user.id); }
+      catch (e) { cashDataStatus = 'unavailable'; }
     }
 
     const startingEquity = brokerPrevCloseEquity || brokerEquity || appEquity;
@@ -98,14 +166,17 @@ export default async function(req) {
     const largestWinner = winners.length > 0 ? Math.max(...winners.map((t) => t.realized_pnl)) : 0;
     const largestLoser = losers.length > 0 ? Math.min(...losers.map((t) => t.realized_pnl)) : 0;
 
-    // --- Trade intent counts ---
-    const tradesSubmitted = dayIntents.length;
-    const tradesFilled = dayIntents.filter((i) => ['filled', 'settled', 'partially_filled'].includes(i.status)).length;
+    // --- Trade intent counts — SEPARATE partial fills from fully filled.
+    // (Fixes Rev.13 #22: partially_filled was lumped with filled/settled.)
+    const tradesFullyFilled = dayIntents.filter((i) => ['filled', 'settled'].includes(i.status)).length;
+    const tradesPartiallyFilled = dayIntents.filter((i) => i.status === 'partially_filled').length;
+    const tradesPending = dayIntents.filter((i) => ['submitted', 'accepted'].includes(i.status)).length;
     const tradesRejected = dayIntents.filter((i) => i.status === 'rejected' || i.status === 'failed').length;
     const tradesCanceled = dayIntents.filter((i) => i.status === 'canceled' || i.status === 'expired').length;
+    const tradesSubmitted = dayIntents.length;
 
     // --- Risk events ---
-    const riskEventTypes = ['daily_loss_breach', 'kill_switch_activated', 'stale_order', 'stale_data_block', 'broker_outage', 'duplicate_attempt'];
+    const riskEventTypes = ['daily_loss_breach', 'kill_switch_activated', 'stale_order', 'stale_data_block', 'broker_outage', 'duplicate_attempt', 'max_drawdown_breach'];
     const riskEvents = dayAudit.filter((a) => riskEventTypes.includes(a.event_type));
     const killSwitchEvents = dayAudit.filter((a) => a.event_type === 'kill_switch_activated' || a.event_type === 'daily_loss_breach');
 
@@ -145,10 +216,32 @@ export default async function(req) {
       }
     }
 
-    // --- Build enriched per-trade log ---
-    // Sort trades by time, compute running daily P&L and outcome labels
+    // --- Build enriched per-trade log with LOT-BASED attribution ---
+    // (Fixes Rev.13 #23, #24, #25: holding time, AI decision, and entry price
+    // are now derived from PositionLots and decision_id, not symbol-matching.)
     const sortedDayTrades = [...dayTrades].sort((a, b) => new Date(a.created_date) - new Date(b.created_date));
     let runningPnl = 0;
+
+    // Build a map of TradeIntents by client_order_id for decision_id lookup.
+    // (Fixes Rev.13 #24: AI decision attribution was symbol-only.)
+    const intentByClientId = {};
+    intents.forEach((i) => { if (i.client_order_id) intentByClientId[i.client_order_id] = i; });
+    const intentByBrokerOrderId = {};
+    intents.forEach((i) => { if (i.broker_order_id) intentByBrokerOrderId[i.broker_order_id] = i; });
+
+    // Build a map of closed lots by closure_fill_id for lot-based attribution.
+    // (Fixes Rev.13 #23, #25.)
+    const closedLotsByFillId = {};
+    positionLots.forEach((lot) => {
+      if (lot.status === 'closed' || lot.status === 'partially_closed') {
+        const closureIds = JSON.parse(lot.closure_fill_ids || '[]');
+        closureIds.forEach((fid) => {
+          if (!closedLotsByFillId[fid]) closedLotsByFillId[fid] = [];
+          closedLotsByFillId[fid].push(lot);
+        });
+      }
+    });
+
     const tradeLog = sortedDayTrades.map((t) => {
       const pnl = t.realized_pnl || 0;
       if (t.action === 'sell') runningPnl += pnl;
@@ -156,14 +249,63 @@ export default async function(req) {
         ? (pnl > 0 ? 'winner' : pnl < 0 ? 'loser' : 'breakeven')
         : 'open';
 
-      // Holding time: find the matching buy fill for this symbol
+      // Find the matching TradeIntent for this trade (by client_order_id or broker_order_id)
+      const matchedIntent = intentByClientId[t.client_order_id] || intentByBrokerOrderId[t.broker_order_id] || null;
+
+      // HOLDING TIME + ENTRY PRICE from closed PositionLots.
+      // (Fixes Rev.13 #23, #25: was using latest prior buy timestamp and sell
+      // fill's filled_avg_price as entry price.)
       let holdingTimeMinutes = null;
+      let entryPrice = null;
       if (t.action === 'sell') {
-        const buyFills = fills.filter((f) => f.symbol === t.symbol && f.side === 'buy' && new Date(f.timestamp || f.created_date) < new Date(t.created_date));
-        if (buyFills.length > 0) {
-          const lastBuy = buyFills.sort((a, b) => new Date(b.timestamp || b.created_date) - new Date(a.timestamp || a.created_date))[0];
-          holdingTimeMinutes = Math.round((new Date(t.created_date) - new Date(lastBuy.timestamp || lastBuy.created_date)) / 60000);
+        // Find fills for this sell trade
+        const sellFills = fills.filter((f) =>
+          (f.broker_order_id === t.broker_order_id || f.client_order_id === t.client_order_id) && f.side === 'sell'
+        );
+        // For each sell fill, find the closed lots and compute holding time + entry price
+        const allClosedLots = [];
+        for (const sf of sellFills) {
+          const lots = closedLotsByFillId[sf.fill_id] || [];
+          allClosedLots.push(...lots);
         }
+        if (allClosedLots.length > 0) {
+          // Holding time: from earliest lot acquisition to sell fill timestamp
+          const earliestAcquisition = Math.min(...allClosedLots.map((l) => new Date(l.acquisition_timestamp).getTime()));
+          const sellTime = sellFills.length > 0
+            ? Math.min(...sellFills.map((f) => new Date(f.timestamp || f.created_date).getTime()))
+            : new Date(t.created_date).getTime();
+          holdingTimeMinutes = Math.round((sellTime - earliestAcquisition) / 60000);
+          // Entry price: weighted average acquisition cost of closed lots
+          const totalQty = allClosedLots.reduce((s, l) => {
+            const closedQty = JSON.parse(l.closure_fill_ids || '[]').length > 0
+              ? l.quantity_opened - l.quantity_remaining
+              : l.quantity_remaining;
+            return s + Math.max(0, closedQty);
+          }, 0);
+          const totalCost = allClosedLots.reduce((s, l) => {
+            const closedQty = JSON.parse(l.closure_fill_ids || '[]').length > 0
+              ? l.quantity_opened - l.quantity_remaining
+              : l.quantity_remaining;
+            return s + Math.max(0, closedQty) * l.acquisition_price;
+          }, 0);
+          entryPrice = totalQty > 0 ? totalCost / totalQty : null;
+        }
+      }
+
+      // Fallback entry price for buys: use the fill price
+      if (entryPrice == null) {
+        entryPrice = t.action === 'buy' ? (t.filled_avg_price || t.price) : (t.filled_avg_price || t.price);
+      }
+
+      // AI DECISION ATTRIBUTION BY ID — match via the TradeIntent's decision_id,
+      // not just symbol+date. (Fixes Rev.13 #24.)
+      let aiDecision = null;
+      if (matchedIntent?.decision_id) {
+        aiDecision = aiDecisions.find((d) => d.id === matchedIntent.decision_id);
+      }
+      // Fallback: symbol + day match only if no decision_id match
+      if (!aiDecision) {
+        aiDecision = aiDecisions.find((d) => d.symbol === t.symbol && inNySessionDay(d.created_date, reportDate));
       }
 
       // Execution latency from fills
@@ -172,16 +314,13 @@ export default async function(req) {
         ? Math.round(tradeFills.reduce((s, f) => s + (f.fill_latency_ms || 0), 0) / tradeFills.length)
         : null;
 
-      // AI decision data
-      const aiDecision = aiDecisions.find((d) => d.symbol === t.symbol && inRange(d.created_date));
-
       return {
         trade_id: t.id,
         timestamp: t.created_date,
         symbol: t.symbol,
         side: t.action,
         quantity: t.filled_qty || t.shares,
-        entry_price: t.filled_avg_price || t.price,
+        entry_price: entryPrice,
         exit_price: t.action === 'sell' ? t.price : null,
         realized_pnl: pnl,
         running_daily_pnl: t.action === 'sell' ? runningPnl : null,
@@ -190,6 +329,7 @@ export default async function(req) {
         execution_latency_ms: avgLatency,
         commission: t.commission || 0,
         broker_order_id: t.broker_order_id,
+        decision_id: matchedIntent?.decision_id || null,
         ai_confidence: aiDecision?.confidence || null,
         ml_score: aiDecision?.ml_score || null,
         risk_score: aiDecision?.risk_score || null,
@@ -220,7 +360,7 @@ export default async function(req) {
       num_scans: dayScans.length,
       num_ai_decisions: dayDecisions.length,
       trades_submitted: tradesSubmitted,
-      trades_filled: tradesFilled,
+      trades_filled: tradesFullyFilled,
       trades_rejected: tradesRejected,
       trades_canceled: tradesCanceled,
       win_rate_pct: Math.round(winRatePct * 100) / 100,
@@ -242,13 +382,17 @@ export default async function(req) {
       generated_at: new Date().toISOString(),
     };
 
-    // --- Create or update (idempotent) ---
-    const existing = await sr.entities.TradingSession.filter({ user_id: user.id, session_id: sessionId });
+    // --- Create or update (idempotent for open sessions only) ---
+    // CLOSED SESSION IMUTABILITY: a closed session is never overwritten.
+    // (Fixes Rev.13 #21.)
     let session;
-    if (existing.length > 0) {
-      session = await sr.entities.TradingSession.update(existing[0].id, sessionData);
-    } else {
+    if (isExistingOpen) {
+      session = await sr.entities.TradingSession.update(existingSessions[0].id, sessionData);
+    } else if (existingSessions.length === 0) {
       session = await sr.entities.TradingSession.create({ user_id: user.id, ...sessionData });
+    } else {
+      // Already closed and not final — return existing
+      session = existingSessions[0];
     }
 
     return Response.json({
@@ -272,6 +416,20 @@ export default async function(req) {
         severity: a.severity,
         message: a.message,
       })),
+      // Report quality indicators (Fixes Rev.13 #27, #28)
+      report_quality: {
+        broker_data_status: brokerDataStatus,
+        cash_data_status: cashDataStatus,
+        degraded: brokerDataStatus === 'unavailable' || cashDataStatus === 'unavailable',
+      },
+      // Partial fill breakdown (Fixes Rev.13 #22)
+      trade_breakdown: {
+        fully_filled: tradesFullyFilled,
+        partially_filled: tradesPartiallyFilled,
+        pending: tradesPending,
+        rejected: tradesRejected,
+        canceled: tradesCanceled,
+      },
     });
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });

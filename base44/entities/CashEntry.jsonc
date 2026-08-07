@@ -20,13 +20,15 @@
         "commission",
         "fee",
         "adjustment",
-        "dividend"
+        "dividend",
+        "reservation",
+        "reservation_release"
       ],
-      "description": "Type of cash flow entry"
+      "description": "Type of cash flow entry. reservation = cash held for a pending order; reservation_release = reservation returned (filled or canceled)"
     },
     "amount": {
       "type": "number",
-      "description": "Positive for credit (cash in), negative for debit (cash out)"
+      "description": "Positive for credit (cash in), negative for debit (cash out). Reservations are negative; releases are positive."
     },
     "balance_after": {
       "type": "number",

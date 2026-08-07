@@ -11,28 +11,28 @@ const RISK_LIMITS = {
   aggressive: {
     max_position_pct: 15, max_sector_pct: 40, min_confidence: 70, max_daily_trades: 8,
     stop_loss_pct: 12, max_drawdown_pct: 25,
-    max_open_positions: 12, max_daily_loss_pct: 5, max_outstanding_orders: 20,
+    max_open_positions: 12, max_daily_loss_pct: 5,
     spread_limit_pct: 2, slippage_limit_pct: 1.5,
     max_risk_per_trade_pct: 0.50, max_total_exposure_pct: 60, max_simultaneous_orders: 5,
   },
   balanced: {
     max_position_pct: 7, max_sector_pct: 20, min_confidence: 80, max_daily_trades: 3,
     stop_loss_pct: 8, max_drawdown_pct: 15,
-    max_open_positions: 5, max_daily_loss_pct: 1.0, max_outstanding_orders: 4,
+    max_open_positions: 5, max_daily_loss_pct: 1.0,
     spread_limit_pct: 1.5, slippage_limit_pct: 1,
     max_risk_per_trade_pct: 0.30, max_total_exposure_pct: 40, max_simultaneous_orders: 2,
   },
   conservative: {
     max_position_pct: 5, max_sector_pct: 15, min_confidence: 88, max_daily_trades: 2,
     stop_loss_pct: 5, max_drawdown_pct: 8,
-    max_open_positions: 3, max_daily_loss_pct: 0.5, max_outstanding_orders: 2,
+    max_open_positions: 3, max_daily_loss_pct: 0.5,
     spread_limit_pct: 1, slippage_limit_pct: 0.5,
     max_risk_per_trade_pct: 0.25, max_total_exposure_pct: 30, max_simultaneous_orders: 2,
   },
   micro: {
     max_position_pct: 20, max_sector_pct: 50, min_confidence: 82, max_daily_trades: 2,
     stop_loss_pct: 6, max_drawdown_pct: 10,
-    max_open_positions: 3, max_daily_loss_pct: 2, max_outstanding_orders: 2,
+    max_open_positions: 3, max_daily_loss_pct: 2,
     spread_limit_pct: 2, slippage_limit_pct: 1,
     max_risk_per_trade_pct: 1.0, max_total_exposure_pct: 70, max_simultaneous_orders: 2,
   },
@@ -93,6 +93,30 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
 
   if (opts.killSwitch) {
     return { approved: false, approvedQuantity: 0, reasons: ['KILL_SWITCH_ACTIVE'], snapshot };
+  }
+
+  // Spread limit check — fail closed if bid/ask unavailable or spread excessive.
+  // (Fixes Rev.13 #16: spread_limit_pct was defined but never enforced.)
+  if (side === 'buy' && limits.spread_limit_pct) {
+    if (opts.bid == null || opts.ask == null) {
+      reasons.push('NO_QUOTE_DATA_FOR_SPREAD_CHECK');
+    } else {
+      const mid = (opts.bid + opts.ask) / 2;
+      if (mid > 0) {
+        const spreadPct = ((opts.ask - opts.bid) / mid) * 100;
+        if (spreadPct > limits.spread_limit_pct) {
+          reasons.push(`SPREAD_EXCEEDS_LIMIT (${spreadPct.toFixed(2)}% > ${limits.spread_limit_pct}%)`);
+        }
+      }
+    }
+  }
+
+  // Slippage limit check — fail closed if estimated slippage is excessive.
+  // (Fixes Rev.13 #17: slippage_limit_pct was defined but never enforced pre-trade.)
+  if (side === 'buy' && limits.slippage_limit_pct && opts.estimated_slippage_pct != null) {
+    if (opts.estimated_slippage_pct > limits.slippage_limit_pct) {
+      reasons.push(`SLIPPAGE_EXCEEDS_LIMIT (${opts.estimated_slippage_pct.toFixed(2)}% > ${limits.slippage_limit_pct}%)`);
+    }
   }
 
   if (side === 'sell') {
@@ -194,10 +218,12 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
 // 9pm is not mistaken for a fresh quote. Note: the execution gateway now
 // fetches the authoritative quote directly and does not depend on this check
 // for new candidates; this remains for secondary/defensive freshness validation.
+// (Fixes Rev.13 #31: queries by symbol instead of loading 200 global snapshots
+// and searching in memory — the requested symbol may not be in the newest 200.)
 export async function checkDataFreshness(sr, symbol, maxAgeMinutes = 5) {
-  const snaps = await sr.entities.PriceSnapshot.list('-timestamp', 200);
   const sym = String(symbol).toUpperCase();
-  const latest = snaps.find((s) => String(s.symbol).toUpperCase() === sym);
+  const snaps = await sr.entities.PriceSnapshot.filter({ symbol: sym }, '-timestamp', 1);
+  const latest = snaps && snaps[0];
   if (!latest) return { fresh: false, reason: 'NO_PRICE_SNAPSHOT', ageMinutes: null };
   const ts = latest.provider_timestamp || latest.timestamp;
   const ageMinutes = (Date.now() - new Date(ts).getTime()) / 60000;
@@ -205,4 +231,25 @@ export async function checkDataFreshness(sr, symbol, maxAgeMinutes = 5) {
     return { fresh: false, reason: 'STALE_MARKET_DATA', ageMinutes: Math.round(ageMinutes) };
   }
   return { fresh: true, ageMinutes: Math.round(ageMinutes) };
+}
+
+// Check max drawdown against historical peak equity. (Fixes Rev.13 #15.)
+// Uses PnlRecord equity snapshots to find the peak and compute current drawdown.
+// Blocks new buys when the profile threshold is reached — a pre-trade runtime
+// control, not just a retrospective report metric.
+export async function checkMaxDrawdown(sr, userId, currentEquity, limits) {
+  if (!limits.max_drawdown_pct) return { breached: false };
+  const records = await sr.entities.PnlRecord.filter({ user_id: userId }, '-date', 100);
+  let peak = currentEquity;
+  for (const r of records) {
+    if (r.equity && r.equity > peak) peak = r.equity;
+  }
+  if (peak <= 0) return { breached: false };
+  const drawdownPct = ((peak - currentEquity) / peak) * 100;
+  return {
+    breached: drawdownPct >= limits.max_drawdown_pct,
+    drawdown_pct: Math.round(drawdownPct * 100) / 100,
+    peak_equity: peak,
+    limit: limits.max_drawdown_pct,
+  };
 }
