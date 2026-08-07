@@ -227,6 +227,30 @@
     },
     "risk_score": {
       "type": "number"
+    },
+    "reserved_cash": {
+      "type": "number",
+      "description": "Cash reserved for this pending buy order \u2014 set before broker submission, consumed by fills, released on cancel"
+    },
+    "consumed_cash": {
+      "type": "number",
+      "description": "Cash consumed by confirmed fills \u2014 updated by the settlement processor"
+    },
+    "released_cash": {
+      "type": "number",
+      "description": "Cash released when order canceled/expired (remaining reservation after partial fills)"
+    },
+    "reservation_status": {
+      "type": "string",
+      "enum": [
+        "none",
+        "reserved",
+        "partially_consumed",
+        "consumed",
+        "released"
+      ],
+      "default": "none",
+      "description": "Reservation state machine \u2014 owned by TradeIntent, not independent CashEntries. Settlement processor updates this deterministically from confirmed fills."
     }
   },
   "required": [

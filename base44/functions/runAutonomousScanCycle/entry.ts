@@ -247,6 +247,14 @@ export default async function(req) {
       if (new Date(lock.expires_at).getTime() <= Date.now()) {
         throw new Error('SCAN_LOCK_EXPIRED: lock TTL exceeded during scan');
       }
+      // SCAN GENERATION INVALIDATION — if a newer scan superseded this one,
+      // discard all results and abort. LLM calls can't be canceled, but stale
+      // results can be invalidated. (Per the architecture spec: optimistic
+      // cancellation — verify after every external operation.)
+      const scanRuns = await sr.entities.ScanRun.filter({ user_id: user.id, scan_run_id: runId });
+      if (scanRuns[0] && scanRuns[0].status !== 'running') {
+        throw new Error('SCAN_SUPERSEDED: scan is no longer active — discarding stale results');
+      }
     };
 
     // USER-SCOPED: only this user's holdings
@@ -334,6 +342,7 @@ export default async function(req) {
       },
     });
     await heartbeat();
+    await verifyOwnership();
     assertScanHealthy();
     // EXECUTABLE UNIVERSE FILTER — only execute trades for symbols in the
     // fixed liquid universe. Candidates outside the universe are research-
@@ -377,6 +386,7 @@ export default async function(req) {
     });
 
     await heartbeat();
+    await verifyOwnership();
     assertScanHealthy();
     // Construct proposals deterministically from candidates.
     // BUY candidates: STRONG_BUY/BUY with confidence >= min_confidence, sorted by confidence.
@@ -482,6 +492,7 @@ export default async function(req) {
       proposals = proposals.filter((p) => consensusMap[p.symbol.toUpperCase()] === true);
     }
     await heartbeat();
+    await verifyOwnership();
     assertScanHealthy();
 
     // PASS 3b — Deterministic ML multi-factor scoring (CHAMPION weights)
@@ -497,6 +508,7 @@ export default async function(req) {
       return { ...p, ml_score: Math.round(ml_score * 10) / 10, ml_signal: signalFromComposite(ml_score), realFactors: f, realPrice: ef?.realPrice };
     });
     await heartbeat();
+    await verifyOwnership();
     assertScanHealthy();
     let approved = scored.filter((p) => p.ml_score >= 55);
 
@@ -527,6 +539,7 @@ export default async function(req) {
       approved = approved.filter((p) => vetoMap[p.symbol.toUpperCase()] === 'approved');
     }
     await heartbeat();
+    await verifyOwnership();
     assertScanHealthy();
 
     // PASS 5 — Causal Contagion
@@ -555,6 +568,7 @@ export default async function(req) {
     }
 
     await heartbeat();
+    await verifyOwnership();
     assertScanHealthy();
     // Broker account equity was fetched early (before Pass 2) so the AI could
     // size proposals against real capital. accountEquity is already defined.

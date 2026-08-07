@@ -26,6 +26,7 @@ import { fetchQuote } from './marketDataAdapter.ts';
 import { isUsMarketOpen, usMarketSession } from './marketHours.ts';
 import { AlpacaError } from './alpacaErrors.ts';
 import { recordBuySettlement, recordSellSettlement } from './cashLedger.ts';
+import { nowIso, genId, parseClosureFills } from './lotAccounting.ts';
 
 const FILL_TIMEOUT_MS = 20000;
 const POLL_INTERVAL_MS = 1000;
@@ -36,22 +37,7 @@ function isTerminalFailure(status) {
 function isTerminal(status) {
   return ['filled', 'done_for_day', ...['rejected', 'canceled', 'expired', 'replaced']].includes(status);
 }
-function nowIso() { return new Date().toISOString(); }
-function genId(prefix) { return `${prefix}-${crypto.randomUUID()}`; }
 
-// Parse closure_fill_ids, handling both old (string array) and new (object array) formats.
-// Old format: ["fill-1", "fill-2"] — qty unknown
-// New format: [{ fill_id: "fill-1", qty: 4 }, { fill_id: "fill-2", qty: 6 }]
-// (Fixes Rev.15 #11: per-fill closure quantities prevent double-counting when
-// a lot is closed by multiple sell fills.)
-function parseClosureFills(closure_fill_ids) {
-  const parsed = JSON.parse(closure_fill_ids || '[]');
-  if (parsed.length === 0) return [];
-  if (typeof parsed[0] === 'string') {
-    return parsed.map((fid) => ({ fill_id: fid, qty: null }));
-  }
-  return parsed;
-}
 
 // Fetch the authoritative executable quote for a symbol and persist it as a
 // PriceSnapshot. The execution gateway does NOT trust the frontend/LLM price —
@@ -385,7 +371,7 @@ export async function executeIntent(base44, user, input) {
       }
       // If in-progress (submitted/accepted/partially_filled), resume polling.
       if (['submitted', 'accepted', 'partially_filled', 'risk_approved'].includes(intentRecord.status)) {
-        return await resumeBrokerOrder(sr, userId, intentRecord, input, brokerCred);
+        return await resumeBrokerOrder(base44, sr, userId, intentRecord, input, brokerCred);
       }
       // If proposed, continue the flow from risk evaluation.
     }
@@ -552,9 +538,14 @@ export async function executeIntent(base44, user, input) {
   }
 
   const approvedQty = risk.approvedQuantity;
+  const estimatedNotional = approvedQty * refPrice;
   await sr.entities.TradeIntent.update(intentRecord.id, {
     status: 'risk_approved',
     requested_quantity: approvedQty,
+    reserved_cash: side === 'buy' ? estimatedNotional + (input.commission || 0) + (input.fees || 0) : 0,
+    consumed_cash: 0,
+    released_cash: 0,
+    reservation_status: side === 'buy' ? 'reserved' : 'none',
     risk_snapshot: JSON.stringify({ reasons: risk.reasons, approvedQuantity: approvedQty, limits, snapshot: { totalEquity: snapshot.totalEquity, openPositions: snapshot.openPositions, tradesToday: snapshot.tradesToday, dailyPnlPct: snapshot.dailyPnlPct } }),
     portfolio_snapshot: JSON.stringify({ totalEquity: snapshot.totalEquity, openPositions: snapshot.openPositions, sectorMap: snapshot.sectorMap }),
   });
@@ -567,29 +558,82 @@ export async function executeIntent(base44, user, input) {
     const venue = executionMode === 'shadow_live' ? 'shadow' : 'paper';
     const fillId = genId('fill');
 
+    // Record the Fill (raw execution ledger — idempotent by fill_id)
+    await recordFill(sr, {
+      user_id: userId,
+      fill_id: fillId,
+      broker_order_id: null,
+      client_order_id: clientOrderId,
+      trade_intent_id: tradeIntentId,
+      symbol,
+      asset_id: input.native_asset_id || symbol,
+      side,
+      filled_quantity: filledQty,
+      filled_price: filledPrice,
+      notional: filledQty * filledPrice,
+      commission: input.commission || 0,
+      fees: input.fees || 0,
+      slippage: 0,
+      timestamp: nowIso(),
+      venue,
+      strategy_id: strategyId,
+      decision_id: input.decision_id || null,
+      portfolio_id: intentRecord.portfolio_id || input.portfolio_id || null,
+      execution_mode: executionMode,
+      asset_class: input.asset_class || 'stocks',
+      arrival_price: Number(input.arrival_price || input.price) || null,
+      decision_price: Number(input.decision_price || input.price) || null,
+      submission_price: Number(input.price) || null,
+      first_fill_price: filledPrice,
+      vwap_fill_price: filledPrice,
+      implementation_shortfall: Number(input.price) && filledPrice ? Number(input.price) - filledPrice : null,
+      fill_latency_ms: null,
+    });
+
+    // Create a SettlementEvent — the settlement processor handles all projection
+    // (lots, cash, holding, trade, P&L). This is the single-writer boundary:
+    // no execution request directly mutates CashEntry/PositionLot/Holding.
+    await sr.entities.SettlementEvent.create({
+      user_id: userId,
+      portfolio_id: intentRecord.portfolio_id || input.portfolio_id || null,
+      event_id: fillId,
+      trade_intent_id: tradeIntentId,
+      broker_order_id: null,
+      broker_fill_id: null,
+      client_order_id: clientOrderId,
+      symbol, side,
+      quantity: filledQty, price: filledPrice,
+      notional: filledQty * filledPrice,
+      commission: input.commission || 0, fees: input.fees || 0,
+      occurred_at: nowIso(),
+      status: 'pending',
+      execution_mode: executionMode,
+      asset_class: input.asset_class || 'stocks',
+      company_name: input.company_name || symbol,
+      sector: input.sector || '',
+      strategy_id: strategyId,
+      decision_id: input.decision_id || null,
+      venue,
+      arrival_price: Number(input.arrival_price || input.price) || null,
+      decision_price: Number(input.decision_price || input.price) || null,
+      submission_price: Number(input.price) || null,
+      first_fill_price: filledPrice,
+      vwap_fill_price: filledPrice,
+      implementation_shortfall: Number(input.price) && filledPrice ? Number(input.price) - filledPrice : null,
+    });
+
     await sr.entities.TradeIntent.update(intentRecord.id, {
       status: 'filled',
       filled_quantity: filledQty,
       filled_avg_price: filledPrice,
     });
 
-    // Idempotent fill insertion + settlement.
-    await settleFill(sr, userId, {
-      fillId,
-      brokerOrderId: null,
-      clientOrderId,
-      tradeIntentId,
-      symbol,
-      side,
-      filledQty,
-      filledPrice,
-      venue,
-      executionMode,
-      strategyId,
-      decisionId: input.decision_id || null,
-      input,
-      intentRecord,
-    });
+    // Invoke the settlement processor to project lots, cash, holding, trade.
+    // For internal_paper this is synchronous (immediate feedback). The processor
+    // is idempotent — a retry or scheduled invocation won't double-project.
+    try {
+      await base44.functions.invoke('processSettlementQueue', {});
+    } catch (e) { /* non-fatal — scheduled processor will retry */ }
 
     return {
       status: 'paper_filled',
@@ -639,20 +683,19 @@ export async function executeIntent(base44, user, input) {
   }
 
   // 3c. Poll until terminal state. Record each incremental fill idempotently.
-  return await pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId);
+  return await pollAndSettle(base44, sr, userId, intentRecord, creds, alpacaMode, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId);
 }
 
 // Poll a broker order until terminal state, recording incremental fills.
 // A partial fill records its increment but keeps the intent partially_filled.
 // Only when the order reaches filled/canceled/done_for_day/rejected do we settle.
-async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId) {
+async function pollAndSettle(base44, sr, userId, intentRecord, creds, alpacaMode, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId) {
   const symbol = intentRecord.symbol;
   const side = intentRecord.side;
   const executionMode = intentRecord.execution_mode;
   let lastFilledQty = intentRecord.filled_quantity || 0;
   let lastFilledPrice = intentRecord.filled_avg_price || 0;
   const venue = executionMode === 'live' ? 'alpaca' : 'alpaca_paper';
-  let accumulatedRealizedPnl = 0;
 
   const start = Date.now();
   while (Date.now() - start < FILL_TIMEOUT_MS) {
@@ -725,9 +768,37 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
       });
 
       if (recorded) {
-        // Project the holding for this incremental fill and capture realized P&L.
-        const fillRealizedPnl = await projectHolding(sr, userId, symbol, side, incrementalQty, incrementalPrice, { ...input, fill_id: fillId });
-        if (fillRealizedPnl != null) accumulatedRealizedPnl += fillRealizedPnl;
+        // Create a SettlementEvent — the settlement processor handles all projection
+        // (lots, cash, holding, trade, P&L). This is the single-writer boundary.
+        await sr.entities.SettlementEvent.create({
+          user_id: userId,
+          portfolio_id: intentRecord.portfolio_id || input.portfolio_id || null,
+          event_id: fillId,
+          trade_intent_id: tradeIntentId,
+          broker_order_id: brokerOrderId,
+          broker_fill_id: fillId,
+          client_order_id: clientOrderId,
+          symbol, side,
+          quantity: incrementalQty, price: incrementalPrice,
+          notional: incrementalQty * incrementalPrice,
+          commission: input.commission || 0, fees: input.fees || 0,
+          occurred_at: nowIso(),
+          status: 'pending',
+          execution_mode: executionMode,
+          asset_class: input.asset_class || 'stocks',
+          company_name: input.company_name || symbol,
+          sector: input.sector || '',
+          strategy_id: strategyId,
+          decision_id: input.decision_id || null,
+          venue,
+          arrival_price: Number(input.arrival_price || input.price) || null,
+          decision_price: Number(input.decision_price || input.price) || null,
+          submission_price: Number(input.price) || null,
+          first_fill_price: lastFilledQty === 0 ? incrementalPrice : null,
+          vwap_fill_price: cumulativeAvgPrice > 0 ? cumulativeAvgPrice : null,
+          implementation_shortfall: Number(input.price) && incrementalPrice ? Number(input.price) - incrementalPrice : null,
+          fill_latency_ms: null,
+        });
       }
 
       lastFilledQty = cumulativeFilled;
@@ -736,8 +807,6 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
 
     // Check for terminal state.
     if (status === 'filled' || status === 'done_for_day') {
-      // Final settlement — record the Trade, AITradeDecision, and settle the intent.
-      // Preserve both settlement status and broker terminal disposition.
       await sr.entities.TradeIntent.update(intentRecord.id, {
         status: 'filled',
         filled_quantity: cumulativeFilled,
@@ -745,18 +814,20 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
         broker_terminal_status: status,
         unfilled_quantity: Math.max(0, intentRecord.requested_quantity - cumulativeFilled),
       });
-      // Atomically claim the settlement — prevents double-settlement if the
-      // reconciliation worker also observes this terminal state.
-      const fillClaim = await claimSettlement(sr, userId, tradeIntentId, `poll-${brokerOrderId}`);
-      if (!fillClaim.claimed) return { status: 'already_settled', intentId: intentRecord.id, trade_intent_id: tradeIntentId, reason: fillClaim.reason };
-      await sr.entities.TradeIntent.update(fillClaim.intent.id, { settlement_state: 'projected' });
-      return await settleFromFills(sr, userId, fillClaim.intent, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, cumulativeFilled, cumulativeAvgPrice, executionMode, venue, accumulatedRealizedPnl);
+      // Invoke the settlement processor to project all pending events for this order.
+      try { await base44.functions.invoke('processSettlementQueue', {}); }
+      catch (e) { /* non-fatal — scheduled processor will retry */ }
+      return {
+        status: executionMode === 'live' ? 'filled' : 'paper_filled',
+        intentId: intentRecord.id, trade_intent_id: tradeIntentId,
+        brokerOrderId, clientOrderId,
+        filled_qty: cumulativeFilled, filled_avg_price: cumulativeAvgPrice,
+        total_value: cumulativeFilled * cumulativeAvgPrice,
+        execution_mode: executionMode, symbol, action: side,
+      };
     }
 
     if (isTerminalFailure(status)) {
-      // Order terminated with partial or no fill. Settle what was filled (if anything).
-      // Preserve the broker's terminal disposition (canceled/rejected/expired/replaced)
-      // alongside the filled quantity so both facts are visible: e.g. 25 filled + 75 canceled.
       if (cumulativeFilled > 0) {
         await sr.entities.TradeIntent.update(intentRecord.id, {
           status: 'partially_filled',
@@ -764,19 +835,28 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
           filled_avg_price: cumulativeAvgPrice,
           broker_terminal_status: status,
           unfilled_quantity: Math.max(0, intentRecord.requested_quantity - cumulativeFilled),
+          released_cash: Math.max(0, (intentRecord.reserved_cash || 0) - (intentRecord.consumed_cash || 0)),
+          reservation_status: 'released',
         });
-        // Atomically claim the settlement — prevents double-settlement.
-        const partialClaim = await claimSettlement(sr, userId, tradeIntentId, `poll-${brokerOrderId}`);
-        if (!partialClaim.claimed) return { status: 'already_settled', intentId: intentRecord.id, trade_intent_id: tradeIntentId, reason: partialClaim.reason };
-        await sr.entities.TradeIntent.update(partialClaim.intent.id, { settlement_state: 'projected' });
-        return await settleFromFills(sr, userId, partialClaim.intent, input, brokerOrderId, clientOrderId, tradeIntentId, strategyId, cumulativeFilled, cumulativeAvgPrice, executionMode, venue, accumulatedRealizedPnl);
+        try { await base44.functions.invoke('processSettlementQueue', {}); }
+        catch (e) { /* non-fatal — scheduled processor will retry */ }
+        return {
+          status: 'partially_filled',
+          intentId: intentRecord.id, trade_intent_id: tradeIntentId,
+          brokerOrderId, clientOrderId,
+          filled_qty: cumulativeFilled, filled_avg_price: cumulativeAvgPrice,
+          execution_mode: executionMode, symbol, action: side,
+        };
       }
-      // No fill at all — reject.
+      // No fill at all — reject and release the full reservation.
       await sr.entities.TradeIntent.update(intentRecord.id, {
         status: status === 'rejected' ? 'rejected' : 'canceled',
         rejection_reason: `BROKER_${status.toUpperCase()}`,
         broker_terminal_status: status,
         unfilled_quantity: intentRecord.requested_quantity,
+        released_cash: intentRecord.reserved_cash || 0,
+        reserved_cash: 0,
+        reservation_status: 'released',
       });
       return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, orderStatus: status, brokerOrderId, symbol, side, requestedQty: intentRecord.requested_quantity };
     }
@@ -812,7 +892,7 @@ async function pollAndSettle(sr, userId, intentRecord, creds, alpacaMode, input,
 }
 
 // Resume an in-progress broker order (idempotent retry path).
-async function resumeBrokerOrder(sr, userId, intentRecord, input, brokerCred) {
+async function resumeBrokerOrder(base44, sr, userId, intentRecord, input, brokerCred) {
   if (!intentRecord.broker_order_id) {
     // Not yet submitted — re-enter the main flow from risk evaluation.
     return null; // caller will continue
@@ -820,7 +900,7 @@ async function resumeBrokerOrder(sr, userId, intentRecord, input, brokerCred) {
   const creds = { apiKey: brokerCred.api_key, secretKey: brokerCred.api_secret, mode: brokerCred.mode };
   const alpacaMode = intentRecord.execution_mode === 'live' ? 'live' : 'paper';
   return await pollAndSettle(
-    sr, userId, intentRecord, creds, alpacaMode, input,
+    base44, sr, userId, intentRecord, creds, alpacaMode, input,
     intentRecord.broker_order_id, intentRecord.client_order_id, intentRecord.trade_intent_id, intentRecord.strategy_id
   );
 }

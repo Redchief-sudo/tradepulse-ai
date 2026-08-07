@@ -8,6 +8,7 @@
 //   broker_unavailable — broker API unreachable or account invalid
 //   market_closed    — outside market hours (stocks only; crypto is 24/7)
 //   manually_stopped — user pressed Stop
+//   financial_integrity_blocked — settlement integrity check failed; new entries blocked, protective exits only
 //
 // The kill switch (risk_stopped) requires manual reset — the system does NOT
 // auto-re-enable on the same day. The user must acknowledge the stop and
@@ -27,6 +28,7 @@ export const SESSION_STATES = {
   BROKER_UNAVAILABLE: 'broker_unavailable',
   MARKET_CLOSED: 'market_closed',
   MANUALLY_STOPPED: 'manually_stopped',
+  FINANCIAL_INTEGRITY_BLOCKED: 'financial_integrity_blocked',
 };
 
 // Update the user's session state. Called by the scan cycle, stop-loss cycle,
@@ -40,7 +42,7 @@ export async function updateSessionState(sr, userId, newState, reason = null) {
     patch.kill_switch_reset_required = true;
     patch.trading_active = false;
   }
-  if (newState === SESSION_STATES.DISABLED || newState === SESSION_STATES.MANUALLY_STOPPED) {
+  if (newState === SESSION_STATES.DISABLED || newState === SESSION_STATES.MANUALLY_STOPPED || newState === SESSION_STATES.FINANCIAL_INTEGRITY_BLOCKED) {
     patch.trading_active = false;
   }
   if (newState === SESSION_STATES.ACTIVE) {

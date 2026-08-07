@@ -10,6 +10,10 @@
       "type": "string",
       "description": "Canonical scan-cycle identifier (stable across retries)"
     },
+    "scan_generation": {
+      "type": "number",
+      "description": "Monotonically increasing generation counter \u2014 incremented on every external call. After each async operation, the scan verifies this generation is still active. If another scan superseded it, the result is discarded."
+    },
     "started_at": {
       "type": "string",
       "format": "date-time"
@@ -17,7 +21,7 @@
     "last_heartbeat_at": {
       "type": "string",
       "format": "date-time",
-      "description": "Last heartbeat timestamp \u2014 updated periodically during the scan. A scan is considered stale only when this stops advancing, not simply because started_at is old. This prevents declaring a long-running scan dead while it is still active."
+      "description": "Last heartbeat timestamp \u2014 updated periodically during the scan. A scan is considered stale only when this stops advancing, not simply because started_at is old."
     },
     "completed_at": {
       "type": "string",
@@ -40,9 +44,11 @@
         "completed",
         "failed",
         "no_candidates",
-        "broker_unavailable"
+        "broker_unavailable",
+        "superseded"
       ],
-      "default": "running"
+      "default": "running",
+      "description": "superseded = a newer scan generation invalidated this one \u2014 its LLM results were discarded"
     },
     "candidates_found": {
       "type": "number",

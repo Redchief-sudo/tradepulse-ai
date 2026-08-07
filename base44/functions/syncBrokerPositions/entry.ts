@@ -1,5 +1,6 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { getAlpacaActivities } from '../../shared/alpaca.ts';
+import { nowIso, genId } from '../../shared/lotAccounting.ts';
 
 // Broker-authoritative reconciliation. The broker is the source of truth for positions.
 // USER-SCOPED: all queries filter by user_id. Credentials read from BrokerCredential.
@@ -14,9 +15,6 @@ import { getAlpacaActivities } from '../../shared/alpaca.ts';
 // The position is flagged for review — the accounting lifecycle is never finalized
 // without closure evidence. This prevents stale lots from resurrecting a closed
 // position and prevents wrong P&L attribution from a guessed exit price.
-
-function nowIso() { return new Date().toISOString(); }
-function genId(prefix) { return `${prefix}-${crypto.randomUUID()}`; }
 
 // Close open lots FIFO for a symbol at the given exit price. Returns realized P&L.
 // If no lots exist but a holding does (legacy pre-lot state), backfills a lot from

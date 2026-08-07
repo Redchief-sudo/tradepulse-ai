@@ -1,6 +1,7 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { getAlpacaOrder } from '../../shared/alpaca.ts';
-import { recordFill, projectHolding, settleFromFills, claimSettlement } from '../../shared/execution.ts';
+import { recordFill } from '../../shared/execution.ts';
+import { nowIso } from '../../shared/lotAccounting.ts';
 
 // Continuous order reconciliation worker.
 // Finds all nonterminal TradeIntents, fetches broker order state, ingests
@@ -58,27 +59,37 @@ export default async function(req) {
     });
 
     for (const intent of staleClaimed) {
-      const claim = await claimSettlement(sr, user.id, intent.trade_intent_id, workerId);
-      if (!claim.claimed) continue;
-
-      // Check if Trade already exists (settlement was partially completed before crash)
-      const existingTrades = await sr.entities.Trade.filter({ user_id: user.id, client_order_id: intent.client_order_id });
-      if (existingTrades && existingTrades.length > 0) {
-        await sr.entities.TradeIntent.update(claim.intent.id, { status: 'settled', settlement_state: 'settled' });
-        results.push({ intent_id: intent.trade_intent_id, symbol: intent.symbol, status: 'recovered_settled', reason: 'trade_already_exists' });
-      } else if (intent.filled_quantity > 0) {
-        const venue = intent.execution_mode === 'live' ? 'alpaca' : 'alpaca_paper';
-        await settleFromFills(sr, user.id, claim.intent,
-          { company_name: intent.company_name, sector: intent.sector, asset_class: intent.asset_class,
-            confidence: intent.confidence, target_price: intent.target_price, stop_loss: intent.stop_loss,
-            reasoning: intent.reasoning, ml_score: intent.ml_score, technical_score: intent.technical_score,
-            momentum_score: intent.momentum_score, risk_score: intent.risk_score, ai_recommended: intent.strategy_id !== 'manual',
-            recordDecision: !!intent.decision_id, portfolio_id: intent.portfolio_id },
-          intent.broker_order_id, intent.client_order_id, intent.trade_intent_id, intent.strategy_id,
-          intent.filled_quantity, intent.filled_avg_price, intent.execution_mode, venue, 0);
-        results.push({ intent_id: intent.trade_intent_id, symbol: intent.symbol, status: 'recovered_settled', reason: 'settleFromFills_completed' });
+      // Reset the settlement state so the settlement processor can retry.
+      // In the new architecture, the processor handles claiming via
+      // SettlementEvent status, not TradeIntent settlement_state.
+      if (intent.filled_quantity > 0) {
+        // Create a SettlementEvent for the fills if one doesn't exist yet
+        const existingEvents = await sr.entities.SettlementEvent.filter({ user_id: user.id, trade_intent_id: intent.trade_intent_id });
+        if (existingEvents.length === 0) {
+          await sr.entities.SettlementEvent.create({
+            user_id: user.id,
+            portfolio_id: intent.portfolio_id || null,
+            event_id: `${intent.broker_order_id || intent.client_order_id}:recovery`,
+            trade_intent_id: intent.trade_intent_id,
+            broker_order_id: intent.broker_order_id,
+            client_order_id: intent.client_order_id,
+            symbol: intent.symbol, side: intent.side,
+            quantity: intent.filled_quantity, price: intent.filled_avg_price,
+            notional: intent.filled_quantity * intent.filled_avg_price,
+            occurred_at: intent.accepted_at || intent.created_date,
+            status: 'pending',
+            execution_mode: intent.execution_mode,
+            asset_class: intent.asset_class || 'stocks',
+            company_name: intent.company_name || intent.symbol,
+            sector: intent.sector || '',
+            strategy_id: intent.strategy_id,
+            decision_id: intent.decision_id,
+          });
+        }
+        await sr.entities.TradeIntent.update(intent.id, { settlement_state: 'pending' });
+        results.push({ intent_id: intent.trade_intent_id, symbol: intent.symbol, status: 'recovery_event_created' });
       } else {
-        await sr.entities.TradeIntent.update(claim.intent.id, { status: 'canceled', settlement_state: 'settled', rejection_reason: 'CRASH_RECOVERY_NO_FILLS' });
+        await sr.entities.TradeIntent.update(intent.id, { status: 'canceled', settlement_state: 'settled', rejection_reason: 'CRASH_RECOVERY_NO_FILLS' });
         results.push({ intent_id: intent.trade_intent_id, symbol: intent.symbol, status: 'recovered_canceled', reason: 'no_fills' });
       }
     }
@@ -102,7 +113,6 @@ export default async function(req) {
         let lastFilledQty = intent.filled_quantity || 0;
         let lastFilledPrice = intent.filled_avg_price || 0;
         let newFills = 0;
-        let accumulatedRealizedPnl = 0;
 
         if (cumulativeFilled > lastFilledQty) {
           const incrementalQty = cumulativeFilled - lastFilledQty;
@@ -149,15 +159,28 @@ export default async function(req) {
 
           if (inserted) {
             newFills++;
-            // Use canonical projectHolding — lot-based, sell-qty validated
-            const fillRealizedPnl = await projectHolding(sr, user.id, intent.symbol, intent.side, incrementalQty, incrementalPrice, {
-              portfolio_id: intent.portfolio_id,
-              company_name: intent.company_name,
-              sector: intent.sector,
-              asset_class: intent.asset_class,
-              fill_id: fillId,
+            // Create a SettlementEvent — the settlement processor handles all projection.
+            await sr.entities.SettlementEvent.create({
+              user_id: user.id,
+              portfolio_id: intent.portfolio_id || null,
+              event_id: fillId,
+              trade_intent_id: intent.trade_intent_id,
+              broker_order_id: intent.broker_order_id,
+              broker_fill_id: fillId,
+              client_order_id: intent.client_order_id,
+              symbol: intent.symbol, side: intent.side,
+              quantity: incrementalQty, price: incrementalPrice,
+              notional: incrementalQty * incrementalPrice,
+              occurred_at: nowIso(),
+              status: 'pending',
+              execution_mode: intent.execution_mode,
+              asset_class: intent.asset_class || 'stocks',
+              company_name: intent.company_name || intent.symbol,
+              sector: intent.sector || '',
+              strategy_id: intent.strategy_id,
+              decision_id: intent.decision_id,
+              venue: alpacaMode === 'live' ? 'alpaca' : 'alpaca_paper',
             });
-            if (fillRealizedPnl != null) accumulatedRealizedPnl += fillRealizedPnl;
 
             await sr.entities.AuditEvent.create({
               user_id: user.id,
@@ -181,54 +204,33 @@ export default async function(req) {
           const isFailure = ['canceled', 'rejected', 'expired', 'replaced'].includes(status);
 
           if (cumulativeFilled > 0) {
-            // Atomically claim the settlement — prevents double-settlement
-            const claim = await claimSettlement(sr, user.id, intent.trade_intent_id, workerId);
-            if (claim.claimed) {
-              // Use canonical settleFromFills — creates Trade, AITradeDecision, settles intent
-              const venue = alpacaMode === 'live' ? 'alpaca' : 'alpaca_paper';
-              await settleFromFills(
-                sr, user.id, claim.intent,
-                {
-                  company_name: intent.company_name,
-                  sector: intent.sector,
-                  asset_class: intent.asset_class,
-                  confidence: intent.confidence,
-                  target_price: intent.target_price,
-                  stop_loss: intent.stop_loss,
-                  reasoning: intent.reasoning,
-                  ml_score: intent.ml_score,
-                  technical_score: intent.technical_score,
-                  momentum_score: intent.momentum_score,
-                  risk_score: intent.risk_score,
-                  regime: null,
-                  ai_recommended: intent.strategy_id !== 'manual',
-                  recordDecision: !!intent.decision_id,
-                  portfolio_id: intent.portfolio_id,
-                },
-                intent.broker_order_id, intent.client_order_id, intent.trade_intent_id, intent.strategy_id,
-                cumulativeFilled, cumulativeAvgPrice, intent.execution_mode, venue,
-                accumulatedRealizedPnl
-              );
+            // Update terminal status — the settlement processor handles projection
+            await sr.entities.TradeIntent.update(intent.id, {
+              status: cumulativeFilled >= intent.requested_quantity ? 'filled' : 'partially_filled',
+              filled_quantity: cumulativeFilled,
+              filled_avg_price: cumulativeAvgPrice,
+              broker_terminal_status: status,
+              unfilled_quantity: unfilledQty,
+              released_cash: isFailure ? Math.max(0, (intent.reserved_cash || 0) - (intent.consumed_cash || 0)) : 0,
+              reservation_status: isFailure ? 'released' : (cumulativeFilled >= intent.requested_quantity ? 'consumed' : 'partially_consumed'),
+            });
 
-              // Update terminal status fields
-              await sr.entities.TradeIntent.update(claim.intent.id, {
-                broker_terminal_status: status,
-                unfilled_quantity: unfilledQty,
-              });
+            // Invoke the settlement processor to project all pending events.
+            try { await base44.functions.invoke('processSettlementQueue', {}); }
+            catch (e) { /* non-fatal — scheduled processor will retry */ }
 
-              results.push({ intent_id: intent.trade_intent_id, symbol: intent.symbol, status: 'settled', broker_status: status, new_fills: newFills, filled_qty: cumulativeFilled });
-            } else {
-              // Another worker already claimed or settled — skip
-              results.push({ intent_id: intent.trade_intent_id, symbol: intent.symbol, status: 'already_claimed', reason: claim.reason, broker_status: status });
-            }
+            results.push({ intent_id: intent.trade_intent_id, symbol: intent.symbol, status: 'settled', broker_status: status, new_fills: newFills, filled_qty: cumulativeFilled });
           } else if (isFailure) {
-            // No fill at all — mark as canceled/rejected
+            // No fill at all — mark as canceled/rejected and release reservation
             await sr.entities.TradeIntent.update(intent.id, {
               status: status === 'rejected' ? 'rejected' : 'canceled',
               settlement_state: 'settled',
               rejection_reason: `BROKER_${status.toUpperCase()}`,
               broker_terminal_status: status,
               unfilled_quantity: intent.requested_quantity,
+              released_cash: intent.reserved_cash || 0,
+              reserved_cash: 0,
+              reservation_status: 'released',
             });
 
             await sr.entities.AuditEvent.create({

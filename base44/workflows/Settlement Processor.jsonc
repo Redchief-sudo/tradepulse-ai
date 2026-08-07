@@ -1,24 +1,24 @@
 {
-  "name": "Intraday AI Scan",
-  "description": "Every 15 minutes during US market hours: calls the Scan Coordinator \u2014 the single entry point that serializes scan execution. The coordinator checks for pending manual ScanRequests first, then runs a scheduled scan if trading is active. This prevents browser requests and scheduled workflows from competing to create scans.",
+  "name": "Settlement Processor",
+  "description": "Every 5 minutes: processes pending SettlementEvents sequentially \u2014 the single-writer that projects lots, cash, holdings, trades, and P&L. No other function may directly mutate CashEntry, PositionLot, Holding, or final Trade settlement. Also handles crash recovery by picking up stale processing events.",
   "definition": {
     "document": {
       "dsl": "1.0.0",
-      "name": "intraday_ai_scan",
+      "name": "settlement_processor",
       "version": "1.0",
       "namespace": "base44"
     },
     "do": [
       {
-        "scan": {
+        "settle": {
           "call": "invoke_backend_function",
           "with": {
-            "function_name": "runScanCoordinator"
+            "function_name": "processSettlementQueue"
           },
           "then": "end",
           "x-base44": {
-            "title": "Run scan coordinator",
-            "description": "Serializes scan execution \u2014 consumes manual requests, runs scheduled scans"
+            "title": "Process settlement queue",
+            "description": "Single-writer settlement \u2014 projects lots, cash, holdings, trades from events"
           }
         }
       }
@@ -30,7 +30,7 @@
       "trigger_type": "scheduled",
       "events": [],
       "schedule_mode": "recurring",
-      "cron_expression": "*/15 6-13 * * 1-5",
+      "cron_expression": "*/5 * * * *",
       "one_time_date": null,
       "timezone": "America/Los_Angeles",
       "interval_value": null,

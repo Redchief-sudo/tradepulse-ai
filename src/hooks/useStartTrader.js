@@ -1,14 +1,14 @@
 import { useState, useCallback } from 'react';
 import { base44 } from '@/api/base44Client';
 
-// Reusable hook that runs the full autonomous cycle via the backend
-// runAutonomousScanCycle function — the authoritative 5-pass AI scan +
-// auto-execute pipeline. This sizes positions from real broker account
-// equity (not stale holdings cache), persists ScanRun records, uses the
-// champion StrategyModel weights, and routes every trade through the
-// canonical execution gateway with lot-based accounting.
+// Reusable hook that initiates an autonomous scan via the Scan Coordinator.
 //
-// Used by the Dashboard "Start Trader" button.
+// ARCHITECTURE: Manual UI actions do NOT call runAutonomousScanCycle directly.
+// They create a ScanRequest, then invoke the Scan Coordinator — the single
+// entry point that serializes scan execution. This prevents browser requests
+// and scheduled workflows from competing to create scans.
+//
+// The coordinator picks up the pending ScanRequest and runs the 5-pass AI scan.
 export function useStartTrader() {
   const [isRunning, setIsRunning] = useState(false);
   const [stageLabel, setStageLabel] = useState(null);
@@ -19,20 +19,29 @@ export function useStartTrader() {
     setIsRunning(true);
     setError(null);
     setResult(null);
-    setStageLabel('Running full AI scan + auto-execution');
+    setStageLabel('Creating scan request');
 
     try {
-      const res = await base44.functions.invoke('runAutonomousScanCycle', { trigger_source: 'dashboard' });
+      // Create a ScanRequest — the coordinator consumes it.
+      await base44.entities.ScanRequest.create({
+        status: 'pending',
+        trigger_source: 'dashboard',
+        requested_at: new Date().toISOString(),
+      });
+
+      setStageLabel('Running scan coordinator');
+
+      // Invoke the scan coordinator — it picks up the pending request and runs the scan.
+      const res = await base44.functions.invoke('runScanCoordinator', {});
       const data = res?.data || res;
 
       if (!data || data.ok === false || data.error) {
-        throw new Error(data?.error || 'Scan cycle failed');
+        throw new Error(data?.error || 'Scan coordinator failed');
       }
 
-      // The executed array includes rejected attempts too. Count only
-      // actually-filled trades (filled / paper_filled) so the UI reflects
-      // real portfolio changes.
-      const executedList = data.executed || [];
+      // The coordinator returns the scan result
+      const scanData = data.result || data;
+      const executedList = scanData?.executed || [];
       const filled = executedList.filter(
         (e) =>
           e.settlement?.status === 'filled' ||
@@ -51,7 +60,7 @@ export function useStartTrader() {
         proposals,
         executed: filled.length,
         attempted: executedList.length,
-        marketSummary: data.market_summary,
+        marketSummary: scanData?.market_summary,
       });
 
       if (onComplete) {
