@@ -13,6 +13,7 @@
     "entry_type": {
       "type": "string",
       "enum": [
+        "account_opening",
         "deposit",
         "withdrawal",
         "buy",
@@ -24,7 +25,7 @@
         "reservation",
         "reservation_release"
       ],
-      "description": "Type of cash flow entry. reservation = cash held for a pending order; reservation_release = reservation returned (filled or canceled)"
+      "description": "Type of cash flow entry. account_opening = immutable opening balance (exactly one per user); reservation = cash held for a pending order; reservation_release = reservation returned (filled or canceled)"
     },
     "amount": {
       "type": "number",
@@ -32,7 +33,7 @@
     },
     "balance_after": {
       "type": "number",
-      "description": "Cash balance after this entry was applied"
+      "description": "Cash balance after this entry was applied. Informational only \u2014 under concurrent writes it may be stale. The authoritative balance is always sum(amount) across all entries."
     },
     "symbol": {
       "type": "string",

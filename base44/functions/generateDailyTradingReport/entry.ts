@@ -243,18 +243,31 @@ export default async function(req) {
             ? Math.min(...sellFills.map((f) => new Date(f.timestamp || f.created_date).getTime()))
             : new Date(t.created_date).getTime();
           holdingTimeMinutes = Math.round((sellTime - earliestAcquisition) / 60000);
-          // Entry price: weighted average acquisition cost of closed lots
+
+          // PER-FILL LOT ALLOCATION: use the per-fill closure quantities stored in
+          // closure_fill_ids, not the lot's total opened-remaining delta.
+          // (Fixes Rev.15 #11: the old code used quantity_opened - quantity_remaining
+          // for the ENTIRE lot for EACH closure fill, double-counting when a lot
+          // was closed by multiple sell fills.)
+          const sellFillIds = new Set(sellFills.map((f) => f.fill_id));
+          const parseClosureFills = (cfid) => {
+            const parsed = JSON.parse(cfid || '[]');
+            if (parsed.length === 0) return [];
+            if (typeof parsed[0] === 'string') return parsed.map((fid) => ({ fill_id: fid, qty: null }));
+            return parsed;
+          };
           const totalQty = allClosedLots.reduce((s, l) => {
-            const closedQty = JSON.parse(l.closure_fill_ids || '[]').length > 0
-              ? l.quantity_opened - l.quantity_remaining
-              : l.quantity_remaining;
-            return s + Math.max(0, closedQty);
+            const allocations = parseClosureFills(l.closure_fill_ids);
+            return s + allocations
+              .filter((a) => sellFillIds.has(a.fill_id))
+              .reduce((sum, a) => sum + (a.qty || 0), 0);
           }, 0);
           const totalCost = allClosedLots.reduce((s, l) => {
-            const closedQty = JSON.parse(l.closure_fill_ids || '[]').length > 0
-              ? l.quantity_opened - l.quantity_remaining
-              : l.quantity_remaining;
-            return s + Math.max(0, closedQty) * l.acquisition_price;
+            const allocations = parseClosureFills(l.closure_fill_ids);
+            const qty = allocations
+              .filter((a) => sellFillIds.has(a.fill_id))
+              .reduce((sum, a) => sum + (a.qty || 0), 0);
+            return s + qty * l.acquisition_price;
           }, 0);
           entryPrice = totalQty > 0 ? totalCost / totalQty : null;
         }
@@ -275,7 +288,10 @@ export default async function(req) {
           exitPrice = totalQty > 0 ? totalNotional / totalQty : null;
         }
       }
-      if (exitPrice == null) exitPrice = t.action === 'sell' ? t.price : null;
+      // EXIT PRICE: no fallback to Trade.price. If no linked Fill records exist,
+      // the exit price is marked as unavailable — a supposedly authoritative daily
+      // journal should not silently substitute the order-summary price.
+      // (Fixes Rev.15 #12: the fallback concealed fill-level execution detail.)
 
       // Fallback entry price for buys: use the fill price
       if (entryPrice == null) {
@@ -305,6 +321,7 @@ export default async function(req) {
         quantity: t.filled_qty || t.shares,
         entry_price: entryPrice,
         exit_price: exitPrice,
+        exit_price_source: exitPrice != null ? 'fill_ledger' : 'unavailable',
         realized_pnl: pnl,
         running_daily_pnl: t.action === 'sell' ? runningPnl : null,
         outcome_label: outcomeLabel,

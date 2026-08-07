@@ -39,6 +39,20 @@ function isTerminal(status) {
 function nowIso() { return new Date().toISOString(); }
 function genId(prefix) { return `${prefix}-${crypto.randomUUID()}`; }
 
+// Parse closure_fill_ids, handling both old (string array) and new (object array) formats.
+// Old format: ["fill-1", "fill-2"] — qty unknown
+// New format: [{ fill_id: "fill-1", qty: 4 }, { fill_id: "fill-2", qty: 6 }]
+// (Fixes Rev.15 #11: per-fill closure quantities prevent double-counting when
+// a lot is closed by multiple sell fills.)
+function parseClosureFills(closure_fill_ids) {
+  const parsed = JSON.parse(closure_fill_ids || '[]');
+  if (parsed.length === 0) return [];
+  if (typeof parsed[0] === 'string') {
+    return parsed.map((fid) => ({ fill_id: fid, qty: null }));
+  }
+  return parsed;
+}
+
 // Fetch the authoritative executable quote for a symbol and persist it as a
 // PriceSnapshot. The execution gateway does NOT trust the frontend/LLM price —
 // it fetches the live quote itself and uses that same price for risk sizing,
@@ -207,14 +221,14 @@ export async function projectHolding(sr, userId, symbol, side, filledQty, filled
     realizedPnl += lotPnl;
 
     const newRemaining = lot.quantity_remaining - closeQty;
-    const closureIds = JSON.parse(lot.closure_fill_ids || '[]');
-    if (fillId) closureIds.push(fillId);
+    const closureAllocations = parseClosureFills(lot.closure_fill_ids);
+    if (fillId) closureAllocations.push({ fill_id: fillId, qty: closeQty });
 
     await sr.entities.PositionLot.update(lot.id, {
       quantity_remaining: newRemaining,
       status: newRemaining <= 0.0001 ? 'closed' : 'partially_closed',
       realized_pnl: (lot.realized_pnl || 0) + lotPnl,
-      closure_fill_ids: JSON.stringify(closureIds),
+      closure_fill_ids: JSON.stringify(closureAllocations),
     });
 
     remainingQty -= closeQty;
@@ -488,8 +502,17 @@ export async function executeIntent(base44, user, input) {
 
   // 2. RISK evaluation — deterministic, veto authority. DENIED ⇒ zero order, zero mutation.
   // Uses real broker account equity when available (broker_paper/live), falls back to
-  // holdings-based equity for internal_paper mode.
-  const snapshot = await buildPortfolioSnapshot(sr, userId, accountEquity);
+  // holdings-based equity for internal_paper mode. Passes broker prev-close equity so
+  // the daily-loss check uses broker equity decline, not app-realized P&L.
+  // (Fixes Rev.15 #9: scan and execution had inconsistent daily-loss definitions.)
+  let brokerPrevCloseEquity = null;
+  if (executionMode === 'live' || executionMode === 'broker_paper') {
+    try {
+      const acct = await getAlpacaAccount({ apiKey: brokerCred.api_key, secretKey: brokerCred.api_secret, mode: brokerCred.mode });
+      brokerPrevCloseEquity = Number(acct.last_equity) || null;
+    } catch (e) { /* non-fatal — fall back to app P&L */ }
+  }
+  const snapshot = await buildPortfolioSnapshot(sr, userId, accountEquity, brokerPrevCloseEquity);
   const limits = riskLimitsForProfile(user.trade_profile || 'balanced');
 
   // Max drawdown check — compute before evaluateRisk so it can be enforced
@@ -1039,13 +1062,13 @@ export async function rebuildPositionsFromFills(sr, userId) {
         if (remainingQty <= 0.0001) break;
         const closeQty = Math.min(lot.quantity_remaining, remainingQty);
         const newRemaining = lot.quantity_remaining - closeQty;
-        const closureIds = JSON.parse(lot.closure_fill_ids || '[]');
-        closureIds.push(fill.fill_id);
+        const closureAllocations = parseClosureFills(lot.closure_fill_ids);
+        closureAllocations.push({ fill_id: fill.fill_id, qty: closeQty });
         await sr.entities.PositionLot.update(lot.id, {
           quantity_remaining: newRemaining,
           status: newRemaining <= 0.0001 ? 'closed' : 'partially_closed',
           realized_pnl: (lot.realized_pnl || 0) + (price - lot.acquisition_price) * closeQty,
-          closure_fill_ids: JSON.stringify(closureIds),
+          closure_fill_ids: JSON.stringify(closureAllocations),
         });
         remainingQty -= closeQty;
       }

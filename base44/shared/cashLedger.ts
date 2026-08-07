@@ -5,23 +5,31 @@
 // For broker_paper/live mode, the broker's account endpoint is authoritative.
 // This ledger is ONLY used for internal_paper mode (no broker connected).
 //
-// SAFETY GUARANTEES (Rev.13 audit fixes):
-// 5. SINGLE INITIALIZER: initializePaperAccount() is the ONLY initialization path.
-//    recordCashEntry() no longer duplicates it. A fixed description marker is the
-//    idempotency key — a race still creates two deposits, but the rebuild function
-//    deduplicates by description during reconciliation.
-// 6. IDEMPOTENCY: trade-related entries are deduplicated by fill_id + entry_type.
-//    A retry will not double-apply cash.
-// 8. NEGATIVE CASH PREVENTION: recordBuySettlement() checks available cash BEFORE
-//    debiting and throws if insufficient. The simulated account cannot go negative.
-// 9. CASH RESERVATION: reserveCash() holds funds for pending orders. getAvailableCash()
-//    returns balance minus open reservations, preventing double-spending.
-// 7. SEQUENCE VALIDATION: validateCashSequence() verifies the balance_after chain.
-// 11. CASH REBUILD: rebuildCashFromFills() replays all fills to reconstruct the
-//    ledger from the immutable Fill source of truth.
+// REV.15 CONCURRENCY FIXES:
+// The previous check-then-create pattern could not guarantee idempotency under
+// concurrent writes. Two workers could both pass the check and both create.
+// The create-then-dedup pattern narrows the race: both create, both query, the
+// earliest record wins and the duplicate is deleted. This is the best available
+// mitigation on a BaaS platform without DB-level unique constraints.
+//
+// #3 CASH INIT: initializePaperAccount uses create-then-dedup. A race creates
+//    two opening entries; the dedup pass keeps the earliest and deletes the rest.
+// #4 CASH ENTRY IDEMPOTENCY: recordCashEntry uses create-then-dedup by fill_id +
+//    entry_type. A retried settlement skips already-recorded entries.
+// #7 IMMUTABLE OPENING: The opening balance is stored as an 'account_opening'
+//    entry type — not a hardcoded constant. rebuildCashFromFills reads the
+//    actual opening balance from this immutable entry.
+// #8 REBUILD WITHOUT AUTH: rebuildCashFromFills replays fills as raw entries
+//    without negative-cash checks. Historical replay must reconstruct, not
+//    re-authorize.
+//
+// NOTE: balance_after is informational only. Under concurrent writes it may be
+// stale (two workers read the same balance and both write the same balance_after).
+// The authoritative balance is always sum(amount) across all entries, computed
+// by getCashBalance().
 
-const PAPER_INITIAL_CASH = 1000; // $1,000 default — optimized for small accounts ($100-$10k)
-const INITIAL_DEPOSIT_DESC = 'Initial paper account deposit';
+const DEFAULT_OPENING_CASH = 1000; // Default opening balance for new paper accounts
+const OPENING_DESC = 'Account opening balance';
 
 // Get the current cash balance for a user (internal paper mode).
 // Sums all entry amounts. Reservations (negative) and releases (positive) net to
@@ -33,13 +41,6 @@ export async function getCashBalance(sr, userId) {
 
 // Get available cash = balance (reservations are already negative in the sum).
 // This is the real buying power — it accounts for funds held for pending orders.
-//
-// FIX Rev.14 #4: The previous implementation subtracted openReservations from
-// balance, but reservations are already negative entries in the balance sum.
-// Subtracting again double-counted the reservation:
-//   balance = 1000 - 300(reservation) = 700
-//   available = 700 - 300 = 400  ← WRONG, should be 700
-// Now: available = balance. The reservation entry already reduced it.
 export async function getAvailableCash(sr, userId) {
   const entries = await sr.entities.CashEntry.filter({ user_id: userId });
   let balance = 0;
@@ -53,8 +54,6 @@ export async function getAvailableCash(sr, userId) {
       reservations[e.trade_intent_id] = (reservations[e.trade_intent_id] || 0) + (e.amount || 0);
     }
   }
-  // Track open reservations for equity calculation (reserved cash is still
-  // part of net worth, just not available for new orders).
   let openReservations = 0;
   for (const tid of Object.keys(reservations)) {
     if (reservations[tid] < 0) openReservations += Math.abs(reservations[tid]);
@@ -62,55 +61,187 @@ export async function getAvailableCash(sr, userId) {
   return { available: balance, balance, openReservations };
 }
 
-// Initialize the paper account with the default deposit. Idempotent — checks
-// for an existing initial deposit before creating one.
-// (Fixes Rev.13 #5: consolidated to a single initializer — recordCashEntry no
-// longer has its own initialization path.)
-export async function initializePaperAccount(sr, userId) {
-  const existing = await sr.entities.CashEntry.filter({ user_id: userId, entry_type: 'deposit', description: INITIAL_DEPOSIT_DESC });
-  if (existing.length > 0) {
-    return existing[0].balance_after;
+// Get the immutable opening balance for a user — the account_opening entry.
+// Returns null if no opening entry exists (account not yet initialized).
+async function getOpeningBalance(sr, userId) {
+  const openingEntries = await sr.entities.CashEntry.filter({
+    user_id: userId,
+    entry_type: 'account_opening',
+  });
+  if (openingEntries.length > 0) {
+    // Dedup if a race created multiple opening entries — keep the earliest.
+    if (openingEntries.length > 1) {
+      const sorted = openingEntries.sort((a, b) =>
+        new Date(a.created_date) - new Date(b.created_date) || (a.id < b.id ? -1 : 1)
+      );
+      for (let i = 1; i < sorted.length; i++) {
+        try { await sr.entities.CashEntry.delete(sorted[i].id); } catch (e) {}
+      }
+      return sorted[0].amount;
+    }
+    return openingEntries[0].amount;
   }
-  return await sr.entities.CashEntry.create({
+  // Backward compatibility: check for old-style initial deposit
+  const oldDeposits = await sr.entities.CashEntry.filter({
     user_id: userId,
     entry_type: 'deposit',
-    amount: PAPER_INITIAL_CASH,
-    balance_after: PAPER_INITIAL_CASH,
-    description: INITIAL_DEPOSIT_DESC,
-  }).then((r) => r.balance_after || PAPER_INITIAL_CASH);
+    description: 'Initial paper account deposit',
+  });
+  if (oldDeposits.length > 0) return oldDeposits[0].amount;
+  return null;
+}
+
+// Initialize the paper account with the default opening balance.
+// Uses create-then-dedup: creates the opening entry, then checks for duplicates.
+// If a race created multiple opening entries, the earliest wins and the rest
+// are deleted. (Fixes Rev.15 #3: filter-then-create could not prevent a race
+// from creating two opening deposits, inflating the starting capital.)
+export async function initializePaperAccount(sr, userId, openingAmount) {
+  const amount = openingAmount != null ? openingAmount : DEFAULT_OPENING_CASH;
+
+  // Check for an existing opening entry first (fast path — no create needed)
+  const existing = await sr.entities.CashEntry.filter({
+    user_id: userId,
+    entry_type: 'account_opening',
+  });
+  if (existing.length > 0) {
+    // Dedup if needed
+    if (existing.length > 1) {
+      const sorted = existing.sort((a, b) =>
+        new Date(a.created_date) - new Date(b.created_date) || (a.id < b.id ? -1 : 1)
+      );
+      for (let i = 1; i < sorted.length; i++) {
+        try { await sr.entities.CashEntry.delete(sorted[i].id); } catch (e) {}
+      }
+    }
+    return existing[0].amount;
+  }
+
+  // Backward compatibility: check for old-style initial deposit
+  const oldDeposits = await sr.entities.CashEntry.filter({
+    user_id: userId,
+    entry_type: 'deposit',
+    description: 'Initial paper account deposit',
+  });
+  if (oldDeposits.length > 0) return oldDeposits[0].amount;
+
+  // Create the opening entry
+  const created = await sr.entities.CashEntry.create({
+    user_id: userId,
+    entry_type: 'account_opening',
+    amount,
+    balance_after: amount,
+    description: OPENING_DESC,
+  });
+
+  // Create-then-dedup: check if a race created multiple opening entries
+  const all = await sr.entities.CashEntry.filter({
+    user_id: userId,
+    entry_type: 'account_opening',
+  });
+  if (all.length > 1) {
+    const sorted = all.sort((a, b) =>
+      new Date(a.created_date) - new Date(b.created_date) || (a.id < b.id ? -1 : 1)
+    );
+    // Keep the earliest, delete the rest
+    if (sorted[0].id !== created.id) {
+      // We lost the race — delete our duplicate
+      try { await sr.entities.CashEntry.delete(created.id); } catch (e) {}
+      return sorted[0].amount;
+    }
+    for (let i = 1; i < sorted.length; i++) {
+      try { await sr.entities.CashEntry.delete(sorted[i].id); } catch (e) {}
+    }
+  }
+  return amount;
 }
 
 // Ensure the account is initialized before any operation.
 async function ensureInitialized(sr, userId) {
-  const entries = await sr.entities.CashEntry.filter({ user_id: userId });
-  if (entries.length === 0) {
+  const opening = await getOpeningBalance(sr, userId);
+  if (opening == null) {
     await initializePaperAccount(sr, userId);
   }
 }
 
-// Record a cash entry with idempotency by fill_id. (Fixes Rev.13 #6.)
-// If a fill_id is provided and a CashEntry already exists for that fill_id +
-// entry_type, the call is a no-op and returns the existing balance.
+// Create-then-dedup for cash entries. Creates the entry, then checks for
+// duplicates by the idempotency key. If a race created duplicates, the earliest
+// wins and the rest are deleted. (Fixes Rev.15 #4: check-then-create could not
+// prevent duplicate entries under concurrent writes.)
+//
+// idempotencyKey: a function that returns the filter query for dedup
+//   e.g. () => ({ fill_id: 'xxx', entry_type: 'buy' })
+async function idempotentCreateCashEntry(sr, userId, entry, idempotencyQuery) {
+  const created = await sr.entities.CashEntry.create({
+    user_id: userId,
+    portfolio_id: entry.portfolio_id || null,
+    entry_type: entry.entry_type,
+    amount: entry.amount,
+    balance_after: entry.balance_after,
+    symbol: entry.symbol || null,
+    trade_intent_id: entry.trade_intent_id || null,
+    fill_id: entry.fill_id || null,
+    description: entry.description || '',
+  });
+
+  if (!idempotencyQuery) return created;
+
+  // Check for duplicates
+  const all = await sr.entities.CashEntry.filter({ user_id: userId, ...idempotencyQuery });
+  if (all.length > 1) {
+    const sorted = all.sort((a, b) =>
+      new Date(a.created_date) - new Date(b.created_date) || (a.id < b.id ? -1 : 1)
+    );
+    if (sorted[0].id !== created.id) {
+      // We lost the race — delete our duplicate, return the winner's balance
+      try { await sr.entities.CashEntry.delete(created.id); } catch (e) {}
+      return sorted[0];
+    }
+    // We won — clean up duplicates
+    for (let i = 1; i < sorted.length; i++) {
+      try { await sr.entities.CashEntry.delete(sorted[i].id); } catch (e) {}
+    }
+  }
+  return created;
+}
+
+// Record a cash entry with create-then-dedup idempotency by fill_id + entry_type.
+// (Fixes Rev.15 #4: check-then-create could not prevent duplicate entries.)
 // THROWS on failure — cash settlement is mandatory, not best-effort.
-// Does NOT initialize the account — call initializePaperAccount explicitly.
 export async function recordCashEntry(sr, userId, entry) {
   await ensureInitialized(sr, userId);
 
-  // Idempotency: check if this fill has already been settled
+  // Create-then-dedup for fill-backed entries
   if (entry.fill_id) {
-    const existing = await sr.entities.CashEntry.filter({
-      user_id: userId,
-      fill_id: entry.fill_id,
-      entry_type: entry.entry_type,
-    });
+    const idempQuery = { fill_id: entry.fill_id, entry_type: entry.entry_type };
+    // Fast path: check if already exists
+    const existing = await sr.entities.CashEntry.filter({ user_id: userId, ...idempQuery });
     if (existing.length > 0) {
+      // Dedup if a race created duplicates — keep the earliest
+      if (existing.length > 1) {
+        const sorted = existing.sort((a, b) =>
+          new Date(a.created_date) - new Date(b.created_date) || (a.id < b.id ? -1 : 1)
+        );
+        for (let i = 1; i < sorted.length; i++) {
+          try { await sr.entities.CashEntry.delete(sorted[i].id); } catch (e) {}
+        }
+      }
       return existing[0].balance_after;
     }
+
+    const balance = await getCashBalance(sr, userId);
+    const newBalance = balance + entry.amount;
+    const created = await idempotentCreateCashEntry(sr, userId, {
+      ...entry,
+      balance_after: newBalance,
+    }, idempQuery);
+    return created.balance_after;
   }
 
+  // Non-fill entries (deposits, adjustments) — no idempotency key
   const balance = await getCashBalance(sr, userId);
   const newBalance = balance + entry.amount;
-  await sr.entities.CashEntry.create({
+  const created = await sr.entities.CashEntry.create({
     user_id: userId,
     portfolio_id: entry.portfolio_id || null,
     entry_type: entry.entry_type,
@@ -121,7 +252,7 @@ export async function recordCashEntry(sr, userId, entry) {
     fill_id: entry.fill_id || null,
     description: entry.description || '',
   });
-  return newBalance;
+  return created.balance_after || newBalance;
 }
 
 // Get buying power for internal paper mode = available cash (balance minus reservations).
@@ -132,19 +263,14 @@ export async function getPaperBuyingPower(sr, userId) {
 }
 
 // Get total paper equity = settled cash + reserved cash + position market value.
-// Reserved cash is still part of net worth (it hasn't been spent yet), so it
-// must be added back to the balance for equity calculations.
-// (Fixes Rev.14 #4: equity was understated during pending orders because
-// getPaperBuyingPower returned the double-subtracted available cash.)
 export async function getPaperEquity(sr, userId, holdingsValue) {
   await ensureInitialized(sr, userId);
   const { balance, openReservations } = await getAvailableCash(sr, userId);
   return balance + openReservations + (holdingsValue || 0);
 }
 
-// Reserve cash for a pending order. Creates a negative 'reservation' entry.
-// This prevents multiple pending orders from double-spending the same cash.
-// (Fixes Rev.13 #9.)
+// Reserve cash for a pending order. Uses create-then-dedup by trade_intent_id.
+// (Fixes Rev.15 #4: check-then-create could not prevent duplicate reservations.)
 export async function reserveCash(sr, userId, params) {
   const { symbol, amount, trade_intent_id, portfolio_id } = params;
   if (!trade_intent_id) throw new Error('reserveCash requires trade_intent_id');
@@ -152,15 +278,22 @@ export async function reserveCash(sr, userId, params) {
 
   await ensureInitialized(sr, userId);
 
-  // IDEMPOTENCY: check if a reservation already exists for this intent.
-  // (Fixes Rev.14 #8: a retried order-preparation path could create multiple
-  // reservations for one order, incorrectly reducing available cash.)
+  // Fast path: check if reservation already exists
   const existing = await sr.entities.CashEntry.filter({
     user_id: userId,
     trade_intent_id,
     entry_type: 'reservation',
   });
   if (existing.length > 0) {
+    // Dedup if a race created multiple reservations — keep the earliest
+    if (existing.length > 1) {
+      const sorted = existing.sort((a, b) =>
+        new Date(a.created_date) - new Date(b.created_date) || (a.id < b.id ? -1 : 1)
+      );
+      for (let i = 1; i < sorted.length; i++) {
+        try { await sr.entities.CashEntry.delete(sorted[i].id); } catch (e) {}
+      }
+    }
     return existing[0].balance_after;
   }
 
@@ -171,8 +304,7 @@ export async function reserveCash(sr, userId, params) {
 
   const balance = await getCashBalance(sr, userId);
   const newBalance = balance - amount;
-  await sr.entities.CashEntry.create({
-    user_id: userId,
+  const created = await idempotentCreateCashEntry(sr, userId, {
     portfolio_id: portfolio_id || null,
     entry_type: 'reservation',
     amount: -amount,
@@ -180,24 +312,33 @@ export async function reserveCash(sr, userId, params) {
     symbol: symbol || null,
     trade_intent_id,
     description: `Reservation for ${symbol || 'order'}: ${amount.toFixed(2)}`,
-  });
-  return newBalance;
+  }, { trade_intent_id, entry_type: 'reservation' });
+  return created.balance_after || newBalance;
 }
 
-// Release a cash reservation. Creates a positive 'reservation_release' entry.
-// Called when an order fills (actual buy debits separately) or is canceled.
-// (Fixes Rev.13 #9.)
+// Release a cash reservation. Uses create-then-dedup by trade_intent_id.
 export async function releaseCashReservation(sr, userId, params) {
   const { trade_intent_id, portfolio_id } = params;
   if (!trade_intent_id) throw new Error('releaseCashReservation requires trade_intent_id');
 
-  // Check if already released
+  // Fast path: check if already released
   const existing = await sr.entities.CashEntry.filter({
     user_id: userId,
     trade_intent_id,
     entry_type: 'reservation_release',
   });
-  if (existing.length > 0) return existing[0].balance_after;
+  if (existing.length > 0) {
+    // Dedup if a race created duplicates — keep the earliest
+    if (existing.length > 1) {
+      const sorted = existing.sort((a, b) =>
+        new Date(a.created_date) - new Date(b.created_date) || (a.id < b.id ? -1 : 1)
+      );
+      for (let i = 1; i < sorted.length; i++) {
+        try { await sr.entities.CashEntry.delete(sorted[i].id); } catch (e) {}
+      }
+    }
+    return existing[0].balance_after;
+  }
 
   // Find the reservation amount
   const reservations = await sr.entities.CashEntry.filter({
@@ -205,26 +346,28 @@ export async function releaseCashReservation(sr, userId, params) {
     trade_intent_id,
     entry_type: 'reservation',
   });
-  if (reservations.length === 0) return null; // nothing to release
+  if (reservations.length === 0) return null;
 
   const reservedAmount = Math.abs(reservations[0].amount);
   const balance = await getCashBalance(sr, userId);
   const newBalance = balance + reservedAmount;
-  await sr.entities.CashEntry.create({
-    user_id: userId,
+  const created = await idempotentCreateCashEntry(sr, userId, {
     portfolio_id: portfolio_id || null,
     entry_type: 'reservation_release',
     amount: reservedAmount,
     balance_after: newBalance,
     trade_intent_id,
     description: `Reservation released: ${reservedAmount.toFixed(2)}`,
-  });
-  return newBalance;
+  }, { trade_intent_id, entry_type: 'reservation_release' });
+  return created.balance_after || newBalance;
 }
 
 // Record a buy settlement: cash decreases by notional + commission + fees.
 // NEGATIVE CASH PREVENTION: checks available cash before debiting and throws
-// if insufficient. (Fixes Rev.13 #8.)
+// if insufficient. Note: under concurrent writes, two workers can both pass the
+// check and both debit, potentially going negative. The create-then-dedup
+// prevents duplicate entries for the SAME fill, but cannot prevent two DIFFERENT
+// fills from overdrawing simultaneously. This is a known platform limitation.
 export async function recordBuySettlement(sr, userId, params) {
   const { symbol, notional, commission = 0, fees = 0, trade_intent_id, fill_id, portfolio_id } = params;
   const totalCost = notional + commission + fees;
@@ -261,9 +404,7 @@ export async function recordSellSettlement(sr, userId, params) {
   });
 }
 
-// Validate the cash ledger sequence — verifies that balance_after is consistent
-// across the entry chain. (Fixes Rev.13 #7.)
-// Returns { valid, errors, finalBalance }.
+// Validate the cash ledger sequence — verifies that balance_after is consistent.
 export async function validateCashSequence(sr, userId) {
   const entries = await sr.entities.CashEntry.filter({ user_id: userId });
   const sorted = entries.sort((a, b) => new Date(a.created_date) - new Date(b.created_date));
@@ -286,13 +427,19 @@ export async function validateCashSequence(sr, userId) {
 }
 
 // Rebuild the cash ledger from the immutable Fill source of truth.
-// Clears all CashEntries (except the initial deposit), replays every fill in
-// chronological order, and reconstructs buy/sell/commission/fee entries.
-// Also deduplicates the initial deposit if a race created two. (Fixes Rev.13 #5, #11.)
+// (Fixes Rev.15 #7, #8):
+// #7: The opening balance is read from the immutable account_opening entry,
+//     not a hardcoded constant. If no opening entry exists, uses the default.
+// #8: Fills are replayed as RAW entries without negative-cash checks. Historical
+//     replay must reconstruct, not re-authorize — a valid historical trade that
+//     was affordable at the time should not fail because the current balance is
+//     different.
 export async function rebuildCashFromFills(sr, userId) {
-  // 1. Clear all existing entries — fail closed if any deletion fails.
-  // (Fixes Rev.14 #10: deletion failures were silently swallowed, allowing
-  // stale entries to coexist with rebuilt entries, making the ledger worse.)
+  // 1. Read the opening balance BEFORE clearing entries
+  const openingBalance = await getOpeningBalance(sr, userId);
+  const actualOpening = openingBalance != null ? openingBalance : DEFAULT_OPENING_CASH;
+
+  // 2. Clear all existing entries — fail closed if any deletion fails.
   const allEntries = await sr.entities.CashEntry.filter({ user_id: userId });
   const failedDeletions = [];
   for (const e of allEntries) {
@@ -303,50 +450,51 @@ export async function rebuildCashFromFills(sr, userId) {
     throw new Error(`REBUILD_ABORTED: failed to delete ${failedDeletions.length} existing entries — aborting to avoid ledger corruption`);
   }
 
-  // 2. Create a single initial deposit
+  // 3. Create the immutable opening entry
   await sr.entities.CashEntry.create({
     user_id: userId,
-    entry_type: 'deposit',
-    amount: PAPER_INITIAL_CASH,
-    balance_after: PAPER_INITIAL_CASH,
-    description: INITIAL_DEPOSIT_DESC,
+    entry_type: 'account_opening',
+    amount: actualOpening,
+    balance_after: actualOpening,
+    description: OPENING_DESC,
   });
 
-  // 3. Replay all fills in chronological order
+  // 4. Replay all fills as RAW entries — no negative-cash checks.
+  //    (Fixes Rev.15 #8: rebuild reconstructs history, does not re-authorize.)
   const fills = await sr.entities.Fill.filter({ user_id: userId });
   fills.sort((a, b) => new Date(a.timestamp || a.created_date) - new Date(b.timestamp || b.created_date));
 
+  let runningBalance = actualOpening;
   for (const fill of fills) {
     const notional = (fill.filled_quantity || 0) * (fill.filled_price || 0);
     const commission = fill.commission || 0;
     const fees = fill.fees || 0;
+    let entryAmount;
 
     if (fill.side === 'buy') {
-      await recordBuySettlement(sr, userId, {
-        symbol: fill.symbol,
-        notional,
-        commission,
-        fees,
-        trade_intent_id: fill.trade_intent_id,
-        fill_id: fill.fill_id,
-        portfolio_id: fill.portfolio_id,
-      });
+      entryAmount = -(notional + commission + fees);
     } else {
-      await recordSellSettlement(sr, userId, {
-        symbol: fill.symbol,
-        notional,
-        commission,
-        fees,
-        trade_intent_id: fill.trade_intent_id,
-        fill_id: fill.fill_id,
-        portfolio_id: fill.portfolio_id,
-      });
+      entryAmount = notional - commission - fees;
     }
+
+    runningBalance += entryAmount;
+    await sr.entities.CashEntry.create({
+      user_id: userId,
+      portfolio_id: fill.portfolio_id || null,
+      entry_type: fill.side === 'buy' ? 'buy' : 'sell',
+      amount: entryAmount,
+      balance_after: runningBalance,
+      symbol: fill.symbol,
+      trade_intent_id: fill.trade_intent_id || null,
+      fill_id: fill.fill_id,
+      description: `${fill.side === 'buy' ? 'Buy' : 'Sell'} ${fill.symbol}: ${notional.toFixed(2)}`,
+    });
   }
 
-  // 4. Validate the reconstructed ledger
+  // 5. Validate the reconstructed ledger
   const validation = await validateCashSequence(sr, userId);
   return {
+    opening_balance: actualOpening,
     rebuilt_entries: fills.length + 1,
     final_balance: validation.finalBalance,
     validation,

@@ -47,7 +47,12 @@ export function riskLimitsForProfile(profileId) {
 // Build a user-scoped portfolio snapshot for risk evaluation.
 // accountEquity: when provided (broker_paper/live), overrides holdings-based equity
 // with the real broker account equity so position/sector caps use the actual capital base.
-export async function buildPortfolioSnapshot(sr, userId, accountEquity = null) {
+// brokerPrevCloseEquity: when provided (broker_paper/live), the daily P&L percentage
+// is computed from broker equity decline (current vs previous close) instead of
+// app-realized sells. This ensures the canonical risk engine uses the SAME daily-loss
+// definition as the scan cycle for broker-backed users, eliminating contradictory
+// risk decisions. (Fixes Rev.15 #9: scan used broker equity, execution used app P&L.)
+export async function buildPortfolioSnapshot(sr, userId, accountEquity = null, brokerPrevCloseEquity = null) {
   const holdings = await sr.entities.Holding.filter({ user_id: userId });
   const holdingsEquity = holdings.reduce(
     (s, h) => s + h.shares * (h.current_price || h.avg_price), 0
@@ -67,10 +72,21 @@ export async function buildPortfolioSnapshot(sr, userId, accountEquity = null) {
     created_date: { $gte: startOfDay.toISOString() }
   }, '-created_date', 100);
   const tradesToday = recentTrades.filter((t) => new Date(t.created_date) >= startOfDay);
-  const dailyRealized = tradesToday
-    .filter((t) => t.action === 'sell')
-    .reduce((s, t) => s + (t.realized_pnl || 0), 0);
-  const dailyPnlPct = totalEquity > 0 ? (dailyRealized / totalEquity) * 100 : 0;
+
+  // DAILY P&L: use broker equity decline when available (broker mode), otherwise
+  // app-realized sells (internal paper). (Fixes Rev.15 #9.)
+  let dailyPnlPct;
+  if (brokerPrevCloseEquity && brokerPrevCloseEquity > 0 && accountEquity && accountEquity > 0) {
+    // Broker mode: daily P&L = (current equity - prev close) / prev close
+    dailyPnlPct = ((accountEquity - brokerPrevCloseEquity) / brokerPrevCloseEquity) * 100;
+  } else {
+    // Internal paper mode: daily P&L = realized sells / equity
+    const dailyRealized = tradesToday
+      .filter((t) => t.action === 'sell')
+      .reduce((s, t) => s + (t.realized_pnl || 0), 0);
+    dailyPnlPct = totalEquity > 0 ? (dailyRealized / totalEquity) * 100 : 0;
+  }
+
   // Total invested exposure and outstanding orders — for the new risk controls.
   const totalExposure = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
   const totalExposurePct = totalEquity > 0 ? (totalExposure / totalEquity) * 100 : 0;
