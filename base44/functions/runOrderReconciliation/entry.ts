@@ -297,7 +297,9 @@ export default async function(req) {
           subject: `TradePulse: ${staleOrders.length} stale order(s) detected`,
           body: staleOrders.map((s) => `${s.symbol}: open for ${s.age_minutes}m (broker: ${s.broker_status})`).join('\n'),
         });
-      } catch (e) {}
+      } catch (e) {
+        await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'notification_failed', severity: 'warning', entity_type: 'TradeIntent', message: `Stale order email failed: ${e.message}` });
+      }
     }
 
     return Response.json({

@@ -329,6 +329,8 @@ export default async function(req) {
       num_ai_decisions: dayDecisions.length,
       trades_submitted: tradesSubmitted,
       trades_filled: tradesFullyFilled,
+      trades_partially_filled: tradesPartiallyFilled,
+      trades_pending: tradesPending,
       trades_rejected: tradesRejected,
       trades_canceled: tradesCanceled,
       win_rate_pct: Math.round(winRatePct * 100) / 100,
