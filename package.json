@@ -10,7 +10,8 @@
     "lint:fix": "eslint . --fix",
     "typecheck": "tsc -p ./jsconfig.json",
     "preview": "vite preview",
-    "test": "node -e \"console.log('Regression tests: invoke the runExecutionTests backend function via the Base44 SDK or dashboard. No standalone test runner is configured for this BaaS project.'); process.exit(0)\""
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@base44/sdk": "^0.8.41",

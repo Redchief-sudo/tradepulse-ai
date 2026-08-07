@@ -9,7 +9,7 @@
     "session_date": {
       "type": "string",
       "format": "date",
-      "description": "The trading date (YYYY-MM-DD)"
+      "description": "The trading date (YYYY-MM-DD) in America/New_York timezone"
     },
     "session_id": {
       "type": "string",
@@ -22,7 +22,7 @@
         "closed"
       ],
       "default": "open",
-      "description": "open = market still in session or report generated mid-day; closed = end-of-day final report"
+      "description": "open = market still in session or report generated mid-day; closed = end-of-day final report (immutable once closed)"
     },
     "starting_equity": {
       "type": "number",
@@ -90,7 +90,15 @@
     },
     "trades_filled": {
       "type": "number",
-      "description": "Number of trade intents filled during the session"
+      "description": "Number of trade intents fully filled during the session (excludes partial fills)"
+    },
+    "trades_partially_filled": {
+      "type": "number",
+      "description": "Number of trade intents partially filled (some shares filled, remainder canceled/expired)"
+    },
+    "trades_pending": {
+      "type": "number",
+      "description": "Number of trade intents still pending (submitted/accepted, not yet terminal)"
     },
     "trades_rejected": {
       "type": "number",

@@ -12,6 +12,7 @@ import { isExecutable } from '../../shared/executableUniverse.ts';
 import { riskLimitsForProfile, checkMaxDrawdown } from '../../shared/riskEngine.ts';
 import { getPaperEquity } from '../../shared/cashLedger.ts';
 import { updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
+import { nyDayStart } from '../../shared/marketHours.ts';
 
 // Risk limits are defined in ONE place: riskEngine.ts. The scan cycle, execution
 // gateway, and risk engine all use riskLimitsForProfile() so they never disagree.
@@ -556,8 +557,8 @@ export default async function(req) {
       circuitBreakerTripped = equityDeclinePct >= pp.max_daily_loss_pct;
     } else {
       // Internal paper mode: consecutive_loss_limit + realized_loss_limit only.
-      const dayStart = new Date();
-      dayStart.setHours(0, 0, 0, 0);
+      // Use NY market session midnight, not server-local midnight. (Fixes Rev.13 #20.)
+      const dayStart = nyDayStart();
       const recentTrades = await sr.entities.Trade.filter({ user_id: user.id });
       const todayLosses = recentTrades.filter((t) =>
         t.action === 'sell' && (t.realized_pnl || 0) < 0 && new Date(t.created_date) >= dayStart

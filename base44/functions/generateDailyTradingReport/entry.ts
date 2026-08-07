@@ -1,6 +1,7 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { getAlpacaAccount } from '../../shared/alpaca.ts';
 import { getCashBalance } from '../../shared/cashLedger.ts';
+import { nySessionDateStr } from '../../shared/marketHours.ts';
 
 // Generates a comprehensive daily trading report — one TradingSession record
 // per trading day that ties together trades, fills, scan runs, audit events,
@@ -26,46 +27,13 @@ import { getCashBalance } from '../../shared/cashLedger.ts';
 // 28. CASH-BALANCE FAILURE: when cash balance can't be loaded, the report
 //     marks itself incomplete instead of proceeding with null cash.
 
-// Compute the New York market-session date for a given timestamp (or now).
-// The US equity trading day runs 9:30 AM – 4:00 PM ET with extended hours
-// until 8:00 PM ET. A trade at 7 PM ET belongs to the same session date.
-// After 8 PM ET, the next session date begins. (Fixes Rev.13 #26.)
-function nySessionDate(ts) {
-  const date = ts ? new Date(ts) : new Date();
-  // Format in America/New_York to get the local date components
-  const nyStr = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York',
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hour12: false,
-  }).format(date);
-  // Parse the NY components
-  const match = nyStr.match(/(\d{2})\/(\d{2})\/(\d{4}),\s*(\d{2}):(\d{2})/);
-  if (!match) return date.toISOString().slice(0, 10);
-  const [, month, day, year, hourStr] = match;
-  let hour = parseInt(hourStr, 10);
-  if (hour === 24) hour = 0; // midnight edge case
-  // If before 8 PM ET (20:00), it's the same session date
-  // If after 8 PM ET, it's still the same date (extended hours belong to the day)
-  // If after midnight but the market hasn't opened yet (before 4 AM), it's the
-  // previous day's extended session — but for simplicity, we use the NY date
-  // at the time of the report. The caller passes the desired date.
-  return `${year}-${month}-${day}`;
-}
+// NY session date helpers are in shared/marketHours.ts (nySessionDateStr).
+// (Fixes Rev.13 #26: trading day is computed in America/New_York, not UTC.)
 
 // Check if a timestamp falls within the NY market session day.
-// Uses America/New_York timezone so a 7 PM ET trade on Monday counts as Monday,
-// not Tuesday (UTC). (Fixes Rev.13 #26.)
 function inNySessionDay(ts, sessionDate) {
   if (!ts) return false;
-  const nyStr = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York',
-    year: 'numeric', month: '2-digit', day: '2-digit',
-  }).format(new Date(ts));
-  const match = nyStr.match(/(\d{2})\/(\d{2})\/(\d{4})/);
-  if (!match) return false;
-  const [, month, day, year] = match;
-  const tsDate = `${year}-${month}-${day}`;
-  return tsDate === sessionDate;
+  return nySessionDateStr(new Date(ts)) === sessionDate;
 }
 
 export default async function(req) {
@@ -78,7 +46,7 @@ export default async function(req) {
     const body = await req.json().catch(() => ({}));
     // Use NY session date — the report date represents the US market trading day.
     // (Fixes Rev.13 #26.)
-    const reportDate = body.date || nySessionDate();
+    const reportDate = body.date || nySessionDateStr();
     const sessionId = `session-${reportDate}`;
     const isFinal = body.final === true;
 

@@ -3,6 +3,8 @@
 // The risk engine has veto authority over every strategy and AI signal.
 // All queries are user-scoped — no cross-user data leakage.
 
+import { nyDayStart } from './marketHours.ts';
+
 // Conservative engineering defaults — per the risk containment audit.
 // max_risk_per_trade_pct: max loss per position as % of equity (risk-based sizing)
 // max_total_exposure_pct: max total invested exposure as % of equity
@@ -57,7 +59,9 @@ export async function buildPortfolioSnapshot(sr, userId, accountEquity = null) {
     sectorMap[sec] = (sectorMap[sec] || 0) + h.shares * (h.current_price || h.avg_price);
   });
   // Filter trades server-side by date to avoid fetching entire trade history on every risk check.
-  const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
+  // Use NY market session midnight, not server-local midnight — a trade at 8 PM ET
+  // on Monday belongs to Monday's session. (Fixes Rev.13 #20.)
+  const startOfDay = nyDayStart();
   const recentTrades = await sr.entities.Trade.filter({
     user_id: userId,
     created_date: { $gte: startOfDay.toISOString() }
