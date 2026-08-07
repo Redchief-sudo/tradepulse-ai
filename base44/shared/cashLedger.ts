@@ -31,12 +31,19 @@ export async function getCashBalance(sr, userId) {
   return entries.reduce((sum, e) => sum + (e.amount || 0), 0);
 }
 
-// Get available cash = balance minus open (unreleased) reservations.
+// Get available cash = balance (reservations are already negative in the sum).
 // This is the real buying power — it accounts for funds held for pending orders.
+//
+// FIX Rev.14 #4: The previous implementation subtracted openReservations from
+// balance, but reservations are already negative entries in the balance sum.
+// Subtracting again double-counted the reservation:
+//   balance = 1000 - 300(reservation) = 700
+//   available = 700 - 300 = 400  ← WRONG, should be 700
+// Now: available = balance. The reservation entry already reduced it.
 export async function getAvailableCash(sr, userId) {
   const entries = await sr.entities.CashEntry.filter({ user_id: userId });
   let balance = 0;
-  const reservations = {}; // trade_intent_id -> reserved amount
+  const reservations = {}; // trade_intent_id -> net reserved amount
   for (const e of entries) {
     balance += e.amount || 0;
     if (e.entry_type === 'reservation' && e.trade_intent_id) {
@@ -46,12 +53,13 @@ export async function getAvailableCash(sr, userId) {
       reservations[e.trade_intent_id] = (reservations[e.trade_intent_id] || 0) + (e.amount || 0);
     }
   }
-  // Open reservations = reservations that haven't been fully released
+  // Track open reservations for equity calculation (reserved cash is still
+  // part of net worth, just not available for new orders).
   let openReservations = 0;
   for (const tid of Object.keys(reservations)) {
     if (reservations[tid] < 0) openReservations += Math.abs(reservations[tid]);
   }
-  return { available: balance - openReservations, balance, openReservations };
+  return { available: balance, balance, openReservations };
 }
 
 // Initialize the paper account with the default deposit. Idempotent — checks
@@ -123,10 +131,15 @@ export async function getPaperBuyingPower(sr, userId) {
   return available;
 }
 
-// Get total paper equity = cash balance + position market value. (Fixes Rev.12 #8.)
+// Get total paper equity = settled cash + reserved cash + position market value.
+// Reserved cash is still part of net worth (it hasn't been spent yet), so it
+// must be added back to the balance for equity calculations.
+// (Fixes Rev.14 #4: equity was understated during pending orders because
+// getPaperBuyingPower returned the double-subtracted available cash.)
 export async function getPaperEquity(sr, userId, holdingsValue) {
-  const cash = await getPaperBuyingPower(sr, userId);
-  return cash + (holdingsValue || 0);
+  await ensureInitialized(sr, userId);
+  const { balance, openReservations } = await getAvailableCash(sr, userId);
+  return balance + openReservations + (holdingsValue || 0);
 }
 
 // Reserve cash for a pending order. Creates a negative 'reservation' entry.
@@ -138,6 +151,19 @@ export async function reserveCash(sr, userId, params) {
   if (amount <= 0) throw new Error('reserveCash requires positive amount');
 
   await ensureInitialized(sr, userId);
+
+  // IDEMPOTENCY: check if a reservation already exists for this intent.
+  // (Fixes Rev.14 #8: a retried order-preparation path could create multiple
+  // reservations for one order, incorrectly reducing available cash.)
+  const existing = await sr.entities.CashEntry.filter({
+    user_id: userId,
+    trade_intent_id,
+    entry_type: 'reservation',
+  });
+  if (existing.length > 0) {
+    return existing[0].balance_after;
+  }
+
   const { available } = await getAvailableCash(sr, userId);
   if (available < amount) {
     throw new Error(`INSUFFICIENT_CASH_FOR_RESERVATION: available ${available}, required ${amount}`);
@@ -264,10 +290,17 @@ export async function validateCashSequence(sr, userId) {
 // chronological order, and reconstructs buy/sell/commission/fee entries.
 // Also deduplicates the initial deposit if a race created two. (Fixes Rev.13 #5, #11.)
 export async function rebuildCashFromFills(sr, userId) {
-  // 1. Clear all existing entries
+  // 1. Clear all existing entries — fail closed if any deletion fails.
+  // (Fixes Rev.14 #10: deletion failures were silently swallowed, allowing
+  // stale entries to coexist with rebuilt entries, making the ledger worse.)
   const allEntries = await sr.entities.CashEntry.filter({ user_id: userId });
+  const failedDeletions = [];
   for (const e of allEntries) {
-    try { await sr.entities.CashEntry.delete(e.id); } catch (err) { /* continue */ }
+    try { await sr.entities.CashEntry.delete(e.id); }
+    catch (err) { failedDeletions.push({ id: e.id, error: err.message }); }
+  }
+  if (failedDeletions.length > 0) {
+    throw new Error(`REBUILD_ABORTED: failed to delete ${failedDeletions.length} existing entries — aborting to avoid ledger corruption`);
   }
 
   // 2. Create a single initial deposit

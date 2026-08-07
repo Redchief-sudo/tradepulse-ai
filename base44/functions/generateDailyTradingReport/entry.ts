@@ -260,20 +260,35 @@ export default async function(req) {
         }
       }
 
+      // Exit price from linked Fill records, not the order-summary Trade.price.
+      // (Fixes Rev.14 #21: the order-summary price can conceal fill-level
+      // execution detail for partial fills. The authoritative exit price
+      // comes from the linked Fill records.)
+      let exitPrice = null;
+      if (t.action === 'sell') {
+        const sellFills = fills.filter((f) =>
+          (f.broker_order_id === t.broker_order_id || f.client_order_id === t.client_order_id) && f.side === 'sell'
+        );
+        if (sellFills.length > 0) {
+          const totalNotional = sellFills.reduce((s, f) => s + (f.filled_quantity || 0) * (f.filled_price || 0), 0);
+          const totalQty = sellFills.reduce((s, f) => s + (f.filled_quantity || 0), 0);
+          exitPrice = totalQty > 0 ? totalNotional / totalQty : null;
+        }
+      }
+      if (exitPrice == null) exitPrice = t.action === 'sell' ? t.price : null;
+
       // Fallback entry price for buys: use the fill price
       if (entryPrice == null) {
         entryPrice = t.action === 'buy' ? (t.filled_avg_price || t.price) : (t.filled_avg_price || t.price);
       }
 
-      // AI DECISION ATTRIBUTION BY ID — match via the TradeIntent's decision_id,
-      // not just symbol+date. (Fixes Rev.13 #24.)
+      // AI DECISION ATTRIBUTION BY ID — match via the TradeIntent's decision_id.
+      // (Fixes Rev.14 #22: removed the symbol+day fallback — it could attach
+      // the wrong decision when multiple decisions exist for one symbol.
+      // Missing exact decision linkage now returns null, not a guess.)
       let aiDecision = null;
       if (matchedIntent?.decision_id) {
         aiDecision = aiDecisions.find((d) => d.id === matchedIntent.decision_id);
-      }
-      // Fallback: symbol + day match only if no decision_id match
-      if (!aiDecision) {
-        aiDecision = aiDecisions.find((d) => d.symbol === t.symbol && inNySessionDay(d.created_date, reportDate));
       }
 
       // Execution latency from fills
@@ -289,7 +304,7 @@ export default async function(req) {
         side: t.action,
         quantity: t.filled_qty || t.shares,
         entry_price: entryPrice,
-        exit_price: t.action === 'sell' ? t.price : null,
+        exit_price: exitPrice,
         realized_pnl: pnl,
         running_daily_pnl: t.action === 'sell' ? runningPnl : null,
         outcome_label: outcomeLabel,

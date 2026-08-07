@@ -57,6 +57,16 @@ export default async function(req) {
   let lockOwnerToken = null;
   let userIdRef = null;
   let heartbeatIntervalRef = null;
+  // Shared fatal flag — when the periodic heartbeat reaches its failure limit,
+  // it sets this. Every stage boundary checks it via assertScanHealthy() so
+  // the scan aborts immediately instead of continuing through long LLM calls.
+  // (Fixes Rev.14 #3: the heartbeat interval caught its own fatal exception,
+  // but the main scan never knew — it continued consuming credits after the
+  // heartbeat had declared the scan dead.)
+  let heartbeatFatalError = null;
+  const assertScanHealthy = () => {
+    if (heartbeatFatalError) throw heartbeatFatalError;
+  };
 
   try {
     const base44 = createClientFromRequest(req);
@@ -182,7 +192,11 @@ export default async function(req) {
         } catch (ae) {}
         if (heartbeatFailures >= 3) {
           try { await updateSessionState(sr, user.id, SESSION_STATES.SYSTEM_DEGRADED, `Heartbeat persistence failed ${heartbeatFailures} times`); } catch (se) {}
-          throw new Error('HEARTBEAT_PERSISTENCE_FAILED: scan cannot continue without reliable heartbeats');
+          // Set the shared fatal flag so the main scan thread can see it.
+          // (Fixes Rev.14 #3: the throw was caught by the interval callback and
+          // never propagated to the main scan.)
+          heartbeatFatalError = new Error('HEARTBEAT_PERSISTENCE_FAILED: scan cannot continue without reliable heartbeats');
+          throw heartbeatFatalError;
         }
       }
     };
@@ -219,7 +233,7 @@ export default async function(req) {
     // every 30 seconds so a long LLM call cannot let the lock expire and let
     // another scan start. (Fixes Rev.13 #2.)
     heartbeatIntervalRef = setInterval(async () => {
-      try { await heartbeat(); } catch (e) { /* heartbeat() already handles failures */ }
+      try { await heartbeat(); } catch (e) { /* heartbeat() sets heartbeatFatalError */ }
     }, 30000);
 
     // OWNERSHIP VERIFICATION — before every execution decision, verify we still
@@ -320,6 +334,7 @@ export default async function(req) {
       },
     });
     await heartbeat();
+    assertScanHealthy();
     // EXECUTABLE UNIVERSE FILTER — only execute trades for symbols in the
     // fixed liquid universe. Candidates outside the universe are research-
     // only: they can be analyzed but never auto-executed. (Per the audit:
@@ -362,6 +377,7 @@ export default async function(req) {
     });
 
     await heartbeat();
+    assertScanHealthy();
     // Construct proposals deterministically from candidates.
     // BUY candidates: STRONG_BUY/BUY with confidence >= min_confidence, sorted by confidence.
     // SELL candidates: SELL/STRONG_SELL for symbols currently held.
@@ -466,6 +482,7 @@ export default async function(req) {
       proposals = proposals.filter((p) => consensusMap[p.symbol.toUpperCase()] === true);
     }
     await heartbeat();
+    assertScanHealthy();
 
     // PASS 3b — Deterministic ML multi-factor scoring (CHAMPION weights)
     const scored = proposals.map((p) => {
@@ -480,6 +497,7 @@ export default async function(req) {
       return { ...p, ml_score: Math.round(ml_score * 10) / 10, ml_signal: signalFromComposite(ml_score), realFactors: f, realPrice: ef?.realPrice };
     });
     await heartbeat();
+    assertScanHealthy();
     let approved = scored.filter((p) => p.ml_score >= 55);
 
     // PASS 4 — Adversarial Risk Officer veto
@@ -509,6 +527,7 @@ export default async function(req) {
       approved = approved.filter((p) => vetoMap[p.symbol.toUpperCase()] === 'approved');
     }
     await heartbeat();
+    assertScanHealthy();
 
     // PASS 5 — Causal Contagion
     let contagion = null;
@@ -536,6 +555,7 @@ export default async function(req) {
     }
 
     await heartbeat();
+    assertScanHealthy();
     // Broker account equity was fetched early (before Pass 2) so the AI could
     // size proposals against real capital. accountEquity is already defined.
 

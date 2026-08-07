@@ -101,7 +101,9 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
 
   // Spread limit check — fail closed if bid/ask unavailable or spread excessive.
   // (Fixes Rev.13 #16: spread_limit_pct was defined but never enforced.)
-  if (side === 'buy' && limits.spread_limit_pct) {
+  // Internal paper / shadow mode have no real market data — skip with a
+  // documented exemption. Broker mode must pass bid/ask or be rejected.
+  if (side === 'buy' && limits.spread_limit_pct && !opts.skipMarketDataChecks) {
     if (opts.bid == null || opts.ask == null) {
       reasons.push('NO_QUOTE_DATA_FOR_SPREAD_CHECK');
     } else {
@@ -115,12 +117,25 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
     }
   }
 
-  // Slippage limit check — fail closed if estimated slippage is excessive.
-  // (Fixes Rev.13 #17: slippage_limit_pct was defined but never enforced pre-trade.)
-  if (side === 'buy' && limits.slippage_limit_pct && opts.estimated_slippage_pct != null) {
-    if (opts.estimated_slippage_pct > limits.slippage_limit_pct) {
+  // Slippage limit check — fail closed if no estimate is supplied.
+  // (Fixes Rev.14 #12: slippage failed open when no estimate was supplied,
+  // allowing trades to bypass the configured slippage limit.)
+  // Internal paper / shadow mode have no real market data — skip with a
+  // documented exemption. Broker mode must supply an estimate or be rejected.
+  if (side === 'buy' && limits.slippage_limit_pct && !opts.skipMarketDataChecks) {
+    if (opts.estimated_slippage_pct == null) {
+      reasons.push('NO_SLIPPAGE_ESTIMATE');
+    } else if (opts.estimated_slippage_pct > limits.slippage_limit_pct) {
       reasons.push(`SLIPPAGE_EXCEEDS_LIMIT (${opts.estimated_slippage_pct.toFixed(2)}% > ${limits.slippage_limit_pct}%)`);
     }
+  }
+
+  // Max drawdown check — block new buys when drawdown exceeds the profile limit.
+  // (Fixes Rev.14 #13: max drawdown was only enforced in the scan cycle, not
+  // in the canonical risk engine. Other trade surfaces could bypass it.)
+  // Sells are always permitted (risk management always runs).
+  if (side === 'buy' && opts.maxDrawdownBreached) {
+    reasons.push('MAX_DRAWDOWN_BREACHED');
   }
 
   if (side === 'sell') {

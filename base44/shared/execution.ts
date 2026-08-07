@@ -21,7 +21,7 @@
 //    (RLS-locked, service-role only) — never from the User object.
 
 import { placeAlpacaOrder, getAlpacaOrder, getAlpacaAccount } from './alpaca.ts';
-import { evaluateRisk, riskLimitsForProfile, buildPortfolioSnapshot, checkDataFreshness } from './riskEngine.ts';
+import { evaluateRisk, riskLimitsForProfile, buildPortfolioSnapshot, checkDataFreshness, checkMaxDrawdown } from './riskEngine.ts';
 import { fetchQuote } from './marketDataAdapter.ts';
 import { isUsMarketOpen, usMarketSession } from './marketHours.ts';
 import { AlpacaError } from './alpacaErrors.ts';
@@ -491,11 +491,31 @@ export async function executeIntent(base44, user, input) {
   // holdings-based equity for internal_paper mode.
   const snapshot = await buildPortfolioSnapshot(sr, userId, accountEquity);
   const limits = riskLimitsForProfile(user.trade_profile || 'balanced');
+
+  // Max drawdown check — compute before evaluateRisk so it can be enforced
+  // in the canonical risk engine, not just the scan cycle.
+  // (Fixes Rev.14 #13: other trade surfaces bypassed the scan-level drawdown guard.)
+  let maxDrawdownBreached = false;
+  if (side === 'buy' && limits.max_drawdown_pct && snapshot.totalEquity > 0) {
+    try {
+      const ddCheck = await checkMaxDrawdown(sr, userId, snapshot.totalEquity, limits);
+      if (ddCheck.breached) {
+        maxDrawdownBreached = true;
+        await audit(sr, userId, 'max_drawdown_breach', 'critical', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Max drawdown limit reached: ${ddCheck.drawdown_pct}% (limit ${ddCheck.limit}%, peak $${ddCheck.peak_equity.toFixed(0)})` });
+      }
+    } catch (e) { /* non-fatal — drawdown check is best-effort */ }
+  }
+
+  // Internal paper / shadow mode have no real market data — skip spread and
+  // slippage checks with a documented exemption. Broker mode must pass bid/ask
+  // and slippage estimates or be rejected. (Fixes Rev.14 #12.)
+  const skipMarketDataChecks = executionMode === 'internal_paper' || executionMode === 'shadow_live';
+
   const risk = evaluateRisk(
     { symbol, side, requested_quantity: requestedQty, limit_price: refPrice, price: refPrice, sector: input.sector, confidence: input.confidence, stop_loss: input.stop_loss },
     snapshot,
     limits,
-    { killSwitch: !!user.kill_switch_reset_required || user.trading_session_state === 'risk_stopped' }
+    { killSwitch: !!user.kill_switch_reset_required || user.trading_session_state === 'risk_stopped', maxDrawdownBreached, skipMarketDataChecks }
   );
 
   if (!risk.approved) {

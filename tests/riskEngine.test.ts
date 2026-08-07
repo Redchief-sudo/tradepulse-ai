@@ -159,7 +159,7 @@ describe('evaluateRisk — position sizing caps', () => {
       symbol: 'AAPL', side: 'buy', requested_quantity: 10, limit_price: 150, price: 150,
       sector: 'Technology', confidence: 90, stop_loss: 140,
     };
-    const result = evaluateRisk(intent, snapshot, limits, { bid: 149.5, ask: 150.5 });
+    const result = evaluateRisk(intent, snapshot, limits, { bid: 149.5, ask: 150.5, estimated_slippage_pct: 0.5 });
     expect(result.approved).toBe(true);
     const maxNotional = (limits.max_position_pct / 100) * 10000;
     expect(result.approvedQuantity * 150).toBeLessThanOrEqual(maxNotional + 0.01);
@@ -172,7 +172,7 @@ describe('evaluateRisk — position sizing caps', () => {
       symbol: 'AAPL', side: 'buy', requested_quantity: 10, limit_price: 150, price: 150,
       sector: 'Technology', confidence: 90, stop_loss: 149, // very tight stop = high qty
     };
-    const result = evaluateRisk(intent, snapshot, limits, { bid: 149.5, ask: 150.5 });
+    const result = evaluateRisk(intent, snapshot, limits, { bid: 149.5, ask: 150.5, estimated_slippage_pct: 0.5 });
     expect(result.approved).toBe(true);
     const maxNotional = (limits.max_position_pct / 100) * 10000;
     expect(result.approvedQuantity * 150).toBeLessThanOrEqual(maxNotional + 0.1);
@@ -191,7 +191,7 @@ describe('evaluateRisk — position sizing caps', () => {
       symbol: 'AAPL', side: 'buy', requested_quantity: 5, limit_price: 150, price: 150,
       sector: 'Technology', confidence: 90, stop_loss: 140,
     };
-    const result = evaluateRisk(intent, sectorSnapshot, limits, { bid: 149.5, ask: 150.5 });
+    const result = evaluateRisk(intent, sectorSnapshot, limits, { bid: 149.5, ask: 150.5, estimated_slippage_pct: 0.5 });
     expect(result.approved).toBe(true);
     // Remaining sector capacity = 2000 - 1800 = 200 → 200/150 ≈ 1.33 shares
     expect(result.approvedQuantity).toBeLessThanOrEqual(2);
@@ -221,5 +221,80 @@ describe('riskLimitsForProfile', () => {
       expect(l.max_total_exposure_pct).toBeGreaterThan(0);
       expect(l.max_simultaneous_orders).toBeGreaterThan(0);
     }
+  });
+});
+
+// Rev.14 audit fixes: slippage fail-closed and max drawdown in canonical risk engine.
+describe('evaluateRisk — Rev.14 fail-closed checks', () => {
+  const limits = riskLimitsForProfile('balanced');
+  const goodSnapshot = {
+    holdings: [], totalEquity: 10000, sectorMap: {}, openPositions: 0,
+    tradesToday: 0, dailyPnlPct: 0, totalExposure: 0, totalExposurePct: 0,
+    outstandingOrders: 0,
+  };
+  const goodIntent = {
+    symbol: 'AAPL', side: 'buy', requested_quantity: 10, limit_price: 150, price: 150,
+    sector: 'Technology', confidence: 90, stop_loss: 140,
+  };
+
+  it('rejects buys when slippage estimate is missing (fail-closed)', () => {
+    const result = evaluateRisk(goodIntent, goodSnapshot, limits, {
+      killSwitch: false,
+      skipMarketDataChecks: false,
+      // no estimated_slippage_pct — should fail closed
+    });
+    expect(result.approved).toBe(false);
+    expect(result.reasons).toContain('NO_SLIPPAGE_ESTIMATE');
+    expect(result.approvedQuantity).toBe(0);
+  });
+
+  it('rejects buys when slippage exceeds limit', () => {
+    const result = evaluateRisk(goodIntent, goodSnapshot, limits, {
+      killSwitch: false,
+      skipMarketDataChecks: false,
+      estimated_slippage_pct: 5.0,
+    });
+    expect(result.approved).toBe(false);
+    expect(result.reasons.some((r) => r.startsWith('SLIPPAGE_EXCEEDS_LIMIT'))).toBe(true);
+    expect(result.approvedQuantity).toBe(0);
+  });
+
+  it('skips slippage and spread checks when skipMarketDataChecks is true', () => {
+    const result = evaluateRisk(goodIntent, goodSnapshot, limits, {
+      killSwitch: false,
+      skipMarketDataChecks: true, // internal paper mode — no real market data
+    });
+    // Should not have NO_SLIPPAGE_ESTIMATE or NO_QUOTE_DATA reasons
+    expect(result.reasons).not.toContain('NO_SLIPPAGE_ESTIMATE');
+    expect(result.reasons).not.toContain('NO_QUOTE_DATA_FOR_SPREAD_CHECK');
+  });
+
+  it('rejects buys when max drawdown is breached (canonical engine)', () => {
+    const result = evaluateRisk(goodIntent, goodSnapshot, limits, {
+      killSwitch: false,
+      skipMarketDataChecks: true,
+      maxDrawdownBreached: true,
+    });
+    expect(result.approved).toBe(false);
+    expect(result.reasons).toContain('MAX_DRAWDOWN_BREACHED');
+    expect(result.approvedQuantity).toBe(0);
+  });
+
+  it('allows sells even when max drawdown is breached', () => {
+    const sellIntent = {
+      symbol: 'AAPL', side: 'sell', requested_quantity: 10, limit_price: 150, price: 150,
+      sector: 'Technology', confidence: 90, stop_loss: 140,
+    };
+    const snapshot = {
+      ...goodSnapshot,
+      holdings: [{ symbol: 'AAPL', shares: 10 }],
+    };
+    const result = evaluateRisk(sellIntent, snapshot, limits, {
+      killSwitch: false,
+      skipMarketDataChecks: true,
+      maxDrawdownBreached: true,
+    });
+    expect(result.approved).toBe(true);
+    expect(result.approvedQuantity).toBe(10);
   });
 });
