@@ -12,9 +12,8 @@ import { nowIso } from '../../shared/lotAccounting.ts';
 // settlement accounting. It retrieves broker state and calls the SAME
 // canonical execution primitives used by the live execution gateway:
 //   - recordFill() for user-scoped, dedup-safe fill ingestion
-//   - projectHolding() for lot-based position projection
-//   - claimSettlement() for atomic settlement claim (prevents double-settlement)
-//   - settleFromFills() for final Trade/AITradeDecision/intent settlement
+//   - SettlementEvent creation for canonical, resumable projection
+//   - processSettlementQueue as the sole financial-state writer
 //
 // This ensures financial accounting has exactly one implementation.
 export default async function(req) {

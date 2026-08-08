@@ -2,6 +2,10 @@
   "name": "AITradeDecision",
   "type": "object",
   "properties": {
+    "settlement_event_id": {
+      "type": "string",
+      "description": "SettlementEvent idempotency key that produced this decision projection"
+    },
     "user_id": {
       "type": "string",
       "description": "Owner user id \u2014 every query must filter by this"

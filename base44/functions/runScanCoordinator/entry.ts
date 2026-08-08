@@ -50,8 +50,9 @@ export default async function(req) {
     });
 
     // Re-read to verify claim
-    const reloaded = await sr.entities.ScanRequest.filter({ user_id: user.id, _id: oldest.id });
-    if (reloaded[0] && reloaded[0].processing_owner !== workerId) {
+    const afterClaim = await sr.entities.ScanRequest.filter({ user_id: user.id });
+    const reloaded = afterClaim.find((candidate) => candidate.id === oldest.id);
+    if (!reloaded || reloaded.processing_owner !== workerId) {
       return Response.json({ ok: true, skipped: true, reason: 'Lost claim race' });
     }
 
@@ -78,8 +79,10 @@ export default async function(req) {
     }
   }
 
-  // 2. No manual requests — run a scheduled scan if trading is active
-  if (user.trading_active) {
+  // 2. The coordinator polls every minute for manual requests, but autonomous
+  // scheduled scans retain the 15-minute cadence.
+  const scheduledSlotDue = new Date().getUTCMinutes() % 15 === 0;
+  if (user.trading_active && scheduledSlotDue) {
     try {
       const result = await base44.functions.invoke('runAutonomousScanCycle', {
         trigger_source: 'scheduled',
@@ -91,5 +94,5 @@ export default async function(req) {
     }
   }
 
-  return Response.json({ ok: true, skipped: true, reason: 'No pending requests and trading not active' });
+  return Response.json({ ok: true, skipped: true, reason: 'No pending request and no scheduled scan due' });
 }

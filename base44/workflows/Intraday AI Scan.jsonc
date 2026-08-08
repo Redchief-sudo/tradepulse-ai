@@ -1,6 +1,6 @@
 {
   "name": "Intraday AI Scan",
-  "description": "Every 15 minutes during US market hours: calls the Scan Coordinator \u2014 the single entry point that serializes scan execution. The coordinator checks for pending manual ScanRequests first, then runs a scheduled scan if trading is active. This prevents browser requests and scheduled workflows from competing to create scans.",
+  "description": "Every minute during US market hours: the sole Scan Coordinator consumer drains manual ScanRequests or runs scheduled scans. Browsers only enqueue requests.",
   "definition": {
     "document": {
       "dsl": "1.0.0",
@@ -30,7 +30,7 @@
       "trigger_type": "scheduled",
       "events": [],
       "schedule_mode": "recurring",
-      "cron_expression": "*/15 6-13 * * 1-5",
+      "cron_expression": "* 6-13 * * 1-5",
       "one_time_date": null,
       "timezone": "America/Los_Angeles",
       "interval_value": null,

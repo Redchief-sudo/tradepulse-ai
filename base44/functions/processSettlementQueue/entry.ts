@@ -6,8 +6,8 @@
 // processor handles the projection sequentially.
 //
 // For each event:
-// 1. Claim the event (atomic with lease — crash recovery via stale lease)
-// 2. Idempotent check (has this event already been projected?)
+// 1. Serialize processors per user, then claim each event with a recoverable lease
+// 2. Resume after the last durable stage checkpoint
 // 3. Lot accounting (create PositionLot for buy, close lots FIFO for sell)
 // 4. Cash accounting (debit for buy, credit for sell — internal paper only)
 // 5. Holding projection (derive from open PositionLots)
@@ -24,8 +24,39 @@ import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { recordBuySettlement, recordSellSettlement, getCashBalance } from '../../shared/cashLedger.ts';
 import { updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
 import { nowIso, genId, parseClosureFills } from '../../shared/lotAccounting.ts';
+import { classifySettlementFailure, isSettlementProcessable, runSettlementStages, selectLeaseWinner } from '../../shared/settlementState.ts';
 
 const STALE_LEASE_MS = 5 * 60 * 1000; // 5 minutes
+const PROCESSOR_LEASE_MS = 10 * 60 * 1000;
+
+async function acquireProcessorLease(sr, userId, workerId) {
+  const acquiredAt = nowIso();
+  const lockKey = `settlement-processor-${userId}`;
+  const ownLock = await sr.entities.ScanLock.create({
+    user_id: userId,
+    lock_key: lockKey,
+    owner_token: workerId,
+    acquired_at: acquiredAt,
+    heartbeat_at: acquiredAt,
+    expires_at: new Date(Date.now() + PROCESSOR_LEASE_MS).toISOString(),
+  });
+  const locks = await sr.entities.ScanLock.filter({ user_id: userId, lock_key: lockKey });
+  const activeLocks = locks.filter((lock) => new Date(lock.expires_at).getTime() > Date.now());
+  const winner = selectLeaseWinner(activeLocks);
+  if (!winner || winner.owner_token !== workerId) {
+    await sr.entities.ScanLock.delete(ownLock.id).catch(() => {});
+    return null;
+  }
+  return ownLock;
+}
+
+async function renewProcessorLease(sr, lock) {
+  const heartbeatAt = nowIso();
+  await sr.entities.ScanLock.update(lock.id, {
+    heartbeat_at: heartbeatAt,
+    expires_at: new Date(Date.now() + PROCESSOR_LEASE_MS).toISOString(),
+  });
+}
 
 // Audit helper
 async function audit(sr, userId, eventType, severity, details) {
@@ -58,23 +89,10 @@ async function claimEvent(sr, userId, event, workerId) {
   return { claimed: false, reason: 'LOST_RACE' };
 }
 
-// Idempotent check — has this event already been projected?
-async function checkAlreadyProjected(sr, userId, event) {
-  if (event.side === 'buy') {
-    const lots = await sr.entities.PositionLot.filter({ user_id: userId, originating_fill_id: event.event_id });
-    return lots.length > 0;
-  }
-  // For sells: check if event_id is in any lot's closure_fill_ids
-  const lots = await sr.entities.PositionLot.filter({ user_id: userId, symbol: event.symbol });
-  for (const lot of lots) {
-    const closures = parseClosureFills(lot.closure_fill_ids);
-    if (closures.some((c) => c.fill_id === event.event_id)) return true;
-  }
-  return false;
-}
-
 // Create a PositionLot for a buy fill
 async function createPositionLot(sr, userId, event) {
+  const existing = await sr.entities.PositionLot.filter({ user_id: userId, originating_fill_id: event.event_id });
+  if (existing.length > 0) return;
   await sr.entities.PositionLot.create({
     user_id: userId,
     portfolio_id: event.portfolio_id || null,
@@ -100,17 +118,31 @@ async function createPositionLot(sr, userId, event) {
 // Close lots FIFO for a sell fill — returns realized P&L
 async function closeLotsFifo(sr, userId, event) {
   const lots = await sr.entities.PositionLot.filter({ user_id: userId, symbol: event.symbol });
+  let alreadyAllocated = 0;
+  let realizedPnl = 0;
+  for (const lot of lots) {
+    for (const allocation of parseClosureFills(lot.closure_fill_ids)) {
+      if (allocation.fill_id === event.event_id) {
+        alreadyAllocated += Number(allocation.qty) || 0;
+        realizedPnl += (event.price - lot.acquisition_price) * (Number(allocation.qty) || 0);
+      }
+    }
+  }
+  if (alreadyAllocated > event.quantity + 0.0001) {
+    throw new Error(`INTEGRITY_VIOLATION: SELL_EVENT_OVERALLOCATED ${alreadyAllocated} > ${event.quantity}`);
+  }
+
   const openLots = lots
     .filter((l) => l.status === 'open' || l.status === 'partially_closed')
     .sort((a, b) => new Date(a.acquisition_timestamp) - new Date(b.acquisition_timestamp));
 
+  const remainingRequired = event.quantity - alreadyAllocated;
   const availableQty = openLots.reduce((s, l) => s + l.quantity_remaining, 0);
-  if (event.quantity > availableQty + 0.0001) {
-    throw new Error(`SELL_FILL_EXCEEDS_ACCOUNTED_POSITION: requested ${event.quantity}, available ${availableQty} for ${event.symbol}`);
+  if (remainingRequired > availableQty + 0.0001) {
+    throw new Error(`SELL_FILL_EXCEEDS_ACCOUNTED_POSITION: remaining ${remainingRequired}, available ${availableQty} for ${event.symbol}`);
   }
 
-  let remainingQty = event.quantity;
-  let realizedPnl = 0;
+  let remainingQty = remainingRequired;
 
   for (const lot of openLots) {
     if (remainingQty <= 0.0001) break;
@@ -229,10 +261,11 @@ async function createAiDecisionIfApplicable(sr, userId, event) {
   const intent = intents[0];
   if (!intent || intent.ml_score == null) return; // not AI-driven
 
-  // If the intent already has a decision_id, the decision was already created
-  if (intent.decision_id) return;
+  const existing = await sr.entities.AITradeDecision.filter({ user_id: userId, settlement_event_id: event.event_id });
+  if (existing.length > 0) return;
 
   await sr.entities.AITradeDecision.create({
+    settlement_event_id: event.event_id,
     user_id: userId,
     portfolio_id: event.portfolio_id || null,
     symbol: event.symbol,
@@ -275,15 +308,19 @@ async function updateTradeIntent(sr, userId, event, realizedPnl) {
 
   // Reservation state machine (buys only)
   if (event.side === 'buy' && intent.reserved_cash > 0) {
-    const fillCost = event.notional + (event.commission || 0) + (event.fees || 0);
-    const newConsumed = (intent.consumed_cash || 0) + fillCost;
-    patch.consumed_cash = newConsumed;
-    patch.reservation_status = newConsumed >= intent.reserved_cash ? 'consumed' : 'partially_consumed';
+    const consumed = fills.reduce((sum, fill) => sum +
+      (Number(fill.notional) || (Number(fill.filled_quantity) || 0) * (Number(fill.filled_price) || 0)) +
+      (Number(fill.commission) || 0) + (Number(fill.fees) || 0), 0);
+    patch.consumed_cash = consumed;
+    patch.reservation_status = consumed >= intent.reserved_cash ? 'consumed' : 'partially_consumed';
   }
 
   // Accumulate realized P&L for sells
   if (event.side === 'sell' && realizedPnl != null) {
-    patch.realized_pnl = (intent.realized_pnl || 0) + realizedPnl;
+    const settlementEvents = await sr.entities.SettlementEvent.filter({ user_id: userId, trade_intent_id: event.trade_intent_id });
+    patch.realized_pnl = settlementEvents
+      .filter((candidate) => candidate.lot_projected)
+      .reduce((sum, candidate) => sum + (Number(candidate.realized_pnl) || 0), 0);
   }
 
   await sr.entities.TradeIntent.update(intent.id, patch);
@@ -337,71 +374,52 @@ async function verifyIntegrity(sr, userId, event) {
 
 // Process a single settlement event — the core projection logic.
 async function processEvent(sr, userId, event) {
-  // 1. Idempotent check
-  if (await checkAlreadyProjected(sr, userId, event)) {
-    await sr.entities.SettlementEvent.update(event.id, {
-      status: 'completed',
-      completed_at: nowIso(),
-      integrity_verified: true,
-    });
-    return { symbol: event.symbol, side: event.side, skipped: true, reason: 'already_projected' };
-  }
+  const handlers = {
+    projectLot: async (state) => {
+      const realizedPnl = state.side === 'buy' ? null : await closeLotsFifo(sr, userId, state);
+      if (state.side === 'buy') await createPositionLot(sr, userId, state);
+      return { patch: { realized_pnl: realizedPnl } };
+    },
+    projectCash: async (state) => {
+      if (state.execution_mode !== 'internal_paper' && state.execution_mode !== 'shadow_live') return;
+      const params = {
+        symbol: state.symbol,
+        notional: state.quantity * state.price,
+        commission: state.commission || 0,
+        fees: state.fees || 0,
+        trade_intent_id: state.trade_intent_id,
+        fill_id: state.event_id,
+        portfolio_id: state.portfolio_id,
+      };
+      if (state.side === 'buy') await recordBuySettlement(sr, userId, params);
+      else await recordSellSettlement(sr, userId, params);
+    },
+    projectHolding: async (state) => updateHoldingProjection(sr, userId, state),
+    projectTrade: async (state) => createOrUpdateTrade(sr, userId, state, state.realized_pnl),
+    projectDecision: async (state) => createAiDecisionIfApplicable(sr, userId, state),
+    projectIntent: async (state) => updateTradeIntent(sr, userId, state, state.realized_pnl),
+    verifyIntegrity: async (state) => {
+      const integrity = await verifyIntegrity(sr, userId, state);
+      if (!integrity.ok) throw new Error(`INTEGRITY_VIOLATION: ${integrity.reason}`);
+    },
+  };
+  const finalState = await runSettlementStages(
+    event,
+    handlers,
+    (patch) => sr.entities.SettlementEvent.update(event.id, patch)
+  );
 
-  // 2. Lot accounting
-  let realizedPnl = null;
-  if (event.side === 'buy') {
-    await createPositionLot(sr, userId, event);
-  } else {
-    realizedPnl = await closeLotsFifo(sr, userId, event);
-  }
-
-  // 3. Cash accounting (internal paper / shadow mode only)
-  if (event.execution_mode === 'internal_paper' || event.execution_mode === 'shadow_live') {
-    const notional = event.quantity * event.price;
-    if (event.side === 'buy') {
-      await recordBuySettlement(sr, userId, {
-        symbol: event.symbol, notional,
-        commission: event.commission || 0, fees: event.fees || 0,
-        trade_intent_id: event.trade_intent_id, fill_id: event.event_id,
-        portfolio_id: event.portfolio_id,
-      });
-    } else {
-      await recordSellSettlement(sr, userId, {
-        symbol: event.symbol, notional,
-        commission: event.commission || 0, fees: event.fees || 0,
-        trade_intent_id: event.trade_intent_id, fill_id: event.event_id,
-        portfolio_id: event.portfolio_id,
-      });
-    }
-  }
-
-  // 4. Holding projection
-  await updateHoldingProjection(sr, userId, event);
-
-  // 5. Trade summary
-  await createOrUpdateTrade(sr, userId, event, realizedPnl);
-
-  // 6. AITradeDecision
-  await createAiDecisionIfApplicable(sr, userId, event);
-
-  // 7. TradeIntent update (reservation state + settlement state)
-  await updateTradeIntent(sr, userId, event, realizedPnl);
-
-  // 8. Financial integrity verification
-  const integrity = await verifyIntegrity(sr, userId, event);
-  if (!integrity.ok) {
-    throw new Error(`INTEGRITY_VIOLATION: ${integrity.reason}`);
-  }
-
-  // 9. Mark completed
   await sr.entities.SettlementEvent.update(event.id, {
     status: 'completed',
     completed_at: nowIso(),
     integrity_verified: true,
-    realized_pnl: realizedPnl,
+    processing_owner: null,
+    processing_started_at: null,
+    error: null,
+    next_retry_at: null,
   });
 
-  return { symbol: event.symbol, side: event.side, quantity: event.quantity, price: event.price, realized_pnl: realizedPnl };
+  return { symbol: event.symbol, side: event.side, quantity: event.quantity, price: event.price, realized_pnl: finalState.realized_pnl };
 }
 
 export default async function(req) {
@@ -414,50 +432,53 @@ export default async function(req) {
   const workerId = `settlement-${crypto.randomUUID()}`;
   const now = Date.now();
 
-  // Find pending or stale processing events
-  const allEvents = await sr.entities.SettlementEvent.filter({ user_id: userId });
-  const processable = allEvents
-    .filter((e) =>
-      e.status === 'pending' ||
-      (e.status === 'processing' && e.processing_started_at &&
-        now - new Date(e.processing_started_at).getTime() > STALE_LEASE_MS)
-    )
-    .sort((a, b) => new Date(a.occurred_at) - new Date(b.occurred_at));
-
-  const results = [];
-  for (const event of processable) {
-    const claimResult = await claimEvent(sr, userId, event, workerId);
-    if (!claimResult.claimed) continue;
-
-    try {
-      const result = await processEvent(sr, userId, claimResult.event);
-      results.push({ event_id: event.event_id, status: 'completed', ...result });
-    } catch (error) {
-      await sr.entities.SettlementEvent.update(claimResult.event.id, {
-        status: 'failed',
-        error: error.message,
-        completed_at: nowIso(),
-      });
-      results.push({ event_id: event.event_id, status: 'failed', error: error.message });
-
-      await audit(sr, userId, 'settlement_failed', 'error', {
-        correlation_id: event.trade_intent_id,
-        entity_type: 'SettlementEvent',
-        entity_id: event.id,
-        message: `Settlement failed for ${event.symbol} ${event.side} ${event.quantity}: ${error.message}`,
-      });
-
-      // Financial integrity violation — block the system
-      if (error.message.startsWith('INTEGRITY_VIOLATION')) {
-        try {
-          await updateSessionState(sr, userId, SESSION_STATES.FINANCIAL_INTEGRITY_BLOCKED, error.message);
-          await audit(sr, userId, 'financial_integrity_blocked', 'critical', {
-            message: `Financial integrity blocked: ${error.message}`,
-          });
-        } catch (e) { /* non-fatal */ }
-      }
-    }
+  const processorLease = await acquireProcessorLease(sr, userId, workerId);
+  if (!processorLease) {
+    return Response.json({ ok: true, processed: 0, skipped: 'processor_already_running' });
   }
 
-  return Response.json({ ok: true, processed: results.length, results });
+  try {
+    // Find pending, due retryable failures, or stale processing events.
+    const allEvents = await sr.entities.SettlementEvent.filter({ user_id: userId });
+    const processable = allEvents
+      .filter((event) => isSettlementProcessable(event, now, STALE_LEASE_MS))
+      .sort((a, b) => new Date(a.occurred_at) - new Date(b.occurred_at));
+
+    const results = [];
+    for (const event of processable) {
+      await renewProcessorLease(sr, processorLease);
+      const claimResult = await claimEvent(sr, userId, event, workerId);
+      if (!claimResult.claimed) continue;
+
+      try {
+        const result = await processEvent(sr, userId, claimResult.event);
+        results.push({ event_id: event.event_id, status: 'completed', ...result });
+      } catch (error) {
+        const failure = classifySettlementFailure(claimResult.event, error);
+        await sr.entities.SettlementEvent.update(claimResult.event.id, failure);
+        results.push({ event_id: event.event_id, status: failure.status, error: error.message });
+
+        await audit(sr, userId, 'settlement_failed', 'error', {
+          correlation_id: event.trade_intent_id,
+          entity_type: 'SettlementEvent',
+          entity_id: event.id,
+          message: `Settlement failed for ${event.symbol} ${event.side} ${event.quantity}: ${error.message}`,
+        });
+
+        // Any failed projection may have mutated financial state before the
+        // provider write or checkpoint failed. Block new exposure until replay
+        // completes and an operator explicitly re-enables the session.
+        try {
+          await updateSessionState(sr, userId, SESSION_STATES.FINANCIAL_INTEGRITY_BLOCKED, `SETTLEMENT_RECOVERY_REQUIRED: ${error.message}`);
+          await audit(sr, userId, 'financial_integrity_blocked', 'critical', {
+            message: `Settlement recovery required: ${error.message}`,
+          });
+        } catch (e) { /* failure is already persisted on the event */ }
+      }
+    }
+
+    return Response.json({ ok: true, processed: results.length, results });
+  } finally {
+    await sr.entities.ScanLock.delete(processorLease.id).catch(() => {});
+  }
 }

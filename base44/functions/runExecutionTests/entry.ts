@@ -1,5 +1,5 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
-import { recordFill, projectHolding, claimSettlement, rebuildPositionsFromFills } from '../../shared/execution.ts';
+import { recordFill } from '../../shared/execution.ts';
 
 // Automated execution test suite — verifies critical financial integrity scenarios.
 // Creates its own test data, asserts behavior, and cleans up.
@@ -186,93 +186,6 @@ export default async function(req) {
       assert('Dup fill: first returns true', first === true);
       assert('Dup fill: second returns false', second === false);
       assert('Dup fill: exactly one fill record', fills.length === 1, `got ${fills.length}`);
-    }
-
-    // === TEST 9: Settlement state machine — double-claim prevention ===
-    {
-      const intentId = `${testRunId}-claim-intent`;
-      const intent = await sr.entities.TradeIntent.create({
-        user_id: userId, trade_intent_id: intentId, symbol: `TST${Math.floor(Math.random() * 9999)}`,
-        side: 'buy', requested_quantity: 10, execution_mode: 'internal_paper', status: 'filled',
-      });
-      cleanup.push(intent.symbol);
-
-      const claim1 = await claimSettlement(sr, userId, intentId, 'worker-A');
-      assert('Settlement: first claim succeeds', claim1.claimed === true);
-
-      const claim2 = await claimSettlement(sr, userId, intentId, 'worker-B');
-      assert('Settlement: second claim by other worker fails', claim2.claimed === false);
-      assert('Settlement: second claim reason is CLAIMED_BY_OTHER', claim2.reason === 'CLAIMED_BY_OTHER');
-
-      const claim3 = await claimSettlement(sr, userId, intentId, 'worker-A');
-      assert('Settlement: re-claim by same worker succeeds', claim3.claimed === true);
-    }
-
-    // === TEST 10: Sell exceeding available lots throws hard failure ===
-    {
-      const sym = `TST${Math.floor(Math.random() * 9999)}`;
-      cleanup.push(sym);
-
-      await sr.entities.PositionLot.create({
-        user_id: userId, lot_id: `${testRunId}-lot`, symbol: sym,
-        quantity_opened: 10, quantity_remaining: 10, acquisition_price: 100,
-        acquisition_timestamp: new Date().toISOString(), status: 'open',
-        realized_pnl: 0, closure_fill_ids: '[]', cost_basis_method: 'fifo',
-      });
-
-      let threw = false;
-      try {
-        await projectHolding(sr, userId, sym, 'sell', 20, 110, { fill_id: `${testRunId}-oversell` });
-      } catch (e) { threw = true; }
-
-      assert('Sell exceeds: throws SELL_FILL_EXCEEDS_ACCOUNTED_POSITION', threw);
-
-      const lots = await sr.entities.PositionLot.filter({ user_id: userId, symbol: sym });
-      assert('Sell exceeds: lot unchanged after hard failure', lots[0]?.quantity_remaining === 10, `got ${lots[0]?.quantity_remaining}`);
-    }
-
-    // === TEST 11: Position rebuild produces correct cost basis (not net cash flow) ===
-    {
-      const sym = `TST${Math.floor(Math.random() * 9999)}`;
-      cleanup.push(sym);
-
-      await base44.functions.invoke('executeTrade', {
-        symbol: sym, action: 'buy', qty: 10, price: 100,
-        execution_mode: 'internal_paper', idempotency_key: `${testRunId}-rbuy-${sym}`,
-      });
-      await base44.functions.invoke('executeTrade', {
-        symbol: sym, action: 'sell', qty: 5, price: 150,
-        execution_mode: 'internal_paper', idempotency_key: `${testRunId}-rsell-${sym}`,
-      });
-
-      await rebuildPositionsFromFills(sr, userId);
-
-      const holdings = await sr.entities.Holding.filter({ user_id: userId, symbol: sym });
-      assert('Rebuild: 5 shares remain', holdings[0]?.shares === 5, `got ${holdings[0]?.shares}`);
-      assert('Rebuild: avg_price = 100 (not 50)', holdings[0]?.avg_price === 100, `got ${holdings[0]?.avg_price}`);
-
-      const lots = await sr.entities.PositionLot.filter({ user_id: userId, symbol: sym });
-      const openLot = lots.find((l) => l.status === 'open' || l.status === 'partially_closed');
-      assert('Rebuild: lot acquisition price = 100', openLot?.acquisition_price === 100, `got ${openLot?.acquisition_price}`);
-    }
-
-    // === TEST 12: Crash recovery — stale claimed intent can be re-claimed ===
-    {
-      const sym = `TST${Math.floor(Math.random() * 9999)}`;
-      cleanup.push(sym);
-      const intentId = `${testRunId}-crash-intent`;
-      const staleTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-
-      await sr.entities.TradeIntent.create({
-        user_id: userId, trade_intent_id: intentId, symbol: sym, side: 'buy',
-        requested_quantity: 10, execution_mode: 'internal_paper', status: 'filled',
-        settlement_state: 'claimed', settlement_owner: 'crashed-worker',
-        settlement_claimed_at: staleTime, settlement_version: 1,
-        client_order_id: `${testRunId}-crash-client`, filled_quantity: 10, filled_avg_price: 100,
-      });
-
-      const recovery = await claimSettlement(sr, userId, intentId, 'recovery-worker');
-      assert('Crash recovery: stale claim can be taken over', recovery.claimed === true, recovery.reason);
     }
 
     // === CLEANUP ===

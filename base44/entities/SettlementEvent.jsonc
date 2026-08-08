@@ -67,10 +67,12 @@
         "pending",
         "processing",
         "completed",
-        "failed"
+        "retryable_failed",
+        "integrity_blocked",
+        "terminal_failed"
       ],
       "default": "pending",
-      "description": "pending = waiting for settlement processor; processing = claimed by a worker; completed = fully projected (lots, cash, holding, trade); failed = projection error (retryable)"
+      "description": "Explicit lifecycle: pending, processing, retryable_failed with backoff, integrity_blocked, terminal_failed, or completed after every projection checkpoint"
     },
     "processing_owner": {
       "type": "string",
@@ -88,6 +90,46 @@
     "error": {
       "type": "string",
       "description": "Error message if status = failed"
+    },
+    "attempt_count": {
+      "type": "number",
+      "default": 0
+    },
+    "next_retry_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "failure_kind": {
+      "type": "string",
+      "enum": ["transient_projection", "integrity", "retry_exhausted"]
+    },
+    "fill_received": {
+      "type": "boolean",
+      "default": true
+    },
+    "lot_projected": {
+      "type": "boolean",
+      "default": false
+    },
+    "cash_projected": {
+      "type": "boolean",
+      "default": false
+    },
+    "holding_projected": {
+      "type": "boolean",
+      "default": false
+    },
+    "trade_projected": {
+      "type": "boolean",
+      "default": false
+    },
+    "decision_projected": {
+      "type": "boolean",
+      "default": false
+    },
+    "intent_projected": {
+      "type": "boolean",
+      "default": false
     },
     "execution_mode": {
       "type": "string",
