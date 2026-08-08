@@ -1,10 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { base44 } from '@/api/base44Client';
-import { BookOpen, RefreshCw, ChevronLeft, TrendingUp, TrendingDown } from 'lucide-react';
+import { BookOpen, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import TradingSessionCard from '@/components/TradingSessionCard';
 import TradingSessionDetail from '@/components/TradingSessionDetail';
-import { cn } from '@/lib/utils';
 
 export default function TradingJournal() {
   const [sessions, setSessions] = useState([]);

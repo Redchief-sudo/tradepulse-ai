@@ -48,7 +48,7 @@ export default function MLScoreCard({ scores }) {
     <div className="rounded-xl border border-accent/20 bg-accent/5 p-4 my-3">
       <div className="flex items-center gap-2 mb-3">
         <Cpu className="w-4 h-4 text-accent" />
-        <h4 className="text-sm font-semibold">ML Multi-Factor Score</h4>
+        <h4 className="text-sm font-semibold">Multi-Factor Composite Score</h4>
         <span
           className={cn(
             'ml-auto text-xs font-bold px-2 py-0.5 rounded-full text-white',

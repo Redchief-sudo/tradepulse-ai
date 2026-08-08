@@ -13,7 +13,6 @@ import {
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { formatCurrency } from '@/lib/portfolio';
-import { cn } from '@/lib/utils';
 
 export default function StopLossScanner({ holdings, stopLossPct, onStopLossPctChange, onHoldingsChange }) {
   const [scanning, setScanning] = useState(false);

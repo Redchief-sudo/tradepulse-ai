@@ -64,7 +64,7 @@ export default function RiskAnalytics({ holdings, autoTriggerKey }) {
 
   useEffect(() => {
     if (autoTriggerKey > 0) load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [autoTriggerKey]);
 
   if (!holdings || holdings.length === 0) return null;

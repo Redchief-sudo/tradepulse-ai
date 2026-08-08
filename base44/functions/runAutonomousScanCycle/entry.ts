@@ -374,7 +374,7 @@ export default async function(req) {
     // proposals from candidate data directly — the candidates already carry
     // confidence, target_price, stop_loss, and recommendation from Pass 1.
     const p2 = await sr.integrations.Core.InvokeLLM({
-      model: 'claude-sonnet-5',
+      model: 'claude_sonnet_4_6',
       prompt: `You are AlphaTrade AI. PASS 2 — Portfolio fit & risk assessment.\nCurrent portfolio:\n${pCtx}\n\nSector exposure:\n${secCtx}\nTotal portfolio value: $${accountEquity.toFixed(0)} (available capital)\n\nCandidates:\n${JSON.stringify(enriched.map((e) => ({ symbol: e.symbol, sector: e.sector, current_price: e.realPrice, recommendation: e.recommendation, confidence: e.confidence, summary: e.summary })), null, 2)}\n\nProvide a BRIEF risk assessment (2-3 sentences) of these candidates for a ${user.trade_profile || 'balanced'} risk profile. Which are strongest? Any concentration or correlation concerns?`,
       response_json_schema: {
         type: 'object',
@@ -465,10 +465,11 @@ export default async function(req) {
       });
     }
 
-    // PASS 3a — Investment Committee Debate
+    // PASS 3a — prompted LLM panel. The archetypes are perspectives requested
+    // from one model, not independent committee members or separate agents.
     if (proposals.length) {
       const committee = await sr.integrations.Core.InvokeLLM({
-        model: 'claude-sonnet-5',
+        model: 'claude_sonnet_4_6',
         prompt: `You are AlphaTrade AI's INVESTMENT COMMITTEE — 4 archetypes debate each candidate.\nProposals:\n${JSON.stringify(proposals.map((p) => ({ symbol: p.symbol, action: p.action, sector: p.sector, confidence: p.confidence, reasoning: p.reasoning })), null, 2)}\nFor each, 4 archetypes (Value/Utility Specialist, Macro Contrarian, Quant Statistician, Tail-Risk Hedger) each give vote (bullish/bearish/neutral) + one-line argument + conviction (0-100). consensus_votes = count of bullish (of 4). consensus = true if >= 3 bullish. Return debates.`,
         response_json_schema: {
           type: 'object',
@@ -495,7 +496,9 @@ export default async function(req) {
     await verifyOwnership();
     assertScanHealthy();
 
-    // PASS 3b — Deterministic ML multi-factor scoring (CHAMPION weights)
+    // PASS 3b — deterministic multi-factor composite (champion weights).
+    // The persisted ml_score field is retained as a schema contract, but this
+    // calculation is a weighted formula rather than a trained ML prediction.
     const scored = proposals.map((p) => {
       const ef = enriched.find((e) => e.symbol === p.symbol);
       const f = ef?.realFactors;
@@ -515,7 +518,7 @@ export default async function(req) {
     // PASS 4 — Adversarial Risk Officer veto
     if (approved.length) {
       const p4 = await sr.integrations.Core.InvokeLLM({
-        model: 'claude-sonnet-5',
+        model: 'claude_sonnet_4_6',
         prompt: `You are the ADVERSARIAL RISK OFFICER. Veto dangerous trades.\nPortfolio:\n${pCtx}\nSector exposure:\n${secCtx}\n\nProposals:\n${JSON.stringify(approved.map((p) => ({ symbol: p.symbol, action: p.action, sector: p.sector, confidence: p.confidence, ml_score: p.ml_score, suggested_position_pct: p.suggested_position_pct })), null, 2)}\nFor each, return verdict "approved"/"flagged"/"vetoed" + one-line note. Veto on hidden correlation, liquidity trap, concentration breach, or regime mismatch.`,
         response_json_schema: {
           type: 'object',
@@ -542,12 +545,12 @@ export default async function(req) {
     await verifyOwnership();
     assertScanHealthy();
 
-    // PASS 5 — Causal Contagion
+    // PASS 5 — qualitative LLM contagion assessment (not a causal graph model)
     let contagion = null;
     if (approved.length) {
       try {
         contagion = await sr.integrations.Core.InvokeLLM({
-          model: 'claude-sonnet-5',
+          model: 'claude_sonnet_4_6',
           prompt: `You are AlphaTrade AI's CAUSAL CONTAGION ENGINE. For each approved trade, give a one-line root_cause and a contagion_risk score (0-100).\nApproved:\n${JSON.stringify(approved.map((p) => ({ symbol: p.symbol, action: p.action, sector: p.sector })), null, 2)}\nPortfolio: ${holdings.map((h) => h.symbol).join(', ') || 'empty'}`,
           response_json_schema: {
             type: 'object',

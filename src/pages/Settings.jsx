@@ -319,22 +319,22 @@ export default function Settings() {
         </div>
       </div>
 
-      {/* Auto-Promote Paper → Live */}
+      {/* Paper performance readiness notification */}
       <div className="mb-6">
         <div className="rounded-2xl border border-border bg-card p-5 space-y-4">
           <div className="flex items-center gap-2">
             <Rocket className="w-4 h-4 text-primary" />
-            <h2 className="font-semibold">Auto-Promote Paper → Live</h2>
+            <h2 className="font-semibold">Paper Performance Readiness</h2>
           </div>
           <p className="text-xs text-muted-foreground leading-relaxed">
-            Automatically switch from paper to live trading once your paper performance proves itself.
-            The system counts closed positions (sells with a realized P&L) and promotes only when both
-            the minimum trade count <em>and</em> minimum win rate are met. Fires once — it never re-triggers.
+            Notify you when configured paper-performance thresholds are met. This never enables live
+            trading automatically; live operation requires separately validated live credentials and
+            an explicit mode selection.
           </p>
           <div className="flex items-center justify-between">
             <div>
-              <div className="font-medium text-sm">Enable Auto-Promotion</div>
-              <div className="text-xs text-muted-foreground">Switch to live when thresholds are met</div>
+              <div className="font-medium text-sm">Enable Readiness Notification</div>
+              <div className="text-xs text-muted-foreground">Notify when paper thresholds are met</div>
             </div>
             <button
               type="button"
@@ -377,16 +377,16 @@ export default function Settings() {
             <div className="rounded-lg p-3 text-sm flex items-start gap-2 bg-emerald-500/10 text-emerald-500">
               <CheckCircle2 className="w-4 h-4 flex-shrink-0 mt-0.5" />
               <span className="text-xs leading-relaxed">
-                Auto-promotion fired on {new Date(user.auto_promote_triggered_at).toLocaleString('en-US', {
+                Readiness thresholds were met on {new Date(user.auto_promote_triggered_at).toLocaleString('en-US', {
                   month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit',
-                })}. Your account is now in LIVE mode.
+                })}. Live trading remains disabled until valid live credentials are connected.
               </span>
             </div>
           )}
           {form.auto_promote_enabled && !user?.auto_promote_triggered_at && (
             <p className="text-xs text-amber-400 flex items-center gap-1.5">
               <AlertTriangle className="w-3 h-3" />
-              When both thresholds are met, your broker credentials will switch to LIVE and real orders will be placed.
+              Meeting these thresholds only sends a notification; it never places real-money orders.
             </p>
           )}
         </div>

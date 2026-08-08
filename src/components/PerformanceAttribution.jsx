@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Activity, Award, AlertTriangle, Clock, Gauge, Layers, TrendingDown, TrendingUp } from 'lucide-react';
+import { Activity, Award, AlertTriangle, Layers } from 'lucide-react';
 import { base44 } from '@/api/base44Client';
 import { Loader2 } from 'lucide-react';
 

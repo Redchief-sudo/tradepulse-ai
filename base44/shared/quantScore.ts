@@ -1,7 +1,7 @@
-// Real deterministic quant factor scores computed from actual OHLCV.
+// Deterministic quant factor scores computed from OHLCV.
 // Technical / Momentum / Risk are precise formulas (no LLM).
-// Fundamental & Sentiment are qualitative — supplied by the LLM where available,
-// defaulted to neutral (50) otherwise. Never fabricated here.
+// Missing fundamental and sentiment inputs are neutral (50). The resulting
+// composite is a weighted heuristic, not a trained machine-learning prediction.
 
 import { rsi, macd, bollinger, sma, momentum, volatility, atr } from './indicators.ts';
 

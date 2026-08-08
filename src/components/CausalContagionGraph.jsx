@@ -25,7 +25,7 @@ export default function CausalContagionGraph({ proposal, holdings }) {
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
           <GitBranch className="w-3.5 h-3.5 text-accent" />
-          <span className="text-xs font-semibold">Causal Contagion Graph</span>
+          <span className="text-xs font-semibold">LLM Contagion Assessment</span>
         </div>
         <Button
           size="sm"

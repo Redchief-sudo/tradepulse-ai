@@ -230,7 +230,7 @@ async function generateHypothesis(sr, champion, outcomes) {
   }
 
   const sl = await sr.integrations.Core.InvokeLLM({
-    model: 'claude-sonnet-5',
+    model: 'claude_sonnet_4_6',
     prompt: `You are the MODEL GOVERNANCE HYPOTHESIS ENGINE. Analyze which factors predicted winners vs losers and propose a DIRECTIONAL HYPOTHESIS for each factor. Do NOT propose numerical weights — only state whether to INCREASE, DECREASE, or keep NEUTRAL each factor's weight. The deterministic optimizer will find the exact values.
 
 Factor analysis (winners vs losers averages):

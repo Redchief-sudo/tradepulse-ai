@@ -29,7 +29,7 @@ export default function CommitteeDebate({ debate }) {
       >
         <div className="flex items-center gap-2">
           <Users className="w-3.5 h-3.5 text-accent" />
-          <span className="text-xs font-semibold">Investment Committee Debate</span>
+          <span className="text-xs font-semibold">Prompted LLM Panel</span>
           <span
             className={cn(
               'text-xs px-1.5 py-0.5 rounded-full border',

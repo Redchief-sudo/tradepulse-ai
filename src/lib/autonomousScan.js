@@ -116,12 +116,12 @@ Prioritize stocks with strong setups that would IMPROVE diversification AND matc
   });
 }
 
-// Pass 2 — Investment Committee Debate (4-archetype consensus)
+// Pass 2 — prompted LLM panel (four requested archetypes; not independent agents)
 export async function runCommitteeDebate(candidates) {
   if (!candidates.length) return { debates: [] };
 
   return await base44.integrations.Core.InvokeLLM({
-    model: 'claude-sonnet-5',
+    model: 'claude_sonnet_4_6',
     prompt: `You are AlphaTrade AI's INVESTMENT COMMITTEE — a simulated multi-archetype debate panel. Each candidate asset is debated by 4 distinct investment philosophies before it can advance to execution.
 
 THE 4 ARCHETYPES:
@@ -198,7 +198,7 @@ export async function runPass2(holdings, candidates, profile, regime) {
   }));
 
   return await base44.integrations.Core.InvokeLLM({
-    model: 'claude-sonnet-5',
+    model: 'claude_sonnet_4_6',
     prompt: `You are AlphaTrade AI. PASS 2 — Portfolio Fit & Risk-Aware Selection (Reinforcement Learning / Deep Q-Network for execution & position-sizing optimization · Claude Sonnet 5 reasoning).
 
 Current portfolio:
@@ -291,8 +291,8 @@ export async function runPass3(proposals, candidates, weights) {
   }));
 
   return await base44.integrations.Core.InvokeLLM({
-    model: 'claude-sonnet-5',
-    prompt: `You are AlphaTrade AI's Machine Learning scoring engine — a hybrid ensemble: multi-factor quantitative model + Graph Neural Network (GNN) for sector contagion mapping (like those used in hedge funds).
+    model: 'claude_sonnet_4_6',
+    prompt: `Produce a qualitative multi-factor assessment from the supplied data. This is an LLM assessment, not a trained ML or graph-neural-network model.
 
 For each proposed trade, compute scores (0-100) across 5 factors using the analysis data below:
 
@@ -328,14 +328,14 @@ FACTOR DEFINITIONS:
     - Correlation with existing portfolio
     - SECTOR CONTAGION (GNN): how a downturn in this stock's sector would propagate to existing holdings — high contagion = lower score
 
-COMPOSITE ML SCORE = weighted average (SELF-LEARNING ADJUSTED WEIGHTS — reflect recent trade performance):
+COMPOSITE SCORE = weighted average using the supplied governance weights:
 - Technical: ${w.technical}%
 - Fundamental: ${w.fundamental}%
 - Sentiment: ${w.sentiment}%
 - Momentum: ${w.momentum}%
 - Risk: ${w.risk}%
 
-ML SIGNAL:
+COMPOSITE SIGNAL:
 - >80: STRONG_BUY
 - 65-80: BUY
 - 45-65: HOLD
@@ -386,7 +386,7 @@ export async function runAdversarialReview(proposals, holdings, regime) {
   const regimeLabel = regime && regime.market_regime ? regime.market_regime : 'unknown';
 
   return await base44.integrations.Core.InvokeLLM({
-    model: 'claude-sonnet-5',
+    model: 'claude_sonnet_4_6',
     prompt: `You are the ADVERSARIAL RISK OFFICER — a ruthlessly conservative, independent AI agent in AlphaTrade AI's multi-agent system. Your sole job is to find flaws in the Alpha Generator's trade proposals and VETO dangerous ones.
 
 You are adversarial by design. You actively try to block trades by predicting hidden correlation risks, liquidity traps, regime mismatches, and concentration dangers.
@@ -448,7 +448,7 @@ export async function runSelfLearning(decisions) {
   }));
 
   return await base44.integrations.Core.InvokeLLM({
-    model: 'claude-sonnet-5',
+    model: 'claude_sonnet_4_6',
     prompt: `You are AlphaTrade AI's SELF-LEARNING ENGINE — a post-mortem feedback loop that diagnoses past trade performance and dynamically adjusts the 5 quant factor weights.
 
 Past AI trade decisions (most recent 30):
@@ -501,7 +501,7 @@ Also produce 2-4 short post-mortem diagnoses of the worst trades, and an accurac
 // Causal Supply Chain & Cross-Asset Contagion Engine (DAG)
 export async function runCausalContagion(proposal, holdings) {
   return await base44.integrations.Core.InvokeLLM({
-    model: 'claude-sonnet-5',
+    model: 'claude_sonnet_4_6',
     prompt: `You are AlphaTrade AI's CAUSAL CONTAGION ENGINE. Compute a Directed Acyclic Graph (DAG) of causal contagion paths for the proposed trade — root cause drivers versus simple surface price correlation.
 
 Proposed trade: ${proposal.symbol} (${proposal.asset_class || 'stocks'}, ${proposal.action}, sector: ${proposal.sector || 'n/a'})

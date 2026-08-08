@@ -35,7 +35,7 @@
     },
     "source": {
       "type": "string",
-      "description": "finnhub | binance | alpaca"
+      "description": "finnhub | coinbase | alpaca_iex | alpaca_crypto"
     }
   },
   "required": [

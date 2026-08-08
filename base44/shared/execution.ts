@@ -20,7 +20,7 @@
 // 7. CREDENTIAL ISOLATION: Broker secrets are read from the BrokerCredential entity
 //    (RLS-locked, service-role only) — never from the User object.
 
-import { placeAlpacaOrder, getAlpacaOrder, getAlpacaAccount } from './alpaca.ts';
+import { placeAlpacaOrder, getAlpacaOrder, getAlpacaAccount, getAlpacaLatestQuote } from './alpaca.ts';
 import { evaluateRisk, riskLimitsForProfile, buildPortfolioSnapshot, checkDataFreshness, checkMaxDrawdown } from './riskEngine.ts';
 import { fetchQuote } from './marketDataAdapter.ts';
 import { isUsMarketOpen, usMarketSession } from './marketHours.ts';
@@ -36,6 +36,22 @@ function isTerminalFailure(status) {
 }
 function isTerminal(status) {
   return ['filled', 'done_for_day', ...['rejected', 'canceled', 'expired', 'replaced']].includes(status);
+}
+
+export function executableQuoteMetrics(quote, side, nowMs = Date.now()) {
+  const bid = Number(quote?.bid);
+  const ask = Number(quote?.ask);
+  const mid = (bid + ask) / 2;
+  const observedMs = quote?.timestamp ? new Date(quote.timestamp).getTime() : NaN;
+  const ageMs = Number.isFinite(observedMs) ? Math.max(0, nowMs - observedMs) : null;
+  if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0 || ask < bid) return null;
+  return {
+    bid,
+    ask,
+    referencePrice: side === 'buy' ? ask : bid,
+    estimatedSlippagePct: ((ask - bid) / 2 / mid) * 100,
+    ageMs,
+  };
 }
 
 
@@ -57,7 +73,13 @@ async function fetchAuthoritativeQuote(sr, symbol, assetClass, finnhubKey) {
   }
   const providerTs = q.quote_timestamp
     ? new Date(q.quote_timestamp * 1000).toISOString()
-    : nowIso();
+    : null;
+  if (!providerTs) return { ok: false, reason: 'QUOTE_TIMESTAMP_MISSING', price: null };
+  const ageMs = Date.now() - new Date(providerTs).getTime();
+  const maxAgeMs = ac === 'crypto' ? 60000 : 30000;
+  if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > maxAgeMs) {
+    return { ok: false, reason: `STALE_LIVE_QUOTE age_ms=${Number.isFinite(ageMs) ? ageMs : 'invalid'}`, price: null };
+  }
   const session = usMarketSession(new Date(providerTs));
   try {
     await sr.entities.PriceSnapshot.create({
@@ -67,7 +89,7 @@ async function fetchAuthoritativeQuote(sr, symbol, assetClass, finnhubKey) {
       provider_timestamp: providerTs,
       market_session: session,
       is_market_open: session === 'regular',
-      source: ac === 'crypto' ? 'binance' : 'finnhub',
+      source: ac === 'crypto' ? 'coinbase' : 'finnhub',
     });
   } catch (e) { /* non-fatal — snapshot is for freshness checks, not execution */ }
   return { ok: true, price: q.price, provider_timestamp: providerTs, market_session: session };
@@ -422,13 +444,13 @@ export async function executeIntent(base44, user, input) {
     intentRecord = await sr.entities.TradeIntent.create(intentData);
   }
 
-  // 1b. MARKET HOURS GATE (broker_paper and live). The backend independently
+  // 1b. MARKET HOURS GATE for equities in every execution mode. The backend independently
   // verifies the US regular session is open before submitting a broker order.
   // Cron timing alone is insufficient — the gateway is the authoritative gate.
   // A day order submitted after hours can queue and fill at a gapped next open.
   // Checked before the quote fetch so we don't burn a provider call when the
   // session is closed.
-  if (executionMode === 'live' || executionMode === 'broker_paper') {
+  if (String(input.asset_class || 'stocks').toLowerCase() !== 'crypto') {
     if (!isUsMarketOpen()) {
       const session = usMarketSession();
       await sr.entities.TradeIntent.update(intentRecord.id, {
@@ -440,14 +462,50 @@ export async function executeIntent(base44, user, input) {
     }
   }
 
-  // 1b.5. AUTHORITATIVE QUOTE (broker_paper and live). The gateway fetches the
-  // live executable quote itself and uses THAT price — not the frontend/LLM
-  // price — for risk sizing and order metadata. This is the single source of
+  // 1b.5. AUTHORITATIVE QUOTE. Every mode uses a provider-backed price; internal
+  // paper must never turn a frontend/LLM estimate into a simulated fill. Broker
+  // modes additionally require Alpaca top-of-book data for spread/slippage gates.
+  // The gateway uses that quote—not the frontend/LLM price—for risk sizing and
+  // order metadata. This is the single source of
   // truth for the execution reference price. It also persists a fresh
   // PriceSnapshot (with the provider's observation timestamp) so subsequent
   // freshness checks and outcome labeling have an authoritative record, and
   // so newly-discovered symbols are never rejected for a missing snapshot.
+  let executableQuote = null;
+  let brokerExecutableSymbol = symbol;
   if (executionMode === 'live' || executionMode === 'broker_paper') {
+    try {
+      const rawQuote = await getAlpacaLatestQuote(
+        { apiKey: brokerCred.api_key, secretKey: brokerCred.api_secret },
+        symbol,
+        input.asset_class || 'stocks'
+      );
+      executableQuote = executableQuoteMetrics(rawQuote, side);
+      brokerExecutableSymbol = rawQuote.symbol;
+      const maxQuoteAgeMs = String(input.asset_class || 'stocks').toLowerCase() === 'crypto' ? 60000 : 30000;
+      if (!executableQuote || executableQuote.ageMs == null || executableQuote.ageMs > maxQuoteAgeMs) {
+        throw new Error(`STALE_EXECUTABLE_QUOTE: age_ms=${executableQuote?.ageMs ?? 'unknown'}`);
+      }
+      refPrice = executableQuote.referencePrice;
+      try {
+        const isCrypto = String(input.asset_class || 'stocks').toLowerCase() === 'crypto';
+        await sr.entities.PriceSnapshot.create({
+          symbol,
+          price: refPrice,
+          timestamp: nowIso(),
+          provider_timestamp: rawQuote.timestamp,
+          source: rawQuote.source,
+          ...(isCrypto ? {} : {
+            market_session: usMarketSession(new Date(rawQuote.timestamp)),
+            is_market_open: isUsMarketOpen(),
+          }),
+        });
+      } catch (e) { /* non-fatal — execution still uses the verified quote */ }
+    } catch (e) {
+      await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: `NO_EXECUTABLE_QUOTE: ${e.message}` });
+      return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: `No executable broker quote: ${e.message}`, symbol, side, requestedQty };
+    }
+  } else {
     const quote = await fetchAuthoritativeQuote(sr, symbol, input.asset_class, input.finnhub_key);
     if (!quote.ok) {
       await sr.entities.TradeIntent.update(intentRecord.id, {
@@ -460,11 +518,11 @@ export async function executeIntent(base44, user, input) {
     // Override the reference price with the authoritative quote. All downstream
     // sizing, risk caps, and order metadata use this price.
     refPrice = quote.price;
-    await sr.entities.TradeIntent.update(intentRecord.id, {
-      requested_notional: requestedQty * refPrice,
-      limit_price: (intentRecord.order_type === 'limit' || input.order_type === 'limit') ? refPrice : null,
-    });
   }
+  await sr.entities.TradeIntent.update(intentRecord.id, {
+    requested_notional: requestedQty * refPrice,
+    limit_price: (intentRecord.order_type === 'limit' || input.order_type === 'limit') ? refPrice : null,
+  });
 
   // 1c. Fetch real account equity for risk sizing (broker_paper/live only).
   // FAIL-CLOSED: if account is unreachable or has no equity, reject before risk
@@ -524,7 +582,14 @@ export async function executeIntent(base44, user, input) {
     { symbol, side, requested_quantity: requestedQty, limit_price: refPrice, price: refPrice, sector: input.sector, confidence: input.confidence, stop_loss: input.stop_loss },
     snapshot,
     limits,
-    { killSwitch: !!user.kill_switch_reset_required || user.trading_session_state === 'risk_stopped', maxDrawdownBreached, skipMarketDataChecks }
+    {
+      killSwitch: !!user.kill_switch_reset_required || user.trading_session_state === 'risk_stopped',
+      maxDrawdownBreached,
+      skipMarketDataChecks,
+      bid: executableQuote?.bid,
+      ask: executableQuote?.ask,
+      estimated_slippage_pct: executableQuote?.estimatedSlippagePct,
+    }
   );
 
   if (!risk.approved) {
@@ -665,7 +730,7 @@ export async function executeIntent(base44, user, input) {
     try {
       await sr.entities.TradeIntent.update(intentRecord.id, { status: 'submitted', broker: brokerCred.broker, submitted_at: nowIso() });
       const placed = await placeAlpacaOrder({
-        ...creds, mode: alpacaMode, symbol, qty: approvedQty, side, client_order_id: clientOrderId,
+        ...creds, mode: alpacaMode, symbol: brokerExecutableSymbol, qty: approvedQty, side, client_order_id: clientOrderId,
         order_type: intentRecord.order_type || 'market',
         limit_price: intentRecord.limit_price,
         stop_price: intentRecord.stop_price,

@@ -51,22 +51,22 @@
     "auto_promote_enabled": {
       "type": "boolean",
       "default": false,
-      "description": "If true, the system auto-promotes from paper to live trading once the configured paper-trade count and win-rate thresholds are both met"
+      "description": "If true, notify when configured paper-trade count and win-rate readiness thresholds are both met; never enables live trading"
     },
     "auto_promote_min_trades": {
       "type": "number",
       "default": 20,
-      "description": "Minimum number of closed paper trades required before auto-promotion to live"
+      "description": "Minimum number of closed paper trades required for a live-readiness notification"
     },
     "auto_promote_min_win_rate": {
       "type": "number",
       "default": 60,
-      "description": "Minimum win-rate percentage (0-100) required before auto-promotion to live"
+      "description": "Minimum win-rate percentage (0-100) required for a live-readiness notification"
     },
     "auto_promote_triggered_at": {
       "type": "string",
       "format": "date-time",
-      "description": "When the auto-promotion from paper to live fired \u2014 set once, prevents re-triggering"
+      "description": "When the live-readiness notification fired \u2014 set once, prevents re-triggering"
     },
     "telegram_chat_id": {
       "type": "string",

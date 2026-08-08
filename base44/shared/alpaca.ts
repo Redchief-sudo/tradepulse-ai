@@ -4,6 +4,7 @@ import { throwAlpacaError, extractRequestId } from './alpacaErrors.ts';
 
 const PAPER_BASE = 'https://paper-api.alpaca.markets/v2';
 const LIVE_BASE = 'https://api.alpaca.markets/v2';
+const DATA_BASE = 'https://data.alpaca.markets';
 
 function baseUrl(mode) {
   return mode === 'live' ? LIVE_BASE : PAPER_BASE;
@@ -76,6 +77,28 @@ export async function getAlpacaClock({ apiKey, secretKey, mode }) {
   if (!res.ok) await throwAlpacaError(res, 'getClock');
   const data = await res.json().catch(() => ({}));
   return data;
+}
+
+// Latest executable top-of-book quote from Alpaca Market Data. Unlike a last
+// trade price, bid/ask is sufficient to enforce spread and estimated-slippage
+// limits before an order reaches the broker.
+export async function getAlpacaLatestQuote({ apiKey, secretKey }, symbol, assetClass = 'stocks') {
+  const isCrypto = String(assetClass).toLowerCase() === 'crypto';
+  const normalized = String(symbol).toUpperCase().replace(/-/g, '/');
+  const url = isCrypto
+    ? `${DATA_BASE}/v1beta3/crypto/us/latest/quotes?symbols=${encodeURIComponent(normalized)}`
+    : `${DATA_BASE}/v2/stocks/${encodeURIComponent(normalized)}/quotes/latest?feed=iex`;
+  const res = await fetch(url, { headers: headers(apiKey, secretKey) });
+  if (!res.ok) await throwAlpacaError(res, 'getLatestQuote');
+  const data = await res.json().catch(() => ({}));
+  const quote = isCrypto ? data?.quotes?.[normalized] : data?.quote;
+  const bid = Number(quote?.bp);
+  const ask = Number(quote?.ap);
+  const timestamp = quote?.t || null;
+  if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0 || ask < bid) {
+    throw new Error(`ALPACA_QUOTE_INVALID: ${normalized}`);
+  }
+  return { bid, ask, timestamp, symbol: normalized, source: isCrypto ? 'alpaca_crypto' : 'alpaca_iex' };
 }
 
 // Cancel an open order — used by the kill switch to cancel unfilled entry orders.

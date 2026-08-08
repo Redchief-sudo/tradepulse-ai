@@ -72,7 +72,7 @@ export default function PortfolioOptimization({ holdings, autoTriggerKey }) {
 
   useEffect(() => {
     if (autoTriggerKey > 0) load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [autoTriggerKey]);
 
   if (!holdings || holdings.length < 2) return null;

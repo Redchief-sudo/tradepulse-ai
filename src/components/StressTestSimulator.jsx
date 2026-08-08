@@ -31,7 +31,7 @@ export default function StressTestSimulator({ holdings }) {
         current_price: h.current_price || h.avg_price,
       }));
       const result = await base44.integrations.Core.InvokeLLM({
-        prompt: `You are AlphaTrade AI's Generative Simulation engine (GAN-style synthetic scenario generator). Simulate how the following portfolio would perform under severe black-swan scenarios.
+        prompt: `Generate qualitative stress scenarios for the following portfolio. These are LLM estimates, not outputs from a trained GAN or calibrated risk model.
 
 Portfolio value: $${portfolioValue.toFixed(0)}
 Positions: ${JSON.stringify(positions, null, 2)}
@@ -40,7 +40,7 @@ For each of these scenarios, project the portfolio impact and identify the most 
 ${SCENARIOS.map((s, i) => `${i + 1}. ${s}`).join('\n')}
 
 For each scenario return: name, a brief description of the synthetic shock, the projected portfolio impact (negative %), the 2-3 most vulnerable symbols, and a 1-line pre-computed playbook action the AI should take.`,
-        model: 'claude-sonnet-5',
+        model: 'claude_sonnet_4_6',
         response_json_schema: {
           type: 'object',
           properties: {
@@ -76,7 +76,7 @@ For each scenario return: name, a brief description of the synthetic shock, the 
       <div className="flex items-center justify-between flex-wrap gap-3 mb-2">
         <div className="flex items-center gap-2">
           <FlaskConical className="w-4 h-4 text-accent" />
-          <h3 className="font-semibold text-sm">Generative Stress-Test Simulation</h3>
+          <h3 className="font-semibold text-sm">LLM Scenario Exploration</h3>
         </div>
         <Button
           size="sm"
@@ -90,8 +90,8 @@ For each scenario return: name, a brief description of the synthetic shock, the 
         </Button>
       </div>
       <p className="text-xs text-muted-foreground mb-3 leading-relaxed">
-        GAN-style synthetic futures — simulate black-swan events and pre-compute execution playbooks
-        before real capital is at risk.
+        Qualitative, uncalibrated LLM estimates for exploring black-swan narratives. Do not treat
+        projected losses as measured risk forecasts.
       </p>
 
       <AnimatePresence>

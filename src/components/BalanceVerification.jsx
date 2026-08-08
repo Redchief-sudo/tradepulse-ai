@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { base44 } from '@/api/base44Client';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ShieldCheck, Loader2, RefreshCw, AlertTriangle, CheckCircle2, XCircle, ArrowRight, Zap } from 'lucide-react';
+import { ShieldCheck, Loader2, AlertTriangle, CheckCircle2, XCircle, ArrowRight, Zap } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
 function formatCurrency(n) {

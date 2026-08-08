@@ -5,7 +5,6 @@ import {
   Zap,
   Loader2,
   Brain,
-  CheckCircle2,
   TrendingUp,
   TrendingDown,
   History,
@@ -55,10 +54,10 @@ function timeAgo(date) {
 
 const SCAN_STAGES = [
   { key: 'pass1', label: 'Pass 1: Multi-asset market scan', model: 'Gemini 3.1 Pro · Transformer' },
-  { key: 'pass2', label: 'Pass 2: Investment committee debate', model: 'Claude Sonnet 5 · 4 Archetypes' },
-  { key: 'pass3', label: 'Pass 3: RL execution & cross-asset fit', model: 'Claude Sonnet 5 · RL-DQN' },
-  { key: 'pass4', label: 'Pass 4: GNN + ML multi-factor scoring', model: 'Claude Sonnet 5 · GNN ensemble' },
-  { key: 'pass5', label: 'Pass 5: Adversarial risk veto', model: 'Claude Sonnet 5 · Risk Officer' },
+  { key: 'pass2', label: 'Pass 2: LLM panel assessment', model: 'Claude Sonnet · Prompted archetypes' },
+  { key: 'pass3', label: 'Pass 3: LLM portfolio-fit assessment', model: 'Claude Sonnet · Structured analysis' },
+  { key: 'pass4', label: 'Pass 4: Multi-factor composite scoring', model: 'Deterministic weighted formula' },
+  { key: 'pass5', label: 'Pass 5: LLM risk review', model: 'Claude Sonnet · Prompted review' },
 ];
 
 export default function AutonomousTrader() {
@@ -139,7 +138,7 @@ export default function AutonomousTrader() {
       const candidateMap = {};
       (p1.candidates || []).forEach((c) => { candidateMap[c.symbol.toUpperCase()] = c; });
 
-      // Pass 2: Investment Committee Debate (4-archetype consensus)
+      // Pass 2: prompted LLM panel assessment (four requested archetypes)
       setScanStageIndex(1);
       const committee = await runCommitteeDebate(p1.candidates || []);
       const debateMap = {};
@@ -494,7 +493,7 @@ export default function AutonomousTrader() {
         </div>
       )}
 
-      {/* Trade proposals with ML scores */}
+      {/* Trade proposals with multi-factor composite scores */}
       {!scanning && proposals.length > 0 && (
         <div className="space-y-4 mb-8">
           <AnimatePresence>
