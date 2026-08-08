@@ -6,6 +6,7 @@ export const SETTLEMENT_STAGES = [
   ['decision_projected', 'projectDecision'],
   ['intent_projected', 'projectIntent'],
   ['integrity_verified', 'verifyIntegrity'],
+  ['post_settlement_projected', 'projectPostSettlement'],
 ] as const;
 
 export const MAX_SETTLEMENT_ATTEMPTS = 8;

@@ -185,6 +185,11 @@
       "default": false,
       "description": "True if financial integrity verification passed after projection"
     },
+    "post_settlement_projected": {
+      "type": "boolean",
+      "default": false,
+      "description": "True after intent-owned post-settlement Holding metadata has been projected"
+    },
     "realized_pnl": {
       "type": "number",
       "description": "Realized P&L computed during settlement (sells only)"

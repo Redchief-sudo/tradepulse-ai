@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   MAX_SETTLEMENT_ATTEMPTS,
+  SETTLEMENT_STAGES,
   classifySettlementFailure,
   deriveOrderSettlementSummary,
   isSettlementProcessable,
@@ -16,7 +17,7 @@ function handlers(log: string[], failAt?: string) {
   };
   return Object.fromEntries([
     'projectLot', 'projectCash', 'projectHolding', 'projectTrade',
-    'projectDecision', 'projectIntent', 'verifyIntegrity',
+    'projectDecision', 'projectIntent', 'verifyIntegrity', 'projectPostSettlement',
   ].map((name) => [name, build(name)]));
 }
 
@@ -34,6 +35,30 @@ describe('SettlementEvent stage recovery', () => {
     expect(retryLog).not.toContain('projectLot');
     expect(retryLog[0]).toBe('projectCash');
     expect(stored.integrity_verified).toBe(true);
+  });
+
+  it('projects post-settlement metadata only after integrity verification', async () => {
+    const calls: string[] = [];
+    const handlers = Object.fromEntries(
+      SETTLEMENT_STAGES.map(([, handler]) => [handler, async () => { calls.push(handler); }])
+    );
+    await runSettlementStages({}, handlers, async () => {});
+
+    expect(calls.indexOf('projectPostSettlement')).toBeGreaterThan(calls.indexOf('verifyIntegrity'));
+    expect(calls.slice(-1)).toEqual(['projectPostSettlement']);
+  });
+
+  it('does not run post-settlement metadata when integrity verification fails', async () => {
+    const calls: string[] = [];
+    const handlers = Object.fromEntries(
+      SETTLEMENT_STAGES.map(([, handler]) => [handler, async () => {
+        calls.push(handler);
+        if (handler === 'verifyIntegrity') throw new Error('INTEGRITY_VIOLATION');
+      }])
+    );
+
+    await expect(runSettlementStages({}, handlers, async () => {})).rejects.toThrow('INTEGRITY_VIOLATION');
+    expect(calls).not.toContain('projectPostSettlement');
   });
 
   it('resumes after cash projection without repeating earlier stages', async () => {
@@ -55,7 +80,7 @@ describe('SettlementEvent stage recovery', () => {
   it('checks lease ownership before each incomplete stage', async () => {
     const guard = vi.fn();
     await runSettlementStages({}, handlers([]), vi.fn(), guard);
-    expect(guard).toHaveBeenCalledTimes(7);
+    expect(guard).toHaveBeenCalledTimes(SETTLEMENT_STAGES.length);
   });
 
   it('classifies transient failures as retryable with backoff', () => {
@@ -94,7 +119,7 @@ describe('SettlementEvent stage recovery', () => {
     await runSettlementStages({
       lot_projected: true, cash_projected: true, holding_projected: true,
       trade_projected: true, decision_projected: true, intent_projected: true,
-      integrity_verified: true,
+      integrity_verified: true, post_settlement_projected: true,
     }, handlers(log), vi.fn());
     expect(log).toEqual([]);
   });

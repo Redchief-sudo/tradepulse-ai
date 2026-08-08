@@ -384,6 +384,30 @@ async function verifyIntegrity(sr, userId, event) {
   return errors.length > 0 ? { ok: false, reason: errors.join('; ') } : { ok: true };
 }
 
+// Apply intent-owned holding metadata only after every financial projection and
+// integrity check has succeeded. This makes adaptive exit changes recoverable:
+// a failure leaves the event incomplete and the scheduled processor retries it.
+async function projectPostSettlementMetadata(sr, userId, event) {
+  if (event.side !== 'sell') return;
+  const intents = await sr.entities.TradeIntent.filter({
+    user_id: userId,
+    trade_intent_id: event.trade_intent_id,
+  });
+  const intent = intents[0];
+  if (!intent || intent.stop_loss == null || intent.target_price == null) return;
+
+  const holdings = await sr.entities.Holding.filter({ user_id: userId });
+  const holding = holdings.find((candidate) =>
+    String(candidate.symbol).toUpperCase() === String(event.symbol).toUpperCase()
+  );
+  if (!holding) return;
+
+  await sr.entities.Holding.update(holding.id, {
+    stop_loss: intent.stop_loss,
+    target_price: intent.target_price,
+  });
+}
+
 // Process a single settlement event — the core projection logic.
 async function processEvent(sr, userId, event, beforeStage) {
   const handlers = {
@@ -414,6 +438,7 @@ async function processEvent(sr, userId, event, beforeStage) {
       const integrity = await verifyIntegrity(sr, userId, state);
       if (!integrity.ok) throw new Error(`INTEGRITY_VIOLATION: ${integrity.reason}`);
     },
+    projectPostSettlement: async (state) => projectPostSettlementMetadata(sr, userId, state),
   };
   const finalState = await runSettlementStages(
     event,

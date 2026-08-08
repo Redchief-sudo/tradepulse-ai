@@ -113,6 +113,14 @@ export default async function(req) {
           ? `stop-loss @ $${h.stop_loss} (price $${live.toFixed(2)}, ${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(1)}%)`
           : `stop-loss @ -${dropPct.toFixed(1)}% (threshold ${stopThreshold}%)`;
 
+      // A partial exit's adaptive metadata is carried on the TradeIntent and
+      // projected only by the settlement processor after financial integrity
+      // verification. The stop-loss caller must not mutate the Holding based
+      // merely on an order/fill response.
+      const targetDistance = partialExit ? h.target_price - h.avg_price : null;
+      const postSettlementStop = partialExit ? h.avg_price : null;
+      const postSettlementTarget = partialExit ? h.target_price + targetDistance : null;
+
       // ASSET-CLASS-AWARE MARKET HOURS GATE — crypto trades 24/7, so only
       // stock positions are gated by the US regular session. Crypto positions
       // can be exited at any time. (Fixes Rev.10 defects #8 + #13: the old
@@ -138,20 +146,10 @@ export default async function(req) {
         idempotency_key: `${isTakeProfit ? 'tp' : 'sl'}-${h.portfolio_id || 'default'}-${h.id}-${h.symbol}-${new Date().toISOString().slice(0, 13)}`,
         signal_timestamp: new Date().toISOString(),
         finnhub_key: key,
+        stop_loss: postSettlementStop,
+        target_price: postSettlementTarget,
       });
-      // ADAPTIVE EXIT — after a partial take-profit, update the remaining
-      // holding: raise stop to breakeven, set a higher target for the rest.
       const rStatus = result?.status || result?.settlement?.status;
-      if (partialExit && (rStatus === 'filled' || rStatus === 'paper_filled')) {
-        const targetDistance = h.target_price - h.avg_price;
-        const newTarget = h.target_price + targetDistance;
-        try {
-          await sr.entities.Holding.update(h.id, {
-            stop_loss: h.avg_price,
-            target_price: newTarget,
-          });
-        } catch (e) { /* non-fatal — next cycle will retry */ }
-      }
       // Classify the result status — only confirmed fills are "sold".
       let status = 'submitted';
       if (rStatus === 'filled' || rStatus === 'paper_filled') status = 'filled';
