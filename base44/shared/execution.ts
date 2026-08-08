@@ -26,6 +26,7 @@ import { fetchQuote } from './marketDataAdapter.ts';
 import { isUsMarketOpen, usMarketSession } from './marketHours.ts';
 import { AlpacaError } from './alpacaErrors.ts';
 import { nowIso, genId } from './lotAccounting.ts';
+import { executionSessionDecision } from './sessionState.ts';
 
 const FILL_TIMEOUT_MS = 20000;
 const POLL_INTERVAL_MS = 1000;
@@ -201,6 +202,20 @@ export async function executeIntent(base44, user, input) {
     return { status: 'invalid', error: 'a reference price is required' };
   }
 
+  // Reload server-authoritative session state at the execution boundary. The
+  // caller's User snapshot may predate a settlement/reconciliation block.
+  let authoritativeUser;
+  try {
+    authoritativeUser = await sr.entities.User.get(userId);
+  } catch (error) {
+    return { status: 'rejected', error: `SESSION_STATE_UNAVAILABLE: ${error.message}`, symbol, side, requestedQty };
+  }
+  const sessionDecision = executionSessionDecision(authoritativeUser, side);
+  if (!sessionDecision.allowed) {
+    return { status: 'rejected', reasons: [sessionDecision.reason], symbol, side, requestedQty };
+  }
+  user = authoritativeUser;
+
   // Load broker credentials from the secure BrokerCredential entity.
   const brokerCred = await loadBrokerCredentials(sr, userId);
   const executionMode = resolveExecutionMode(user, input, brokerCred);
@@ -368,14 +383,15 @@ export async function executeIntent(base44, user, input) {
   // so position/sector caps are computed against the real capital base, not stale
   // holding cache drift.
   let accountEquity = null;
+  let brokerAccount = null;
   if (executionMode === 'live' || executionMode === 'broker_paper') {
     try {
-      const acct = await getAlpacaAccount({ apiKey: brokerCred.api_key, secretKey: brokerCred.api_secret, mode: brokerCred.mode });
-      if (!acct || Number(acct.equity) <= 0) {
+      brokerAccount = await getAlpacaAccount({ apiKey: brokerCred.api_key, secretKey: brokerCred.api_secret, mode: brokerCred.mode });
+      if (!brokerAccount || Number(brokerAccount.equity) <= 0) {
         await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: 'BROKER_ACCOUNT_INVALID: no equity' });
         return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: 'Broker account invalid', symbol, side, requestedQty };
       }
-      accountEquity = Number(acct.equity);
+      accountEquity = Number(brokerAccount.equity);
     } catch (e) {
       await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: `BROKER_UNREACHABLE: ${e.message}` });
       return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: `Broker unreachable: ${e.message}`, symbol, side, requestedQty };
@@ -389,10 +405,11 @@ export async function executeIntent(base44, user, input) {
   // (Fixes Rev.15 #9: scan and execution had inconsistent daily-loss definitions.)
   let brokerPrevCloseEquity = null;
   if (executionMode === 'live' || executionMode === 'broker_paper') {
-    try {
-      const acct = await getAlpacaAccount({ apiKey: brokerCred.api_key, secretKey: brokerCred.api_secret, mode: brokerCred.mode });
-      brokerPrevCloseEquity = Number(acct.last_equity) || null;
-    } catch (e) { /* non-fatal — fall back to app P&L */ }
+    brokerPrevCloseEquity = Number(brokerAccount?.last_equity) || null;
+    if (side === 'buy' && !brokerPrevCloseEquity) {
+      await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: 'BROKER_DAILY_LOSS_BASELINE_UNAVAILABLE' });
+      return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: 'BROKER_DAILY_LOSS_BASELINE_UNAVAILABLE', symbol, side, requestedQty };
+    }
   }
   const snapshot = await buildPortfolioSnapshot(sr, userId, accountEquity, brokerPrevCloseEquity);
   const limits = riskLimitsForProfile(user.trade_profile || 'balanced');
@@ -408,7 +425,10 @@ export async function executeIntent(base44, user, input) {
         maxDrawdownBreached = true;
         await audit(sr, userId, 'max_drawdown_breach', 'critical', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Max drawdown limit reached: ${ddCheck.drawdown_pct}% (limit ${ddCheck.limit}%, peak $${ddCheck.peak_equity.toFixed(0)})` });
       }
-    } catch (e) { /* non-fatal — drawdown check is best-effort */ }
+    } catch (e) {
+      await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: `DRAWDOWN_STATE_UNAVAILABLE: ${e.message}` });
+      return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: `DRAWDOWN_STATE_UNAVAILABLE: ${e.message}`, symbol, side, requestedQty };
+    }
   }
 
   // Internal paper / shadow mode have no real market data — skip spread and
@@ -452,6 +472,22 @@ export async function executeIntent(base44, user, input) {
     risk_snapshot: JSON.stringify({ reasons: risk.reasons, approvedQuantity: approvedQty, limits, snapshot: { totalEquity: snapshot.totalEquity, openPositions: snapshot.openPositions, tradesToday: snapshot.tradesToday, dailyPnlPct: snapshot.dailyPnlPct } }),
     portfolio_snapshot: JSON.stringify({ totalEquity: snapshot.totalEquity, openPositions: snapshot.openPositions, sectorMap: snapshot.sectorMap }),
   });
+
+  // External quote/account/risk calls may take long enough for an operator or
+  // reconciliation worker to stop trading. Revalidate immediately before the
+  // irreversible fill/submission boundary.
+  let preSubmissionUser;
+  try {
+    preSubmissionUser = await sr.entities.User.get(userId);
+  } catch (error) {
+    await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: `SESSION_STATE_UNAVAILABLE: ${error.message}` });
+    return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: `SESSION_STATE_UNAVAILABLE: ${error.message}`, symbol, side, requestedQty };
+  }
+  const preSubmissionDecision = executionSessionDecision(preSubmissionUser, side);
+  if (!preSubmissionDecision.allowed) {
+    await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: preSubmissionDecision.reason });
+    return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, reasons: [preSubmissionDecision.reason], symbol, side, requestedQty };
+  }
 
   // 3. Execution by environment.
   if (executionMode === 'internal_paper' || executionMode === 'shadow_live') {

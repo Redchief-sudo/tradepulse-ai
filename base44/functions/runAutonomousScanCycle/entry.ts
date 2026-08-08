@@ -11,8 +11,9 @@ import { sendTelegramMessage } from '../../shared/telegram.ts';
 import { isExecutable } from '../../shared/executableUniverse.ts';
 import { riskLimitsForProfile, checkMaxDrawdown } from '../../shared/riskEngine.ts';
 import { getPaperEquity } from '../../shared/cashLedger.ts';
-import { updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
+import { executionSessionDecision, updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
 import { nyDayStart } from '../../shared/marketHours.ts';
+import { hasNewerScanGeneration, nextScanGeneration } from '../../shared/scanState.ts';
 
 // Risk limits are defined in ONE place: riskEngine.ts. The scan cycle, execution
 // gateway, and risk engine all use riskLimitsForProfile() so they never disagree.
@@ -91,6 +92,7 @@ export default async function(req) {
     // every ScanRun was hardcoded as 'scheduled' even for manual/dashboard runs.)
     const body = await req.json().catch(() => ({}));
     const triggerSource = body.trigger_source || 'scheduled';
+    const requestIdentity = body.scan_request_id ? String(body.scan_request_id) : 'scheduled';
 
     // Run-level identifier — includes the 15-minute occurrence slot so scans
     // within the same hour get distinct IDs. (Fixes Rev.9 defect #2: four scans
@@ -99,7 +101,7 @@ export default async function(req) {
     // the same ID; the next slot gets a new one.
     const now = new Date();
     const minuteSlot = Math.floor(now.getUTCMinutes() / 15) * 15;
-    const runId = `scan-${now.getUTCFullYear()}${String(now.getUTCMonth()+1).padStart(2,'0')}${String(now.getUTCDate()).padStart(2,'0')}-${String(now.getUTCHours()).padStart(2,'0')}${String(minuteSlot).padStart(2,'0')}`;
+    const runId = `scan-${now.getUTCFullYear()}${String(now.getUTCMonth()+1).padStart(2,'0')}${String(now.getUTCDate()).padStart(2,'0')}-${String(now.getUTCHours()).padStart(2,'0')}${String(minuteSlot).padStart(2,'0')}-${requestIdentity}`;
 
     // SCAN LOCK — dedicated ScanLock entity with owner token. (Fixes Rev.12 #1:
     // the old filter+create on ScanRun was not truly atomic — two workers could
@@ -112,7 +114,7 @@ export default async function(req) {
     // 4) If another lock is older, we lost — delete ours and abort.
     // 5) Clean up stale expired locks from previous runs.
     lockOwnerToken = crypto.randomUUID();
-    const lockKey = `scan-${user.id}-${runId}`;
+    const lockKey = `scan-${user.id}`;
     const lockExpiry = new Date(Date.now() + 3 * 60 * 1000).toISOString(); // 3 min TTL
     await sr.entities.ScanLock.create({
       user_id: user.id,
@@ -148,11 +150,24 @@ export default async function(req) {
       catch (e) { try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'lock_cleanup_failed', severity: 'warning', message: `Failed to delete stale lock ${sl.id}: ${e.message}` }); } catch (ae) {} }
     }
 
+    // Persist a monotonically increasing generation. Any older running scan is
+    // superseded before this generation becomes authoritative.
+    const priorRuns = await sr.entities.ScanRun.filter({ user_id: user.id }, '-started_at', 200);
+    const scanGeneration = nextScanGeneration(priorRuns);
+    for (const prior of priorRuns.filter((candidate) => candidate.status === 'running')) {
+      await sr.entities.ScanRun.update(prior.id, {
+        status: 'superseded',
+        completed_at: new Date().toISOString(),
+        error: `SUPERSEDED_BY_GENERATION_${scanGeneration}`,
+      });
+    }
+
     // Persist an authoritative ScanRun record so the Dashboard can display
     // scan state from durable data rather than transient page state.
     const scanRun = await sr.entities.ScanRun.create({
       user_id: user.id,
       scan_run_id: runId,
+      scan_generation: scanGeneration,
       started_at: now.toISOString(),
       last_heartbeat_at: now.toISOString(),
       trigger_source: triggerSource,
@@ -255,6 +270,15 @@ export default async function(req) {
       if (scanRuns[0] && scanRuns[0].status !== 'running') {
         throw new Error('SCAN_SUPERSEDED: scan is no longer active — discarding stale results');
       }
+      const newerRuns = await sr.entities.ScanRun.filter({ user_id: user.id });
+      if (hasNewerScanGeneration(newerRuns, scanGeneration)) {
+        throw new Error('SCAN_GENERATION_STALE: a newer scan superseded this result');
+      }
+      const currentUser = await sr.entities.User.get(user.id);
+      const sessionDecision = executionSessionDecision(currentUser, 'buy');
+      if (!sessionDecision.allowed) {
+        throw new Error(`SCAN_SESSION_INVALID: ${sessionDecision.reason}`);
+      }
     };
 
     // USER-SCOPED: only this user's holdings
@@ -280,6 +304,9 @@ export default async function(req) {
     if (brokerCreds[0] && brokerCreds[0].broker === 'alpaca') {
       try {
         const acct = await getAlpacaAccount({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode });
+        await heartbeat();
+        await verifyOwnership();
+        assertScanHealthy();
         if (!acct || Number(acct.equity) <= 0) {
           await finishRun({ status: 'broker_unavailable', error: 'BROKER_ACCOUNT_UNAVAILABLE', market_regime: regime.market_regime, model_version: champion?.version || 'default' });
           return Response.json({ ok: false, error: 'BROKER_ACCOUNT_UNAVAILABLE: cannot size positions without real account equity' }, { status: 503 });
@@ -295,6 +322,9 @@ export default async function(req) {
         // Alpaca's clock endpoint as the authority for stock-market session.)
         try {
           const clock = await getAlpacaClock({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode });
+          await heartbeat();
+          await verifyOwnership();
+          assertScanHealthy();
           if (clock && !clock.is_open) {
             await updateSessionState(sr, user.id, SESSION_STATES.MARKET_CLOSED, 'Alpaca clock reports market closed');
           }
@@ -363,6 +393,9 @@ export default async function(req) {
     for (const c of candidates) {
       const ac = (c.asset_class || 'stocks').toLowerCase();
       const candles = await fetchMultiAssetCandles(c.symbol, ac, candleFrom, candleTo, key);
+      await heartbeat();
+      await verifyOwnership();
+      assertScanHealthy();
       const factors = candles ? computeRealFactors(candles) : null;
       enriched.push({ ...c, asset_class: ac, realFactors: factors, realPrice: factors?.price || c.current_price });
     }
@@ -767,6 +800,9 @@ export default async function(req) {
         signal_timestamp: new Date().toISOString(),
         finnhub_key: key,
       });
+      await heartbeat();
+      await verifyOwnership();
+      assertScanHealthy();
       const rStatus = result?.status || result?.settlement?.status;
       if (rStatus === 'rejected' || rStatus === 'failed' || rStatus === 'canceled') tradesRejected++;
       executed.push({ symbol: pr.symbol, action: pr.action, qty: shares, price, ml_score: pr.ml_score, settlement: result });

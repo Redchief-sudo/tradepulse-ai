@@ -7,14 +7,12 @@ import {
   TrendingDown,
   RefreshCw,
   PieChart as PieChartIcon,
-  Trash2,
   ArrowUpRight,
   ArrowDownRight,
   Loader2,
 } from 'lucide-react';
 import { AreaChart, Area, PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
 import StatCard from '@/components/StatCard';
-import AddPositionDialog from '@/components/AddPositionDialog';
 import SectorExposure from '@/components/SectorExposure';
 import ExitAlerts from '@/components/ExitAlerts';
 import RealDataPipeline from '@/components/RealDataPipeline';
@@ -152,16 +150,6 @@ export default function Dashboard() {
 
   const handleStart = () => setAnalyticsTrigger((n) => n + 1);
 
-  const addHolding = async (data) => {
-    await base44.entities.Holding.create(data);
-    await loadData();
-  };
-
-  const deleteHolding = async (id) => {
-    await base44.entities.Holding.delete(id);
-    await loadData();
-  };
-
   const handleExitPosition = async (holding) => {
     const exitPrice = holding.current_price || holding.avg_price;
     try {
@@ -246,7 +234,6 @@ export default function Dashboard() {
             {refreshing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
             Refresh Prices
           </Button>
-          <AddPositionDialog onAdd={addHolding} />
         </div>
       </div>
 
@@ -294,9 +281,8 @@ export default function Dashboard() {
           <Wallet className="w-12 h-12 mx-auto text-muted-foreground mb-4" />
           <h3 className="text-lg font-semibold mb-2">No positions yet</h3>
           <p className="text-muted-foreground text-sm mb-6 max-w-md mx-auto">
-            Add your first stock position or head to the AI Trader for personalized recommendations.
+            Positions appear only after an authoritative fill is processed through settlement.
           </p>
-          <AddPositionDialog onAdd={addHolding} />
         </motion.div>
       ) : (
         <>
@@ -400,7 +386,6 @@ export default function Dashboard() {
                     <th className="text-right font-medium p-4 hidden sm:table-cell">Day %</th>
                     <th className="text-right font-medium p-4">Value</th>
                     <th className="text-right font-medium p-4">P&L</th>
-                    <th className="p-4"></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -448,14 +433,6 @@ export default function Dashboard() {
                               {plPercent.toFixed(2)}%)
                             </span>
                           </span>
-                        </td>
-                        <td className="p-4">
-                          <button
-                            onClick={() => deleteHolding(h.id)}
-                            className="text-muted-foreground hover:text-red-500 transition-colors"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
                         </td>
                       </tr>
                     );

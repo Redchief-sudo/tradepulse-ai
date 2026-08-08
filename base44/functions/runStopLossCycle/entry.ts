@@ -143,12 +143,10 @@ export default async function(req) {
       // holding: raise stop to breakeven, set a higher target for the rest.
       const rStatus = result?.status || result?.settlement?.status;
       if (partialExit && (rStatus === 'filled' || rStatus === 'paper_filled')) {
-        const remainingShares = Math.round((h.shares - exitQty) * 1000) / 1000;
         const targetDistance = h.target_price - h.avg_price;
         const newTarget = h.target_price + targetDistance;
         try {
           await sr.entities.Holding.update(h.id, {
-            shares: remainingShares,
             stop_loss: h.avg_price,
             target_price: newTarget,
           });

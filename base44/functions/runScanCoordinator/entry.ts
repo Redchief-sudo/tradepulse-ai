@@ -59,6 +59,7 @@ export default async function(req) {
     try {
       const result = await base44.functions.invoke('runAutonomousScanCycle', {
         trigger_source: oldest.trigger_source,
+        scan_request_id: oldest.id,
       });
       const data = result?.data || result;
 
