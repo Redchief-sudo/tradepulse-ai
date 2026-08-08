@@ -12,12 +12,12 @@
         "summary": {
           "call": "invoke_backend_function",
           "with": {
-            "function_name": "sendDailySummary"
+            "function_name": "handleMarketClose"
           },
           "then": "end",
           "x-base44": {
-            "title": "Send daily P&L summary",
-            "description": "Email + Telegram summary of today's performance at market close"
+            "title": "Stop bot and send daily P&L summary",
+            "description": "Authoritative market-close stop followed by email and Telegram summary"
           }
         }
       }

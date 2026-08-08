@@ -150,8 +150,9 @@ export default async function(req) {
             best ? `Best: ${best.symbol} ${fmtPct(best.change)}` : '',
             worst ? `Worst: ${worst.symbol} ${fmtPct(worst.change)}` : '',
           ].filter(Boolean).join('\n');
-          await sendTelegramMessage(botToken, String(user.telegram_chat_id), tgLines);
-          telegramSent = true;
+          const telegramResult = await sendTelegramMessage(botToken, String(user.telegram_chat_id), tgLines);
+          telegramSent = telegramResult.ok;
+          if (!telegramResult.ok) throw new Error(telegramResult.error || 'Telegram API rejected daily summary');
         }
       } catch (e) {
         try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'notification_failed', severity: 'warning', entity_type: 'Trade', message: `Daily summary Telegram failed: ${e.message}` }); } catch (ae) {}

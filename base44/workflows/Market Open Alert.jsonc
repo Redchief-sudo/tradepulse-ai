@@ -1,6 +1,6 @@
 {
   "name": "Market Open Alert",
-  "description": "Sends a Telegram notification with portfolio summary at US market open (9:30 AM ET / 6:30 AM Pacific, weekdays).",
+  "description": "At 9:30 AM ET weekdays, verifies Alpaca's clock, starts the bot when safety gates allow, invokes the scan coordinator, and sends one Telegram status notification.",
   "definition": {
     "document": {
       "dsl": "1.0.0",
@@ -18,7 +18,7 @@
           "then": "end",
           "x-base44": {
             "title": "Send market open alert",
-            "description": "Telegram notification at 9:30 AM ET"
+            "description": "Verify Alpaca open, start bot, invoke scan, and notify Telegram"
           }
         }
       }
@@ -30,9 +30,9 @@
       "trigger_type": "scheduled",
       "events": [],
       "schedule_mode": "recurring",
-      "cron_expression": "30 6 * * 1-5",
+      "cron_expression": "30 9 * * 1-5",
       "one_time_date": null,
-      "timezone": "America/Los_Angeles",
+      "timezone": "America/New_York",
       "interval_value": null,
       "interval_unit": null,
       "interval_anchor": null,

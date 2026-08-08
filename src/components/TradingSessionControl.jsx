@@ -312,7 +312,7 @@ export default function TradingSessionControl({ onComplete, onStart }) {
                 </div>
               </div>
               <div>
-                <div className="text-xs text-muted-foreground">All-Time P&L</div>
+                <div className="text-xs text-muted-foreground">Open Unrealized P&L</div>
                 <div className={cn('text-lg font-bold', summary.totalPL >= 0 ? 'text-emerald-500' : 'text-red-500')}>
                   {summary.totalPL >= 0 ? '+' : ''}{formatCurrency(summary.totalPL)}
                 </div>
