@@ -32,6 +32,7 @@ export default function TradingSessionControl({ onComplete, onStart }) {
   const [integrityManualRequired, setIntegrityManualRequired] = useState(false);
   const [integrityRecoveredAt, setIntegrityRecoveredAt] = useState(null);
   const [integrityReason, setIntegrityReason] = useState(null);
+  const [actionError, setActionError] = useState(null);
   const trader = useStartTrader();
 
   const loadStatus = useCallback(async () => {
@@ -60,23 +61,17 @@ export default function TradingSessionControl({ onComplete, onStart }) {
 
   const handleStart = async () => {
     setSummary(null);
+    setActionError(null);
     try {
-      await base44.auth.updateMe({
-        trading_active: true,
-        trading_session_state: 'active',
-        kill_switch_reset_required: false,
-        kill_switch_reason: null,
-        kill_switch_at: null,
-      });
-      setActive(true);
-      setSessionState('active');
-      setKillSwitchResetRequired(false);
-      setKillSwitchReason(null);
+      const response = await base44.functions.invoke('manageTradingSession', { action: 'start' });
+      const data = response?.data || response;
+      if (!data?.ok) throw new Error(data?.error || 'Unable to start trading');
+      await loadStatus();
       if (onStart) onStart();
       // Run an immediate scan so the user doesn't wait for the next scheduled one
       trader.startTrader({ onComplete });
     } catch (e) {
-      console.error(e);
+      setActionError(e.message || 'Unable to start trading');
     }
   };
 
@@ -86,11 +81,14 @@ export default function TradingSessionControl({ onComplete, onStart }) {
     // Stop trading first — this is the critical action and must not be
     // blocked by a summary failure.
     try {
-      await base44.auth.updateMe({ trading_active: false, trading_session_state: 'manually_stopped' });
-      setActive(false);
-      setSessionState('manually_stopped');
+      const response = await base44.functions.invoke('manageTradingSession', { action: 'stop' });
+      const data = response?.data || response;
+      if (!data?.ok) throw new Error(data?.error || 'Unable to stop trading');
+      await loadStatus();
     } catch (e) {
-      console.error(e);
+      setActionError(e.message || 'Unable to stop trading');
+      setStopping(false);
+      return;
     }
     // Fetch summary separately so a summary failure doesn't undo the stop.
     // (Fixes Rev.9 defect #11: stop success + summary failure were combined
@@ -110,38 +108,26 @@ export default function TradingSessionControl({ onComplete, onStart }) {
   };
 
   const handleResetKillSwitch = async () => {
+    setActionError(null);
     try {
-      await base44.auth.updateMe({
-        kill_switch_reset_required: false,
-        kill_switch_reason: null,
-        kill_switch_at: null,
-        trading_session_state: 'disabled',
-        trading_active: false,
-      });
-      setKillSwitchResetRequired(false);
-      setKillSwitchReason(null);
-      setSessionState('disabled');
-      setActive(false);
+      const response = await base44.functions.invoke('manageTradingSession', { action: 'reset_kill_switch' });
+      const data = response?.data || response;
+      if (!data?.ok) throw new Error(data?.error || 'Unable to reset kill switch');
+      await loadStatus();
     } catch (e) {
-      console.error(e);
+      setActionError(e.message || 'Unable to reset kill switch');
     }
   };
 
   const handleAcknowledgeIntegrityRecovery = async () => {
+    setActionError(null);
     try {
-      await base44.auth.updateMe({
-        trading_active: false,
-        trading_session_state: 'disabled',
-        financial_integrity_manual_reenable_required: false,
-        financial_integrity_reason: null,
-        financial_integrity_recovered_at: null,
-      });
-      setIntegrityManualRequired(false);
-      setIntegrityRecoveredAt(null);
-      setIntegrityReason(null);
-      setSessionState('disabled');
+      const response = await base44.functions.invoke('manageTradingSession', { action: 'acknowledge_integrity_recovery' });
+      const data = response?.data || response;
+      if (!data?.ok) throw new Error(data?.error || 'Unable to acknowledge recovery');
+      await loadStatus();
     } catch (e) {
-      console.error(e);
+      setActionError(e.message || 'Unable to acknowledge recovery');
     }
   };
 
@@ -248,6 +234,11 @@ export default function TradingSessionControl({ onComplete, onStart }) {
       </motion.div>
 
       {/* Kill switch alert */}
+      {actionError && (
+        <div className="rounded-2xl border border-red-500/30 bg-red-500/10 p-4 mt-3">
+          <p className="text-xs text-red-500">{actionError}</p>
+        </div>
+      )}
       {killSwitchResetRequired && (
         <motion.div
           initial={{ opacity: 0, y: 10 }}

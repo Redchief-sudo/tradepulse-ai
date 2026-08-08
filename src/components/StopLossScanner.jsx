@@ -56,27 +56,19 @@ export default function StopLossScanner({ holdings, stopLossPct, onStopLossPctCh
     setHasScanned(false);
     try {
       // 1. Refresh live prices
-      const symbols = holdings.map((h) => h.symbol);
-      const result = await base44.functions.invoke('marketData', { symbols });
-      const quotes = (result.data?.quotes || []).filter((q) => !q.error);
+      const items = holdings.map((h) => ({ symbol: h.symbol, asset_class: h.asset_class || 'stocks' }));
+      const result = await base44.functions.invoke('getMultiAssetQuotes', { items });
+      const quotes = (result.data?.quotes || result.quotes || []).filter((q) => !q.error);
       const priceMap = {};
       quotes.forEach((q) => {
-        priceMap[q.symbol.toUpperCase()] = q.current_price;
+        priceMap[q.symbol.toUpperCase()] = q.price;
       });
-
-      // Update stored prices
-      const updates = holdings
-        .filter((h) => priceMap[h.symbol])
-        .map((h) => ({ id: h.id, current_price: priceMap[h.symbol] }));
-      if (updates.length) {
-        await base44.entities.Holding.bulkUpdate(updates);
-      }
 
       // 2. Check stop-loss with live prices and auto-execute
       const executed = [];
       const stillAtRisk = [];
       for (const h of holdings) {
-        const livePrice = priceMap[h.symbol] || h.current_price || h.avg_price;
+        const livePrice = priceMap[String(h.symbol).toUpperCase()] || h.current_price || h.avg_price;
         const dropPct =
           h.avg_price > 0 ? ((h.avg_price - livePrice) / h.avg_price) * 100 : 0;
         if (dropPct >= localPct) {

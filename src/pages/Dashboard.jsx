@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { base44 } from '@/api/base44Client';
 import { motion } from 'framer-motion';
 import {
@@ -11,7 +11,7 @@ import {
   ArrowDownRight,
   Loader2,
 } from 'lucide-react';
-import { AreaChart, Area, PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
+import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
 import StatCard from '@/components/StatCard';
 import SectorExposure from '@/components/SectorExposure';
 import ExitAlerts from '@/components/ExitAlerts';
@@ -44,6 +44,7 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [analyticsTrigger, setAnalyticsTrigger] = useState(0);
+  const [dataError, setDataError] = useState(null);
 
   const loadData = useCallback(async () => {
     try {
@@ -53,8 +54,9 @@ export default function Dashboard() {
       ]);
       setHoldings(h || []);
       setTrades(t || []);
+      setDataError(null);
     } catch (e) {
-      console.error(e);
+      setDataError(e.message || 'Unable to load portfolio data');
     }
     setLoading(false);
   }, []);
@@ -87,33 +89,26 @@ export default function Dashboard() {
         setRefreshing(false);
         return;
       }
-      const symbols = fresh.map((h) => h.symbol);
-      const result = await base44.functions.invoke('marketData', { symbols });
-      const quotes = (result.data?.quotes || []).filter((q) => !q.error);
-      const stockData = quotes.reduce((acc, q) => {
+      const items = fresh.map((h) => ({ symbol: h.symbol, asset_class: h.asset_class || 'stocks' }));
+      const result = await base44.functions.invoke('getMultiAssetQuotes', { items });
+      const quotes = (result.data?.quotes || result.quotes || []).filter((q) => !q.error);
+      const quoteMap = quotes.reduce((acc, q) => {
         acc[q.symbol.toUpperCase()] = q;
         return acc;
       }, {});
-      const updates = fresh
-        .filter((h) => stockData[h.symbol])
-        .map((h) => ({
-          id: h.id,
-          current_price: stockData[h.symbol].current_price,
-          day_change_percent: stockData[h.symbol].day_change_percent,
-        }));
-      if (updates.length > 0) {
-        await base44.entities.Holding.bulkUpdate(updates);
-      }
-      await loadData();
+      setHoldings(fresh.map((holding) => {
+        const quote = quoteMap[String(holding.symbol).toUpperCase()];
+        return quote ? { ...holding, current_price: quote.price, day_change_percent: quote.day_change_percent } : holding;
+      }));
+      setDataError(null);
     } catch (e) {
-      console.error(e);
+      setDataError(e.message || 'Unable to refresh prices');
     }
     if (!silent) setRefreshing(false);
   }, []);
 
-  // Auto-refresh prices every 60s (silent — no spinner flash). Quotes are
-  // fetched and holdings are bulk-updated; the real-time subscription below
-  // patches local state instantly from the update events.
+  // Auto-refresh display prices every 60s (silent — no spinner flash). The
+  // browser never persists Holding projections; settlement remains the writer.
   useEffect(() => {
     const priceTimer = setInterval(() => { refreshPrices(true); }, 60000);
     return () => clearInterval(priceTimer);
@@ -159,53 +154,38 @@ export default function Dashboard() {
         qty: holding.shares,
         price: exitPrice,
         company_name: holding.company_name,
-        ai_recommended: true,
+        asset_class: holding.asset_class || 'stocks',
+        portfolio_id: holding.portfolio_id || null,
+        ai_recommended: false,
         source: 'dashboard_exit',
         notes: 'Manual exit from Dashboard',
+        idempotency_key: `dashboard-exit-${holding.id}-${holding.shares}`,
+        signal_timestamp: new Date().toISOString(),
       });
       await loadData();
     } catch (e) {
-      console.error('Exit failed:', e);
+      setDataError(e.message || 'Exit request failed');
     }
   };
 
-  const totalValue = holdings.reduce(
+  const openPositionValue = holdings.reduce(
     (sum, h) => sum + h.shares * (h.current_price || h.avg_price),
     0
   );
-  const totalInvested = holdings.reduce((sum, h) => sum + h.shares * h.avg_price, 0);
-  const totalPL = totalValue - totalInvested;
-  const totalPLPercent = totalInvested > 0 ? (totalPL / totalInvested) * 100 : 0;
-  const dayPL = holdings.reduce(
-    (sum, h) =>
-      sum + h.shares * (h.current_price || h.avg_price) * ((h.day_change_percent || 0) / 100),
-    0
-  );
+  const openCostBasis = holdings.reduce((sum, h) => sum + h.shares * h.avg_price, 0);
+  const unrealizedPL = openPositionValue - openCostBasis;
+  const unrealizedPLPercent = openCostBasis > 0 ? (unrealizedPL / openCostBasis) * 100 : 0;
+  const openPositionsDayMove = holdings.reduce((sum, h) => {
+    const current = h.current_price || h.avg_price;
+    const pct = Number(h.day_change_percent) || 0;
+    const previousClose = pct > -100 ? current / (1 + pct / 100) : current;
+    return sum + h.shares * (current - previousClose);
+  }, 0);
 
   const pieData = holdings.map((h) => ({
     name: h.symbol,
     value: h.shares * (h.current_price || h.avg_price),
   }));
-
-  const perfData = useMemo(() => {
-    if (holdings.length === 0) return [];
-    const points = 30;
-    const data = [];
-    const startValue = totalInvested;
-    const endValue = totalValue;
-    for (let i = 0; i < points; i++) {
-      const progress = i / (points - 1);
-      const baseValue = startValue + (endValue - startValue) * progress;
-      const noise =
-        (Math.sin(i * 1.3) + Math.cos(i * 0.7)) * (Math.abs(endValue - startValue) * 0.04 + startValue * 0.01);
-      data.push({
-        day: `Day ${i + 1}`,
-        value: Math.max(0, baseValue + noise),
-      });
-    }
-    data[points - 1].value = endValue;
-    return data;
-  }, [holdings, totalInvested, totalValue]);
 
   if (loading) {
     return (
@@ -237,19 +217,25 @@ export default function Dashboard() {
         </div>
       </div>
 
+      {dataError && (
+        <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-3 mb-6 text-sm text-red-500">
+          {dataError}
+        </div>
+      )}
+
       <TradingSessionControl onComplete={handleCycleComplete} onStart={handleStart} />
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4 mb-8">
-        <StatCard label="Portfolio Value" value={formatCurrency(totalValue)} icon={Wallet} accent />
-        <StatCard label="Total Invested" value={formatCurrency(totalInvested)} icon={TrendingUp} />
+        <StatCard label="Open Position Value" value={formatCurrency(openPositionValue)} icon={Wallet} accent />
+        <StatCard label="Open Cost Basis" value={formatCurrency(openCostBasis)} icon={TrendingUp} />
         <StatCard
-          label="Total P&L"
-          value={formatCurrency(totalPL)}
-          change={totalPLPercent}
-          changeLabel="all time"
-          icon={totalPL >= 0 ? TrendingUp : TrendingDown}
+          label="Unrealized P&L"
+          value={formatCurrency(unrealizedPL)}
+          change={unrealizedPLPercent}
+          changeLabel="open positions"
+          icon={unrealizedPL >= 0 ? TrendingUp : TrendingDown}
         />
-        <StatCard label="Today's Change" value={formatCurrency(dayPL)} icon={TrendingUp} />
+        <StatCard label="Open Positions Day Move" value={formatCurrency(openPositionsDayMove)} icon={TrendingUp} />
       </div>
 
       <AssetClassBreakdown holdings={holdings} />
@@ -290,47 +276,7 @@ export default function Dashboard() {
             <motion.div
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
-              className="lg:col-span-2 rounded-2xl border border-border bg-card p-5"
-            >
-              <h3 className="font-semibold mb-1 flex items-center gap-2">
-                <TrendingUp className="w-4 h-4 text-primary" />
-                Portfolio Performance
-              </h3>
-              <p className="text-xs text-muted-foreground mb-3">
-                Projected trend (interpolated from cost basis to current value) —
-                not actual historical equity. Daily snapshots are not yet recorded.
-              </p>
-              <ResponsiveContainer width="100%" height={250}>
-                <AreaChart data={perfData}>
-                  <defs>
-                    <linearGradient id="colorValue" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="#10b981" stopOpacity={0.3} />
-                      <stop offset="100%" stopColor="#10b981" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <Area
-                    type="monotone"
-                    dataKey="value"
-                    stroke="#10b981"
-                    strokeWidth={2}
-                    fill="url(#colorValue)"
-                  />
-                  <Tooltip
-                    contentStyle={{
-                      background: '#131826',
-                      border: '1px solid #232b3d',
-                      borderRadius: '8px',
-                    }}
-                    formatter={(v) => [formatCurrency(v), 'Value']}
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
-            </motion.div>
-
-            <motion.div
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="rounded-2xl border border-border bg-card p-5"
+              className="rounded-2xl border border-border bg-card p-5 lg:col-span-1"
             >
               <h3 className="font-semibold mb-4 flex items-center gap-2">
                 <PieChartIcon className="w-4 h-4 text-accent" />

@@ -3,7 +3,7 @@ import { secrets } from 'base44:runtime';
 import { fetchQuotes } from '../../shared/marketDataAdapter.ts';
 
 // Multi-asset quote endpoint. Accepts a list of { symbol, asset_class } and
-// returns live prices routed by asset class (stocks → Finnhub, crypto → Binance).
+// returns live prices routed by asset class (stocks → Finnhub, crypto → Coinbase).
 // Used by the frontend to price any holding regardless of asset class.
 export default async function (req) {
   try {

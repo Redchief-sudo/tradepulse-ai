@@ -69,6 +69,7 @@ export default function RealPnlChart() {
         sharpe,
         maxDD: maxDD * 100,
         count: sorted.length,
+        initialEquity: sorted[0].equity,
       },
     };
   }, [records]);
@@ -96,7 +97,7 @@ export default function RealPnlChart() {
           <Activity className="w-4 h-4 text-emerald-400" />
           <h3 className="font-semibold text-sm">Real P&L Performance</h3>
           <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
-            LIVE · Binance BTC/USDT · {stats.count} days
+            Persisted daily equity · {stats.count} records
           </span>
         </div>
         <Button size="sm" variant="ghost" onClick={load} disabled={loading} className="h-7 gap-1.5">
@@ -151,7 +152,7 @@ export default function RealPnlChart() {
             axisLine={false}
             tickLine={false}
           />
-          <ReferenceLine y={10000} stroke="#475569" strokeDasharray="3 3" />
+          <ReferenceLine y={stats.initialEquity} stroke="#475569" strokeDasharray="3 3" />
           <Tooltip
             contentStyle={{ background: '#131826', border: '1px solid #232b3d', borderRadius: '8px' }}
             labelStyle={{ color: '#94a3b8' }}
@@ -170,8 +171,8 @@ export default function RealPnlChart() {
       </ResponsiveContainer>
 
       <p className="text-[10px] text-muted-foreground mt-2">
-        Inception {stats.inception} → {stats.end} · $10,000 start · real daily returns from Binance
-        BTC/USDT candles · Sharpe & max-drawdown computed from the live return series.
+        Inception {stats.inception} → {stats.end} · starting equity {fmtCurrency(stats.initialEquity)} ·
+        metrics computed only from persisted daily P&amp;L records.
       </p>
     </motion.div>
   );
