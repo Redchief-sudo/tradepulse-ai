@@ -117,10 +117,11 @@
         "pending",
         "claimed",
         "projected",
+        "current_fills_settled",
         "settled"
       ],
       "default": "pending",
-      "description": "Durable settlement state machine \u2014 only one worker may transition pending \u2192 claimed. Enables crash recovery and prevents double-settlement."
+      "description": "Fill projection state, separate from order status. current_fills_settled means every known fill is projected while the broker order may remain open."
     },
     "settlement_owner": {
       "type": "string",

@@ -45,12 +45,20 @@ export async function updateSessionState(sr, userId, newState, reason = null) {
   if (newState === SESSION_STATES.DISABLED || newState === SESSION_STATES.MANUALLY_STOPPED || newState === SESSION_STATES.FINANCIAL_INTEGRITY_BLOCKED) {
     patch.trading_active = false;
   }
+  if (newState === SESSION_STATES.FINANCIAL_INTEGRITY_BLOCKED) {
+    patch.financial_integrity_reason = reason;
+    patch.financial_integrity_recovered_at = null;
+    patch.financial_integrity_manual_reenable_required = true;
+  }
   if (newState === SESSION_STATES.ACTIVE) {
     // Resetting the kill switch when manually re-activating
     patch.kill_switch_reset_required = false;
     patch.kill_switch_reason = null;
     patch.kill_switch_at = null;
     patch.trading_active = true;
+    patch.financial_integrity_reason = null;
+    patch.financial_integrity_recovered_at = null;
+    patch.financial_integrity_manual_reenable_required = false;
   }
   // FAIL-CLOSED: throw on persistence failure. The caller must handle the
   // error — for risk_stopped, a failed update means the kill switch may not

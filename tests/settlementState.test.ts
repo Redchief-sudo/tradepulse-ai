@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   MAX_SETTLEMENT_ATTEMPTS,
   classifySettlementFailure,
+  deriveOrderSettlementSummary,
   isSettlementProcessable,
   runSettlementStages,
   selectLeaseWinner,
@@ -49,6 +50,12 @@ describe('SettlementEvent stage recovery', () => {
     const checkpoint = vi.fn();
     await expect(runSettlementStages({}, handlers([], 'projectLot'), checkpoint)).rejects.toThrow();
     expect(checkpoint).not.toHaveBeenCalled();
+  });
+
+  it('checks lease ownership before each incomplete stage', async () => {
+    const guard = vi.fn();
+    await runSettlementStages({}, handlers([]), vi.fn(), guard);
+    expect(guard).toHaveBeenCalledTimes(7);
   });
 
   it('classifies transient failures as retryable with backoff', () => {
@@ -104,5 +111,37 @@ describe('SettlementEvent stage recovery', () => {
       { id: 'worker-a', acquired_at: '2026-01-01T00:00:00.000Z' },
     ]);
     expect(tieWinner.id).toBe('worker-a');
+  });
+
+  it('keeps a nonterminal partially-filled order distinct from settled fills', () => {
+    const summary = deriveOrderSettlementSummary(
+      { requested_quantity: 10, status: 'partially_filled' },
+      [{ filled_quantity: 4, timestamp: '2026-01-01T00:00:02Z' }]
+    );
+    expect(summary.orderStatus).toBe('partially_filled');
+    expect(summary.settlementState).toBe('current_fills_settled');
+  });
+
+  it('derives terminal status and chronology from intent and Fill timestamps', () => {
+    const summary = deriveOrderSettlementSummary(
+      { requested_quantity: 10, status: 'filled', broker_terminal_status: 'filled' },
+      [
+        { filled_quantity: 6, timestamp: '2026-01-01T00:00:05Z' },
+        { filled_quantity: 4, timestamp: '2026-01-01T00:00:01Z' },
+      ]
+    );
+    expect(summary.orderStatus).toBe('filled');
+    expect(summary.settlementState).toBe('settled');
+    expect(summary.firstFillAt).toBe('2026-01-01T00:00:01Z');
+    expect(summary.lastFillAt).toBe('2026-01-01T00:00:05Z');
+  });
+
+  it('does not declare settlement terminal from quantity alone', () => {
+    const summary = deriveOrderSettlementSummary(
+      { requested_quantity: 10, status: 'partially_filled' },
+      [{ filled_quantity: 10, timestamp: '2026-01-01T00:00:01Z' }]
+    );
+    expect(summary.orderStatus).toBe('partially_filled');
+    expect(summary.settlementState).toBe('current_fills_settled');
   });
 });

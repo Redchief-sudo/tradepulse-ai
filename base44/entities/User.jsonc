@@ -112,7 +112,8 @@
         "system_degraded",
         "broker_unavailable",
         "market_closed",
-        "manually_stopped"
+        "manually_stopped",
+        "financial_integrity_blocked"
       ],
       "default": "disabled",
       "description": "Hard session state machine \u2014 the authoritative trading state. Not just active/inactive: includes risk_stopped (kill switch tripped), system_degraded (scan/data failure), broker_unavailable, market_closed, manually_stopped."
@@ -130,6 +131,19 @@
       "type": "boolean",
       "default": false,
       "description": "If true, the user must manually reset before trading can resume \u2014 prevents auto-re-enable on the same day"
+    },
+    "financial_integrity_reason": {
+      "type": "string",
+      "description": "Settlement or reconciliation failure requiring manual acknowledgement before trading resumes"
+    },
+    "financial_integrity_recovered_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When all retryable settlement events became complete; session remains blocked until manual acknowledgement"
+    },
+    "financial_integrity_manual_reenable_required": {
+      "type": "boolean",
+      "default": false
     }
   },
   "required": [

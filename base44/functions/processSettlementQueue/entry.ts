@@ -24,7 +24,7 @@ import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { recordBuySettlement, recordSellSettlement, getCashBalance } from '../../shared/cashLedger.ts';
 import { updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
 import { nowIso, genId, parseClosureFills } from '../../shared/lotAccounting.ts';
-import { classifySettlementFailure, isSettlementProcessable, runSettlementStages, selectLeaseWinner } from '../../shared/settlementState.ts';
+import { classifySettlementFailure, deriveOrderSettlementSummary, isSettlementProcessable, runSettlementStages, selectLeaseWinner } from '../../shared/settlementState.ts';
 
 const STALE_LEASE_MS = 5 * 60 * 1000; // 5 minutes
 const PROCESSOR_LEASE_MS = 10 * 60 * 1000;
@@ -56,6 +56,12 @@ async function renewProcessorLease(sr, lock) {
     heartbeat_at: heartbeatAt,
     expires_at: new Date(Date.now() + PROCESSOR_LEASE_MS).toISOString(),
   });
+}
+
+async function ownsProcessorLease(sr, userId, lock) {
+  const locks = await sr.entities.ScanLock.filter({ user_id: userId, lock_key: lock.lock_key });
+  const activeLocks = locks.filter((candidate) => new Date(candidate.expires_at).getTime() > Date.now());
+  return selectLeaseWinner(activeLocks)?.owner_token === lock.owner_token;
 }
 
 // Audit helper
@@ -211,9 +217,12 @@ async function createOrUpdateTrade(sr, userId, event, realizedPnl) {
 
   const existingTrades = await sr.entities.Trade.filter({ user_id: userId, client_order_id: event.client_order_id });
   const fills = await sr.entities.Fill.filter({ user_id: userId, client_order_id: event.client_order_id });
+  const intents = await sr.entities.TradeIntent.filter({ user_id: userId, trade_intent_id: event.trade_intent_id });
+  const intent = intents[0] || {};
   const cumulativeQty = fills.reduce((s, f) => s + (f.filled_quantity || 0), 0);
   const totalNotional = fills.reduce((s, f) => s + (f.filled_quantity || 0) * (f.filled_price || 0), 0);
   const avgPrice = cumulativeQty > 0 ? totalNotional / cumulativeQty : event.price;
+  const summary = deriveOrderSettlementSummary(intent, fills);
 
   if (existingTrades.length > 0) {
     await sr.entities.Trade.update(existingTrades[0].id, {
@@ -223,7 +232,9 @@ async function createOrUpdateTrade(sr, userId, event, realizedPnl) {
       filled_qty: cumulativeQty,
       filled_avg_price: avgPrice,
       fill_count: fills.length,
-      last_fill_at: nowIso(),
+      order_status: summary.orderStatus,
+      first_fill_at: summary.firstFillAt,
+      last_fill_at: summary.lastFillAt,
       realized_pnl: event.side === 'sell' ? realizedPnl : existingTrades[0].realized_pnl,
     });
     return existingTrades[0].id;
@@ -243,14 +254,14 @@ async function createOrUpdateTrade(sr, userId, event, realizedPnl) {
     client_order_id: event.client_order_id,
     filled_qty: cumulativeQty,
     filled_avg_price: avgPrice,
-    order_status: 'filled',
+    order_status: summary.orderStatus,
     commission: event.commission || 0,
     source: event.strategy_id,
     realized_pnl: event.side === 'sell' ? realizedPnl : null,
     record_type: 'order_summary',
     fill_count: fills.length,
-    first_fill_at: event.occurred_at,
-    last_fill_at: nowIso(),
+    first_fill_at: summary.firstFillAt,
+    last_fill_at: summary.lastFillAt,
   });
   return trade.id;
 }
@@ -298,11 +309,12 @@ async function updateTradeIntent(sr, userId, event, realizedPnl) {
   const cumulativeQty = fills.reduce((s, f) => s + (f.filled_quantity || 0), 0);
   const totalNotional = fills.reduce((s, f) => s + (f.filled_quantity || 0) * (f.filled_price || 0), 0);
   const avgPrice = cumulativeQty > 0 ? totalNotional / cumulativeQty : 0;
+  const summary = deriveOrderSettlementSummary(intent, fills);
 
   const patch = {
     filled_quantity: cumulativeQty,
     filled_avg_price: avgPrice,
-    settlement_state: 'settled',
+    settlement_state: summary.settlementState,
     settlement_version: (intent.settlement_version || 0) + 1,
   };
 
@@ -373,7 +385,7 @@ async function verifyIntegrity(sr, userId, event) {
 }
 
 // Process a single settlement event — the core projection logic.
-async function processEvent(sr, userId, event) {
+async function processEvent(sr, userId, event, beforeStage) {
   const handlers = {
     projectLot: async (state) => {
       const realizedPnl = state.side === 'buy' ? null : await closeLotsFifo(sr, userId, state);
@@ -406,7 +418,8 @@ async function processEvent(sr, userId, event) {
   const finalState = await runSettlementStages(
     event,
     handlers,
-    (patch) => sr.entities.SettlementEvent.update(event.id, patch)
+    (patch) => sr.entities.SettlementEvent.update(event.id, patch),
+    beforeStage
   );
 
   await sr.entities.SettlementEvent.update(event.id, {
@@ -437,6 +450,23 @@ export default async function(req) {
     return Response.json({ ok: true, processed: 0, skipped: 'processor_already_running' });
   }
 
+  // Keep the processor lease alive independently of event duration. A failed
+  // heartbeat prevents the worker from claiming another event; ownership is
+  // also verified at stage boundaries before further projection.
+  let heartbeatFailure = null;
+  let heartbeatInFlight = false;
+  const heartbeatTimer = setInterval(async () => {
+    if (heartbeatInFlight || heartbeatFailure) return;
+    heartbeatInFlight = true;
+    try {
+      await renewProcessorLease(sr, processorLease);
+    } catch (error) {
+      heartbeatFailure = error;
+    } finally {
+      heartbeatInFlight = false;
+    }
+  }, 60_000);
+
   try {
     // Find pending, due retryable failures, or stale processing events.
     const allEvents = await sr.entities.SettlementEvent.filter({ user_id: userId });
@@ -445,15 +475,26 @@ export default async function(req) {
       .sort((a, b) => new Date(a.occurred_at) - new Date(b.occurred_at));
 
     const results = [];
+    let settlementFailureSeen = false;
     for (const event of processable) {
+      if (heartbeatFailure) throw new Error(`SETTLEMENT_LEASE_HEARTBEAT_FAILED: ${heartbeatFailure.message}`);
       await renewProcessorLease(sr, processorLease);
+      if (!await ownsProcessorLease(sr, userId, processorLease)) {
+        throw new Error('SETTLEMENT_LEASE_OWNERSHIP_LOST');
+      }
       const claimResult = await claimEvent(sr, userId, event, workerId);
       if (!claimResult.claimed) continue;
 
       try {
-        const result = await processEvent(sr, userId, claimResult.event);
+        const result = await processEvent(sr, userId, claimResult.event, async () => {
+          if (heartbeatFailure) throw new Error(`SETTLEMENT_LEASE_HEARTBEAT_FAILED: ${heartbeatFailure.message}`);
+          if (!await ownsProcessorLease(sr, userId, processorLease)) {
+            throw new Error('SETTLEMENT_LEASE_OWNERSHIP_LOST');
+          }
+        });
         results.push({ event_id: event.event_id, status: 'completed', ...result });
       } catch (error) {
+        settlementFailureSeen = true;
         const failure = classifySettlementFailure(claimResult.event, error);
         await sr.entities.SettlementEvent.update(claimResult.event.id, failure);
         results.push({ event_id: event.event_id, status: failure.status, error: error.message });
@@ -477,8 +518,23 @@ export default async function(req) {
       }
     }
 
+    const refreshedEvents = await sr.entities.SettlementEvent.filter({ user_id: userId });
+    const unresolved = refreshedEvents.filter((event) => event.status !== 'completed');
+    const recoveringBlockedSession = user.trading_session_state === SESSION_STATES.FINANCIAL_INTEGRITY_BLOCKED || settlementFailureSeen;
+    if (recoveringBlockedSession && results.some((result) => result.status === 'completed') && unresolved.length === 0) {
+      await sr.entities.User.update(userId, {
+        financial_integrity_recovered_at: nowIso(),
+        financial_integrity_manual_reenable_required: true,
+        trading_active: false,
+      });
+      await audit(sr, userId, 'settlement_recovered_manual_reenable_required', 'warning', {
+        message: 'All settlement events are complete and integrity verified; manual trading re-enable is required',
+      });
+    }
+
     return Response.json({ ok: true, processed: results.length, results });
   } finally {
+    clearInterval(heartbeatTimer);
     await sr.entities.ScanLock.delete(processorLease.id).catch(() => {});
   }
 }

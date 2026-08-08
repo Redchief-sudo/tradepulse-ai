@@ -1,5 +1,5 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
-import { getAlpacaOrder } from '../../shared/alpaca.ts';
+import { getAlpacaActivities, getAlpacaOrder } from '../../shared/alpaca.ts';
 import { recordFill } from '../../shared/execution.ts';
 import { nowIso } from '../../shared/lotAccounting.ts';
 
@@ -33,10 +33,6 @@ export default async function(req) {
       nonterminalStatuses.includes(i.status) && i.broker_order_id && i.execution_mode !== 'internal_paper'
     );
 
-    if (pending.length === 0) {
-      return Response.json({ ok: true, message: 'No pending orders to reconcile', checked: 0 });
-    }
-
     // Load broker credentials
     const creds = await sr.entities.BrokerCredential.filter({ user_id: user.id, status: 'active' });
     if (!creds[0]) {
@@ -47,6 +43,130 @@ export default async function(req) {
 
     const results = [];
     const staleOrders = [];
+
+    // === EXTERNAL BROKER ACTIVITY INGESTION ===
+    // Manual Alpaca transactions have no pre-existing TradeIntent. Preserve
+    // their broker identity in an explicit broker_external intent, then route
+    // the authoritative activity through the same Fill -> SettlementEvent
+    // boundary as application-originated orders. Never infer missing fields.
+    let activities = [];
+    try {
+      activities = await getAlpacaActivities({
+        ...brokerCreds,
+        sinceDate: new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10),
+      });
+    } catch (error) {
+      await sr.entities.AuditEvent.create({
+        user_id: user.id,
+        event_type: 'broker_activity_ingestion_failed',
+        severity: 'error',
+        entity_type: 'Fill',
+        message: `Broker activity ingestion failed: ${error.message}`,
+        details: JSON.stringify({ error: error.message }),
+      });
+      results.push({ status: 'external_activity_error', error: error.message });
+    }
+    for (const activity of activities) {
+      const activityId = activity.id || activity.activity_id;
+      const symbol = String(activity.symbol || '').toUpperCase();
+      const side = String(activity.side || '').toLowerCase();
+      const quantity = Number(activity.qty);
+      const price = Number(activity.price);
+      const occurredAt = activity.transaction_time || activity.date;
+      if (!activityId || !symbol || !['buy', 'sell'].includes(side) || quantity <= 0 || price <= 0 || !occurredAt) {
+        await sr.entities.AuditEvent.create({
+          user_id: user.id,
+          event_type: 'broker_activity_rejected',
+          severity: 'warning',
+          entity_type: 'Fill',
+          entity_id: activityId || null,
+          message: 'Broker activity missing stable identity or required execution fields',
+          details: JSON.stringify({ activity_id: activityId || null, symbol, side, quantity, price, occurred_at: occurredAt || null }),
+        });
+        continue;
+      }
+
+      const fillId = `alpaca-activity:${activityId}`;
+      const existingFills = await sr.entities.Fill.filter({ user_id: user.id, fill_id: fillId });
+      if (existingFills.length > 0) continue;
+
+      // Activities already associated with an application intent are ingested
+      // by the order loop below and must not be reclassified as external.
+      const mappedIntent = allIntents.find((intent) =>
+        (activity.order_id && intent.broker_order_id === activity.order_id) ||
+        (activity.order_client_id && intent.client_order_id === activity.order_client_id)
+      );
+      if (mappedIntent) continue;
+
+      const tradeIntentId = `broker-external:${activityId}`;
+      const clientOrderId = activity.order_client_id || `broker-external-${activityId}`;
+      const existingExternalIntents = await sr.entities.TradeIntent.filter({ user_id: user.id, trade_intent_id: tradeIntentId });
+      const externalIntent = existingExternalIntents[0] || await sr.entities.TradeIntent.create({
+        user_id: user.id,
+        trade_intent_id: tradeIntentId,
+        idempotency_key: tradeIntentId,
+        strategy_id: 'broker_external',
+        symbol,
+        side,
+        requested_quantity: quantity,
+        execution_mode: cred.mode === 'live' ? 'live' : 'broker_paper',
+        status: 'filled',
+        settlement_state: 'pending',
+        broker: 'alpaca',
+        broker_order_id: activity.order_id || null,
+        client_order_id: clientOrderId,
+        filled_quantity: quantity,
+        filled_avg_price: price,
+        broker_terminal_status: 'filled',
+        unfilled_quantity: 0,
+        company_name: symbol,
+        asset_class: 'stocks',
+      });
+      const executionMode = externalIntent.execution_mode;
+      const inserted = await recordFill(sr, {
+        user_id: user.id,
+        fill_id: fillId,
+        broker_order_id: activity.order_id || null,
+        client_order_id: clientOrderId,
+        trade_intent_id: tradeIntentId,
+        symbol,
+        asset_id: symbol,
+        side,
+        filled_quantity: quantity,
+        filled_price: price,
+        notional: quantity * price,
+        commission: 0,
+        fees: 0,
+        timestamp: new Date(occurredAt).toISOString(),
+        venue: cred.mode === 'live' ? 'alpaca' : 'alpaca_paper',
+        strategy_id: 'broker_external',
+        execution_mode: executionMode,
+        asset_class: 'stocks',
+      });
+      if (inserted) {
+        await sr.entities.SettlementEvent.create({
+          user_id: user.id,
+          event_id: fillId,
+          trade_intent_id: tradeIntentId,
+          broker_order_id: activity.order_id || null,
+          broker_fill_id: String(activityId),
+          client_order_id: clientOrderId,
+          symbol,
+          side,
+          quantity,
+          price,
+          notional: quantity * price,
+          occurred_at: new Date(occurredAt).toISOString(),
+          status: 'pending',
+          execution_mode: executionMode,
+          asset_class: 'stocks',
+          company_name: symbol,
+          strategy_id: 'broker_external',
+          venue: cred.mode === 'live' ? 'alpaca' : 'alpaca_paper',
+        });
+        results.push({ intent_id: tradeIntentId, symbol, status: 'external_activity_ingested', fill_id: fillId });
+      }
+    }
 
     // === STALE CLAIM RECOVERY ===
     // Find intents stuck in 'claimed' state with stale claims (> 5 min).

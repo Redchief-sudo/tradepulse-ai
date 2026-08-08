@@ -29,6 +29,9 @@ export default function TradingSessionControl({ onComplete, onStart }) {
   const [sessionState, setSessionState] = useState('disabled');
   const [killSwitchResetRequired, setKillSwitchResetRequired] = useState(false);
   const [killSwitchReason, setKillSwitchReason] = useState(null);
+  const [integrityManualRequired, setIntegrityManualRequired] = useState(false);
+  const [integrityRecoveredAt, setIntegrityRecoveredAt] = useState(null);
+  const [integrityReason, setIntegrityReason] = useState(null);
   const trader = useStartTrader();
 
   const loadStatus = useCallback(async () => {
@@ -38,6 +41,9 @@ export default function TradingSessionControl({ onComplete, onStart }) {
       setSessionState(me.trading_session_state || 'disabled');
       setKillSwitchResetRequired(!!me.kill_switch_reset_required);
       setKillSwitchReason(me.kill_switch_reason || null);
+      setIntegrityManualRequired(!!me.financial_integrity_manual_reenable_required);
+      setIntegrityRecoveredAt(me.financial_integrity_recovered_at || null);
+      setIntegrityReason(me.financial_integrity_reason || null);
       setLoadError(false);
     } catch (e) {
       // Show an error state instead of silently defaulting to inactive.
@@ -121,6 +127,24 @@ export default function TradingSessionControl({ onComplete, onStart }) {
     }
   };
 
+  const handleAcknowledgeIntegrityRecovery = async () => {
+    try {
+      await base44.auth.updateMe({
+        trading_active: false,
+        trading_session_state: 'disabled',
+        financial_integrity_manual_reenable_required: false,
+        financial_integrity_reason: null,
+        financial_integrity_recovered_at: null,
+      });
+      setIntegrityManualRequired(false);
+      setIntegrityRecoveredAt(null);
+      setIntegrityReason(null);
+      setSessionState('disabled');
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
   if (loading) return null;
 
   return (
@@ -147,6 +171,10 @@ export default function TradingSessionControl({ onComplete, onStart }) {
                   ? 'Unable to determine trading state'
                   : killSwitchResetRequired
                     ? 'Kill Switch Active — Trading Stopped'
+                    : integrityManualRequired
+                      ? integrityRecoveredAt
+                        ? 'Settlement Recovered — Manual Re-enable Required'
+                        : 'Financial Integrity Block — Trading Stopped'
                     : sessionState === 'risk_stopped'
                       ? 'Risk Stopped — Manual Reset Required'
                       : sessionState === 'broker_unavailable'
@@ -164,6 +192,10 @@ export default function TradingSessionControl({ onComplete, onStart }) {
                   ? 'Check your connection and reload the page'
                   : killSwitchReason
                     ? `Reason: ${killSwitchReason}`
+                    : integrityManualRequired
+                      ? integrityRecoveredAt
+                        ? 'All settlement events passed integrity verification. Acknowledge recovery before restarting.'
+                        : `Settlement recovery is incomplete. ${integrityReason || 'Review settlement and reconciliation events.'}`
                     : active
                       ? trader.isRunning
                         ? 'AI is actively scanning and executing trades'
@@ -182,10 +214,19 @@ export default function TradingSessionControl({ onComplete, onStart }) {
                 Reset Kill Switch
               </Button>
             )}
+            {integrityManualRequired && integrityRecoveredAt && (
+              <Button
+                onClick={handleAcknowledgeIntegrityRecovery}
+                variant="outline"
+                className="gap-2 border-amber-500/50 text-amber-500 hover:bg-amber-500/10"
+              >
+                Acknowledge Recovery
+              </Button>
+            )}
             {!active ? (
               <Button
                 onClick={handleStart}
-                disabled={trader.isRunning || killSwitchResetRequired}
+                disabled={trader.isRunning || killSwitchResetRequired || integrityManualRequired}
                 className="gap-2 bg-gradient-to-r from-primary to-accent"
               >
                 {trader.isRunning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
