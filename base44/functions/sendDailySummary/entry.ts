@@ -2,6 +2,8 @@ import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { secrets } from 'base44:runtime';
 import { sendTelegramMessage } from '../../shared/telegram.ts';
 import { getAlpacaAccount } from '../../shared/alpaca.ts';
+import { nySessionDateStr } from '../../shared/marketHours.ts';
+import { calculatePositionDayPnl } from '../../shared/dailyPerformance.ts';
 
 // Sends a daily P&L summary via email + Telegram.
 // Called when the user presses "Stop" or automatically at market close (4 PM ET).
@@ -28,7 +30,7 @@ export default async function(req) {
     const costBasis = holdings.reduce((s, h) => s + h.shares * h.avg_price, 0);
     const totalPL = portfolioValue - costBasis;
     const totalPLPct = costBasis > 0 ? (totalPL / costBasis) * 100 : 0;
-    const dayPL = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price) * ((h.day_change_percent || 0) / 100), 0);
+    const dayPL = calculatePositionDayPnl(holdings);
     const prevValue = portfolioValue - dayPL;
     const dayPLPct = prevValue > 0 ? (dayPL / prevValue) * 100 : 0;
 
@@ -49,10 +51,9 @@ export default async function(req) {
     }
 
     // Today's activity
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-    const todayTrades = trades.filter((t) => new Date(t.created_date) >= todayStart);
-    const todayScans = scanRuns.filter((s) => new Date(s.started_at) >= todayStart);
+    const sessionDate = nySessionDateStr();
+    const todayTrades = trades.filter((t) => nySessionDateStr(new Date(t.created_date)) === sessionDate);
+    const todayScans = scanRuns.filter((s) => nySessionDateStr(new Date(s.started_at)) === sessionDate);
 
     // Best / worst performers today
     const performers = holdings
@@ -70,7 +71,9 @@ export default async function(req) {
     const appRealizedPL = todayTrades
       .filter((t) => t.action === 'sell')
       .reduce((s, t) => s + (t.realized_pnl || 0), 0);
-    const reconciliationDiff = (brokerEquity != null) ? brokerEquity - portfolioValue : null;
+    // Holdings value excludes cash, so it cannot be truthfully compared with
+    // total broker equity as a reconciliation difference.
+    const reconciliationDiff = null;
 
     const summary = {
       portfolioValue,
@@ -123,7 +126,9 @@ export default async function(req) {
     try {
       await sr.integrations.Core.SendEmail({
         to: user.email,
-        subject: `TradePulse Daily Summary: ${dayPL >= 0 ? '+' : ''}${fmt(dayPL)} (${fmtPct(dayPLPct)})`,
+        subject: brokerDayPL != null
+          ? `TradePulse Daily Summary: ${brokerDayPL >= 0 ? '+' : ''}${fmt(brokerDayPL)} (broker)`
+          : `TradePulse Daily Summary: ${dayPL >= 0 ? '+' : ''}${fmt(dayPL)} (${fmtPct(dayPLPct)}) (estimate)`,
         body: emailLines,
       });
       emailSent = true;

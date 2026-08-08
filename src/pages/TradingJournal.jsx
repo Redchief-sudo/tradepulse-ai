@@ -38,7 +38,7 @@ export default function TradingJournal() {
       setError(null);
       const result = await base44.functions.invoke('generateDailyTradingReport', {
         date: date || new Date().toISOString().slice(0, 10),
-        final: true,
+        final: false,
       });
       const data = result?.data || result;
       if (!data || data.ok === false || data.error) {
@@ -92,7 +92,7 @@ export default function TradingJournal() {
           className="gap-2"
         >
           {generating ? <RefreshCw className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-          {generating ? 'Generating...' : "Generate Today's Report"}
+          {generating ? 'Generating...' : "Generate Today's Snapshot"}
         </Button>
       </div>
 
@@ -118,7 +118,7 @@ export default function TradingJournal() {
             <div className="p-6 rounded-xl border border-border bg-card text-center">
               <p className="text-sm text-muted-foreground">No sessions yet.</p>
               <p className="text-xs text-muted-foreground mt-1">
-                Click "Generate Today's Report" to create the first entry.
+                Click "Generate Today's Snapshot" to create the first entry.
               </p>
             </div>
           ) : (

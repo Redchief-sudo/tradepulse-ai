@@ -143,6 +143,24 @@
       "type": "string",
       "description": "Summary of reconciliation state (clean / N blocked positions)"
     },
+    "broker_data_status": {
+      "type": "string",
+      "enum": ["available", "unavailable", "not_applicable"],
+      "description": "Availability of broker-authoritative account evidence"
+    },
+    "cash_data_status": {
+      "type": "string",
+      "enum": ["available", "unavailable", "not_applicable"],
+      "description": "Availability of the internal-paper cash ledger"
+    },
+    "unresolved_settlements": {
+      "type": "number",
+      "description": "SettlementEvents for this session that were not completed when finalized"
+    },
+    "malformed_lot_allocations": {
+      "type": "number",
+      "description": "PositionLots excluded because closure allocation evidence was malformed"
+    },
     "model_version": {
       "type": "string",
       "description": "Champion model version used during the session"
@@ -188,26 +206,8 @@
         }
       ]
     },
-    "create": {},
-    "update": {
-      "$or": [
-        {
-          "created_by_id": "{{user.id}}"
-        },
-        {
-          "data.user_id": "{{user.id}}"
-        }
-      ]
-    },
-    "delete": {
-      "$or": [
-        {
-          "created_by_id": "{{user.id}}"
-        },
-        {
-          "data.user_id": "{{user.id}}"
-        }
-      ]
-    }
+    "create": false,
+    "update": false,
+    "delete": false
   }
 }

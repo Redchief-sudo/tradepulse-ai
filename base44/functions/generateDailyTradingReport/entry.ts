@@ -2,6 +2,7 @@ import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { getAlpacaAccount } from '../../shared/alpaca.ts';
 import { getCashBalance } from '../../shared/cashLedger.ts';
 import { nySessionDateStr } from '../../shared/marketHours.ts';
+import { calculateDailyReturn, indexClosedLotsByFillId } from '../../shared/dailyPerformance.ts';
 
 // Generates a comprehensive daily trading report — one TradingSession record
 // per trading day that ties together trades, fills, scan runs, audit events,
@@ -60,7 +61,7 @@ export default async function(req) {
     const isExistingOpen = existingSessions.length > 0 && existingSessions[0].status === 'open';
 
     // Fetch all user-scoped data
-    const [trades, intents, scanRuns, auditEvents, aiDecisions, fills, holdings, positionLots] = await Promise.all([
+    const [trades, intents, scanRuns, auditEvents, aiDecisions, fills, holdings, positionLots, settlementEvents, reconciliationEvents] = await Promise.all([
       sr.entities.Trade.filter({ user_id: user.id }),
       sr.entities.TradeIntent.filter({ user_id: user.id }),
       sr.entities.ScanRun.filter({ user_id: user.id }),
@@ -69,6 +70,8 @@ export default async function(req) {
       sr.entities.Fill.filter({ user_id: user.id }),
       sr.entities.Holding.filter({ user_id: user.id }),
       sr.entities.PositionLot.filter({ user_id: user.id }),
+      sr.entities.SettlementEvent.filter({ user_id: user.id }),
+      sr.entities.ReconciliationEvent.filter({ user_id: user.id }),
     ]);
 
     // Filter to the NY session day (Fixes Rev.13 #26)
@@ -78,18 +81,24 @@ export default async function(req) {
     const dayAudit = auditEvents.filter((a) => inNySessionDay(a.created_date, reportDate));
     const dayDecisions = aiDecisions.filter((a) => inNySessionDay(a.created_date, reportDate));
     const dayFills = fills.filter((f) => inNySessionDay(f.timestamp || f.created_date, reportDate));
+    const daySettlements = settlementEvents.filter((e) => inNySessionDay(e.occurred_at || e.created_date, reportDate));
+    const dayReconciliation = reconciliationEvents.filter((e) => inNySessionDay(e.run_timestamp || e.created_date, reportDate));
+    if (isFinal && !dayAudit.some((e) => e.event_type === 'market_open_bot_started')) {
+      return Response.json({ ok: true, skipped: true, reason: 'No broker-authorized market-open marker for session date' });
+    }
 
     // --- Equity calculations ---
-    const appEquity = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
+    const appPositionValue = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
     const costBasis = holdings.reduce((s, h) => s + h.shares * h.avg_price, 0);
-    const unrealizedPnl = appEquity - costBasis;
+    const unrealizedPnl = appPositionValue - costBasis;
 
     let brokerEquity = null;
     let brokerPrevCloseEquity = null;
     let buyingPower = null;
-    let brokerDataStatus = 'available';
+    let brokerDataStatus = 'not_applicable';
     const brokerCreds = await sr.entities.BrokerCredential.filter({ user_id: user.id, status: 'active' });
     if (brokerCreds[0] && brokerCreds[0].broker === 'alpaca') {
+      brokerDataStatus = 'available';
       try {
         const acct = await getAlpacaAccount({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode });
         brokerEquity = Number(acct.equity);
@@ -106,15 +115,21 @@ export default async function(req) {
     // (Fixes Rev.13 #28: cash balance loading failure was silently swallowed,
     // proceeding with null cash and making equity look authoritative.)
     let cashBalance = null;
-    let cashDataStatus = 'available';
+    let cashDataStatus = brokerCreds[0] ? 'not_applicable' : 'available';
     if (!brokerCreds[0]) {
       try { cashBalance = await getCashBalance(sr, user.id); }
       catch (e) { cashDataStatus = 'unavailable'; }
     }
 
-    const startingEquity = brokerPrevCloseEquity || brokerEquity || appEquity;
-    const endingEquity = brokerEquity || (appEquity + (cashBalance || 0));
-    const dailyReturnPct = startingEquity > 0 ? ((endingEquity - startingEquity) / startingEquity) * 100 : 0;
+    const appEquity = cashBalance == null ? null : appPositionValue + cashBalance;
+    const priorClosedSessions = (await sr.entities.TradingSession.filter({ user_id: user.id }))
+      .filter((s) => s.status === 'closed' && s.session_date < reportDate && s.ending_equity != null && Number.isFinite(Number(s.ending_equity)))
+      .sort((a, b) => String(b.session_date).localeCompare(String(a.session_date)));
+    const startingEquity = brokerCreds[0]
+      ? (Number.isFinite(brokerPrevCloseEquity) ? brokerPrevCloseEquity : null)
+      : (priorClosedSessions.length > 0 ? Number(priorClosedSessions[0].ending_equity) : null);
+    const endingEquity = brokerCreds[0] ? brokerEquity : appEquity;
+    const dailyReturnPct = calculateDailyReturn(startingEquity, endingEquity);
 
     // --- Realized P&L from sell trades ---
     const sellTrades = dayTrades.filter((t) => t.action === 'sell');
@@ -125,7 +140,7 @@ export default async function(req) {
     const feesTotal = dayFills.reduce((s, f) => s + (f.fees || 0), 0);
 
     // --- Win/loss metrics ---
-    const closedTrades = sellTrades.filter((t) => (t.realized_pnl || 0) !== 0);
+    const closedTrades = sellTrades;
     const winners = closedTrades.filter((t) => (t.realized_pnl || 0) > 0);
     const losers = closedTrades.filter((t) => (t.realized_pnl || 0) < 0);
     const winRatePct = closedTrades.length > 0 ? (winners.length / closedTrades.length) * 100 : 0;
@@ -150,9 +165,25 @@ export default async function(req) {
 
     // --- Reconciliation status ---
     const blockedHoldings = holdings.filter((h) => h.reconciliation_blocked);
-    const reconciliationStatus = blockedHoldings.length === 0
-      ? 'clean'
-      : `${blockedHoldings.length} blocked position(s): ${blockedHoldings.map((h) => h.symbol).join(', ')}`;
+    const unresolvedSettlements = daySettlements.filter((e) => e.status !== 'completed');
+    const latestReconciliationBySymbol = {};
+    for (const event of dayReconciliation) {
+      const prior = latestReconciliationBySymbol[event.symbol];
+      if (!prior || new Date(event.run_timestamp || event.created_date) > new Date(prior.run_timestamp || prior.created_date)) {
+        latestReconciliationBySymbol[event.symbol] = event;
+      }
+    }
+    const driftEvents = Object.values(latestReconciliationBySymbol).filter((e) => e.event_type !== 'matched');
+    const hasReconciliationEvidence = brokerCreds[0]
+      ? dayReconciliation.length > 0 || (holdings.length === 0 && dayIntents.length === 0)
+      : daySettlements.length > 0 || dayIntents.length === 0;
+    const reconciliationStatus = blockedHoldings.length > 0
+      ? `${blockedHoldings.length} blocked position(s): ${blockedHoldings.map((h) => h.symbol).join(', ')}`
+      : unresolvedSettlements.length > 0
+        ? `${unresolvedSettlements.length} unresolved settlement(s)`
+        : driftEvents.length > 0
+          ? `${driftEvents.length} reconciliation drift event(s)`
+          : hasReconciliationEvidence ? 'clean' : 'not_verified';
 
     // --- Sector exposure ---
     const sectorMap = {};
@@ -171,9 +202,10 @@ export default async function(req) {
     const latestScan = dayScans.sort((a, b) => new Date(b.started_at) - new Date(a.started_at))[0];
 
     // --- Max drawdown (from PnlRecord if available, else from equity delta) ---
-    let maxDrawdownPct = 0;
+    let maxDrawdownPct = null;
     const pnlRecords = await sr.entities.PnlRecord.filter({ user_id: user.id, date: reportDate });
     if (pnlRecords.length > 1) {
+      maxDrawdownPct = 0;
       const sorted = pnlRecords.sort((a, b) => new Date(a.timestamp || a.created_date) - new Date(b.timestamp || b.created_date));
       let peak = sorted[0].equity || 0;
       for (const r of sorted) {
@@ -190,8 +222,7 @@ export default async function(req) {
     const sortedDayTrades = [...dayTrades].sort((a, b) => new Date(a.created_date) - new Date(b.created_date));
     let runningPnl = 0;
 
-    // Build a map of TradeIntents by client_order_id for decision_id lookup.
-    // (Fixes Rev.13 #24: AI decision attribution was symbol-only.)
+    // Build TradeIntent maps for canonical trade_intent_id attribution.
     const intentByClientId = {};
     intents.forEach((i) => { if (i.client_order_id) intentByClientId[i.client_order_id] = i; });
     const intentByBrokerOrderId = {};
@@ -199,16 +230,17 @@ export default async function(req) {
 
     // Build a map of closed lots by closure_fill_id for lot-based attribution.
     // (Fixes Rev.13 #23, #25.)
-    const closedLotsByFillId = {};
-    positionLots.forEach((lot) => {
-      if (lot.status === 'closed' || lot.status === 'partially_closed') {
-        const closureIds = JSON.parse(lot.closure_fill_ids || '[]');
-        closureIds.forEach((fid) => {
-          if (!closedLotsByFillId[fid]) closedLotsByFillId[fid] = [];
-          closedLotsByFillId[fid].push(lot);
-        });
-      }
-    });
+    const { index: closedLotsByFillId, malformedLotIds } = indexClosedLotsByFillId(positionLots);
+    for (const lotId of malformedLotIds) {
+      await sr.entities.AuditEvent.create({
+        user_id: user.id,
+        event_type: 'daily_report_integrity_degraded',
+        severity: 'warning',
+        entity_type: 'PositionLot',
+        entity_id: lotId,
+        message: 'Daily report excluded malformed PositionLot closure allocation evidence',
+      });
+    }
 
     const tradeLog = sortedDayTrades.map((t) => {
       const pnl = t.realized_pnl || 0;
@@ -294,18 +326,11 @@ export default async function(req) {
       // (Fixes Rev.15 #12: the fallback concealed fill-level execution detail.)
 
       // Fallback entry price for buys: use the fill price
-      if (entryPrice == null) {
-        entryPrice = t.action === 'buy' ? (t.filled_avg_price || t.price) : (t.filled_avg_price || t.price);
-      }
+      if (entryPrice == null && t.action === 'buy') entryPrice = t.filled_avg_price || t.price || null;
 
-      // AI DECISION ATTRIBUTION BY ID — match via the TradeIntent's decision_id.
-      // (Fixes Rev.14 #22: removed the symbol+day fallback — it could attach
-      // the wrong decision when multiple decisions exist for one symbol.
-      // Missing exact decision linkage now returns null, not a guess.)
+      // AI decisions are projections keyed by canonical trade_intent_id.
       let aiDecision = null;
-      if (matchedIntent?.decision_id) {
-        aiDecision = aiDecisions.find((d) => d.id === matchedIntent.decision_id);
-      }
+      if (matchedIntent?.trade_intent_id) aiDecision = aiDecisions.find((d) => d.trade_intent_id === matchedIntent.trade_intent_id);
 
       // Execution latency from fills
       const tradeFills = fills.filter((f) => f.broker_order_id === t.broker_order_id || f.client_order_id === t.client_order_id);
@@ -329,34 +354,40 @@ export default async function(req) {
         execution_latency_ms: avgLatency,
         commission: t.commission || 0,
         broker_order_id: t.broker_order_id,
-        decision_id: matchedIntent?.decision_id || null,
+        decision_id: aiDecision?.id || matchedIntent?.decision_id || null,
         ai_confidence: aiDecision?.confidence || null,
         ml_score: aiDecision?.ml_score || null,
         risk_score: aiDecision?.risk_score || null,
-        market_regime: latestScan?.market_regime || null,
+        market_regime: matchedIntent?.regime || aiDecision?.regime || null,
         model_version: latestScan?.model_version || null,
         reconciliation_status: t.order_status === 'reconciled_external' ? 'reconciled' : 'direct',
       };
     });
 
     // --- Assemble session data ---
+    const reportDegraded = brokerDataStatus === 'unavailable'
+      || cashDataStatus === 'unavailable'
+      || reconciliationStatus !== 'clean'
+      || tradesPending > 0
+      || malformedLotIds.length > 0;
+    const canFinalize = isFinal && !reportDegraded;
     const sessionData = {
       session_id: sessionId,
       session_date: reportDate,
-      status: isFinal ? 'closed' : 'open',
+      status: canFinalize ? 'closed' : 'open',
       starting_equity: startingEquity,
       ending_equity: endingEquity,
       broker_equity: brokerEquity,
       broker_prev_close_equity: brokerPrevCloseEquity,
       app_equity: appEquity,
-      daily_return_pct: Math.round(dailyReturnPct * 100) / 100,
+      daily_return_pct: dailyReturnPct == null ? null : Math.round(dailyReturnPct * 100) / 100,
       realized_pnl: Math.round(realizedPnl * 100) / 100,
       unrealized_pnl: Math.round(unrealizedPnl * 100) / 100,
       fees_total: Math.round(feesTotal * 100) / 100,
       commissions_total: Math.round(commissionsTotal * 100) / 100,
       buying_power: buyingPower,
       cash_balance: cashBalance,
-      max_drawdown_pct: Math.round(maxDrawdownPct * 100) / 100,
+      max_drawdown_pct: maxDrawdownPct == null ? null : Math.round(maxDrawdownPct * 100) / 100,
       num_scans: dayScans.length,
       num_ai_decisions: dayDecisions.length,
       trades_submitted: tradesSubmitted,
@@ -375,6 +406,10 @@ export default async function(req) {
       num_risk_events: riskEvents.length,
       num_kill_switch_events: killSwitchEvents.length,
       reconciliation_status: reconciliationStatus,
+      broker_data_status: brokerDataStatus,
+      cash_data_status: cashDataStatus,
+      unresolved_settlements: unresolvedSettlements.length,
+      malformed_lot_allocations: malformedLotIds.length,
       model_version: latestScan?.model_version || null,
       market_regime: latestScan?.market_regime || null,
       sector_exposure: JSON.stringify(sectorExposure),
@@ -398,7 +433,7 @@ export default async function(req) {
     }
 
     return Response.json({
-      ok: true,
+      ok: !isFinal || canFinalize,
       session,
       trades: tradeLog,
       scan_runs: dayScans.map((s) => ({
@@ -422,7 +457,9 @@ export default async function(req) {
       report_quality: {
         broker_data_status: brokerDataStatus,
         cash_data_status: cashDataStatus,
-        degraded: brokerDataStatus === 'unavailable' || cashDataStatus === 'unavailable',
+        degraded: reportDegraded,
+        finalized: canFinalize,
+        finalization_blocked: isFinal && !canFinalize,
       },
       // Partial fill breakdown (Fixes Rev.13 #22)
       trade_breakdown: {
@@ -432,7 +469,7 @@ export default async function(req) {
         rejected: tradesRejected,
         canceled: tradesCanceled,
       },
-    });
+    }, { status: isFinal && !canFinalize ? 409 : 200 });
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });
   }

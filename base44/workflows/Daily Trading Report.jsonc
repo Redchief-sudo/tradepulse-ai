@@ -1,5 +1,5 @@
 {
-  "description": "At US market close (4:05 PM ET weekdays): generates a comprehensive daily trading journal \u2014 aggregates all trades, fills, scan runs, audit events, and AI decisions into an immutable TradingSession record for institutional-grade auditing.",
+  "description": "After the reconciliation window (6:05 PM ET weekdays): generates the final immutable daily trading journal.",
   "definition": {
     "document": {
       "dsl": "1.0.0",
@@ -12,7 +12,10 @@
         "report": {
           "call": "invoke_backend_function",
           "with": {
-            "function_name": "generateDailyTradingReport"
+            "function_name": "generateDailyTradingReport",
+            "args": {
+              "final": true
+            }
           },
           "then": "end",
           "x-base44": {
@@ -30,7 +33,7 @@
       "trigger_type": "scheduled",
       "events": [],
       "schedule_mode": "recurring",
-      "cron_expression": "5 16 * * 1-5",
+      "cron_expression": "5 18 * * 1-5",
       "one_time_date": null,
       "timezone": "America/New_York",
       "interval_value": null,

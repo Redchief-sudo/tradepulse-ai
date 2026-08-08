@@ -52,10 +52,10 @@ export default function TradingSessionDetail({ session, trades, scanRuns, auditE
         </div>
         <div className={cn(
           'flex items-center gap-2 px-4 py-2 rounded-xl',
-          (session.daily_return_pct || 0) >= 0 ? 'bg-primary/10 text-primary' : 'bg-destructive/10 text-destructive'
+          session.daily_return_pct == null ? 'bg-muted text-muted-foreground' : session.daily_return_pct >= 0 ? 'bg-primary/10 text-primary' : 'bg-destructive/10 text-destructive'
         )}>
-          {(session.daily_return_pct || 0) >= 0 ? <TrendingUp className="w-5 h-5" /> : <TrendingDown className="w-5 h-5" />}
-          <span className="text-2xl font-bold">{fmtPct(session.daily_return_pct || 0)}</span>
+          {session.daily_return_pct != null && (session.daily_return_pct >= 0 ? <TrendingUp className="w-5 h-5" /> : <TrendingDown className="w-5 h-5" />)}
+          <span className="text-2xl font-bold">{session.daily_return_pct == null ? 'Unavailable' : fmtPct(session.daily_return_pct)}</span>
         </div>
       </div>
 
@@ -75,7 +75,7 @@ export default function TradingSessionDetail({ session, trades, scanRuns, auditE
           <MetricRow label="Unrealized P&L" value={fmt(session.unrealized_pnl)} tone={(session.unrealized_pnl || 0) >= 0 ? 'positive' : 'negative'} />
           <MetricRow label="Commissions" value={fmt(session.commissions_total)} tone="negative" />
           <MetricRow label="Fees" value={fmt(session.fees_total)} tone="negative" />
-          <MetricRow label="Max Drawdown" value={`${(session.max_drawdown_pct || 0).toFixed(2)}%`} tone="negative" />
+          <MetricRow label="Max Drawdown" value={session.max_drawdown_pct == null ? 'Unavailable' : `${session.max_drawdown_pct.toFixed(2)}%`} tone={session.max_drawdown_pct == null ? undefined : 'negative'} />
         </div>
       </div>
 

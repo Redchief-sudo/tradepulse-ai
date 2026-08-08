@@ -3,8 +3,8 @@ import { TrendingUp, TrendingDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 export default function TradingSessionCard({ session, isSelected, onClick }) {
-  const dailyReturn = session.daily_return_pct || 0;
-  const isPositive = dailyReturn >= 0;
+  const dailyReturn = session.daily_return_pct;
+  const isPositive = dailyReturn != null && dailyReturn >= 0;
   const winRate = session.win_rate_pct || 0;
 
   return (
@@ -28,10 +28,10 @@ export default function TradingSessionCard({ session, isSelected, onClick }) {
         </div>
         <div className={cn(
           'flex items-center gap-1 px-2.5 py-1 rounded-lg text-sm font-bold',
-          isPositive ? 'bg-primary/10 text-primary' : 'bg-destructive/10 text-destructive'
+          dailyReturn == null ? 'bg-muted text-muted-foreground' : isPositive ? 'bg-primary/10 text-primary' : 'bg-destructive/10 text-destructive'
         )}>
-          {isPositive ? <TrendingUp className="w-3.5 h-3.5" /> : <TrendingDown className="w-3.5 h-3.5" />}
-          {isPositive ? '+' : ''}{dailyReturn.toFixed(2)}%
+          {dailyReturn != null && (isPositive ? <TrendingUp className="w-3.5 h-3.5" /> : <TrendingDown className="w-3.5 h-3.5" />)}
+          {dailyReturn == null ? 'Unavailable' : `${isPositive ? '+' : ''}${dailyReturn.toFixed(2)}%`}
         </div>
       </div>
 
