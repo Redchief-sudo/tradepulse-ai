@@ -211,7 +211,7 @@ export async function executeIntent(base44, user, input) {
   } catch (error) {
     return { status: 'rejected', error: `SESSION_STATE_UNAVAILABLE: ${error.message}`, symbol, side, requestedQty };
   }
-  const sessionDecision = executionSessionDecision(authoritativeUser, side);
+  const sessionDecision = executionSessionDecision(authoritativeUser, side, input.asset_class);
   if (!sessionDecision.allowed) {
     return { status: 'rejected', reasons: [sessionDecision.reason], symbol, side, requestedQty };
   }
@@ -486,7 +486,7 @@ export async function executeIntent(base44, user, input) {
     await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: `SESSION_STATE_UNAVAILABLE: ${error.message}` });
     return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: `SESSION_STATE_UNAVAILABLE: ${error.message}`, symbol, side, requestedQty };
   }
-  const preSubmissionDecision = executionSessionDecision(preSubmissionUser, side);
+  const preSubmissionDecision = executionSessionDecision(preSubmissionUser, side, input.asset_class);
   if (!preSubmissionDecision.allowed) {
     await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: preSubmissionDecision.reason });
     return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, reasons: [preSubmissionDecision.reason], symbol, side, requestedQty };

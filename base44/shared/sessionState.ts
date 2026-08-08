@@ -74,7 +74,7 @@ export function isTradeable(sessionState) {
 // Canonical execution-session guard. New exposure requires an explicitly
 // active, integrity-healthy session. Protective sells remain available while
 // stopped so risk can be reduced without reopening exposure.
-export function executionSessionDecision(user, side) {
+export function executionSessionDecision(user, side, assetClass = 'stocks') {
   if (side === 'sell') return { allowed: true, reason: 'PROTECTIVE_EXIT_ALLOWED' };
   if (user?.financial_integrity_manual_reenable_required ||
       user?.trading_session_state === SESSION_STATES.FINANCIAL_INTEGRITY_BLOCKED) {
@@ -82,6 +82,9 @@ export function executionSessionDecision(user, side) {
   }
   if (user?.kill_switch_reset_required || user?.trading_session_state === SESSION_STATES.RISK_STOPPED) {
     return { allowed: false, reason: 'KILL_SWITCH_ACTIVE' };
+  }
+  if (user?.trading_active && user?.trading_session_state === SESSION_STATES.MARKET_CLOSED && String(assetClass).toLowerCase() === 'crypto') {
+    return { allowed: true, reason: 'CONTINUOUS_ASSET_SESSION' };
   }
   if (user?.trading_session_state !== SESSION_STATES.ACTIVE || !user?.trading_active) {
     return { allowed: false, reason: `TRADING_SESSION_NOT_ACTIVE (${user?.trading_session_state || 'unknown'})` };

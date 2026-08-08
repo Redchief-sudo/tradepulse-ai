@@ -41,4 +41,10 @@ describe('canonical execution session gate', () => {
       financial_integrity_manual_reenable_required: true,
     }, 'sell')).toEqual({ allowed: true, reason: 'PROTECTIVE_EXIT_ALLOWED' });
   });
+
+  it('allows crypto but not equities after the US market closes', () => {
+    const user = { trading_active: true, trading_session_state: 'market_closed' };
+    expect(executionSessionDecision(user, 'buy', 'crypto')).toEqual({ allowed: true, reason: 'CONTINUOUS_ASSET_SESSION' });
+    expect(executionSessionDecision(user, 'buy', 'equities').allowed).toBe(false);
+  });
 });

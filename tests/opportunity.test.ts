@@ -23,6 +23,17 @@ describe('canonical opportunity contract', () => {
     expect(result).toMatchObject({ native_symbol: 'BTC-USD', canonical_symbol: 'BTCUSD', market_session: 'continuous', execution_capability: 'research_only', spread: 2 });
   });
 
+  it('marks crypto executable only when the caller declares that capability', () => {
+    const result = canonicalizeOpportunity(
+      { asset_class: 'crypto', symbol: 'BTC-USD' },
+      { price: 60000, quote_timestamp: Date.parse(receivedAt) / 1000, source: 'coinbase', venue: 'coinbase' },
+      receivedAt,
+      'paper',
+      ['crypto'],
+    );
+    expect(result.execution_capability).toBe('paper_executable');
+  });
+
   it.each([
     ['forex', 'EURUSD=X'],
     ['commodities', 'GC=F'],

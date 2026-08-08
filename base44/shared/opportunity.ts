@@ -28,7 +28,7 @@ export function marketSession(assetClass: string, providerTimestamp: string | nu
   return 'after_hours';
 }
 
-export function canonicalizeOpportunity(candidate: any, quote: any, receivedAt: string, brokerMode = 'paper') {
+export function canonicalizeOpportunity(candidate: any, quote: any, receivedAt: string, brokerMode = 'paper', executableAssetClasses: string[] = []) {
   const assetClass = normalizeAssetClass(candidate.asset_class);
   const nativeSymbol = String(candidate.native_symbol || candidate.symbol || '').trim().toUpperCase();
   const providerTimestamp = quote?.quote_timestamp
@@ -39,7 +39,8 @@ export function canonicalizeOpportunity(candidate: any, quote: any, receivedAt: 
   const fresh = observationAgeMs >= 0 && observationAgeMs <= freshnessLimitMs;
   const hasAuthoritativeQuote = !quote?.error && Number(quote?.price) > 0 && Boolean(providerTimestamp) && fresh;
   const equityLikeEtf = (assetClass === 'commodities' || assetClass === 'fixed_income') && !nativeSymbol.includes('=') && isExecutable(nativeSymbol);
-  const explicitlyExecutable = (assetClass === 'equities' || equityLikeEtf) && isExecutable(nativeSymbol);
+  const explicitlyExecutable = (assetClass === 'crypto' && executableAssetClasses.includes('crypto'))
+    || ((assetClass === 'equities' || equityLikeEtf) && isExecutable(nativeSymbol));
   let executionCapability = 'unsupported';
   if (hasAuthoritativeQuote) {
     executionCapability = explicitlyExecutable

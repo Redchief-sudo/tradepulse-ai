@@ -161,17 +161,17 @@ export default function TradingSessionControl({ onComplete, onStart }) {
                       ? integrityRecoveredAt
                         ? 'Settlement Recovered — Manual Re-enable Required'
                         : 'Financial Integrity Block — Trading Stopped'
-                    : sessionState === 'risk_stopped'
-                      ? 'Risk Stopped — Manual Reset Required'
-                      : sessionState === 'broker_unavailable'
-                        ? 'Broker Unavailable'
-                        : sessionState === 'system_degraded'
-                          ? 'System Degraded'
-                          : sessionState === 'market_closed'
-                            ? 'Market Closed'
-                            : active
-                              ? 'Autonomous Trading Enabled'
-                              : 'Trading Inactive'}
+                      : sessionState === 'risk_stopped'
+                        ? 'Risk Stopped — Manual Reset Required'
+                        : sessionState === 'broker_unavailable'
+                          ? 'Broker Unavailable'
+                          : sessionState === 'system_degraded'
+                            ? 'System Degraded'
+                            : sessionState === 'market_closed'
+                              ? 'US Market Closed — 24/7 Assets Active'
+                              : active
+                                ? 'Autonomous Trading Enabled'
+                                : 'Trading Inactive'}
               </h3>
               <p className="text-xs text-muted-foreground">
                 {loadError
@@ -185,7 +185,9 @@ export default function TradingSessionControl({ onComplete, onStart }) {
                     : active
                       ? trader.isRunning
                         ? 'AI is actively scanning and executing trades'
-                        : 'AI will scan every 15 minutes during market hours'
+                        : sessionState === 'market_closed'
+                          ? 'US-session assets are paused; supported 24/7 assets continue every 15 minutes'
+                          : 'AI scans every 15 minutes and enforces each asset’s verified trading session'
                       : 'Press Start and the AI trades for you all day. Press Stop for your P&L.'}
               </p>
             </div>

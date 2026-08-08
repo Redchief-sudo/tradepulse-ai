@@ -1,6 +1,6 @@
 {
   "name": "Intraday AI Scan",
-  "description": "Every minute during US market hours: the sole Scan Coordinator consumer drains manual ScanRequests or runs scheduled scans. Browsers only enqueue requests.",
+  "description": "Every minute, 24/7: the sole Scan Coordinator drains manual requests and runs due asset-session-aware scans.",
   "definition": {
     "document": {
       "dsl": "1.0.0",
@@ -30,7 +30,7 @@
       "trigger_type": "scheduled",
       "events": [],
       "schedule_mode": "recurring",
-      "cron_expression": "* 6-13 * * 1-5",
+      "cron_expression": "* * * * *",
       "one_time_date": null,
       "timezone": "America/Los_Angeles",
       "interval_value": null,

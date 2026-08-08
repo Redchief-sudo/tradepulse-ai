@@ -15,6 +15,7 @@ export default async function(req) {
     if (!user) return Response.json({ error: 'Not authenticated' }, { status: 401 });
 
     const sr = base44.asServiceRole;
+    const body = await req.json().catch(() => ({}));
 
     // USER-SCOPED: only this user's data
     const holdings = await sr.entities.Holding.filter({ user_id: user.id });
@@ -143,7 +144,12 @@ export default async function(req) {
         const botToken = secrets.get('TELEGRAM_BOT_TOKEN');
         if (botToken) {
           const tgLines = [
-            `📊 <b>TradePulse Daily Summary</b>`,
+            `📊 <b>TradePulse US Session Summary</b>`,
+            body.market_close
+              ? body.continuous_assets_active
+                ? `US-session assets are paused. Supported 24/7 assets remain active.`
+                : `US-session assets are closed. Autonomous trading remains stopped.`
+              : '',
             `━━━━━━━━━━━━━━━━━━━`,
             brokerEquity != null ? `<b>Broker Equity:</b> ${fmt(brokerEquity)}` : `<b>Portfolio:</b> ${fmt(portfolioValue)}`,
             brokerDayPL != null ? `Broker Day P&L: ${brokerDayPL >= 0 ? '🟢 +' : '🔴 '}${fmt(brokerDayPL)}` : '',

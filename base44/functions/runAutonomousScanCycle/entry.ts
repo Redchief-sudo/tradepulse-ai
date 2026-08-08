@@ -14,6 +14,7 @@ import { executionSessionDecision, updateSessionState, SESSION_STATES } from '..
 import { nyDayStart } from '../../shared/marketHours.ts';
 import { hasNewerScanGeneration, nextScanGeneration } from '../../shared/scanState.ts';
 import { canonicalizeOpportunity, normalizeAssetClass } from '../../shared/opportunity.ts';
+import { assetSessionDecision, canonicalAssetClass } from '../../shared/assetSessions.ts';
 
 // Risk limits are defined in ONE place: riskEngine.ts. The scan cycle, execution
 // gateway, and risk engine all use riskLimitsForProfile() so they never disagree.
@@ -275,7 +276,7 @@ export default async function(req) {
         throw new Error('SCAN_GENERATION_STALE: a newer scan superseded this result');
       }
       const currentUser = await sr.entities.User.get(user.id);
-      const sessionDecision = executionSessionDecision(currentUser, 'buy');
+      const sessionDecision = executionSessionDecision(currentUser, 'buy', 'crypto');
       if (!sessionDecision.allowed) {
         throw new Error(`SCAN_SESSION_INVALID: ${sessionDecision.reason}`);
       }
@@ -379,6 +380,9 @@ export default async function(req) {
     // timestamp, session, identity, or execution capability.
     const allCandidates = p1.candidates || [];
     const opportunities = [];
+    const executionAssetClasses = !brokerCreds[0] || brokerCreds[0].broker === 'alpaca'
+      ? ['equities', 'crypto']
+      : [];
     for (const candidate of allCandidates) {
       const assetClass = normalizeAssetClass(candidate.asset_class);
       const quote = assetClass === 'unsupported'
@@ -387,7 +391,7 @@ export default async function(req) {
       await heartbeat();
       await verifyOwnership();
       assertScanHealthy();
-      const opportunity = canonicalizeOpportunity(candidate, quote, new Date().toISOString(), brokerCreds[0]?.mode || 'paper');
+      const opportunity = canonicalizeOpportunity(candidate, quote, new Date().toISOString(), brokerCreds[0]?.mode || 'paper', executionAssetClasses);
       await sr.entities.Opportunity.create({
         user_id: user.id,
         scan_run_id: runId,
@@ -396,7 +400,8 @@ export default async function(req) {
       opportunities.push({ ...candidate, ...opportunity, symbol: opportunity.native_symbol });
     }
     const candidates = opportunities.filter((candidate) =>
-      candidate.execution_capability === 'paper_executable' || candidate.execution_capability === 'live_executable'
+      (candidate.execution_capability === 'paper_executable' || candidate.execution_capability === 'live_executable')
+      && assetSessionDecision(candidate.asset_class, now).allowed
     );
     if (!candidates.length) {
       await finishRun({ status: 'no_candidates', market_summary: p1.market_summary, market_regime: regime.market_regime, model_version: champion?.version || 'default' });
@@ -751,8 +756,9 @@ export default async function(req) {
     // defect #9: unknown brokers failed open, allowing candidates through the
     // capability gate only to fail later or route incorrectly.)
     const isAssetClassSupported = (ac) => {
+      const canonical = canonicalAssetClass(ac);
       if (!brokerName) return true; // no broker connected — internal paper mode
-      if (brokerName === 'alpaca') return ['stocks', 'crypto'].includes(ac);
+      if (brokerName === 'alpaca') return ['equities', 'crypto'].includes(canonical);
       return false; // IBKR, TradeStation, custom — not implemented
     };
 
@@ -764,6 +770,10 @@ export default async function(req) {
     for (const pr of approved) {
       // Capability gate — skip unsupported asset classes (research-only)
       if (!isAssetClassSupported(pr.asset_class || 'stocks')) {
+        tradesRejected++;
+        continue;
+      }
+      if (!assetSessionDecision(pr.asset_class || 'stocks').allowed) {
         tradesRejected++;
         continue;
       }
