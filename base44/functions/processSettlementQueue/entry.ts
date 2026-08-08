@@ -266,17 +266,39 @@ async function createOrUpdateTrade(sr, userId, event, realizedPnl) {
   return trade.id;
 }
 
-// Create AITradeDecision for AI-driven trades — idempotent by decision_id.
+// Create one AITradeDecision per logical TradeIntent. Partial fills remain
+// fill-level execution evidence but must not become independent learning samples.
 async function createAiDecisionIfApplicable(sr, userId, event) {
   const intents = await sr.entities.TradeIntent.filter({ user_id: userId, trade_intent_id: event.trade_intent_id });
   const intent = intents[0];
   if (!intent || intent.ml_score == null) return; // not AI-driven
 
-  const existing = await sr.entities.AITradeDecision.filter({ user_id: userId, settlement_event_id: event.event_id });
-  if (existing.length > 0) return;
+  const fills = await sr.entities.Fill.filter({ user_id: userId, trade_intent_id: event.trade_intent_id });
+  const sameSideFills = fills.filter((fill) => fill.side === event.side);
+  const cumulativeQty = sameSideFills.reduce((sum, fill) => sum + (Number(fill.filled_quantity) || 0), 0);
+  const cumulativeNotional = sameSideFills.reduce((sum, fill) => sum + (Number(fill.filled_quantity) || 0) * (Number(fill.filled_price) || 0), 0);
+  const price = cumulativeQty > 0 ? cumulativeNotional / cumulativeQty : event.price;
+  let existing = await sr.entities.AITradeDecision.filter({ user_id: userId, trade_intent_id: event.trade_intent_id });
+  if (!existing.length) {
+    const intentEvents = await sr.entities.SettlementEvent.filter({ user_id: userId, trade_intent_id: event.trade_intent_id });
+    const eventIds = new Set(intentEvents.map((candidate) => candidate.event_id));
+    const legacyDecisions = await sr.entities.AITradeDecision.filter({ user_id: userId });
+    existing = legacyDecisions.filter((decision) => eventIds.has(decision.settlement_event_id));
+  }
+  if (existing.length > 0) {
+    await sr.entities.AITradeDecision.update(existing[0].id, {
+      trade_intent_id: event.trade_intent_id,
+      shares: cumulativeQty,
+      price,
+      position_value: cumulativeNotional,
+      regime: existing[0].regime || event.regime || intent.regime || null,
+    });
+    return;
+  }
 
   await sr.entities.AITradeDecision.create({
     settlement_event_id: event.event_id,
+    trade_intent_id: event.trade_intent_id,
     user_id: userId,
     portfolio_id: event.portfolio_id || null,
     symbol: event.symbol,
@@ -284,9 +306,9 @@ async function createAiDecisionIfApplicable(sr, userId, event) {
     sector: event.sector || intent.sector || '',
     asset_class: event.asset_class || 'stocks',
     action: event.side,
-    shares: event.quantity,
-    price: event.price,
-    position_value: event.quantity * event.price,
+    shares: cumulativeQty,
+    price,
+    position_value: cumulativeNotional,
     confidence: intent.confidence,
     target_price: intent.target_price,
     stop_loss: intent.stop_loss,
@@ -296,6 +318,7 @@ async function createAiDecisionIfApplicable(sr, userId, event) {
     technical_score: intent.technical_score,
     momentum_score: intent.momentum_score,
     risk_score: intent.risk_score,
+    regime: event.regime || intent.regime || null,
   });
 }
 

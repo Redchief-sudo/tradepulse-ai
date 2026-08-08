@@ -156,6 +156,10 @@
     "decision_id": {
       "type": "string"
     },
+    "regime": {
+      "type": "string",
+      "description": "Decision-time regime inherited from TradeIntent"
+    },
     "venue": {
       "type": "string"
     },

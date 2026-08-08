@@ -290,6 +290,7 @@ export async function executeIntent(base44, user, input) {
     technical_score: input.technical_score,
     momentum_score: input.momentum_score,
     risk_score: input.risk_score,
+    regime: input.regime || null,
   };
 
   if (intentRecord) {
@@ -519,6 +520,7 @@ export async function executeIntent(base44, user, input) {
       venue,
       strategy_id: strategyId,
       decision_id: input.decision_id || null,
+      regime: intentRecord.regime || input.regime || null,
       portfolio_id: intentRecord.portfolio_id || input.portfolio_id || null,
       execution_mode: executionMode,
       asset_class: input.asset_class || 'stocks',
@@ -554,6 +556,7 @@ export async function executeIntent(base44, user, input) {
       sector: input.sector || '',
       strategy_id: strategyId,
       decision_id: input.decision_id || null,
+      regime: intentRecord.regime || input.regime || null,
       venue,
       arrival_price: Number(input.arrival_price || input.price) || null,
       decision_price: Number(input.decision_price || input.price) || null,
@@ -731,6 +734,7 @@ async function pollAndSettle(base44, sr, userId, intentRecord, creds, alpacaMode
           sector: input.sector || '',
           strategy_id: strategyId,
           decision_id: input.decision_id || null,
+          regime: intentRecord.regime || input.regime || null,
           venue,
           arrival_price: Number(input.arrival_price || input.price) || null,
           decision_price: Number(input.decision_price || input.price) || null,

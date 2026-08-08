@@ -229,6 +229,10 @@
     "risk_score": {
       "type": "number"
     },
+    "regime": {
+      "type": "string",
+      "description": "Deterministic market regime recorded at decision time; never recomputed for learning attribution"
+    },
     "reserved_cash": {
       "type": "number",
       "description": "Cash reserved for this pending buy order \u2014 set before broker submission, consumed by fills, released on cancel"

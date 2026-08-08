@@ -1,5 +1,5 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
-import { getChampion, passesAllGates } from '../../shared/modelGovernance.ts';
+import { getExactChampion, passesAllGates } from '../../shared/modelGovernance.ts';
 
 // Manual approval of a governance candidate.
 // Used when promotion_mode = 'manual_approval'. The governance cycle creates
@@ -35,7 +35,7 @@ export default async function(req) {
 
     // Find the current champion for this regime and retire it
     const regime = candidate.regime || 'all';
-    const champion = await getChampion(sr, user.id, regime);
+    const champion = await getExactChampion(sr, user.id, regime);
     if (champion && champion.id !== candidate.id) {
       await sr.entities.StrategyModel.update(champion.id, {
         status: 'retired',
@@ -51,7 +51,7 @@ export default async function(req) {
       approved_by: user.id,
       rollback_path: champion
         ? `${champion.rollback_path || champion.version} → ${candidate.version}`
-        : candidate.version,
+        : candidate.rollback_path || candidate.version,
     });
 
     // Update user.ml_weights cache only for global champion

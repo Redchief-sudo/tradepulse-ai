@@ -23,7 +23,6 @@
 // 6. Bounded changes: each factor can move at most ±MAX_WEIGHT_CHANGE_PCT per promotion
 // 7. Automatic rollback: if recent Sharpe degrades below threshold, revert to parent
 
-import { classifyRegimeFromSnapshots } from './regime.ts';
 
 const MAX_WEIGHT_CHANGE_PCT = 20;
 const MIN_SAMPLE_SIZE = 100;
@@ -62,7 +61,9 @@ function std(arr) {
 
 function sharpe(returns) {
   const s = std(returns);
-  return s > 0 ? (mean(returns) / s) * Math.sqrt(252) : 0;
+  // Unannualized trade-level return/risk ratio. Trade observations are not an
+  // equally spaced daily portfolio series, so sqrt(252) would be misleading.
+  return s > 0 ? mean(returns) / s : 0;
 }
 
 function rank(arr) {
@@ -99,14 +100,6 @@ function strategyMetrics(outcomes, weights) {
   const selected = ranked.slice(0, Math.max(1, Math.ceil(ranked.length / 2)))
     .sort((left, right) => new Date(left.created_date) - new Date(right.created_date));
   const returns = selected.map((outcome) => Number(outcome.realized_return)).filter(Number.isFinite);
-  let equity = 1;
-  let peak = 1;
-  let maxDrawdown = 0;
-  for (const value of returns) {
-    equity *= 1 + value;
-    peak = Math.max(peak, equity);
-    maxDrawdown = Math.max(maxDrawdown, peak > 0 ? (peak - equity) / peak : 0);
-  }
   const benchmarkRelative = selected
     .filter((outcome) => Number.isFinite(Number(outcome.benchmark_return)))
     .map((outcome) => Number(outcome.realized_return) - Number(outcome.benchmark_return));
@@ -114,7 +107,8 @@ function strategyMetrics(outcomes, weights) {
     selected: returns.length,
     expectancy: mean(returns),
     sharpe: sharpe(returns),
-    maxDrawdown,
+    maxDrawdown: null,
+    worstTradeLoss: returns.length ? Math.abs(Math.min(0, ...returns)) : 0,
     winRate: returns.length ? returns.filter((value) => value > 0).length / returns.length : 0,
     benchmarkExcess: mean(benchmarkRelative),
   };
@@ -147,6 +141,17 @@ export async function getChampion(sr, userId, regime) {
   return allChampions.find((m) => !m.regime || m.regime === 'all') || null;
 }
 
+export async function getExactChampion(sr, userId, regime) {
+  const champions = await sr.entities.StrategyModel.filter({ user_id: userId, status: 'champion' });
+  const exact = champions.filter((model) => (model.regime || 'all') === (regime || 'all'));
+  if (exact.length > 1) throw new Error(`MULTIPLE_CHAMPIONS_FOR_REGIME: ${regime || 'all'}`);
+  return exact[0] || null;
+}
+
+export async function getGlobalChampion(sr, userId) {
+  return getExactChampion(sr, userId, 'all');
+}
+
 // Collect realized outcomes, optionally filtered by regime.
 // Falls back to all outcomes if regime-specific sample is too small.
 export async function collectOutcomes(sr, userId, regime) {
@@ -155,19 +160,21 @@ export async function collectOutcomes(sr, userId, regime) {
     '-created_date', 500
   );
   const allOutcomes = decisions.filter((d) =>
+    Boolean(d.trade_intent_id) &&
     d.lineage_complete === true &&
     d.realized_return != null &&
     d.technical_score != null &&
     d.momentum_score != null &&
     d.risk_score != null
   );
-  if (!regime || regime === 'all') return allOutcomes;
+  const unique = [...new Map(allOutcomes.map((outcome) => [outcome.trade_intent_id || outcome.id, outcome])).values()];
+  if (!regime || regime === 'all') return unique;
   // RESTRICTION: regime-specific validation must use ONLY regime-specific outcomes.
   // Do NOT fall back to mixed-regime outcomes — that contaminates the regime-specific
   // champion with outcomes from other regimes. If the regime-specific sample is too
   // small, the governance cycle will skip promotion for this regime and fall back
   // to the global champion at execution time.
-  return allOutcomes.filter((d) => d.regime === regime);
+  return unique.filter((d) => d.regime === regime);
 }
 
 function computeMLScore(d, w) {
@@ -212,17 +219,21 @@ export function validateCandidate(outcomes, championWeights, candidateWeights, s
   const candidatePerformance = strategyMetrics(outOfSample, candidateWeights);
   const performanceGate = candidatePerformance.expectancy >= championPerformance.expectancy &&
     candidatePerformance.sharpe >= championPerformance.sharpe &&
-    candidatePerformance.maxDrawdown <= championPerformance.maxDrawdown &&
+    candidatePerformance.worstTradeLoss <= championPerformance.worstTradeLoss &&
     candidatePerformance.benchmarkExcess >= championPerformance.benchmarkExcess;
 
   // Reproducible bootstrap: seeded PRNG ensures the same candidate + seed
   // always produces the same p-value. The seed is persisted with the model.
   const rng = seededRandom(seed);
   let candidateWins = 0;
+  const blockSize = Math.max(2, Math.floor(Math.sqrt(outOfSample.length)));
   for (let b = 0; b < N_BOOTSTRAP; b++) {
     const sample = [];
-    for (let i = 0; i < outOfSample.length; i++) {
-      sample.push(outOfSample[Math.floor(rng() * outOfSample.length)]);
+    while (sample.length < outOfSample.length) {
+      const blockStart = Math.floor(rng() * outOfSample.length);
+      for (let offset = 0; offset < blockSize && sample.length < outOfSample.length; offset++) {
+        sample.push(outOfSample[(blockStart + offset) % outOfSample.length]);
+      }
     }
     const sChamp = sample.map((d) => computeMLScore(d, championWeights));
     const sCand = sample.map((d) => computeMLScore(d, candidateWeights));
@@ -248,7 +259,7 @@ export function validateCandidate(outcomes, championWeights, candidateWeights, s
     testIds: outOfSample.map((d) => d.id),
     seed,
     optimizerVersion: 'deterministic-coordinate-ascent-v2',
-    metricDefinitions: 'spearman_score_return_correlation; seeded_bootstrap_candidate_superiority',
+    metricDefinitions: 'spearman_score_return_correlation; seeded_circular_block_bootstrap; unannualized_trade_return_risk; worst_trade_loss',
     minimumSampleSize,
     championPerformance,
     candidatePerformance,
@@ -408,7 +419,7 @@ function optimizeCandidateWeights(outcomes, championWeights, hypothesis) {
 }
 
 // Promote candidate to champion if it passes ALL gates. Records immutable audit trail.
-async function promoteIfProven(sr, userId, user, candidate, champion, validation, regime) {
+async function promoteIfProven(sr, userId, user, candidate, exactChampion, validation, regime) {
   if (validation.insufficient) return { promoted: false, reason: `INSUFFICIENT_OOS_SAMPLE (${validation.oosSize} < ${MIN_OOS_SIZE})` };
   if (validation.sampleSize < MIN_SAMPLE_SIZE) return { promoted: false, reason: `INSUFFICIENT_SAMPLE (${validation.sampleSize} < ${MIN_SAMPLE_SIZE})` };
   if (validation.foldConsistency < MIN_FOLD_CONSISTENCY) return { promoted: false, reason: `INCONSISTENT_WALK_FORWARD (${validation.foldConsistency} < ${MIN_FOLD_CONSISTENCY})` };
@@ -416,8 +427,8 @@ async function promoteIfProven(sr, userId, user, candidate, champion, validation
   if (validation.improvement < MIN_OOS_IMPROVEMENT) return { promoted: false, reason: `INSUFFICIENT_IMPROVEMENT (${(validation.improvement * 100).toFixed(2)}% < ${(MIN_OOS_IMPROVEMENT * 100).toFixed(0)}%)` };
   if (validation.pValue > MAX_P_VALUE) return { promoted: false, reason: `NOT_SIGNIFICANT (p=${validation.pValue} > ${MAX_P_VALUE})` };
 
-  if (champion) {
-    await sr.entities.StrategyModel.update(champion.id, { status: 'retired', retired_at: new Date().toISOString() });
+  if (exactChampion) {
+    await sr.entities.StrategyModel.update(exactChampion.id, { status: 'retired', retired_at: new Date().toISOString() });
   }
   await sr.entities.StrategyModel.update(candidate.id, {
     status: 'champion',
@@ -425,7 +436,7 @@ async function promoteIfProven(sr, userId, user, candidate, champion, validation
     promoted_at: new Date().toISOString(),
     out_of_sample_metrics: JSON.stringify(validation),
     approved_by: userId,
-    rollback_path: champion ? `${champion.rollback_path || champion.version} → ${candidate.version}` : candidate.version,
+    rollback_path: candidate.rollback_path,
   });
   // Update user.ml_weights cache only for global champion
   if (!regime || regime === 'all') {
@@ -443,14 +454,17 @@ async function rollbackIfDegraded(sr, userId, champion, recentOutcomes) {
   const recentSharpe = sharpe(recentReturns);
 
   if (recentSharpe < ROLLBACK_SHARPE_THRESHOLD) {
-    const parents = await sr.entities.StrategyModel.filter({ user_id: userId, version: champion.parent_version, status: 'retired' });
-    const parent = parents.find((p) => p.regime === champion.regime || (!p.regime && !champion.regime));
+    const parents = await sr.entities.StrategyModel.filter({ user_id: userId, version: champion.parent_version });
+    const parent = parents.find((candidate) => (candidate.regime || 'all') === (champion.regime || 'all'))
+      || parents.find((candidate) => (candidate.regime || 'all') === 'all');
     if (parent) {
       await sr.entities.StrategyModel.update(champion.id, {
         status: 'retired', retired_at: new Date().toISOString(),
         rollback_reason: `Auto-rollback: recent Sharpe ${recentSharpe.toFixed(2)} < ${ROLLBACK_SHARPE_THRESHOLD}`,
       });
-      await sr.entities.StrategyModel.update(parent.id, { status: 'champion', promoted_at: new Date().toISOString() });
+      if ((parent.regime || 'all') === (champion.regime || 'all')) {
+        await sr.entities.StrategyModel.update(parent.id, { status: 'champion', promoted_at: new Date().toISOString() });
+      }
       if (!champion.regime || champion.regime === 'all') {
         await sr.entities.User.update(userId, { ml_weights: parent.weights });
       }
@@ -466,17 +480,8 @@ function bumpVersion(v) {
   return parts.join('.');
 }
 
-// Full governance cycle — called by the scheduled workflow.
-// SEPARATION: This runs offline (weekly workflow), never in the live execution path.
-export async function runGovernanceCycle(sr, userId, user) {
-  // Classify current regime for regime-specific champion selection
-  const regimeInfo = await classifyRegimeFromSnapshots(sr, userId);
-  const currentRegime = regimeInfo.market_regime;
-
-  const champion = await getChampion(sr, userId, currentRegime);
-  const outcomes = await collectOutcomes(sr, userId, currentRegime);
-
-  // Initialize global champion if none exists
+async function initializeGlobalChampion(sr, userId) {
+  let champion = await getGlobalChampion(sr, userId);
   if (!champion) {
     const v1 = await sr.entities.StrategyModel.create({
       user_id: userId,
@@ -493,33 +498,53 @@ export async function runGovernanceCycle(sr, userId, user) {
       rollback_path: '1.0.0',
     });
     await sr.entities.User.update(userId, { ml_weights: DEFAULT_WEIGHTS });
-    return { initialized: true, champion: v1.version, regime: currentRegime, outcomes: outcomes.length };
+    champion = v1;
   }
+  return champion;
+}
 
-  // Check for rollback first
-  const rollback = await rollbackIfDegraded(sr, userId, champion, outcomes);
-  if (rollback.rolled_back) return { rollback, regime: currentRegime };
+async function nextVersionForRegime(sr, userId, regime, baselineVersion) {
+  const models = await sr.entities.StrategyModel.filter({ user_id: userId, regime });
+  const versions = [baselineVersion, ...models.map((model) => model.version)];
+  return versions.sort((left, right) => {
+    const a = String(left).split('.').map(Number);
+    const b = String(right).split('.').map(Number);
+    return (b[0] - a[0]) || (b[1] - a[1]) || (b[2] - a[2]);
+  }).map(bumpVersion)[0];
+}
+
+async function runGovernanceScope(sr, userId, user, regime, promotionMode) {
+  const exactChampion = await getExactChampion(sr, userId, regime);
+  const globalChampion = await getGlobalChampion(sr, userId);
+  const baseline = exactChampion || globalChampion;
+  const outcomes = await collectOutcomes(sr, userId, regime);
+  if (!baseline) throw new Error('GLOBAL_CHAMPION_MISSING');
+
+  // Roll back only a champion owned by this exact scope. A global fallback is
+  // never evaluated or retired using one regime's outcomes.
+  const rollback = exactChampion ? await rollbackIfDegraded(sr, userId, exactChampion, outcomes) : { rolled_back: false };
+  if (rollback.rolled_back) return { rollback, regime };
 
   // Need enough outcomes to generate a candidate
   if (outcomes.length < MIN_SAMPLE_SIZE) {
-    return { skipped: true, reason: `Insufficient outcomes (${outcomes.length} < ${MIN_SAMPLE_SIZE})`, champion: champion.version, regime: currentRegime, recentSharpe: rollback.recentSharpe };
+    return { skipped: true, reason: `Insufficient outcomes (${outcomes.length} < ${MIN_SAMPLE_SIZE})`, champion: baseline.version, regime, recentSharpe: rollback.recentSharpe };
   }
 
   const validationSeed = 42;
 
   // 1. LLM generates HYPOTHESIS (factor directions only — no numerical weights)
-  const { hypothesis, reasoning } = await generateHypothesis(sr, champion, outcomes);
+  const { hypothesis, reasoning } = await generateHypothesis(sr, baseline, outcomes);
 
   // 2. Deterministic optimizer finds exact weights that maximize OOS correlation
-  const optimization = optimizeCandidateWeights(outcomes, champion.weights, hypothesis);
+  const optimization = optimizeCandidateWeights(outcomes, baseline.weights, hypothesis);
 
   // Create challenger record with full audit trail
-  const newVersion = bumpVersion(champion.version);
+  const newVersion = await nextVersionForRegime(sr, userId, regime, baseline.version);
   const challenger = await sr.entities.StrategyModel.create({
     user_id: userId,
-    model_id: champion.model_id,
+    model_id: baseline.model_id,
     version: newVersion,
-    parent_version: champion.version,
+    parent_version: baseline.version,
     weights: optimization.weights,
     status: 'challenger',
     approval_status: 'pending',
@@ -532,13 +557,13 @@ export async function runGovernanceCycle(sr, userId, user) {
     }),
     sample_size: outcomes.length,
     created_at: new Date().toISOString(),
-    regime: currentRegime,
-    rollback_path: `${champion.rollback_path || champion.version} → ${newVersion}`,
+    regime,
+    rollback_path: `${baseline.rollback_path || baseline.version} → ${newVersion}`,
   });
 
   // 3. Walk-forward validate (reproducible — seed persisted for audit)
-  const requiredSamples = currentRegime === 'all' ? MIN_SAMPLE_SIZE : MIN_SAMPLE_PER_REGIME;
-  const validation = validateCandidate(outcomes, champion.weights, optimization.weights, validationSeed, requiredSamples);
+  const requiredSamples = regime === 'all' ? MIN_SAMPLE_SIZE : MIN_SAMPLE_PER_REGIME;
+  const validation = validateCandidate(outcomes, baseline.weights, optimization.weights, validationSeed, requiredSamples);
 
   await sr.entities.StrategyModel.update(challenger.id, {
     out_of_sample_metrics: JSON.stringify(validation),
@@ -547,43 +572,53 @@ export async function runGovernanceCycle(sr, userId, user) {
     p_value: validation.pValue,
   });
 
-  // 4. Promotion mode gate
-  let promotionMode = user.promotion_mode || 'manual_approval';
-  if (promotionMode === 'automatic') {
-    const credentials = await sr.entities.BrokerCredential.filter({ user_id: userId, status: 'active' });
-    if (!credentials.length || credentials.some((credential) => credential.mode === 'paper')) {
-      promotionMode = 'manual_approval';
-    }
-  }
-
   if (promotionMode === 'research') {
     // Validate only, never promote — record everything for analysis
-    return { mode: 'research', champion: champion.version, challenger: challenger.version, regime: currentRegime, validation, promoted: false };
+    return { mode: 'research', champion: baseline.version, challenger: challenger.version, regime, validation, promoted: false };
   }
 
   if (promotionMode === 'manual_approval') {
     // If proven, mark as pending approval; don't auto-promote
     if (passesAllGates(validation)) {
       await sr.entities.StrategyModel.update(challenger.id, { approval_status: 'pending' });
-      return { mode: 'manual_approval', champion: champion.version, challenger: challenger.version, regime: currentRegime, validation, promoted: false, pendingApproval: true };
+      return { mode: 'manual_approval', champion: baseline.version, challenger: challenger.version, regime, validation, promoted: false, pendingApproval: true };
     }
     await sr.entities.StrategyModel.update(challenger.id, { status: 'rejected', approval_status: 'rejected' });
-    return { mode: 'manual_approval', champion: champion.version, challenger: challenger.version, regime: currentRegime, validation, promoted: false };
+    return { mode: 'manual_approval', champion: baseline.version, challenger: challenger.version, regime, validation, promoted: false };
   }
 
   // automatic mode — current behavior
-  const promotion = await promoteIfProven(sr, userId, user, challenger, champion, validation, currentRegime);
+  const promotion = await promoteIfProven(sr, userId, user, challenger, exactChampion, validation, regime);
   if (!promotion.promoted) {
     await sr.entities.StrategyModel.update(challenger.id, { status: 'rejected', approval_status: 'rejected' });
   }
 
   return {
     mode: 'automatic',
-    champion: champion.version,
+    champion: baseline.version,
     challenger: challenger.version,
-    regime: currentRegime,
+    regime,
     validation,
     promotion,
     outcomes: outcomes.length,
   };
+}
+
+// Weekly governance evaluates the global population and every historical regime
+// with enough independent logical decisions. The currently active regime affects
+// execution selection only; it does not decide which historical data may learn.
+export async function runGovernanceCycle(sr, userId, user) {
+  const globalChampion = await initializeGlobalChampion(sr, userId);
+  const allOutcomes = await collectOutcomes(sr, userId, 'all');
+  let promotionMode = user.promotion_mode || 'manual_approval';
+  if (promotionMode === 'automatic') {
+    const credentials = await sr.entities.BrokerCredential.filter({ user_id: userId, status: 'active' });
+    if (!credentials.length || credentials.some((credential) => credential.mode === 'paper')) promotionMode = 'manual_approval';
+  }
+  const eligibleRegimes = [...new Set(allOutcomes.map((outcome) => outcome.regime).filter(Boolean))]
+    .filter((regime) => allOutcomes.filter((outcome) => outcome.regime === regime).length >= MIN_SAMPLE_PER_REGIME);
+  const scopes = ['all', ...eligibleRegimes];
+  const results = [];
+  for (const regime of scopes) results.push(await runGovernanceScope(sr, userId, user, regime, promotionMode));
+  return { champion: globalChampion.version, mode: promotionMode, scopes, results, outcomes: allOutcomes.length };
 }

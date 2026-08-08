@@ -203,6 +203,7 @@ export default async function(req) {
             sector: intent.sector || '',
             strategy_id: intent.strategy_id,
             decision_id: intent.decision_id,
+            regime: intent.regime || null,
           });
         }
         await sr.entities.TradeIntent.update(intent.id, { settlement_state: 'pending' });
@@ -298,6 +299,7 @@ export default async function(req) {
               sector: intent.sector || '',
               strategy_id: intent.strategy_id,
               decision_id: intent.decision_id,
+              regime: intent.regime || null,
               venue: alpacaMode === 'live' ? 'alpaca' : 'alpaca_paper',
             });
 

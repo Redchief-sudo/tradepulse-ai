@@ -6,6 +6,10 @@
       "type": "string",
       "description": "SettlementEvent idempotency key that produced this decision projection"
     },
+    "trade_intent_id": {
+      "type": "string",
+      "description": "Logical learning-unit identity; all partial entry fills aggregate to this decision"
+    },
     "user_id": {
       "type": "string",
       "description": "Owner user id \u2014 every query must filter by this"
@@ -128,7 +132,9 @@
     "lineage_complete": { "type": "boolean", "default": false, "description": "True only when the decision outcome is traced through its opening lot and exact closure fills" },
     "outcome_quantity": { "type": "number" },
     "entry_fill_id": { "type": "string" },
+    "entry_fill_ids": { "type": "string", "description": "JSON array of all partial entry Fill ids for the logical decision" },
     "exit_fill_ids": { "type": "string", "description": "JSON array of exact Fill ids allocated to this outcome" },
+    "final_exit_at": { "type": "string", "format": "date-time", "description": "Latest allocated exit Fill timestamp; freezes realized analytics" },
     "labeled_at": {
       "type": "string",
       "format": "date-time"
