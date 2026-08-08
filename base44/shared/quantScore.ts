@@ -1,7 +1,8 @@
 // Deterministic quant factor scores computed from OHLCV.
 // Technical / Momentum / Risk are precise formulas (no LLM).
-// Missing fundamental and sentiment inputs are neutral (50). The resulting
-// composite is a weighted heuristic, not a trained machine-learning prediction.
+// The governed production model currently uses only the three deterministic
+// factors below. Fundamental/sentiment weights remain zero until authoritative
+// inputs exist; they must not be synthesized from confidence or neutral constants.
 
 import { rsi, macd, bollinger, sma, momentum, volatility, atr } from './indicators.ts';
 

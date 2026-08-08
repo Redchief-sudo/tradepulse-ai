@@ -45,7 +45,7 @@
         "manual_approval",
         "automatic"
       ],
-      "default": "automatic",
+      "default": "manual_approval",
       "description": "Model governance promotion mode: research (validate only, never promote), manual_approval (human approves proven candidates), automatic (auto-promote if proven)"
     },
     "auto_promote_enabled": {

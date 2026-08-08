@@ -103,8 +103,9 @@ export function classifyRegime(closes) {
 }
 
 // classifyRegimeFromSnapshots — load the benchmark (SPY) snapshot series and classify.
-export async function classifyRegimeFromSnapshots(sr, benchmark = 'SPY') {
-  const snaps = await sr.entities.PriceSnapshot.list('-timestamp', 500);
+export async function classifyRegimeFromSnapshots(sr, userId, benchmark = 'SPY') {
+  if (!userId) throw new Error('userId is required for regime classification');
+  const snaps = await sr.entities.PriceSnapshot.filter({ user_id: userId }, '-timestamp', 500);
   const bench = snaps.filter((s) => String(s.symbol).toUpperCase() === benchmark.toUpperCase());
   if (bench.length < 10) {
     return {

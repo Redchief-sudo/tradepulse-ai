@@ -129,26 +129,8 @@
         }
       ]
     },
-    "create": {},
-    "update": {
-      "$or": [
-        {
-          "created_by_id": "{{user.id}}"
-        },
-        {
-          "data.user_id": "{{user.id}}"
-        }
-      ]
-    },
-    "delete": {
-      "$or": [
-        {
-          "created_by_id": "{{user.id}}"
-        },
-        {
-          "data.user_id": "{{user.id}}"
-        }
-      ]
-    }
+    "create": false,
+    "update": false,
+    "delete": false
   }
 }

@@ -33,7 +33,7 @@ export default async function(req) {
     // Market regime from the latest price snapshots
     let regimeText = 'Unknown';
     try {
-      const regime = await classifyRegimeFromSnapshots(sr);
+      const regime = await classifyRegimeFromSnapshots(sr, user.id);
       regimeText = regime.market_regime || 'Unknown';
     } catch (e) { /* non-fatal */ }
 

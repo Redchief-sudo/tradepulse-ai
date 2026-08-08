@@ -9,7 +9,7 @@ export default async function(req) {
     const base44 = createClientFromRequest(req);
     const user = await base44.auth.me();
     if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 });
-    const regime = await classifyRegimeFromSnapshots(base44.asServiceRole);
+    const regime = await classifyRegimeFromSnapshots(base44.asServiceRole, user.id);
     return Response.json({ ok: true, regime });
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });

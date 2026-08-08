@@ -15,17 +15,13 @@ export default async function(req) {
     if (!key) return Response.json({ error: 'FINNHUB_API_KEY not set' }, { status: 500 });
 
     const sr = base44.asServiceRole;
-    const decisions = await sr.entities.AITradeDecision.list('-created_date', 200);
-    const fills = await sr.entities.Fill.list('-created_date', 5000);
+    const decisions = await sr.entities.AITradeDecision.filter({ user_id: user.id }, '-created_date', 200);
     const openSyms = new Set();
     decisions.filter((d) => d.action === 'buy' && d.status === 'executed').forEach((d) => {
       const sym = String(d.symbol).toUpperCase();
-      const hasSell = fills.some(
-        (f) => String(f.symbol).toUpperCase() === sym && f.side === 'sell' && new Date(f.timestamp) >= new Date(d.created_date)
-      );
-      if (!hasSell) openSyms.add(sym);
+      if (d.outcome_status !== 'realized') openSyms.add(sym);
     });
-    const holdings = await sr.entities.Holding.list();
+    const holdings = await sr.entities.Holding.filter({ user_id: user.id });
     const assetClassBySym = {};
     holdings.forEach((h) => { assetClassBySym[String(h.symbol).toUpperCase()] = h.asset_class || 'stocks'; });
     decisions.forEach((d) => { if (!assetClassBySym[String(d.symbol).toUpperCase()]) assetClassBySym[String(d.symbol).toUpperCase()] = d.asset_class || 'stocks'; });
@@ -46,15 +42,15 @@ export default async function(req) {
       try {
         // Record the provider's authoritative observation time, not the database
         // insertion time. An after-hours close fetched at 9pm must not appear fresh.
-        const providerTs = q.quote_timestamp
-          ? new Date(q.quote_timestamp * 1000).toISOString()
-          : now;
+        if (!q.quote_timestamp) throw new Error('Provider timestamp missing');
+        const providerTs = new Date(q.quote_timestamp * 1000).toISOString();
         await sr.entities.PriceSnapshot.create({
+          user_id: user.id,
           symbol: q.symbol, price: q.price, timestamp: now,
           provider_timestamp: providerTs,
           market_session: session,
           is_market_open: marketOpen,
-          source: q.asset_class === 'crypto' ? 'binance' : 'finnhub',
+          source: q.asset_class === 'crypto' ? 'coinbase' : 'finnhub',
         });
         captured++;
       } catch (e) {

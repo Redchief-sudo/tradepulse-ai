@@ -125,6 +125,10 @@
         "realized"
       ]
     },
+    "lineage_complete": { "type": "boolean", "default": false, "description": "True only when the decision outcome is traced through its opening lot and exact closure fills" },
+    "outcome_quantity": { "type": "number" },
+    "entry_fill_id": { "type": "string" },
+    "exit_fill_ids": { "type": "string", "description": "JSON array of exact Fill ids allocated to this outcome" },
     "labeled_at": {
       "type": "string",
       "format": "date-time"

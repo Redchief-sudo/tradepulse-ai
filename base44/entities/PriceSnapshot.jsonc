@@ -2,6 +2,7 @@
   "name": "PriceSnapshot",
   "type": "object",
   "properties": {
+    "user_id": { "type": "string", "description": "Owner user id for governance and outcome isolation" },
     "symbol": {
       "type": "string"
     },
@@ -42,5 +43,11 @@
     "symbol",
     "price",
     "timestamp"
-  ]
+  ],
+  "rls": {
+    "read": { "$or": [{ "created_by_id": "{{user.id}}" }, { "data.user_id": "{{user.id}}" }] },
+    "create": false,
+    "update": false,
+    "delete": false
+  }
 }

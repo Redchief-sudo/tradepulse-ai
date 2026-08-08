@@ -4,7 +4,7 @@ import { settleTrade } from '../../shared/execution.ts';
 import { computeRealFactors, weightedComposite, signalFromComposite } from '../../shared/quantScore.ts';
 import { classifyRegimeFromSnapshots } from '../../shared/regime.ts';
 import { netEdge } from '../../shared/costModel.ts';
-import { getChampion } from '../../shared/modelGovernance.ts';
+import { effectiveGovernedWeights, getChampion } from '../../shared/modelGovernance.ts';
 import { getAlpacaAccount, getAlpacaClock, cancelAlpacaOrder } from '../../shared/alpaca.ts';
 import { fetchCandles as fetchMultiAssetCandles, fetchQuote as fetchMultiAssetQuote } from '../../shared/marketDataAdapter.ts';
 import { sendTelegramMessage } from '../../shared/telegram.ts';
@@ -286,12 +286,12 @@ export default async function(req) {
     const pp = profileParams(user.trade_profile || 'balanced');
 
     // Deterministic market regime (computed first so we can select the regime-specific champion)
-    const regime = await classifyRegimeFromSnapshots(sr);
+    const regime = await classifyRegimeFromSnapshots(sr, user.id);
 
     // CHAMPION MODEL: use the regime-specific champion's weights.
     // The governance workflow promotes challengers; this cycle always uses the champion.
     const champion = await getChampion(sr, user.id, regime.market_regime);
-    const weights = champion?.weights || user.ml_weights || { technical: 25, fundamental: 25, sentiment: 20, momentum: 15, risk: 15 };
+    const weights = effectiveGovernedWeights(champion?.weights || user.ml_weights);
 
     // Authoritative capital base: fetch broker account equity EARLY so the AI
     // passes (especially Pass 2 portfolio fit) can size proposals against real
@@ -555,9 +555,7 @@ export default async function(req) {
       const technical = f?.technical_score ?? 50;
       const momentum = f?.momentum_score ?? 50;
       const risk = f?.risk_score ?? 50;
-      const fundamental = p.confidence ?? 50;
-      const sentiment = 50;
-      const ml_score = weightedComposite({ technical, fundamental, sentiment, momentum, risk }, weights);
+      const ml_score = weightedComposite({ technical, momentum, risk }, weights);
       return { ...p, ml_score: Math.round(ml_score * 10) / 10, ml_signal: signalFromComposite(ml_score), realFactors: f, realPrice: ef?.realPrice };
     });
     await heartbeat();

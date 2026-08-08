@@ -64,7 +64,7 @@ export function executableQuoteMetrics(quote, side, nowMs = Date.now()) {
 //
 // The snapshot records the provider's observation timestamp (not the insertion
 // time) so an after-hours close fetched at 9pm is not mistaken for fresh.
-async function fetchAuthoritativeQuote(sr, symbol, assetClass, finnhubKey) {
+async function fetchAuthoritativeQuote(sr, userId, symbol, assetClass, finnhubKey) {
   const key = finnhubKey;
   const ac = assetClass || 'stocks';
   const q = await fetchQuote(symbol, ac, key);
@@ -83,6 +83,7 @@ async function fetchAuthoritativeQuote(sr, symbol, assetClass, finnhubKey) {
   const session = usMarketSession(new Date(providerTs));
   try {
     await sr.entities.PriceSnapshot.create({
+      user_id: userId,
       symbol: String(symbol).toUpperCase(),
       price: q.price,
       timestamp: nowIso(),
@@ -343,6 +344,7 @@ export async function executeIntent(base44, user, input) {
       try {
         const isCrypto = String(input.asset_class || 'stocks').toLowerCase() === 'crypto';
         await sr.entities.PriceSnapshot.create({
+          user_id: userId,
           symbol,
           price: refPrice,
           timestamp: nowIso(),
@@ -359,7 +361,7 @@ export async function executeIntent(base44, user, input) {
       return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: `No executable broker quote: ${e.message}`, symbol, side, requestedQty };
     }
   } else {
-    const quote = await fetchAuthoritativeQuote(sr, symbol, input.asset_class, input.finnhub_key);
+    const quote = await fetchAuthoritativeQuote(sr, userId, symbol, input.asset_class, input.finnhub_key);
     if (!quote.ok) {
       await sr.entities.TradeIntent.update(intentRecord.id, {
         status: 'rejected',

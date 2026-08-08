@@ -16,7 +16,8 @@
 // GATES:
 // 1. MIN_SAMPLE_SIZE: 100 completed trades minimum (raised from 30 — too small for production)
 // 2. MIN_SAMPLE_PER_REGIME: 20 per regime for regime-specific promotion
-// 3. Walk-forward: 70% in-sample, 30% out-of-sample (temporal split, no look-ahead)
+// 3. Temporal separation: 60% training, 20% walk-forward validation folds,
+//    20% untouched test (no look-ahead)
 // 4. OOS improvement: candidate must beat champion by >= MIN_OOS_IMPROVEMENT
 // 5. Statistical significance: bootstrap p-value <= MAX_P_VALUE
 // 6. Bounded changes: each factor can move at most ±MAX_WEIGHT_CHANGE_PCT per promotion
@@ -26,17 +27,28 @@ import { classifyRegimeFromSnapshots } from './regime.ts';
 
 const MAX_WEIGHT_CHANGE_PCT = 20;
 const MIN_SAMPLE_SIZE = 100;
-const MIN_SAMPLE_PER_REGIME = 20;
+const MIN_SAMPLE_PER_REGIME = 100;
 const MIN_OOS_IMPROVEMENT = 0.02;
 const MAX_P_VALUE = 0.05;
 const ROLLBACK_WINDOW = 20;
 const ROLLBACK_SHARPE_THRESHOLD = -0.5;
-const IS_RATIO = 0.7;
-const MIN_OOS_SIZE = 30;
+const TRAIN_RATIO = 0.6;
+const VALIDATION_RATIO = 0.2;
+const MIN_OOS_SIZE = 20;
+const MIN_FOLD_CONSISTENCY = 2 / 3;
 const N_BOOTSTRAP = 500;
 
-const FACTOR_KEYS = ['technical', 'fundamental', 'sentiment', 'momentum', 'risk'];
-const DEFAULT_WEIGHTS = { technical: 25, fundamental: 25, sentiment: 20, momentum: 15, risk: 15 };
+const FACTOR_KEYS = ['technical', 'momentum', 'risk'];
+const DEFAULT_WEIGHTS = { technical: 40, fundamental: 0, sentiment: 0, momentum: 35, risk: 25 };
+
+export function effectiveGovernedWeights(weights) {
+  const source = weights || DEFAULT_WEIGHTS;
+  const activeTotal = FACTOR_KEYS.reduce((sum, key) => sum + (Number(source[key]) || 0), 0);
+  if (activeTotal <= 0) return { ...DEFAULT_WEIGHTS };
+  const normalized = { fundamental: 0, sentiment: 0 };
+  for (const key of FACTOR_KEYS) normalized[key] = (Number(source[key]) || 0) * 100 / activeTotal;
+  return normalized;
+}
 
 // --- Statistics helpers ---
 
@@ -82,6 +94,32 @@ function pearson(x, y) {
 
 function spearman(x, y) { return pearson(rank(x), rank(y)); }
 
+function strategyMetrics(outcomes, weights) {
+  const ranked = [...outcomes].sort((left, right) => computeMLScore(right, weights) - computeMLScore(left, weights));
+  const selected = ranked.slice(0, Math.max(1, Math.ceil(ranked.length / 2)))
+    .sort((left, right) => new Date(left.created_date) - new Date(right.created_date));
+  const returns = selected.map((outcome) => Number(outcome.realized_return)).filter(Number.isFinite);
+  let equity = 1;
+  let peak = 1;
+  let maxDrawdown = 0;
+  for (const value of returns) {
+    equity *= 1 + value;
+    peak = Math.max(peak, equity);
+    maxDrawdown = Math.max(maxDrawdown, peak > 0 ? (peak - equity) / peak : 0);
+  }
+  const benchmarkRelative = selected
+    .filter((outcome) => Number.isFinite(Number(outcome.benchmark_return)))
+    .map((outcome) => Number(outcome.realized_return) - Number(outcome.benchmark_return));
+  return {
+    selected: returns.length,
+    expectancy: mean(returns),
+    sharpe: sharpe(returns),
+    maxDrawdown,
+    winRate: returns.length ? returns.filter((value) => value > 0).length / returns.length : 0,
+    benchmarkExcess: mean(benchmarkRelative),
+  };
+}
+
 // Mulberry32 — deterministic seeded PRNG for reproducible bootstrap validation.
 // Every governance run with the same seed produces identical bootstrap results,
 // so a future audit can rerun the promotion and obtain the same p-value.
@@ -117,6 +155,7 @@ export async function collectOutcomes(sr, userId, regime) {
     '-created_date', 500
   );
   const allOutcomes = decisions.filter((d) =>
+    d.lineage_complete === true &&
     d.realized_return != null &&
     d.technical_score != null &&
     d.momentum_score != null &&
@@ -132,24 +171,36 @@ export async function collectOutcomes(sr, userId, regime) {
 }
 
 function computeMLScore(d, w) {
+  const effective = effectiveGovernedWeights(w);
   return (
-    (d.technical_score || 0) * (w.technical || 0) +
-    (d.fundamental_score || 0) * (w.fundamental || 0) +
-    (d.sentiment_score || 0) * (w.sentiment || 0) +
-    (d.momentum_score || 0) * (w.momentum || 0) +
-    (d.risk_score || 0) * (w.risk || 0)
+    (d.technical_score || 0) * effective.technical +
+    (d.momentum_score || 0) * effective.momentum +
+    (d.risk_score || 0) * effective.risk
   ) / 100;
 }
 
-// Walk-forward validation: temporal split (oldest 70% IS, newest 30% OOS).
-function validateCandidate(outcomes, championWeights, candidateWeights, seed = 42) {
+// Walk-forward validation with disjoint training, validation, and untouched test data.
+export function validateCandidate(outcomes, championWeights, candidateWeights, seed = 42, minimumSampleSize = MIN_SAMPLE_SIZE) {
   const sorted = [...outcomes].sort((a, b) => new Date(a.created_date) - new Date(b.created_date));
-  const splitIdx = Math.floor(sorted.length * IS_RATIO);
-  const outOfSample = sorted.slice(splitIdx);
+  const trainEnd = Math.floor(sorted.length * TRAIN_RATIO);
+  const validationEnd = Math.floor(sorted.length * (TRAIN_RATIO + VALIDATION_RATIO));
+  const validationSet = sorted.slice(trainEnd, validationEnd);
+  const outOfSample = sorted.slice(validationEnd);
 
   if (outOfSample.length < MIN_OOS_SIZE) {
     return { insufficient: true, oosSize: outOfSample.length, sampleSize: outcomes.length };
   }
+
+  const foldSize = Math.max(1, Math.floor(validationSet.length / 3));
+  const folds = [0, 1, 2].map((index) => {
+    const start = index * foldSize;
+    const end = index === 2 ? validationSet.length : start + foldSize;
+    const fold = validationSet.slice(start, end);
+    const championCorr = spearman(fold.map((d) => computeMLScore(d, championWeights)), fold.map((d) => d.realized_return));
+    const candidateCorr = spearman(fold.map((d) => computeMLScore(d, candidateWeights)), fold.map((d) => d.realized_return));
+    return { size: fold.length, championCorr, candidateCorr, improvement: candidateCorr - championCorr };
+  });
+  const foldConsistency = folds.filter((fold) => fold.improvement > 0).length / folds.length;
 
   const champScores = outOfSample.map((d) => computeMLScore(d, championWeights));
   const candScores = outOfSample.map((d) => computeMLScore(d, candidateWeights));
@@ -157,6 +208,12 @@ function validateCandidate(outcomes, championWeights, candidateWeights, seed = 4
 
   const championCorr = spearman(champScores, oosReturns);
   const candidateCorr = spearman(candScores, oosReturns);
+  const championPerformance = strategyMetrics(outOfSample, championWeights);
+  const candidatePerformance = strategyMetrics(outOfSample, candidateWeights);
+  const performanceGate = candidatePerformance.expectancy >= championPerformance.expectancy &&
+    candidatePerformance.sharpe >= championPerformance.sharpe &&
+    candidatePerformance.maxDrawdown <= championPerformance.maxDrawdown &&
+    candidatePerformance.benchmarkExcess >= championPerformance.benchmarkExcess;
 
   // Reproducible bootstrap: seeded PRNG ensures the same candidate + seed
   // always produces the same p-value. The seed is persisted with the model.
@@ -180,34 +237,56 @@ function validateCandidate(outcomes, championWeights, candidateWeights, seed = 4
     improvement: Math.round((candidateCorr - championCorr) * 1000) / 1000,
     pValue: Math.round(pValue * 1000) / 1000,
     sampleSize: outcomes.length,
+    trainingSize: trainEnd,
+    validationSize: validationSet.length,
     oosSize: outOfSample.length,
+    foldConsistency,
+    folds,
+    datasetCutoff: sorted[sorted.length - 1]?.created_date || null,
+    trainingIds: sorted.slice(0, trainEnd).map((d) => d.id),
+    validationIds: validationSet.map((d) => d.id),
+    testIds: outOfSample.map((d) => d.id),
+    seed,
+    optimizerVersion: 'deterministic-coordinate-ascent-v2',
+    metricDefinitions: 'spearman_score_return_correlation; seeded_bootstrap_candidate_superiority',
+    minimumSampleSize,
+    championPerformance,
+    candidatePerformance,
+    performanceGate,
   };
 }
 
 export function passesAllGates(validation) {
   return !validation.insufficient &&
-    validation.sampleSize >= MIN_SAMPLE_SIZE &&
+    validation.sampleSize >= (validation.minimumSampleSize || MIN_SAMPLE_SIZE) &&
+    validation.foldConsistency >= MIN_FOLD_CONSISTENCY &&
+    validation.performanceGate === true &&
     validation.improvement >= MIN_OOS_IMPROVEMENT &&
     validation.pValue <= MAX_P_VALUE;
 }
 
 // Bound candidate weights to ±MAX_WEIGHT_CHANGE_PCT per factor from champion, then normalize.
-function boundWeights(champion, candidate) {
-  const cw = champion || DEFAULT_WEIGHTS;
-  const bounded = {};
+export function boundWeights(champion, candidate) {
+  const cw = effectiveGovernedWeights(champion);
+  const bounded = { fundamental: 0, sentiment: 0 };
+  const lower = {};
+  const upper = {};
   for (const k of FACTOR_KEYS) {
     const c = cw[k] || 0;
-    const min = c * (1 - MAX_WEIGHT_CHANGE_PCT / 100);
-    const max = c * (1 + MAX_WEIGHT_CHANGE_PCT / 100);
-    bounded[k] = Math.max(5, Math.min(40, Math.min(max, Math.max(min, candidate[k] || 0))));
+    lower[k] = Math.max(5, Math.ceil(c * (1 - MAX_WEIGHT_CHANGE_PCT / 100)));
+    upper[k] = Math.min(40, Math.floor(c * (1 + MAX_WEIGHT_CHANGE_PCT / 100)));
+    bounded[k] = Math.round(Math.min(upper[k], Math.max(lower[k], candidate[k] || 0)));
   }
-  const sum = FACTOR_KEYS.reduce((s, k) => s + bounded[k], 0);
-  if (sum > 0) for (const k of FACTOR_KEYS) bounded[k] = Math.round((bounded[k] / sum) * 100);
-  // Fix rounding residual — ensure weights sum to exactly 100
-  const total = FACTOR_KEYS.reduce((s, k) => s + bounded[k], 0);
-  if (total !== 100) {
-    const largestFactor = FACTOR_KEYS.reduce((max, k) => bounded[k] > bounded[max] ? k : max, FACTOR_KEYS[0]);
-    bounded[largestFactor] += 100 - total;
+  let residual = 100 - FACTOR_KEYS.reduce((sum, key) => sum + bounded[key], 0);
+  while (residual !== 0) {
+    const direction = residual > 0 ? 1 : -1;
+    const eligible = FACTOR_KEYS.filter((key) => direction > 0 ? bounded[key] < upper[key] : bounded[key] > lower[key]);
+    if (!eligible.length) throw new Error('Unable to normalize weights within bounded movement constraints');
+    for (const key of eligible) {
+      if (residual === 0) break;
+      bounded[key] += direction;
+      residual -= direction;
+    }
   }
   return bounded;
 }
@@ -215,14 +294,13 @@ function boundWeights(champion, candidate) {
 // LLM provides HYPOTHESIS only (factor directions). The deterministic optimizer
 // below finds the exact weights. The LLM never invents numerical weights.
 async function generateHypothesis(sr, champion, outcomes) {
-  const championWeights = champion?.weights || DEFAULT_WEIGHTS;
+  const championWeights = effectiveGovernedWeights(champion?.weights);
   const winners = outcomes.filter((o) => o.realized_return > 0);
   const losers = outcomes.filter((o) => o.realized_return < 0);
 
   const factorAnalysis = {};
   for (const [k, field] of [
-    ['technical', 'technical_score'], ['fundamental', 'fundamental_score'],
-    ['sentiment', 'sentiment_score'], ['momentum', 'momentum_score'], ['risk', 'risk_score'],
+    ['technical', 'technical_score'], ['momentum', 'momentum_score'], ['risk', 'risk_score'],
   ]) {
     const winAvg = winners.length ? mean(winners.map((o) => o[field] || 0)) : 0;
     const loseAvg = losers.length ? mean(losers.map((o) => o[field] || 0)) : 0;
@@ -247,8 +325,6 @@ Return a direction for each factor and a concise reasoning.`,
           type: 'object',
           properties: {
             technical: { type: 'string', enum: ['increase', 'decrease', 'neutral'] },
-            fundamental: { type: 'string', enum: ['increase', 'decrease', 'neutral'] },
-            sentiment: { type: 'string', enum: ['increase', 'decrease', 'neutral'] },
             momentum: { type: 'string', enum: ['increase', 'decrease', 'neutral'] },
             risk: { type: 'string', enum: ['increase', 'decrease', 'neutral'] },
           },
@@ -266,8 +342,9 @@ Return a direction for each factor and a concise reasoning.`,
 // The LLM hypothesis biases the search order and starting direction.
 // The optimizer NEVER uses the LLM for numerical weights — only for direction hints.
 function optimizeCandidateWeights(outcomes, championWeights, hypothesis) {
+  championWeights = effectiveGovernedWeights(championWeights);
   const sorted = [...outcomes].sort((a, b) => new Date(a.created_date) - new Date(b.created_date));
-  const splitIdx = Math.floor(sorted.length * IS_RATIO);
+  const splitIdx = Math.floor(sorted.length * TRAIN_RATIO);
   // OPTIMIZE ON IN-SAMPLE ONLY — never touch the OOS holdout.
   // The validator (validateCandidate) evaluates on OOS. This prevents holdout
   // contamination: the optimizer can no longer search weights using the same
@@ -334,6 +411,8 @@ function optimizeCandidateWeights(outcomes, championWeights, hypothesis) {
 async function promoteIfProven(sr, userId, user, candidate, champion, validation, regime) {
   if (validation.insufficient) return { promoted: false, reason: `INSUFFICIENT_OOS_SAMPLE (${validation.oosSize} < ${MIN_OOS_SIZE})` };
   if (validation.sampleSize < MIN_SAMPLE_SIZE) return { promoted: false, reason: `INSUFFICIENT_SAMPLE (${validation.sampleSize} < ${MIN_SAMPLE_SIZE})` };
+  if (validation.foldConsistency < MIN_FOLD_CONSISTENCY) return { promoted: false, reason: `INCONSISTENT_WALK_FORWARD (${validation.foldConsistency} < ${MIN_FOLD_CONSISTENCY})` };
+  if (validation.performanceGate !== true) return { promoted: false, reason: 'RISK_ADJUSTED_PERFORMANCE_GATE_FAILED' };
   if (validation.improvement < MIN_OOS_IMPROVEMENT) return { promoted: false, reason: `INSUFFICIENT_IMPROVEMENT (${(validation.improvement * 100).toFixed(2)}% < ${(MIN_OOS_IMPROVEMENT * 100).toFixed(0)}%)` };
   if (validation.pValue > MAX_P_VALUE) return { promoted: false, reason: `NOT_SIGNIFICANT (p=${validation.pValue} > ${MAX_P_VALUE})` };
 
@@ -391,7 +470,7 @@ function bumpVersion(v) {
 // SEPARATION: This runs offline (weekly workflow), never in the live execution path.
 export async function runGovernanceCycle(sr, userId, user) {
   // Classify current regime for regime-specific champion selection
-  const regimeInfo = await classifyRegimeFromSnapshots(sr);
+  const regimeInfo = await classifyRegimeFromSnapshots(sr, userId);
   const currentRegime = regimeInfo.market_regime;
 
   const champion = await getChampion(sr, userId, currentRegime);
@@ -406,7 +485,7 @@ export async function runGovernanceCycle(sr, userId, user) {
       parent_version: null,
       weights: DEFAULT_WEIGHTS,
       status: 'champion',
-      approval_status: 'auto_promoted',
+      approval_status: 'approved',
       promoted_at: new Date().toISOString(),
       sample_size: 0,
       created_at: new Date().toISOString(),
@@ -425,6 +504,8 @@ export async function runGovernanceCycle(sr, userId, user) {
   if (outcomes.length < MIN_SAMPLE_SIZE) {
     return { skipped: true, reason: `Insufficient outcomes (${outcomes.length} < ${MIN_SAMPLE_SIZE})`, champion: champion.version, regime: currentRegime, recentSharpe: rollback.recentSharpe };
   }
+
+  const validationSeed = 42;
 
   // 1. LLM generates HYPOTHESIS (factor directions only — no numerical weights)
   const { hypothesis, reasoning } = await generateHypothesis(sr, champion, outcomes);
@@ -456,8 +537,8 @@ export async function runGovernanceCycle(sr, userId, user) {
   });
 
   // 3. Walk-forward validate (reproducible — seed persisted for audit)
-  const validationSeed = 42;
-  const validation = validateCandidate(outcomes, champion.weights, optimization.weights, validationSeed);
+  const requiredSamples = currentRegime === 'all' ? MIN_SAMPLE_SIZE : MIN_SAMPLE_PER_REGIME;
+  const validation = validateCandidate(outcomes, champion.weights, optimization.weights, validationSeed, requiredSamples);
 
   await sr.entities.StrategyModel.update(challenger.id, {
     out_of_sample_metrics: JSON.stringify(validation),
@@ -467,7 +548,13 @@ export async function runGovernanceCycle(sr, userId, user) {
   });
 
   // 4. Promotion mode gate
-  const promotionMode = user.promotion_mode || 'automatic';
+  let promotionMode = user.promotion_mode || 'manual_approval';
+  if (promotionMode === 'automatic') {
+    const credentials = await sr.entities.BrokerCredential.filter({ user_id: userId, status: 'active' });
+    if (!credentials.length || credentials.some((credential) => credential.mode === 'paper')) {
+      promotionMode = 'manual_approval';
+    }
+  }
 
   if (promotionMode === 'research') {
     // Validate only, never promote — record everything for analysis
