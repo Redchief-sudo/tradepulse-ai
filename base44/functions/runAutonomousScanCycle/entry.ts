@@ -6,14 +6,14 @@ import { classifyRegimeFromSnapshots } from '../../shared/regime.ts';
 import { netEdge } from '../../shared/costModel.ts';
 import { getChampion } from '../../shared/modelGovernance.ts';
 import { getAlpacaAccount, getAlpacaClock, cancelAlpacaOrder } from '../../shared/alpaca.ts';
-import { fetchCandles as fetchMultiAssetCandles } from '../../shared/marketDataAdapter.ts';
+import { fetchCandles as fetchMultiAssetCandles, fetchQuote as fetchMultiAssetQuote } from '../../shared/marketDataAdapter.ts';
 import { sendTelegramMessage } from '../../shared/telegram.ts';
-import { isExecutable } from '../../shared/executableUniverse.ts';
 import { riskLimitsForProfile, checkMaxDrawdown } from '../../shared/riskEngine.ts';
 import { getPaperEquity } from '../../shared/cashLedger.ts';
 import { executionSessionDecision, updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
 import { nyDayStart } from '../../shared/marketHours.ts';
 import { hasNewerScanGeneration, nextScanGeneration } from '../../shared/scanState.ts';
+import { canonicalizeOpportunity, normalizeAssetClass } from '../../shared/opportunity.ts';
 
 // Risk limits are defined in ONE place: riskEngine.ts. The scan cycle, execution
 // gateway, and risk engine all use riskLimitsForProfile() so they never disagree.
@@ -374,16 +374,33 @@ export default async function(req) {
     await heartbeat();
     await verifyOwnership();
     assertScanHealthy();
-    // EXECUTABLE UNIVERSE FILTER — only execute trades for symbols in the
-    // fixed liquid universe. Candidates outside the universe are research-
-    // only: they can be analyzed but never auto-executed. (Per the audit:
-    // restrict execution to a small liquid stock universe to reduce
-    // spread/slippage risk and make failures easier to diagnose.)
+    // Canonicalize every LLM discovery against asset-native provider data.
+    // Prompt output is discovery only: it cannot supply an executable price,
+    // timestamp, session, identity, or execution capability.
     const allCandidates = p1.candidates || [];
-    const candidates = allCandidates.filter((c) => isExecutable(c.symbol));
+    const opportunities = [];
+    for (const candidate of allCandidates) {
+      const assetClass = normalizeAssetClass(candidate.asset_class);
+      const quote = assetClass === 'unsupported'
+        ? { error: `unsupported asset class: ${candidate.asset_class}` }
+        : await fetchMultiAssetQuote(candidate.symbol, assetClass, key);
+      await heartbeat();
+      await verifyOwnership();
+      assertScanHealthy();
+      const opportunity = canonicalizeOpportunity(candidate, quote, new Date().toISOString(), brokerCreds[0]?.mode || 'paper');
+      await sr.entities.Opportunity.create({
+        user_id: user.id,
+        scan_run_id: runId,
+        ...opportunity,
+      });
+      opportunities.push({ ...candidate, ...opportunity, symbol: opportunity.native_symbol });
+    }
+    const candidates = opportunities.filter((candidate) =>
+      candidate.execution_capability === 'paper_executable' || candidate.execution_capability === 'live_executable'
+    );
     if (!candidates.length) {
       await finishRun({ status: 'no_candidates', market_summary: p1.market_summary, market_regime: regime.market_regime, model_version: champion?.version || 'default' });
-      return Response.json({ ok: true, message: 'No candidates', market_summary: p1.market_summary, champion_version: champion?.version });
+      return Response.json({ ok: true, message: 'No executable candidates', opportunities, market_summary: p1.market_summary, champion_version: champion?.version });
     }
 
     // Enrich each candidate with REAL indicators
@@ -391,13 +408,13 @@ export default async function(req) {
     const candleTo = Math.floor(Date.now() / 1000);
     const candleFrom = candleTo - 220 * 86400;
     for (const c of candidates) {
-      const ac = (c.asset_class || 'stocks').toLowerCase();
+      const ac = c.asset_class;
       const candles = await fetchMultiAssetCandles(c.symbol, ac, candleFrom, candleTo, key);
       await heartbeat();
       await verifyOwnership();
       assertScanHealthy();
       const factors = candles ? computeRealFactors(candles) : null;
-      enriched.push({ ...c, asset_class: ac, realFactors: factors, realPrice: factors?.price || c.current_price });
+      enriched.push({ ...c, asset_class: ac, realFactors: factors, realPrice: factors?.price || c.price });
     }
 
     // PASS 2 — Portfolio fit & risk-aware sizing (Claude Sonnet 5)
@@ -446,7 +463,7 @@ export default async function(req) {
     let proposals = [];
     for (const e of buyCandidates) {
       if (proposals.length >= pp.max_daily_trades) break;
-      const price = e.realPrice || e.current_price || 0;
+      const price = e.realPrice || 0;
       if (price <= 0) continue;
       // Confidence-weighted position sizing: scale from 50% to 100% of max
       // position pct based on confidence (min_confidence → 50%, 100% → 100%).
@@ -487,7 +504,7 @@ export default async function(req) {
         sector: e.sector || 'Other',
         asset_class: e.asset_class || 'stocks',
         action: 'sell',
-        current_price: e.realPrice || e.current_price || 0,
+        current_price: e.realPrice || 0,
         confidence: e.confidence || pp.min_confidence,
         target_price: e.target_price,
         stop_loss: e.stop_loss,

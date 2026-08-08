@@ -1,0 +1,33 @@
+{
+  "name": "Opportunity",
+  "type": "object",
+  "properties": {
+    "user_id": { "type": "string" },
+    "scan_run_id": { "type": "string" },
+    "asset_class": { "type": "string", "enum": ["equities", "crypto", "forex", "commodities", "fixed_income", "unsupported"] },
+    "native_symbol": { "type": "string" },
+    "canonical_symbol": { "type": "string" },
+    "venue": { "type": "string" },
+    "market": { "type": "string" },
+    "price": { "type": "number" },
+    "bid": { "type": "number" },
+    "ask": { "type": "number" },
+    "spread": { "type": "number" },
+    "volume": { "type": "number" },
+    "liquidity": { "type": "number" },
+    "volatility": { "type": "number" },
+    "provider_timestamp": { "type": "string", "format": "date-time" },
+    "received_at": { "type": "string", "format": "date-time" },
+    "market_session": { "type": "string" },
+    "source": { "type": "string" },
+    "execution_capability": { "type": "string", "enum": ["research_only", "paper_executable", "live_executable", "unsupported"] },
+    "provider_error": { "type": "string" }
+  },
+  "required": ["user_id", "scan_run_id", "asset_class", "native_symbol", "canonical_symbol", "received_at", "market_session", "execution_capability"],
+  "rls": {
+    "read": { "$or": [{ "created_by_id": "{{user.id}}" }, { "data.user_id": "{{user.id}}" }] },
+    "create": {},
+    "update": {},
+    "delete": {}
+  }
+}

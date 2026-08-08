@@ -19,6 +19,12 @@ export interface Quote {
   price: number;
   day_change_percent: number;
   quote_timestamp?: number; // unix seconds — provider's authoritative observation time
+  bid?: number;
+  ask?: number;
+  volume?: number;
+  venue?: string;
+  market?: string;
+  source?: string;
   error?: string;
 }
 
@@ -52,17 +58,33 @@ export async function fetchQuote(symbol: string, assetClass: string, finnhubKey?
   if (ac === 'crypto') {
     try {
       const product = coinbaseProduct(sym);
-      const res = await fetch(`${COINBASE_STATS}/${encodeURIComponent(product)}/stats`);
-      if (!res.ok) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: `Coinbase HTTP ${res.status}` };
-      const d = await res.json();
+      const [statsRes, tickerRes] = await Promise.all([
+        fetch(`${COINBASE_STATS}/${encodeURIComponent(product)}/stats`),
+        fetch(`${COINBASE_STATS}/${encodeURIComponent(product)}/ticker`),
+      ]);
+      if (!statsRes.ok || !tickerRes.ok) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: `Coinbase HTTP stats=${statsRes.status} ticker=${tickerRes.status}` };
+      const [d, ticker] = await Promise.all([statsRes.json(), tickerRes.json()]);
       const last = safeNum(d.last);
       const open = safeNum(d.open);
       if (last <= 0) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: 'no price' };
       const dayChange = open > 0 ? ((last - open) / open) * 100 : 0;
-      return { symbol: sym, asset_class: ac, price: last, day_change_percent: dayChange, quote_timestamp: Math.floor(Date.now() / 1000) };
+      const providerTime = Date.parse(ticker.time);
+      if (!Number.isFinite(providerTime)) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: 'missing provider timestamp' };
+      return {
+        symbol: sym, asset_class: ac, price: last, day_change_percent: dayChange,
+        quote_timestamp: Math.floor(providerTime / 1000), bid: safeNum(ticker.bid), ask: safeNum(ticker.ask),
+        volume: safeNum(d.volume), venue: 'coinbase', market: product, source: 'coinbase_exchange',
+      };
     } catch (e: any) {
       return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: e.message };
     }
+  }
+
+  if (ac !== 'stocks' && ac !== 'equities' && ac !== 'commodities' && ac !== 'fixed_income') {
+    return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: `unsupported asset class: ${ac}` };
+  }
+  if ((ac === 'commodities' || ac === 'fixed_income') && (sym.includes('=') || sym.includes('/'))) {
+    return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: `unsupported native instrument: ${sym}` };
   }
 
   // stocks (and other equity-like classes fall back to Finnhub)
@@ -72,7 +94,8 @@ export async function fetchQuote(symbol: string, assetClass: string, finnhubKey?
     if (!res.ok) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: `Finnhub HTTP ${res.status}` };
     const d = await res.json();
     if (!d || typeof d.c !== 'number' || d.c === 0) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: 'no data' };
-    return { symbol: sym, asset_class: ac, price: d.c, day_change_percent: typeof d.dp === 'number' ? d.dp : 0, quote_timestamp: typeof d.t === 'number' && d.t > 0 ? d.t : Math.floor(Date.now() / 1000) };
+    if (typeof d.t !== 'number' || d.t <= 0) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: 'missing provider timestamp' };
+    return { symbol: sym, asset_class: ac, price: d.c, day_change_percent: typeof d.dp === 'number' ? d.dp : 0, quote_timestamp: d.t, venue: 'finnhub', market: 'US', source: 'finnhub' };
   } catch (e: any) {
     return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: e.message };
   }
@@ -114,6 +137,12 @@ export async function fetchCandles(symbol: string, assetClass: string, from: num
       return null;
     }
   }
+
+  // Only equity-like spot/ETF instruments are supported by the Yahoo candle
+  // adapter. Native forex and futures must not silently inherit equity data
+  // semantics merely because Yahoo recognizes a similarly formatted symbol.
+  if (ac !== 'stocks' && ac !== 'equities' && ac !== 'commodities' && ac !== 'fixed_income') return null;
+  if ((ac === 'commodities' || ac === 'fixed_income') && (sym.includes('=') || sym.includes('/'))) return null;
 
   // stocks → Yahoo Finance (no key needed; Finnhub free tier has no historical candles)
   try {
