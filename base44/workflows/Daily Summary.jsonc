@@ -1,5 +1,5 @@
 {
-  "description": "At US market close (4:00 PM ET weekdays): sends a daily P&L summary via email and Telegram so you know exactly how much you made today. Runs automatically \u2014 no action needed.",
+  "description": "Every five minutes from 1:00-4:59 PM ET weekdays, checks Alpaca's clock and transitions at the actual exchange close, including shortened sessions.",
   "definition": {
     "document": {
       "dsl": "1.0.0",
@@ -16,8 +16,8 @@
           },
           "then": "end",
           "x-base44": {
-            "title": "Stop bot and send daily P&L summary",
-            "description": "Authoritative market-close stop followed by email and Telegram summary"
+            "title": "Transition closed assets and send daily P&L summary",
+            "description": "Alpaca-authorized equity close transition followed by email and Telegram summary; continuous assets remain active"
           }
         }
       }
@@ -30,7 +30,7 @@
       "trigger_type": "scheduled",
       "events": [],
       "schedule_mode": "recurring",
-      "cron_expression": "0 16 * * 1-5",
+      "cron_expression": "*/5 13-16 * * 1-5",
       "one_time_date": null,
       "timezone": "America/New_York",
       "interval_value": null,

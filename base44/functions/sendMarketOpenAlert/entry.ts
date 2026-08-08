@@ -18,7 +18,7 @@ export default async function(req) {
     const correlationId = `market-open-${sessionDate}`;
     const priorStarted = await sr.entities.AuditEvent.filter({ user_id: user.id, event_type: 'market_open_bot_started', correlation_id: correlationId });
     const priorBlocked = await sr.entities.AuditEvent.filter({ user_id: user.id, event_type: 'market_open_bot_blocked', correlation_id: correlationId });
-    if (priorStarted.length || priorBlocked.length) return Response.json({ ok: true, skipped: 'already_processed', session_date: sessionDate });
+    if (priorStarted.length) return Response.json({ ok: true, skipped: 'already_started', session_date: sessionDate });
 
     const credentials = await sr.entities.BrokerCredential.filter({ user_id: user.id, broker: 'alpaca', status: 'active' });
     const credential = credentials[0];
@@ -36,14 +36,28 @@ export default async function(req) {
       }
     }
 
-    let scan = 'not_started';
+    let scan = 'not_queued';
     if (transition === 'started' || transition === 'already_active') {
-      try {
-        await base44.functions.invoke('runScanCoordinator', {});
-        scan = 'coordinator_invoked';
-      } catch (error) {
-        scan = `scheduled_retry:${error.message}`;
+      const recentRuns = await sr.entities.ScanRun.filter({ user_id: user.id }, '-started_at', 10);
+      const cutoff = Date.now() - 2 * 60 * 1000;
+      const recentScanExists = recentRuns.some((run) => new Date(run.last_heartbeat_at || run.completed_at || run.started_at).getTime() >= cutoff);
+      const requests = await sr.entities.ScanRequest.filter({ user_id: user.id });
+      const requestAlreadyQueued = requests.some((request) => ['pending', 'processing'].includes(request.status));
+      if (recentScanExists) scan = 'recent_scan_exists';
+      else if (requestAlreadyQueued) scan = 'request_already_queued';
+      else {
+        await sr.entities.ScanRequest.create({
+          user_id: user.id,
+          status: 'pending',
+          trigger_source: 'scheduled',
+          requested_at: new Date().toISOString(),
+        });
+        scan = 'request_queued';
       }
+    }
+
+    if (transition.startsWith('blocked:') && priorBlocked.some((event) => event.message?.includes(transition))) {
+      return Response.json({ ok: false, skipped: 'same_block_already_recorded', transition, session_date: sessionDate }, { status: 409 });
     }
 
     let telegramSent = false;

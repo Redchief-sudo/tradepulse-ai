@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { boundWeights, collectOutcomes, getExactChampion, passesAllGates, runGovernanceCycle, validateCandidate } from '../base44/shared/modelGovernance.ts';
+import { boundWeights, collectOutcomes, getExactChampion, passesAllGates, runGovernanceCycle, strategyMetrics, validateCandidate } from '../base44/shared/modelGovernance.ts';
 
 const champion = { technical: 40, fundamental: 0, sentiment: 0, momentum: 35, risk: 25 };
 const candidate = { technical: 70, fundamental: 0, sentiment: 0, momentum: 20, risk: 10 };
@@ -40,6 +40,19 @@ describe('model governance', () => {
 
   it('rejects a challenger that fails risk-adjusted holdout performance', () => {
     expect(passesAllGates({ sampleSize: 100, minimumSampleSize: 100, insufficient: false, improvement: 0.1, pValue: 0.01, foldConsistency: 1, performanceGate: false })).toBe(false);
+  });
+
+  it('computes compounded portfolio maximum drawdown for promotion metrics', () => {
+    const rows = [0.1, -0.1, -0.1, 0.01, 0.01, 0.01].map((realized_return, index) => ({
+      created_date: new Date(Date.UTC(2026, 0, index + 1)).toISOString(),
+      technical_score: 100 - index,
+      momentum_score: 100 - index,
+      risk_score: 50,
+      realized_return,
+    }));
+    const metrics = strategyMetrics(rows, champion);
+    expect(metrics.maxDrawdown).toBeGreaterThan(0);
+    expect(metrics.maxDrawdown).not.toBe(metrics.worstTradeLoss);
   });
 
   it('bounds every factor movement and normalizes weights', () => {

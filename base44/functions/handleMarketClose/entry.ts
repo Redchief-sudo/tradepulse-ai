@@ -3,8 +3,10 @@ import { secrets } from 'base44:runtime';
 import { sendTelegramMessage } from '../../shared/telegram.ts';
 import { updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
 import { nySessionDateStr } from '../../shared/marketHours.ts';
+import { getAlpacaClock } from '../../shared/alpaca.ts';
 
-// Stopping is protective and remains safe if broker authority is unavailable.
+// Alpaca's clock authorizes the equity-session close transition. If broker
+// authority is unavailable, the recurring workflow retries without guessing.
 // The daily summary supplies the normal Telegram close notification; a fallback
 // is sent only when summary generation fails.
 export default async function(req) {
@@ -19,9 +21,14 @@ export default async function(req) {
     const prior = await sr.entities.AuditEvent.filter({ user_id: user.id, event_type: 'market_close_asset_sessions_updated', correlation_id: correlationId });
     if (prior.length) return Response.json({ ok: true, skipped: 'already_processed', session_date: sessionDate });
     const openMarkers = await sr.entities.AuditEvent.filter({ user_id: user.id, event_type: 'market_open_bot_started', correlation_id: `market-open-${sessionDate}` });
-    if (!openMarkers.length && !user.trading_active) {
+    if (!openMarkers.length && user.trading_session_state !== SESSION_STATES.ACTIVE) {
       return Response.json({ ok: true, skipped: 'no_open_session_for_date', session_date: sessionDate });
     }
+    const credentials = await sr.entities.BrokerCredential.filter({ user_id: user.id, broker: 'alpaca', status: 'active' });
+    const credential = credentials[0];
+    if (!credential) return Response.json({ error: 'ALPACA_CREDENTIALS_REQUIRED_FOR_MARKET_CLOSE_AUTHORITY' }, { status: 409 });
+    const clock = await getAlpacaClock({ apiKey: credential.api_key, secretKey: credential.api_secret, mode: credential.mode });
+    if (clock?.is_open) return Response.json({ ok: true, skipped: 'alpaca_market_still_open', next_close: clock.next_close || null, session_date: sessionDate });
 
     let transition = 'already_stopped';
     if (user.trading_active && user.trading_session_state === SESSION_STATES.ACTIVE) {
@@ -59,7 +66,7 @@ export default async function(req) {
       user_id: user.id, event_type: 'market_close_asset_sessions_updated', severity: (summaryError || closeTelegramMissing) && !fallbackTelegramSent ? 'warning' : 'info',
       correlation_id: correlationId, entity_type: 'User', entity_id: user.id,
       message: `Market-close session transition: ${transition}; summary=${summaryError ? 'failed' : 'sent'}`,
-      details: JSON.stringify({ sessionDate, transition, summaryError, closeTelegramMissing, fallbackTelegramSent }),
+      details: JSON.stringify({ sessionDate, transition, summaryError, closeTelegramMissing, fallbackTelegramSent, alpacaTimestamp: clock?.timestamp || null, alpacaNextOpen: clock?.next_open || null }),
     });
     return Response.json({ ok: !summaryError, transition, continuous_assets_active: continuousAssetsActive, summary, summary_error: summaryError, fallback_telegram_sent: fallbackTelegramSent });
   } catch (error) {

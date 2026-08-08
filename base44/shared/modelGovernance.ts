@@ -95,19 +95,32 @@ function pearson(x, y) {
 
 function spearman(x, y) { return pearson(rank(x), rank(y)); }
 
-function strategyMetrics(outcomes, weights) {
+function compoundedMaxDrawdown(returns) {
+  let equity = 1;
+  let peak = 1;
+  let maxDrawdown = 0;
+  for (const value of returns) {
+    equity *= 1 + value;
+    if (equity > peak) peak = equity;
+    const drawdown = peak > 0 ? (peak - equity) / peak : 1;
+    if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+  }
+  return maxDrawdown;
+}
+
+export function strategyMetrics(outcomes, weights) {
   const ranked = [...outcomes].sort((left, right) => computeMLScore(right, weights) - computeMLScore(left, weights));
   const selected = ranked.slice(0, Math.max(1, Math.ceil(ranked.length / 2)))
     .sort((left, right) => new Date(left.created_date) - new Date(right.created_date));
   const returns = selected.map((outcome) => Number(outcome.realized_return)).filter(Number.isFinite);
   const benchmarkRelative = selected
-    .filter((outcome) => Number.isFinite(Number(outcome.benchmark_return)))
+    .filter((outcome) => outcome.benchmark_return != null && Number.isFinite(Number(outcome.benchmark_return)))
     .map((outcome) => Number(outcome.realized_return) - Number(outcome.benchmark_return));
   return {
     selected: returns.length,
     expectancy: mean(returns),
     sharpe: sharpe(returns),
-    maxDrawdown: null,
+    maxDrawdown: compoundedMaxDrawdown(returns),
     worstTradeLoss: returns.length ? Math.abs(Math.min(0, ...returns)) : 0,
     winRate: returns.length ? returns.filter((value) => value > 0).length / returns.length : 0,
     benchmarkExcess: mean(benchmarkRelative),
@@ -186,7 +199,7 @@ function computeMLScore(d, w) {
   ) / 100;
 }
 
-// Walk-forward validation with disjoint training, validation, and untouched test data.
+// Temporal multi-fold validation with disjoint training, validation, and untouched test data.
 export function validateCandidate(outcomes, championWeights, candidateWeights, seed = 42, minimumSampleSize = MIN_SAMPLE_SIZE) {
   const sorted = [...outcomes].sort((a, b) => new Date(a.created_date) - new Date(b.created_date));
   const trainEnd = Math.floor(sorted.length * TRAIN_RATIO);
@@ -219,6 +232,7 @@ export function validateCandidate(outcomes, championWeights, candidateWeights, s
   const candidatePerformance = strategyMetrics(outOfSample, candidateWeights);
   const performanceGate = candidatePerformance.expectancy >= championPerformance.expectancy &&
     candidatePerformance.sharpe >= championPerformance.sharpe &&
+    candidatePerformance.maxDrawdown <= championPerformance.maxDrawdown &&
     candidatePerformance.worstTradeLoss <= championPerformance.worstTradeLoss &&
     candidatePerformance.benchmarkExcess >= championPerformance.benchmarkExcess;
 
@@ -259,7 +273,7 @@ export function validateCandidate(outcomes, championWeights, candidateWeights, s
     testIds: outOfSample.map((d) => d.id),
     seed,
     optimizerVersion: 'deterministic-coordinate-ascent-v2',
-    metricDefinitions: 'spearman_score_return_correlation; seeded_circular_block_bootstrap; unannualized_trade_return_risk; worst_trade_loss',
+    metricDefinitions: 'spearman_score_return_correlation; seeded_circular_block_bootstrap; unannualized_trade_return_risk; compounded_portfolio_max_drawdown; worst_trade_loss',
     minimumSampleSize,
     championPerformance,
     candidatePerformance,
@@ -422,7 +436,7 @@ function optimizeCandidateWeights(outcomes, championWeights, hypothesis) {
 async function promoteIfProven(sr, userId, user, candidate, exactChampion, validation, regime) {
   if (validation.insufficient) return { promoted: false, reason: `INSUFFICIENT_OOS_SAMPLE (${validation.oosSize} < ${MIN_OOS_SIZE})` };
   if (validation.sampleSize < MIN_SAMPLE_SIZE) return { promoted: false, reason: `INSUFFICIENT_SAMPLE (${validation.sampleSize} < ${MIN_SAMPLE_SIZE})` };
-  if (validation.foldConsistency < MIN_FOLD_CONSISTENCY) return { promoted: false, reason: `INCONSISTENT_WALK_FORWARD (${validation.foldConsistency} < ${MIN_FOLD_CONSISTENCY})` };
+  if (validation.foldConsistency < MIN_FOLD_CONSISTENCY) return { promoted: false, reason: `INCONSISTENT_TEMPORAL_FOLDS (${validation.foldConsistency} < ${MIN_FOLD_CONSISTENCY})` };
   if (validation.performanceGate !== true) return { promoted: false, reason: 'RISK_ADJUSTED_PERFORMANCE_GATE_FAILED' };
   if (validation.improvement < MIN_OOS_IMPROVEMENT) return { promoted: false, reason: `INSUFFICIENT_IMPROVEMENT (${(validation.improvement * 100).toFixed(2)}% < ${(MIN_OOS_IMPROVEMENT * 100).toFixed(0)}%)` };
   if (validation.pValue > MAX_P_VALUE) return { promoted: false, reason: `NOT_SIGNIFICANT (p=${validation.pValue} > ${MAX_P_VALUE})` };
