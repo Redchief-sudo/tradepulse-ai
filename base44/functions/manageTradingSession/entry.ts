@@ -20,8 +20,11 @@ export default async function(req) {
     if (!caller || caller.role !== 'admin') return Response.json({ error: 'Admin only' }, { status: 403 });
     const { action } = await req.json().catch(() => ({}));
     const sr = base44.asServiceRole;
-    const user = await sr.entities.User.get(caller.id);
-    if (!user) return Response.json({ error: 'User not found' }, { status: 404 });
+    // auth.me() already returned the authoritative persisted User record. A
+    // second service-role GET can return 404 in Base44 even though the caller
+    // is authenticated, which made the Start Trader control fail before any
+    // session action was evaluated.
+    const user = caller;
 
     let unresolvedCount = 0;
     if (action === 'acknowledge_integrity_recovery') {
@@ -33,7 +36,7 @@ export default async function(req) {
     await sr.entities.User.update(user.id, decision.patch);
     await audit(sr, user.id, action, `Trading session action authorized: ${action}`);
 
-    const updated = await sr.entities.User.get(user.id);
+    const updated = { ...user, ...decision.patch };
     return Response.json({
       ok: true,
       trading_active: !!updated.trading_active,

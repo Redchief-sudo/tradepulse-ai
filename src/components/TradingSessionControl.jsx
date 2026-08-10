@@ -15,6 +15,10 @@ function formatCurrency(n) {
   }).format(n || 0);
 }
 
+function actionErrorMessage(error, fallback) {
+  return error?.response?.data?.error || error?.data?.error || error?.message || fallback;
+}
+
 // One-button autonomous trading control.
 // Start: activates the AI (trading_active flag) + runs an immediate scan.
 // Stop: deactivates the AI + fetches a daily P&L summary.
@@ -71,7 +75,7 @@ export default function TradingSessionControl({ onComplete, onStart }) {
       // Run an immediate scan so the user doesn't wait for the next scheduled one
       trader.startTrader({ onComplete });
     } catch (e) {
-      setActionError(e.message || 'Unable to start trading');
+      setActionError(actionErrorMessage(e, 'Unable to start trading'));
     }
   };
 
@@ -86,7 +90,7 @@ export default function TradingSessionControl({ onComplete, onStart }) {
       if (!data?.ok) throw new Error(data?.error || 'Unable to stop trading');
       await loadStatus();
     } catch (e) {
-      setActionError(e.message || 'Unable to stop trading');
+      setActionError(actionErrorMessage(e, 'Unable to stop trading'));
       setStopping(false);
       return;
     }
@@ -115,7 +119,7 @@ export default function TradingSessionControl({ onComplete, onStart }) {
       if (!data?.ok) throw new Error(data?.error || 'Unable to reset kill switch');
       await loadStatus();
     } catch (e) {
-      setActionError(e.message || 'Unable to reset kill switch');
+      setActionError(actionErrorMessage(e, 'Unable to reset kill switch'));
     }
   };
 
@@ -127,7 +131,7 @@ export default function TradingSessionControl({ onComplete, onStart }) {
       if (!data?.ok) throw new Error(data?.error || 'Unable to acknowledge recovery');
       await loadStatus();
     } catch (e) {
-      setActionError(e.message || 'Unable to acknowledge recovery');
+      setActionError(actionErrorMessage(e, 'Unable to acknowledge recovery'));
     }
   };
 
