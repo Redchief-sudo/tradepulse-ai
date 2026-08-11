@@ -90,9 +90,10 @@ export default function PerformanceAttribution() {
           <Activity className="w-4 h-4 text-primary" />
           Execution Health
         </h3>
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
           <HealthPill label="Intents" value={health.totalIntents} tone="neutral" />
-          <HealthPill label="Fill Rate" value={fmtPct(health.fillRate)} tone={health.fillRate >= 80 ? 'good' : health.fillRate >= 50 ? 'warn' : 'bad'} />
+          <HealthPill label="Intents With Fills" value={health.filled} tone="neutral" />
+          <HealthPill label="Intent Fill Rate" value={fmtPct(health.fillRate)} tone={health.fillRate >= 80 ? 'good' : health.fillRate >= 50 ? 'warn' : 'bad'} />
           <HealthPill label="Rejection Rate" value={fmtPct(health.rejectionRate)} tone={health.rejectionRate <= 10 ? 'good' : health.rejectionRate <= 30 ? 'warn' : 'bad'} />
           <HealthPill label="Avg Latency" value={fmtMs(health.avgLatencyMs)} tone={health.avgLatencyMs < 2000 ? 'good' : 'warn'} />
           <HealthPill label="P95 Latency" value={fmtMs(health.p95LatencyMs)} tone={health.p95LatencyMs < 5000 ? 'good' : 'warn'} />
@@ -100,7 +101,8 @@ export default function PerformanceAttribution() {
         </div>
 
         {/* Status breakdown */}
-        <div className="mt-4 flex flex-wrap gap-2">
+        <div className="mt-4 text-xs text-muted-foreground">Intent terminal/projection states</div>
+        <div className="mt-2 flex flex-wrap gap-2">
           {Object.entries(health.byStatus).map(([status, count]) => (
             <span key={status} className="text-xs px-2 py-1 rounded-md bg-muted/40 border border-border text-muted-foreground">
               {status}: <span className="font-mono text-foreground">{count}</span>
@@ -132,7 +134,7 @@ export default function PerformanceAttribution() {
               <thead>
                 <tr className="text-muted-foreground border-b border-border">
                   <th className="text-left font-medium py-2">Venue</th>
-                  <th className="text-right font-medium py-2">Fills</th>
+                  <th className="text-right font-medium py-2">Fill events</th>
                   <th className="text-right font-medium py-2">Notional</th>
                   <th className="text-right font-medium py-2">Commissions</th>
                   <th className="text-right font-medium py-2">Slippage</th>

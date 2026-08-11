@@ -451,20 +451,20 @@ export default async function(req) {
     // BUY candidates: STRONG_BUY/BUY with confidence >= min_confidence, sorted by confidence.
     // SELL candidates: SELL/STRONG_SELL for symbols currently held.
     const heldSymbols = new Set(holdings.map((h) => h.symbol.toUpperCase()));
+    const buyFilterReason = (candidate) => {
+      if (!['STRONG_BUY', 'BUY'].includes(candidate.recommendation)) return `recommendation_${String(candidate.recommendation || 'missing').toLowerCase()}`;
+      if ((candidate.confidence || 0) < pp.min_confidence) return `confidence_below_${pp.min_confidence}`;
+      const factors = candidate.realFactors;
+      if (!factors) return 'market_candles_unavailable';
+      if (factors.rsi != null && factors.rsi > 72) return 'rsi_overbought';
+      if (factors.rsi != null && factors.rsi < 30) return 'rsi_oversold_falling_knife';
+      if (factors.ma50 != null && factors.price > factors.ma50 * 1.07) return 'price_extended_above_sma50';
+      if (factors.technical_score < 55) return 'technical_score_below_55';
+      if (factors.momentum_score != null && factors.momentum_score < 50) return 'momentum_score_below_50';
+      return null;
+    };
     const buyCandidates = enriched
-      .filter((e) => ['STRONG_BUY', 'BUY'].includes(e.recommendation) && (e.confidence || 0) >= pp.min_confidence)
-      .filter((e) => {
-        const f = e.realFactors;
-        if (!f) return true;
-        // SELECTIVE ENTRIES — multi-factor quality gate. Only act on setups
-        // with strong technical confirmation AND momentum alignment.
-        if (f.rsi != null && f.rsi > 72) return false;              // RSI > 72 = overbought, wait for pullback
-        if (f.rsi != null && f.rsi < 30) return false;              // RSI < 30 = catching falling knife
-        if (f.ma50 != null && f.price > f.ma50 * 1.07) return false; // > 7% above SMA50 = chasing
-        if (f.technical_score < 55) return false;                    // require strong technical confirmation
-        if (f.momentum_score != null && f.momentum_score < 50) return false; // require momentum alignment
-        return true;
-      })
+      .filter((candidate) => buyFilterReason(candidate) === null)
       .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
     const sellCandidates = enriched
       .filter((e) => ['STRONG_SELL', 'SELL'].includes(e.recommendation) && heldSymbols.has(String(e.symbol).toUpperCase()));
@@ -522,6 +522,35 @@ export default async function(req) {
         realFactors: e.realFactors,
         realPrice: e.realPrice,
       });
+    }
+    const proposedSymbols = new Set(proposals.map((proposal) => String(proposal.symbol).toUpperCase()));
+    for (const candidate of enriched) {
+      if (proposedSymbols.has(String(candidate.symbol).toUpperCase())) continue;
+      const reason = buyFilterReason(candidate) || 'not_an_actionable_held_sell';
+      try {
+        await sr.entities.AuditEvent.create({
+          user_id: user.id,
+          event_type: 'candidate_filtered',
+          severity: 'info',
+          correlation_id: runId,
+          entity_type: 'Opportunity',
+          entity_id: candidate.symbol,
+          message: `${candidate.symbol} filtered before proposal: ${reason}`,
+          details: JSON.stringify({ symbol: candidate.symbol, reason, recommendation: candidate.recommendation || null, confidence: candidate.confidence || 0 }),
+        });
+      } catch (error) {
+        try {
+          await sr.entities.AuditEvent.create({
+            user_id: user.id,
+            event_type: 'candidate_filter_audit_failed',
+            severity: 'warning',
+            correlation_id: runId,
+            entity_type: 'ScanRun',
+            entity_id: scanRun.id,
+            message: `Failed to persist filter reason for ${candidate.symbol}: ${error.message}`,
+          });
+        } catch (auditError) { /* non-fatal observability failure */ }
+      }
     }
     const proposalsBeforeVeto = proposals.length;
     await sr.entities.ScanRun.update(scanRun.id, {

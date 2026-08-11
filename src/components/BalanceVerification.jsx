@@ -18,13 +18,15 @@ export default function BalanceVerification({ holdings, onSynced }) {
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [events, setEvents] = useState([]);
+  const [eventsError, setEventsError] = useState(null);
 
   const loadEvents = useCallback(async () => {
     try {
+      setEventsError(null);
       const recent = await base44.entities.ReconciliationEvent.list('-run_timestamp', 20);
       setEvents(recent || []);
     } catch (e) {
-      // entity may not exist yet or no events
+      setEventsError(e.message || 'Reconciliation events unavailable');
     }
   }, []);
 
@@ -54,8 +56,8 @@ export default function BalanceVerification({ holdings, onSynced }) {
   );
 
   const summary = result?.summary || {};
-  const hasDrift = (summary.qty_drift || 0) > 0 || (summary.adjustments || 0) > 0;
-  const allMatch = result && !hasDrift && (summary.matched || 0) > 0;
+  const hasDrift = (summary.discrepancies || 0) > 0;
+  const allMatch = result?.ok === true && !hasDrift;
 
   return (
     <motion.div
@@ -102,9 +104,9 @@ export default function BalanceVerification({ holdings, onSynced }) {
           <div className="font-semibold text-sm text-emerald-500">{summary.matched ?? '—'}</div>
         </div>
         <div className="rounded-lg bg-muted/40 p-3">
-          <div className="text-xs text-muted-foreground mb-1">Drift / Adjustments</div>
+          <div className="text-xs text-muted-foreground mb-1">Discrepancies</div>
           <div className={`font-semibold text-sm ${hasDrift ? 'text-amber-500' : 'text-emerald-500'}`}>
-            {result ? (summary.qty_drift || 0) + (summary.adjustments || 0) : '—'}
+            {result ? summary.discrepancies || 0 : '—'}
           </div>
         </div>
       </div>
@@ -146,18 +148,21 @@ export default function BalanceVerification({ holdings, onSynced }) {
               )}
               <div>
                 <div className={`text-sm font-medium ${allMatch ? 'text-emerald-500' : 'text-amber-500'}`}>
-                  {allMatch ? 'All positions match broker — no fixes needed' : 'Discrepancies found and fixed'}
+                  {allMatch ? 'All positions match broker' : 'Discrepancies detected — canonical settlement required'}
                 </div>
                 <div className="text-xs text-muted-foreground mt-0.5">
-                  {summary.matched || 0} matched · {summary.qty_drift || 0} qty drift ·{' '}
-                  {summary.price_drift || 0} price drift · {summary.new_from_broker || 0} new from broker ·{' '}
-                  {summary.externally_closed || 0} externally closed · {summary.adjustments || 0} adjustments
+                  {summary.matched || 0} matched · {summary.discrepancies || 0} discrepancies ·{' '}
+                  {summary.financial_writes || 0} direct financial writes
                 </div>
               </div>
             </div>
           </motion.div>
         )}
       </AnimatePresence>
+
+      {eventsError && (
+        <div className="text-xs text-red-500 mb-3">Reconciliation history unavailable: {eventsError}</div>
+      )}
 
       {/* Recent reconciliation events */}
       {events.length > 0 && (

@@ -58,7 +58,7 @@ export default async function(req) {
     if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 });
     let input = {};
     try { input = await req.json(); } catch (error) { /* body is optional */ }
-    const snapshotOnly = input?.snapshot_only === true;
+    const snapshotOnly = input?.snapshot_only === true || input?.data?.snapshot_only === true;
 
     const sr = base44.asServiceRole;
     const runTimestamp = nowIso();
@@ -111,29 +111,40 @@ export default async function(req) {
 
     if (snapshotOnly) {
       const orderParams = new URLSearchParams({ status: 'all', limit: '10', direction: 'desc', nested: 'true' });
-      const [accountResponse, ordersResponse] = await Promise.all([
-        fetch(`${baseUrl}/account`, { headers }),
-        fetch(`${baseUrl}/orders?${orderParams.toString()}`, { headers }),
+      const fetchOptional = async (url, label) => {
+        try {
+          const response = await fetch(url, { headers });
+          if (!response.ok) {
+            const body = await response.text().catch(() => '');
+            return { data: null, error: `${label}: Alpaca HTTP ${response.status}: ${body}` };
+          }
+          return { data: await response.json(), error: null };
+        } catch (error) {
+          return { data: null, error: `${label}: ${error.message}` };
+        }
+      };
+      const [accountResult, ordersResult] = await Promise.all([
+        fetchOptional(`${baseUrl}/account`, 'account'),
+        fetchOptional(`${baseUrl}/orders?${orderParams.toString()}`, 'orders'),
       ]);
-      if (!accountResponse.ok || !ordersResponse.ok) {
-        const failed = !accountResponse.ok ? accountResponse : ordersResponse;
-        const body = await failed.text().catch(() => '');
-        return Response.json({ error: `Alpaca HTTP ${failed.status}: ${body}` }, { status: 502 });
-      }
-      const [account, orders] = await Promise.all([accountResponse.json(), ordersResponse.json()]);
+      const account = accountResult.data;
+      const orders = ordersResult.data;
       return Response.json({
         ok: true,
         snapshot_only: true,
+        partial: Boolean(accountResult.error || ordersResult.error),
         as_of: runTimestamp,
         mode: credential.mode,
-        account: {
+        account: account ? {
           equity: Number(account.equity),
           cash: Number(account.cash),
           buying_power: Number(account.buying_power),
           last_equity: Number(account.last_equity),
-        },
+        } : null,
         positions: brokerPositions.map(normalizeBrokerPosition),
         orders: Array.isArray(orders) ? orders.map(normalizeBrokerOrder) : [],
+        account_error: accountResult.error,
+        orders_error: ordersResult.error,
       });
     }
 

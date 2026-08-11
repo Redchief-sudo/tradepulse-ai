@@ -30,6 +30,7 @@ export default function ScanRunStatus() {
   const [runs, setRuns] = useState([]);
   const [tradingState, setTradingState] = useState({ active: false, session: 'disabled' });
   const [pendingRequests, setPendingRequests] = useState(0);
+  const [filterEvents, setFilterEvents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
   const loadingRef = useRef(false);
@@ -38,12 +39,14 @@ export default function ScanRunStatus() {
     if (loadingRef.current) return;
     loadingRef.current = true;
     try {
-      const [r, requests, user] = await Promise.all([
+      const [r, requests, user, audits] = await Promise.all([
         base44.entities.ScanRun.list('-started_at', 5),
         base44.entities.ScanRequest.list('-requested_at', 20),
         base44.auth.me(),
+        base44.entities.AuditEvent.list('-created_date', 200),
       ]);
       setRuns(r || []);
+      setFilterEvents((audits || []).filter((event) => event.event_type === 'candidate_filtered'));
       setPendingRequests((requests || []).filter((request) => ['pending', 'processing'].includes(request.status)).length);
       setTradingState({ active: Boolean(user?.trading_active), session: user?.trading_session_state || 'disabled' });
       setLoadError(null);
@@ -79,6 +82,9 @@ export default function ScanRunStatus() {
   const Icon = tone.icon;
   const live = activity.state === 'scanning';
   const warning = activity.state === 'stale' || Boolean(loadError);
+  const latestFilterEvents = latest
+    ? filterEvents.filter((event) => event.correlation_id === latest.scan_run_id)
+    : [];
 
   return (
     <motion.div
@@ -132,6 +138,17 @@ export default function ScanRunStatus() {
           <div className="font-medium text-emerald-500">{latest?.trades_filled || 0}</div>
         </div>
       </div>
+
+      {latestFilterEvents.length > 0 && (
+        <div className="mt-4 rounded-lg border border-border bg-muted/20 p-3">
+          <div className="text-xs font-medium text-muted-foreground mb-2">Candidate filter reasons</div>
+          <div className="space-y-1">
+            {latestFilterEvents.slice(0, 8).map((event) => (
+              <div key={event.id} className="text-xs text-muted-foreground">{event.message}</div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {latest?.error && (
         <p className="text-xs text-red-500 mt-3 break-words">{latest.error}</p>

@@ -2,7 +2,7 @@
 //
 // Routes quote + candle requests by asset class:
 //   stocks  → Finnhub (quote) + Yahoo Finance (daily candles)
-//   crypto  → Binance public API (24h ticker + klines) — no key required
+//   crypto  → Coinbase public API (24h stats + daily candles) — no key required
 //
 // This is the single data-fetching boundary every backend function should use,
 // so the stop-loss cycle, snapshot capture, and execution gateway all agree on

@@ -38,6 +38,10 @@ function formatCurrency(n) {
   }).format(n || 0);
 }
 
+function functionErrorMessage(error, fallback) {
+  return error?.response?.data?.error || error?.data?.error || error?.message || fallback;
+}
+
 export default function Dashboard() {
   const [holdings, setHoldings] = useState([]);
   const [trades, setTrades] = useState([]);
@@ -55,7 +59,7 @@ export default function Dashboard() {
         base44.entities.Trade.list('-created_date', 10),
         base44.auth.me(),
         base44.functions.invoke('syncBrokerPositions', { snapshot_only: true }).catch((error) => ({
-          brokerLoadError: error?.message || 'Unable to load Alpaca orders',
+          brokerLoadError: functionErrorMessage(error, 'Unable to load Alpaca portfolio'),
         })),
       ]);
       const appHoldings = h || [];
@@ -91,14 +95,16 @@ export default function Dashboard() {
           ...localByOrderId.get(order.broker_order_id),
           ...order,
         })));
-        setRecentOrdersError(null);
+        setRecentOrdersError(brokerSnapshot?.orders_error || null);
       } else {
         setTrades(alpacaConnected ? [] : localTrades);
         setRecentOrdersError(alpacaConnected ? brokerSnapshot?.brokerLoadError || 'Unable to load Alpaca portfolio and orders' : null);
       }
-      setDataError(alpacaConnected && !brokerSnapshot?.positions
-        ? 'Alpaca portfolio unavailable; local holdings are hidden to prevent stale balances.'
-        : null);
+      setDataError(
+        alpacaConnected && !brokerSnapshot?.positions
+          ? `Alpaca portfolio unavailable; local holdings are hidden. ${brokerSnapshot?.brokerLoadError || ''}`.trim()
+          : brokerSnapshot?.account_error || null
+      );
     } catch (e) {
       setDataError(e.message || 'Unable to load portfolio data');
     }

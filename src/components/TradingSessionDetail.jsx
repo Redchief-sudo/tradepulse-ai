@@ -38,6 +38,11 @@ export default function TradingSessionDetail({ session, trades, scanRuns, auditE
             )}>
               {session.status === 'closed' ? 'Final Report' : 'Intraday Snapshot'}
             </span>
+            {session.status === 'closed' && (
+              <span className="px-2 py-0.5 rounded text-xs bg-muted text-muted-foreground">
+                Immutable historical snapshot
+              </span>
+            )}
             {session.market_regime && (
               <span className="px-2 py-0.5 rounded text-xs bg-muted text-muted-foreground">
                 {session.market_regime}
@@ -116,7 +121,9 @@ export default function TradingSessionDetail({ session, trades, scanRuns, auditE
           <div className="text-xs text-muted-foreground">{session.trades_submitted || 0} submitted, {session.trades_rejected || 0} rejected</div>
         </div>
         <div className="p-3 rounded-xl border border-border bg-card">
-          <div className="text-xs text-muted-foreground">Open Positions</div>
+          <div className="text-xs text-muted-foreground">
+            {session.broker_data_status === 'available' ? 'Broker Positions at Snapshot' : 'Ledger Positions at Snapshot'}
+          </div>
           <div className="text-lg font-semibold mt-0.5">{session.open_positions || 0}</div>
         </div>
       </div>

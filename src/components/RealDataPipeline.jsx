@@ -43,14 +43,15 @@ export default function RealDataPipeline() {
     <motion.div
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
-      className="rounded-2xl border border-emerald-500/30 bg-emerald-500/5 p-5 mb-6"
+      className={`rounded-2xl border p-5 mb-6 ${error ? 'border-red-500/30 bg-red-500/5' : 'border-emerald-500/30 bg-emerald-500/5'}`}
     >
       <div className="flex items-center justify-between flex-wrap gap-3 mb-3">
         <div className="flex items-center gap-2 flex-wrap">
           <Activity className="w-4 h-4 text-emerald-400" />
           <h3 className="font-semibold text-sm">Real Market Data Pipeline</h3>
-          <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
-            <CheckCircle2 className="w-3 h-3" /> LIVE · Binance · Computed Indicators
+          <span className={`text-xs px-2 py-0.5 rounded-full border flex items-center gap-1 ${error ? 'bg-red-500/15 text-red-400 border-red-500/30' : loading ? 'bg-amber-500/15 text-amber-400 border-amber-500/30' : 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'}`}>
+            {error ? <AlertCircle className="w-3 h-3" /> : loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
+            {error ? 'UNAVAILABLE · Coinbase' : loading ? 'CHECKING · Coinbase' : `LIVE · Coinbase · ${rows.length} assets`}
           </span>
         </div>
         <Button size="sm" variant="ghost" onClick={load} disabled={loading} className="h-7 gap-1.5">
@@ -59,7 +60,7 @@ export default function RealDataPipeline() {
         </Button>
       </div>
       <p className="text-xs text-muted-foreground mb-3 leading-relaxed">
-        Live OHLCV from Binance public API. RSI, MACD, Bollinger, volatility, and factor scores are
+        Live OHLCV from Coinbase through the authenticated backend. RSI, MACD, Bollinger, volatility, and factor scores are
         computed with their published formulas — precise, not LLM-estimated.
       </p>
 

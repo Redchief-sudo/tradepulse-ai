@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { base44 } from '@/api/base44Client';
 import { motion } from 'framer-motion';
-import { Activity, Loader2, RefreshCw } from 'lucide-react';
+import { Activity, AlertTriangle, Loader2, RefreshCw } from 'lucide-react';
 import { AreaChart, Area, Tooltip, ResponsiveContainer, XAxis, YAxis, ReferenceLine } from 'recharts';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -22,14 +22,16 @@ function fmtPct(n) {
 export default function RealPnlChart() {
   const [records, setRecords] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
   const load = async () => {
     setLoading(true);
+    setError(null);
     try {
       const r = await base44.entities.PnlRecord.list('date', 1000);
       setRecords(r || []);
     } catch (e) {
-      console.error(e);
+      setError(e.message || 'P&L records unavailable');
     }
     setLoading(false);
   };
@@ -78,6 +80,18 @@ export default function RealPnlChart() {
     return (
       <div className="rounded-2xl border border-border bg-card p-5 mb-6 flex items-center justify-center h-48">
         <Loader2 className="w-5 h-5 animate-spin text-primary" />
+      </div>
+    );
+  }
+
+  if (error && !records.length) {
+    return (
+      <div className="rounded-2xl border border-red-500/30 bg-red-500/5 p-5 mb-6 flex items-start gap-2">
+        <AlertTriangle className="w-4 h-4 text-red-500 mt-0.5" />
+        <div>
+          <div className="text-sm font-medium text-red-500">Real P&amp;L unavailable</div>
+          <div className="text-xs text-muted-foreground mt-1">{error}</div>
+        </div>
       </div>
     );
   }
