@@ -1,5 +1,5 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
-import { getAlpacaAccount } from '../../shared/alpaca.ts';
+import { getAlpacaAccount, getAlpacaPositions } from '../../shared/alpaca.ts';
 import { getCashBalance } from '../../shared/cashLedger.ts';
 import { nySessionDateStr } from '../../shared/marketHours.ts';
 import { calculateDailyReturn, indexClosedLotsByFillId } from '../../shared/dailyPerformance.ts';
@@ -95,15 +95,21 @@ export default async function(req) {
     let brokerEquity = null;
     let brokerPrevCloseEquity = null;
     let buyingPower = null;
+    let brokerOpenPositions = null;
     let brokerDataStatus = 'not_applicable';
     const brokerCreds = await sr.entities.BrokerCredential.filter({ user_id: user.id, status: 'active' });
     if (brokerCreds[0] && brokerCreds[0].broker === 'alpaca') {
       brokerDataStatus = 'available';
       try {
-        const acct = await getAlpacaAccount({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode });
+        const connection = { apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode };
+        const [acct, brokerPositions] = await Promise.all([
+          getAlpacaAccount(connection),
+          getAlpacaPositions(connection),
+        ]);
         brokerEquity = Number(acct.equity);
         brokerPrevCloseEquity = Number(acct.last_equity) || null;
         buyingPower = Number(acct.buying_power) || Number(acct.cash) || null;
+        brokerOpenPositions = brokerPositions.length;
       } catch (e) {
         // BROKER-UNREACHABLE: mark the report as degraded so it's not mistaken
         // for an authoritative broker-sourced report. (Fixes Rev.13 #27.)
@@ -413,7 +419,7 @@ export default async function(req) {
       model_version: latestScan?.model_version || null,
       market_regime: latestScan?.market_regime || null,
       sector_exposure: JSON.stringify(sectorExposure),
-      open_positions: holdings.length,
+      open_positions: brokerOpenPositions ?? holdings.length,
       trade_ids: JSON.stringify(sortedDayTrades.map((t) => t.id)),
       scan_run_ids: JSON.stringify(dayScans.map((s) => s.id)),
       generated_at: new Date().toISOString(),

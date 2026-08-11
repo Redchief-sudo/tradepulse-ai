@@ -46,14 +46,17 @@ export default function Dashboard() {
   const [analyticsTrigger, setAnalyticsTrigger] = useState(0);
   const [dataError, setDataError] = useState(null);
   const [brokerAccount, setBrokerAccount] = useState(null);
+  const [recentOrdersError, setRecentOrdersError] = useState(null);
 
   const loadData = useCallback(async () => {
     try {
-      const [h, t, brokerResponse, fillsResponse] = await Promise.all([
+      const [h, t, brokerResponse, ordersResponse] = await Promise.all([
         base44.entities.Holding.list(),
         base44.entities.Trade.list('-created_date', 10),
         base44.functions.invoke('getBrokerPortfolioSnapshot', {}).catch(() => null),
-        base44.functions.invoke('getBrokerRecentFills', {}).catch(() => null),
+        base44.functions.invoke('getBrokerRecentOrders', {}).catch((error) => ({
+          brokerLoadError: error?.message || 'Unable to load Alpaca orders',
+        })),
       ]);
       const appHoldings = h || [];
       const brokerSnapshot = brokerResponse?.data || brokerResponse;
@@ -73,19 +76,22 @@ export default function Dashboard() {
         setBrokerAccount(null);
       }
       const localTrades = t || [];
-      const brokerFills = (fillsResponse?.data || fillsResponse)?.fills;
-      if (brokerFills) {
+      const brokerOrdersResult = ordersResponse?.data || ordersResponse;
+      const brokerOrders = brokerOrdersResult?.orders;
+      if (brokerOrders) {
         const localByOrderId = new Map(
           localTrades
             .filter((trade) => trade.broker_order_id)
             .map((trade) => [trade.broker_order_id, trade])
         );
-        setTrades(brokerFills.map((fill) => ({
-          ...localByOrderId.get(fill.broker_order_id),
-          ...fill,
+        setTrades(brokerOrders.map((order) => ({
+          ...localByOrderId.get(order.broker_order_id),
+          ...order,
         })));
+        setRecentOrdersError(null);
       } else {
         setTrades(localTrades);
+        setRecentOrdersError(brokerSnapshot ? brokerOrdersResult?.brokerLoadError || 'Unable to load Alpaca orders' : null);
       }
       setDataError(null);
     } catch (e) {
@@ -455,16 +461,21 @@ export default function Dashboard() {
             </div>
           </motion.div>
 
-          {trades.length > 0 && (
+          {(trades.length > 0 || brokerAccount) && (
             <motion.div
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
               className="rounded-2xl border border-border bg-card overflow-hidden"
             >
               <div className="p-5 border-b border-border">
-                <h3 className="font-semibold">Recent Trades</h3>
+                <h3 className="font-semibold">Recent Alpaca Orders</h3>
               </div>
               <div className="divide-y divide-border/50">
+                {trades.length === 0 && !recentOrdersError && (
+                  <div className="p-4 text-sm text-muted-foreground">
+                    Alpaca reports no recent orders.
+                  </div>
+                )}
                 {trades.map((t) => (
                   <div key={t.id} className="flex items-center justify-between p-4">
                     <div className="flex items-center gap-3">
@@ -486,11 +497,12 @@ export default function Dashboard() {
                           {t.action.toUpperCase()} {t.symbol}
                         </div>
                         <div className="text-xs text-muted-foreground">
-                          {t.shares} shares @ {formatCurrency(t.price)}
+                          {t.filled_qty != null ? `${t.filled_qty}/${t.shares}` : t.shares} shares
+                          {t.price != null ? ` @ ${formatCurrency(t.price)}` : ''}
                         </div>
-                        {(t.filled_at || t.last_fill_at || t.first_fill_at || t.created_date) && (
+                        {(t.filled_at || t.submitted_at || t.last_fill_at || t.first_fill_at || t.created_date) && (
                           <div className="text-xs text-muted-foreground/70 mt-0.5">
-                            {new Date(t.filled_at || t.last_fill_at || t.first_fill_at || t.created_date).toLocaleString('en-US', {
+                            {new Date(t.filled_at || t.submitted_at || t.last_fill_at || t.first_fill_at || t.created_date).toLocaleString('en-US', {
                               month: 'short',
                               day: 'numeric',
                               year: 'numeric',
@@ -509,7 +521,7 @@ export default function Dashboard() {
                     </div>
                     <div className="text-right">
                       <div className="font-medium text-sm">
-                        {formatCurrency(t.total_value || t.shares * t.price)}
+                        {t.total_value != null ? formatCurrency(t.total_value) : 'Awaiting fill'}
                       </div>
                       {t.ai_recommended && (
                         <span className="text-xs text-accent">AI Suggested</span>
@@ -519,6 +531,11 @@ export default function Dashboard() {
                 ))}
               </div>
             </motion.div>
+          )}
+          {recentOrdersError && (
+            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-500">
+              Recent Alpaca orders unavailable: {recentOrdersError}
+            </div>
           )}
         </>
       )}

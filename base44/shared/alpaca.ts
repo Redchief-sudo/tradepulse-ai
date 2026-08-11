@@ -56,6 +56,24 @@ export async function getAlpacaOrder({ apiKey, secretKey, mode }, orderId) {
   return data;
 }
 
+// Recent broker orders, including pending, partially filled, filled, canceled,
+// and rejected orders. This prevents submitted orders from disappearing while
+// they are waiting for their first fill activity.
+export async function getAlpacaOrders({ apiKey, secretKey, mode }, { limit = 10 } = {}) {
+  const params = new URLSearchParams({
+    status: 'all',
+    limit: String(limit),
+    direction: 'desc',
+    nested: 'true',
+  });
+  const res = await fetch(`${baseUrl(mode)}/orders?${params.toString()}`, {
+    headers: headers(apiKey, secretKey),
+  });
+  if (!res.ok) await throwAlpacaError(res, 'getOrders');
+  const data = await res.json().catch(() => []);
+  return Array.isArray(data) ? data : [];
+}
+
 // Account state — authoritative equity / buying power / cash for position sizing.
 export async function getAlpacaAccount({ apiKey, secretKey, mode }) {
   const res = await fetch(`${baseUrl(mode)}/account`, {
