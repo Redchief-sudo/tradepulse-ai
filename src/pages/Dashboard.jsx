@@ -50,16 +50,17 @@ export default function Dashboard() {
 
   const loadData = useCallback(async () => {
     try {
-      const [h, t, brokerResponse, ordersResponse] = await Promise.all([
+      const [h, t, me, snapshotResponse] = await Promise.all([
         base44.entities.Holding.list(),
         base44.entities.Trade.list('-created_date', 10),
-        base44.functions.invoke('getBrokerPortfolioSnapshot', {}).catch(() => null),
-        base44.functions.invoke('getBrokerRecentOrders', {}).catch((error) => ({
+        base44.auth.me(),
+        base44.functions.invoke('syncBrokerPositions', { snapshot_only: true }).catch((error) => ({
           brokerLoadError: error?.message || 'Unable to load Alpaca orders',
         })),
       ]);
       const appHoldings = h || [];
-      const brokerSnapshot = brokerResponse?.data || brokerResponse;
+      const brokerSnapshot = snapshotResponse?.data || snapshotResponse;
+      const alpacaConnected = me?.broker === 'alpaca';
       if (brokerSnapshot?.positions) {
         const appBySymbol = new Map(
           appHoldings.map((holding) => [String(holding.symbol).toUpperCase(), holding])
@@ -71,13 +72,15 @@ export default function Dashboard() {
           broker_authoritative: true,
         })));
         setBrokerAccount(brokerSnapshot.account || null);
-      } else {
+      } else if (!alpacaConnected) {
         setHoldings(appHoldings);
+        setBrokerAccount(null);
+      } else {
+        setHoldings([]);
         setBrokerAccount(null);
       }
       const localTrades = t || [];
-      const brokerOrdersResult = ordersResponse?.data || ordersResponse;
-      const brokerOrders = brokerOrdersResult?.orders;
+      const brokerOrders = brokerSnapshot?.orders;
       if (brokerOrders) {
         const localByOrderId = new Map(
           localTrades
@@ -90,10 +93,12 @@ export default function Dashboard() {
         })));
         setRecentOrdersError(null);
       } else {
-        setTrades(localTrades);
-        setRecentOrdersError(brokerSnapshot ? brokerOrdersResult?.brokerLoadError || 'Unable to load Alpaca orders' : null);
+        setTrades(alpacaConnected ? [] : localTrades);
+        setRecentOrdersError(alpacaConnected ? brokerSnapshot?.brokerLoadError || 'Unable to load Alpaca portfolio and orders' : null);
       }
-      setDataError(null);
+      setDataError(alpacaConnected && !brokerSnapshot?.positions
+        ? 'Alpaca portfolio unavailable; local holdings are hidden to prevent stale balances.'
+        : null);
     } catch (e) {
       setDataError(e.message || 'Unable to load portfolio data');
     }
@@ -125,7 +130,7 @@ export default function Dashboard() {
     try {
       const [appHoldings, brokerResponse] = await Promise.all([
         base44.entities.Holding.list(),
-        base44.functions.invoke('getBrokerPortfolioSnapshot', {}).catch(() => null),
+        base44.functions.invoke('syncBrokerPositions', { snapshot_only: true }),
       ]);
       const brokerSnapshot = brokerResponse?.data || brokerResponse;
       const appBySymbol = new Map(

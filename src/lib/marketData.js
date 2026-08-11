@@ -47,9 +47,17 @@ export async function fetchCryptoUniverse(symbols) {
       return { symbol: sym, candles, quote };
     })
   );
-  return results
+  const fulfilled = results
     .filter((r) => r.status === 'fulfilled')
     .map((r) => r.value);
+  if (fulfilled.length === 0) {
+    const reasons = [...new Set(results
+      .filter((r) => r.status === 'rejected')
+      .map((r) => r.reason?.message || String(r.reason))
+    )];
+    throw new Error(`No Binance market data returned: ${reasons.join('; ') || 'all requests failed'}`);
+  }
+  return fulfilled;
 }
 
 export const CRYPTO_SYMBOLS = [

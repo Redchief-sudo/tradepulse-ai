@@ -403,6 +403,10 @@ export default async function(req) {
       (candidate.execution_capability === 'paper_executable' || candidate.execution_capability === 'live_executable')
       && assetSessionDecision(candidate.asset_class, now).allowed
     );
+    await sr.entities.ScanRun.update(scanRun.id, {
+      candidates_found: candidates.length,
+      market_summary: p1.market_summary,
+    });
     if (!candidates.length) {
       await finishRun({ status: 'no_candidates', market_summary: p1.market_summary, market_regime: regime.market_regime, model_version: champion?.version || 'default' });
       return Response.json({ ok: true, message: 'No executable candidates', opportunities, market_summary: p1.market_summary, champion_version: champion?.version });
@@ -519,6 +523,10 @@ export default async function(req) {
         realPrice: e.realPrice,
       });
     }
+    const proposalsBeforeVeto = proposals.length;
+    await sr.entities.ScanRun.update(scanRun.id, {
+      proposals_created: proposalsBeforeVeto,
+    });
 
     // PASS 3a — prompted LLM panel. The archetypes are perspectives requested
     // from one model, not independent committee members or separate agents.
@@ -597,6 +605,9 @@ export default async function(req) {
     await heartbeat();
     await verifyOwnership();
     assertScanHealthy();
+    await sr.entities.ScanRun.update(scanRun.id, {
+      proposals_vetoed: Math.max(0, proposalsBeforeVeto - approved.length),
+    });
 
     // PASS 5 — qualitative LLM contagion assessment (not a causal graph model)
     let contagion = null;
@@ -740,7 +751,6 @@ export default async function(req) {
     const pnlPct = accountEquity > 0 ? (recentNetPnl / accountEquity) * 100 : 0;
     const growthMultiplier = Math.max(0.8, Math.min(1.3, 1 + pnlPct * 0.02));
 
-    const proposalsBeforeVeto = proposals.length;
     const executed = [];
     let tradesRejected = 0;
 

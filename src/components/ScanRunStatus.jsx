@@ -116,7 +116,7 @@ export default function ScanRunStatus() {
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
         <div>
-          <div className="text-xs text-muted-foreground">Candidates</div>
+          <div className="text-xs text-muted-foreground">Executable candidates</div>
           <div className="font-medium">{latest?.candidates_found || 0}</div>
         </div>
         <div>

@@ -13,11 +13,37 @@ import { nowIso } from '../../shared/lotAccounting.ts';
 
 function normalizeBrokerPosition(position) {
   return {
+    asset_id: position.asset_id || null,
     symbol: String(position.symbol || '').toUpperCase(),
     shares: Number(position.qty),
     avg_price: Number(position.avg_entry_price),
     current_price: Number(position.current_price),
     market_value: Number(position.market_value),
+    unrealized_pl: Number(position.unrealized_pl),
+    unrealized_pl_percent: Number(position.unrealized_plpc) * 100,
+    asset_class: position.asset_class === 'crypto' ? 'crypto' : 'stocks',
+  };
+}
+
+function normalizeBrokerOrder(order) {
+  const requestedQuantity = Number(order.qty);
+  const filledQuantity = Number(order.filled_qty);
+  const filledPrice = Number(order.filled_avg_price);
+  return {
+    id: order.id,
+    broker_order_id: order.id,
+    client_order_id: order.client_order_id || null,
+    symbol: String(order.symbol || '').toUpperCase(),
+    action: String(order.side || '').toLowerCase(),
+    shares: requestedQuantity,
+    filled_qty: filledQuantity,
+    price: Number.isFinite(filledPrice) ? filledPrice : null,
+    total_value: Number.isFinite(filledPrice) ? filledQuantity * filledPrice : null,
+    status: order.status || 'unknown',
+    submitted_at: order.submitted_at || order.created_at || null,
+    filled_at: order.filled_at || null,
+    order_type: order.type || null,
+    broker_authoritative: true,
   };
 }
 
@@ -30,6 +56,9 @@ export default async function(req) {
     const base44 = createClientFromRequest(req);
     const user = await base44.auth.me();
     if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+    let input = {};
+    try { input = await req.json(); } catch (error) { /* body is optional */ }
+    const snapshotOnly = input?.snapshot_only === true;
 
     const sr = base44.asServiceRole;
     const runTimestamp = nowIso();
@@ -53,27 +82,59 @@ export default async function(req) {
       if (!response.ok) {
         const body = await response.text().catch(() => '');
         const details = `Alpaca HTTP ${response.status}: ${body}`;
+        if (!snapshotOnly) {
+          await sr.entities.ReconciliationEvent.create({
+            user_id: user.id,
+            run_timestamp: runTimestamp,
+            event_type: 'broker_unreachable',
+            symbol: '*',
+            details,
+            action_taken: 'flagged_for_review',
+          });
+        }
+        return Response.json({ error: details }, { status: 502 });
+      }
+      brokerPositions = await response.json();
+    } catch (error) {
+      if (!snapshotOnly) {
         await sr.entities.ReconciliationEvent.create({
           user_id: user.id,
           run_timestamp: runTimestamp,
           event_type: 'broker_unreachable',
           symbol: '*',
-          details,
+          details: error.message,
           action_taken: 'flagged_for_review',
         });
-        return Response.json({ error: details }, { status: 502 });
       }
-      brokerPositions = await response.json();
-    } catch (error) {
-      await sr.entities.ReconciliationEvent.create({
-        user_id: user.id,
-        run_timestamp: runTimestamp,
-        event_type: 'broker_unreachable',
-        symbol: '*',
-        details: error.message,
-        action_taken: 'flagged_for_review',
-      });
       return Response.json({ error: error.message }, { status: 502 });
+    }
+
+    if (snapshotOnly) {
+      const orderParams = new URLSearchParams({ status: 'all', limit: '10', direction: 'desc', nested: 'true' });
+      const [accountResponse, ordersResponse] = await Promise.all([
+        fetch(`${baseUrl}/account`, { headers }),
+        fetch(`${baseUrl}/orders?${orderParams.toString()}`, { headers }),
+      ]);
+      if (!accountResponse.ok || !ordersResponse.ok) {
+        const failed = !accountResponse.ok ? accountResponse : ordersResponse;
+        const body = await failed.text().catch(() => '');
+        return Response.json({ error: `Alpaca HTTP ${failed.status}: ${body}` }, { status: 502 });
+      }
+      const [account, orders] = await Promise.all([accountResponse.json(), ordersResponse.json()]);
+      return Response.json({
+        ok: true,
+        snapshot_only: true,
+        as_of: runTimestamp,
+        mode: credential.mode,
+        account: {
+          equity: Number(account.equity),
+          cash: Number(account.cash),
+          buying_power: Number(account.buying_power),
+          last_equity: Number(account.last_equity),
+        },
+        positions: brokerPositions.map(normalizeBrokerPosition),
+        orders: Array.isArray(orders) ? orders.map(normalizeBrokerOrder) : [],
+      });
     }
 
     const brokerMap = new Map(
