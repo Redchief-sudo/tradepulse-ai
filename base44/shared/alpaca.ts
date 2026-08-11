@@ -126,9 +126,19 @@ export async function cancelAlpacaOrder({ apiKey, secretKey, mode }, orderId) {
 // Fetch account activities (trade fills) — used by reconciliation to find the ACTUAL
 // close price of a position that was externally closed, rather than inventing one.
 // Returns an array of activity objects with { activity_type, symbol, qty, price, side, date }
-export async function getAlpacaActivities({ apiKey, secretKey, mode, activityType = 'FILL', sinceDate }) {
+export async function getAlpacaActivities({
+  apiKey,
+  secretKey,
+  mode,
+  activityType = 'FILL',
+  sinceDate,
+  pageSize,
+  direction,
+}) {
   const params = new URLSearchParams({ activity_types: activityType });
   if (sinceDate) params.set('after', sinceDate);
+  if (pageSize) params.set('page_size', String(pageSize));
+  if (direction) params.set('direction', direction);
   const res = await fetch(`${baseUrl(mode)}/account/activities?${params.toString()}`, {
     headers: headers(apiKey, secretKey),
   });

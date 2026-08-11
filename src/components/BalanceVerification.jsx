@@ -40,7 +40,7 @@ export default function BalanceVerification({ holdings, onSynced }) {
       const res = await base44.functions.invoke('syncBrokerPositions', {});
       setResult(res.data || res);
       await loadEvents();
-      // Refresh parent holdings so the dashboard reflects the fixed positions.
+      // Refresh the broker-authoritative dashboard snapshot after comparison.
       if (onSynced) await onSynced();
     } catch (e) {
       setError(e.message || 'Verification failed');
@@ -75,14 +75,14 @@ export default function BalanceVerification({ holdings, onSynced }) {
           className="gap-2"
         >
           {verifying ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
-          {verifying ? 'Syncing...' : 'Force Sync & Fix'}
+          {verifying ? 'Comparing...' : 'Compare With Alpaca'}
         </Button>
       </div>
 
       <p className="text-sm text-muted-foreground mb-4">
-        Pulls your live Alpaca positions and forces a full reconciliation — it fixes quantity drift,
-        updates stale prices, imports missing positions, and removes externally closed ones so your
-        portfolio balance matches the broker's records.
+        Compares TradePulse ledger positions with Alpaca and reports reconciliation differences.
+        Financial corrections are applied only through authoritative broker-fill ingestion and
+        canonical settlement.
       </p>
 
       {/* App-side summary always visible */}

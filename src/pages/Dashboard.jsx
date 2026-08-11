@@ -49,10 +49,11 @@ export default function Dashboard() {
 
   const loadData = useCallback(async () => {
     try {
-      const [h, t, brokerResponse] = await Promise.all([
+      const [h, t, brokerResponse, fillsResponse] = await Promise.all([
         base44.entities.Holding.list(),
         base44.entities.Trade.list('-created_date', 10),
         base44.functions.invoke('getBrokerPortfolioSnapshot', {}).catch(() => null),
+        base44.functions.invoke('getBrokerRecentFills', {}).catch(() => null),
       ]);
       const appHoldings = h || [];
       const brokerSnapshot = brokerResponse?.data || brokerResponse;
@@ -71,7 +72,21 @@ export default function Dashboard() {
         setHoldings(appHoldings);
         setBrokerAccount(null);
       }
-      setTrades(t || []);
+      const localTrades = t || [];
+      const brokerFills = (fillsResponse?.data || fillsResponse)?.fills;
+      if (brokerFills) {
+        const localByOrderId = new Map(
+          localTrades
+            .filter((trade) => trade.broker_order_id)
+            .map((trade) => [trade.broker_order_id, trade])
+        );
+        setTrades(brokerFills.map((fill) => ({
+          ...localByOrderId.get(fill.broker_order_id),
+          ...fill,
+        })));
+      } else {
+        setTrades(localTrades);
+      }
       setDataError(null);
     } catch (e) {
       setDataError(e.message || 'Unable to load portfolio data');
@@ -133,7 +148,10 @@ export default function Dashboard() {
       }, {});
       setHoldings(fresh.map((holding) => {
         const quote = quoteMap[String(holding.symbol).toUpperCase()];
-        return quote ? { ...holding, current_price: quote.price, day_change_percent: quote.day_change_percent } : holding;
+        if (!quote) return holding;
+        return holding.broker_authoritative
+          ? { ...holding, day_change_percent: quote.day_change_percent }
+          : { ...holding, current_price: quote.price, day_change_percent: quote.day_change_percent };
       }));
       setDataError(null);
     } catch (e) {
@@ -205,11 +223,14 @@ export default function Dashboard() {
   };
 
   const openPositionValue = holdings.reduce(
-    (sum, h) => sum + h.shares * (h.current_price || h.avg_price),
+    (sum, h) => sum + (h.broker_authoritative ? h.market_value : h.shares * (h.current_price || h.avg_price)),
     0
   );
   const openCostBasis = holdings.reduce((sum, h) => sum + h.shares * h.avg_price, 0);
-  const unrealizedPL = openPositionValue - openCostBasis;
+  const unrealizedPL = holdings.reduce(
+    (sum, h) => sum + (h.broker_authoritative ? h.unrealized_pl : h.shares * ((h.current_price || h.avg_price) - h.avg_price)),
+    0
+  );
   const unrealizedPLPercent = openCostBasis > 0 ? (unrealizedPL / openCostBasis) * 100 : 0;
   const openPositionsDayMove = holdings.reduce((sum, h) => {
     const current = h.current_price || h.avg_price;
@@ -221,7 +242,7 @@ export default function Dashboard() {
 
   const pieData = holdings.map((h) => ({
     name: h.symbol,
-    value: h.shares * (h.current_price || h.avg_price),
+    value: h.broker_authoritative ? h.market_value : h.shares * (h.current_price || h.avg_price),
   }));
 
   if (loading) {
@@ -378,9 +399,13 @@ export default function Dashboard() {
                 </thead>
                 <tbody>
                   {holdings.map((h) => {
-                    const value = h.shares * (h.current_price || h.avg_price);
-                    const pl = h.shares * ((h.current_price || h.avg_price) - h.avg_price);
-                    const plPercent = h.avg_price > 0 ? (pl / (h.shares * h.avg_price)) * 100 : 0;
+                    const value = h.broker_authoritative ? h.market_value : h.shares * (h.current_price || h.avg_price);
+                    const pl = h.broker_authoritative
+                      ? h.unrealized_pl
+                      : h.shares * ((h.current_price || h.avg_price) - h.avg_price);
+                    const plPercent = h.broker_authoritative
+                      ? h.unrealized_pl_percent
+                      : h.avg_price > 0 ? (pl / (h.shares * h.avg_price)) * 100 : 0;
                     return (
                       <tr
                         key={h.id}
@@ -463,15 +488,21 @@ export default function Dashboard() {
                         <div className="text-xs text-muted-foreground">
                           {t.shares} shares @ {formatCurrency(t.price)}
                         </div>
-                        {(t.last_fill_at || t.first_fill_at || t.created_date) && (
+                        {(t.filled_at || t.last_fill_at || t.first_fill_at || t.created_date) && (
                           <div className="text-xs text-muted-foreground/70 mt-0.5">
-                            {new Date(t.last_fill_at || t.first_fill_at || t.created_date).toLocaleString('en-US', {
+                            {new Date(t.filled_at || t.last_fill_at || t.first_fill_at || t.created_date).toLocaleString('en-US', {
                               month: 'short',
                               day: 'numeric',
                               year: 'numeric',
                               hour: 'numeric',
                               minute: '2-digit',
                             })}
+                          </div>
+                        )}
+                        {t.broker_authoritative && (
+                          <div className="text-xs text-muted-foreground/70 mt-0.5">
+                            Alpaca {String(t.status || 'fill').replace(/_/g, ' ')}
+                            {t.broker_order_id ? ` · Order ${t.broker_order_id}` : ''}
                           </div>
                         )}
                       </div>
