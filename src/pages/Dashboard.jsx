@@ -45,14 +45,32 @@ export default function Dashboard() {
   const [refreshing, setRefreshing] = useState(false);
   const [analyticsTrigger, setAnalyticsTrigger] = useState(0);
   const [dataError, setDataError] = useState(null);
+  const [brokerAccount, setBrokerAccount] = useState(null);
 
   const loadData = useCallback(async () => {
     try {
-      const [h, t] = await Promise.all([
+      const [h, t, brokerResponse] = await Promise.all([
         base44.entities.Holding.list(),
         base44.entities.Trade.list('-created_date', 10),
+        base44.functions.invoke('getBrokerPortfolioSnapshot', {}).catch(() => null),
       ]);
-      setHoldings(h || []);
+      const appHoldings = h || [];
+      const brokerSnapshot = brokerResponse?.data || brokerResponse;
+      if (brokerSnapshot?.positions) {
+        const appBySymbol = new Map(
+          appHoldings.map((holding) => [String(holding.symbol).toUpperCase(), holding])
+        );
+        setHoldings(brokerSnapshot.positions.map((position) => ({
+          ...appBySymbol.get(position.symbol),
+          ...position,
+          id: appBySymbol.get(position.symbol)?.id || `alpaca-${position.asset_id || position.symbol}`,
+          broker_authoritative: true,
+        })));
+        setBrokerAccount(brokerSnapshot.account || null);
+      } else {
+        setHoldings(appHoldings);
+        setBrokerAccount(null);
+      }
       setTrades(t || []);
       setDataError(null);
     } catch (e) {
@@ -84,8 +102,25 @@ export default function Dashboard() {
   const refreshPrices = useCallback(async (silent = false) => {
     if (!silent) setRefreshing(true);
     try {
-      const fresh = await base44.entities.Holding.list();
+      const [appHoldings, brokerResponse] = await Promise.all([
+        base44.entities.Holding.list(),
+        base44.functions.invoke('getBrokerPortfolioSnapshot', {}).catch(() => null),
+      ]);
+      const brokerSnapshot = brokerResponse?.data || brokerResponse;
+      const appBySymbol = new Map(
+        (appHoldings || []).map((holding) => [String(holding.symbol).toUpperCase(), holding])
+      );
+      const fresh = brokerSnapshot?.positions
+        ? brokerSnapshot.positions.map((position) => ({
+            ...appBySymbol.get(position.symbol),
+            ...position,
+            id: appBySymbol.get(position.symbol)?.id || `alpaca-${position.asset_id || position.symbol}`,
+            broker_authoritative: true,
+          }))
+        : appHoldings;
+      if (brokerSnapshot?.account) setBrokerAccount(brokerSnapshot.account);
       if (!fresh || fresh.length === 0) {
+        setHoldings([]);
         setRefreshing(false);
         return;
       }
@@ -119,6 +154,7 @@ export default function Dashboard() {
   // without waiting for the next poll.
   useEffect(() => {
     const unsubscribe = base44.entities.Holding.subscribe((event) => {
+      if (brokerAccount) return;
       setHoldings((prev) => {
         if (event.type === 'create') {
           return prev.some((h) => h.id === event.data.id) ? prev : [...prev, event.data];
@@ -133,7 +169,7 @@ export default function Dashboard() {
       });
     });
     return unsubscribe;
-  }, []);
+  }, [brokerAccount]);
 
   // Called after a Start Trader cycle completes: reload holdings/trades, then
   // refresh all holding prices so portfolio totals reflect the new state.
@@ -181,6 +217,7 @@ export default function Dashboard() {
     const previousClose = pct > -100 ? current / (1 + pct / 100) : current;
     return sum + h.shares * (current - previousClose);
   }, 0);
+  const accountEquity = brokerAccount?.equity;
 
   const pieData = holdings.map((h) => ({
     name: h.symbol,
@@ -226,7 +263,12 @@ export default function Dashboard() {
       <TradingSessionControl onComplete={handleCycleComplete} onStart={handleStart} />
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4 mb-8">
-        <StatCard label="Open Position Value" value={formatCurrency(openPositionValue)} icon={Wallet} accent />
+        <StatCard
+          label={accountEquity != null ? 'Alpaca Account Equity' : 'Open Position Value'}
+          value={formatCurrency(accountEquity ?? openPositionValue)}
+          icon={Wallet}
+          accent
+        />
         <StatCard label="Open Cost Basis" value={formatCurrency(openCostBasis)} icon={TrendingUp} />
         <StatCard
           label="Unrealized P&L"
@@ -421,9 +463,9 @@ export default function Dashboard() {
                         <div className="text-xs text-muted-foreground">
                           {t.shares} shares @ {formatCurrency(t.price)}
                         </div>
-                        {t.created_date && (
+                        {(t.last_fill_at || t.first_fill_at || t.created_date) && (
                           <div className="text-xs text-muted-foreground/70 mt-0.5">
-                            {new Date(t.created_date).toLocaleString('en-US', {
+                            {new Date(t.last_fill_at || t.first_fill_at || t.created_date).toLocaleString('en-US', {
                               month: 'short',
                               day: 'numeric',
                               year: 'numeric',

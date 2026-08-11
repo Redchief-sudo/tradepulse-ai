@@ -66,6 +66,18 @@ export async function getAlpacaAccount({ apiKey, secretKey, mode }) {
   return data;
 }
 
+// Current broker positions — authoritative for portfolio display and
+// reconciliation. This is a read-only snapshot; settlement remains the sole
+// owner of financial-ledger and Holding projection writes.
+export async function getAlpacaPositions({ apiKey, secretKey, mode }) {
+  const res = await fetch(`${baseUrl(mode)}/positions`, {
+    headers: headers(apiKey, secretKey),
+  });
+  if (!res.ok) await throwAlpacaError(res, 'getPositions');
+  const data = await res.json().catch(() => []);
+  return Array.isArray(data) ? data : [];
+}
+
 // Get Alpaca market clock — authoritative market session state.
 // Returns { is_open, next_open, next_close, timestamp, session }.
 // This is the authoritative source for whether the US regular session is open,
