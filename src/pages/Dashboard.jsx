@@ -320,7 +320,7 @@ export default function Dashboard() {
 
       <AssetClassBreakdown holdings={holdings} />
 
-      <BalanceVerification holdings={holdings} onSynced={loadData} />
+      <BalanceVerification onSynced={loadData} />
 
       <ScanRunStatus />
 

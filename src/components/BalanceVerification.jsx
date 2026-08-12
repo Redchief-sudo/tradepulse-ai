@@ -13,7 +13,11 @@ function formatCurrency(n) {
   }).format(n || 0);
 }
 
-export default function BalanceVerification({ holdings, onSynced }) {
+function responsePayload(error) {
+  return error?.response?.data || error?.data || null;
+}
+
+export default function BalanceVerification({ onSynced }) {
   const [verifying, setVerifying] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
@@ -45,15 +49,17 @@ export default function BalanceVerification({ holdings, onSynced }) {
       // Refresh the broker-authoritative dashboard snapshot after comparison.
       if (onSynced) await onSynced();
     } catch (e) {
-      setError(e.message || 'Verification failed');
+      const payload = responsePayload(e);
+      if (payload?.summary && Array.isArray(payload.blocked)) {
+        setResult(payload);
+        await loadEvents();
+        if (onSynced) await onSynced();
+      } else {
+        setError(payload?.error || e.message || 'Verification failed');
+      }
     }
     setVerifying(false);
   };
-
-  const appTotalValue = holdings.reduce(
-    (sum, h) => sum + h.shares * (h.current_price || h.avg_price),
-    0
-  );
 
   const summary = result?.summary || {};
   const hasDrift = (summary.discrepancies || 0) > 0;
@@ -90,8 +96,8 @@ export default function BalanceVerification({ holdings, onSynced }) {
       {/* App-side summary always visible */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
         <div className="rounded-lg bg-muted/40 p-3">
-          <div className="text-xs text-muted-foreground mb-1">App Holdings Value</div>
-          <div className="font-semibold text-sm">{formatCurrency(appTotalValue)}</div>
+          <div className="text-xs text-muted-foreground mb-1">Ledger Holdings Value</div>
+          <div className="font-semibold text-sm">{result ? formatCurrency(result.ledger_market_value) : '—'}</div>
         </div>
         <div className="rounded-lg bg-muted/40 p-3">
           <div className="text-xs text-muted-foreground mb-1">Broker Positions</div>
@@ -119,7 +125,7 @@ export default function BalanceVerification({ holdings, onSynced }) {
             <div className="text-sm font-medium text-red-500">Verification Failed</div>
             <div className="text-xs text-muted-foreground mt-0.5">{error}</div>
             <div className="text-xs text-muted-foreground mt-1">
-              Make sure your Alpaca API keys are saved in Settings and the broker is connected.
+              The comparison could not obtain a valid broker or ledger response. Review the exact error above and broker connection status.
             </div>
           </div>
         </div>
@@ -154,6 +160,11 @@ export default function BalanceVerification({ holdings, onSynced }) {
                   {summary.matched || 0} matched · {summary.discrepancies || 0} discrepancies ·{' '}
                   {summary.financial_writes || 0} direct financial writes
                 </div>
+                {result.blocked?.length > 0 && (
+                  <div className="text-xs text-muted-foreground mt-1">
+                    Blocked symbols: {result.blocked.join(', ')}. Run broker-order reconciliation and canonical settlement before re-enabling new exposure.
+                  </div>
+                )}
               </div>
             </div>
           </motion.div>

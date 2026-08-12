@@ -214,6 +214,9 @@ export default async function(req) {
       ok: blocked.length === 0,
       run_timestamp: runTimestamp,
       broker_positions: brokerPositions.length,
+      broker_market_value: brokerPositions.reduce((sum, position) => sum + (Number(position.market_value) || 0), 0),
+      ledger_positions: holdings.length,
+      ledger_market_value: holdings.reduce((sum, holding) => sum + (Number(holding.shares) || 0) * (Number(holding.current_price || holding.avg_price) || 0), 0),
       blocked,
       events: events.length,
       summary: {
