@@ -12,6 +12,7 @@ const FINNHUB_QUOTE = 'https://finnhub.io/api/v1/quote';
 const YAHOO_CHART = 'https://query1.finance.yahoo.com/v8/finance/chart';
 const COINBASE_STATS = 'https://api.exchange.coinbase.com/products';
 const COINBASE_SPOT = 'https://api.coinbase.com/v2/prices';
+const PROVIDER_HEADERS = { Accept: 'application/json', 'User-Agent': 'TradePulse/1.0' };
 
 export interface Quote {
   symbol: string;
@@ -72,8 +73,8 @@ export async function fetchQuote(symbol: string, assetClass: string, finnhubKey?
     try {
       const product = coinbaseProduct(sym);
       const [statsRes, tickerRes] = await Promise.all([
-        fetch(`${COINBASE_STATS}/${encodeURIComponent(product)}/stats`),
-        fetch(`${COINBASE_STATS}/${encodeURIComponent(product)}/ticker`),
+        fetch(`${COINBASE_STATS}/${encodeURIComponent(product)}/stats`, { headers: PROVIDER_HEADERS }),
+        fetch(`${COINBASE_STATS}/${encodeURIComponent(product)}/ticker`, { headers: PROVIDER_HEADERS }),
       ]);
       if (!statsRes.ok || !tickerRes.ok) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, provider: 'coinbase', operation: 'quote', error_code: 'PROVIDER_HTTP_ERROR', http_status: !statsRes.ok ? statsRes.status : tickerRes.status, error: `Coinbase HTTP stats=${statsRes.status} ticker=${tickerRes.status}` };
       const [d, ticker] = await Promise.all([statsRes.json(), tickerRes.json()]);
@@ -130,7 +131,8 @@ export async function fetchCandlesResult(symbol: string, assetClass: string, fro
       const product = coinbaseProduct(sym);
       const startIso = new Date(from * 1000).toISOString();
       const endIso = new Date(to * 1000).toISOString();
-      const res = await fetch(`${COINBASE_STATS}/${encodeURIComponent(product)}/candles?granularity=86400&start=${startIso}&end=${endIso}`);
+      const params = new URLSearchParams({ granularity: '86400', start: startIso, end: endIso });
+      const res = await fetch(`${COINBASE_STATS}/${encodeURIComponent(product)}/candles?${params.toString()}`, { headers: PROVIDER_HEADERS });
       if (!res.ok) return { candles: null, provider: 'coinbase', symbol: sym, error_code: 'PROVIDER_HTTP_ERROR', message: `Coinbase candles HTTP ${res.status}`, http_status: res.status };
       const rows = await res.json();
       // Coinbase candle format: [time, low, high, open, close, volume] (oldest-first or newest-first varies)
