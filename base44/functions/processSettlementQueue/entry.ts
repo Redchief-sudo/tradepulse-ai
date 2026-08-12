@@ -24,7 +24,7 @@ import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { recordBuySettlement, recordSellSettlement, getCashBalance } from '../../shared/cashLedger.ts';
 import { updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
 import { nowIso, genId, parseClosureFills } from '../../shared/lotAccounting.ts';
-import { classifySettlementFailure, deriveOrderSettlementSummary, isSettlementProcessable, runSettlementStages, selectLeaseWinner, summarizeSettlementBatch } from '../../shared/settlementState.ts';
+import { classifySettlementFailure, deriveOrderSettlementSummary, isSettlementProcessable, runSettlementStages, selectLeaseWinner, shouldMarkSettlementRecovered, summarizeSettlementBatch } from '../../shared/settlementState.ts';
 import { lotDirection, planSignedLotFill, signedLotQuantity } from '../../shared/signedLots.ts';
 
 const STALE_LEASE_MS = 5 * 60 * 1000; // 5 minutes
@@ -547,8 +547,7 @@ export default async function(req) {
 
     const refreshedEvents = await sr.entities.SettlementEvent.filter({ user_id: userId });
     const unresolved = refreshedEvents.filter((event) => event.status !== 'completed');
-    const recoveringBlockedSession = user.trading_session_state === SESSION_STATES.FINANCIAL_INTEGRITY_BLOCKED || settlementFailureSeen;
-    if (recoveringBlockedSession && results.some((result) => result.status === 'completed') && unresolved.length === 0) {
+    if (shouldMarkSettlementRecovered(user, unresolved.length, settlementFailureSeen)) {
       await sr.entities.User.update(userId, {
         financial_integrity_recovered_at: nowIso(),
         financial_integrity_manual_reenable_required: true,

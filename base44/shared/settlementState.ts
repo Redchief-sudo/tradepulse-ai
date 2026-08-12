@@ -55,6 +55,13 @@ export function summarizeSettlementBatch(results: any[], unresolvedCount: number
   };
 }
 
+export function shouldMarkSettlementRecovered(user: any, unresolvedCount: number, settlementFailureSeen = false) {
+  const recoveryRequired = settlementFailureSeen ||
+    user?.trading_session_state === 'financial_integrity_blocked' ||
+    user?.financial_integrity_manual_reenable_required === true;
+  return recoveryRequired && unresolvedCount === 0;
+}
+
 export function retryDelayMs(attempt: number) {
   return Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1));
 }

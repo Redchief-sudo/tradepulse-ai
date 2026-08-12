@@ -7,6 +7,7 @@ import {
   isSettlementProcessable,
   runSettlementStages,
   selectLeaseWinner,
+  shouldMarkSettlementRecovered,
   summarizeSettlementBatch,
 } from '../base44/shared/settlementState.ts';
 
@@ -111,6 +112,24 @@ describe('SettlementEvent stage recovery', () => {
 
   it('allows explicit operator recovery to bypass retry backoff', () => {
     expect(isSettlementProcessable({ status: 'retryable_failed', next_retry_at: '2026-01-01T00:00:10Z' }, Date.parse('2026-01-01T00:00:09Z'), 100, true)).toBe(true);
+  });
+
+  it('marks a blocked session recovered whenever no settlement remains unresolved', () => {
+    expect(shouldMarkSettlementRecovered({
+      trading_session_state: 'financial_integrity_blocked',
+      financial_integrity_manual_reenable_required: true,
+    }, 0)).toBe(true);
+    expect(shouldMarkSettlementRecovered({
+      trading_session_state: 'disabled',
+      financial_integrity_manual_reenable_required: true,
+    }, 0)).toBe(true);
+  });
+
+  it('never marks recovery while any settlement remains unresolved', () => {
+    expect(shouldMarkSettlementRecovered({
+      trading_session_state: 'financial_integrity_blocked',
+      financial_integrity_manual_reenable_required: true,
+    }, 1, true)).toBe(false);
   });
 
   it('reclaims stale leases but not active leases', () => {
