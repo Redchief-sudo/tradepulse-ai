@@ -24,7 +24,7 @@ import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { recordBuySettlement, recordSellSettlement, getCashBalance } from '../../shared/cashLedger.ts';
 import { updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
 import { nowIso, genId, parseClosureFills } from '../../shared/lotAccounting.ts';
-import { classifySettlementFailure, deriveOrderSettlementSummary, isSettlementProcessable, runSettlementStages, selectLeaseWinner } from '../../shared/settlementState.ts';
+import { classifySettlementFailure, deriveOrderSettlementSummary, isSettlementProcessable, runSettlementStages, selectLeaseWinner, summarizeSettlementBatch } from '../../shared/settlementState.ts';
 
 const STALE_LEASE_MS = 5 * 60 * 1000; // 5 minutes
 const PROCESSOR_LEASE_MS = 10 * 60 * 1000;
@@ -580,7 +580,8 @@ export default async function(req) {
       });
     }
 
-    return Response.json({ ok: true, processed: results.length, results });
+    const response = summarizeSettlementBatch(results, unresolved.length);
+    return Response.json(response, { status: response.ok ? 200 : 409 });
   } finally {
     clearInterval(heartbeatTimer);
     await sr.entities.ScanLock.delete(processorLease.id).catch(() => {});

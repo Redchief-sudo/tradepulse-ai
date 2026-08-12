@@ -12,7 +12,8 @@ import { sendTelegramMessage } from '../../shared/telegram.ts';
 // 2. Pending orders — TradeIntents stuck in submitted/accepted for too long
 // 3. Broker auth — Alpaca account endpoint returns 401/403
 // 4. Reconciliation blocked — Holdings with reconciliation_blocked = true
-// 5. Kill switch — User has kill_switch_reset_required = true
+// 5. Unresolved settlement — broker fills not yet integrity-verified
+// 6. Kill switch — User has kill_switch_reset_required = true
 //
 // Sends an email + Telegram alert for any issues found, and records AuditEvents.
 export default async function(req) {
@@ -23,6 +24,7 @@ export default async function(req) {
 
     const sr = base44.asServiceRole;
     const issues = [];
+    const inspectionErrors = [];
 
     // 1. STALE SCANS — ScanRun with status 'running' but heartbeat stopped
     const runningScans = await sr.entities.ScanRun.filter({ user_id: user.id, status: 'running' });
@@ -39,7 +41,9 @@ export default async function(req) {
         // Auto-recover: mark the stale scan as failed
         try {
           await sr.entities.ScanRun.update(scan.id, { status: 'failed', error: 'STALE_HEARTBEAT_HEALTH_CHECK', completed_at: new Date().toISOString() });
-        } catch (e) {}
+        } catch (e) {
+          inspectionErrors.push({ check: 'stale_scan_recovery', message: e.message, scan_run_id: scan.scan_run_id });
+        }
       }
     }
 
@@ -101,7 +105,20 @@ export default async function(req) {
       });
     }
 
-    // 5. KILL SWITCH — check if kill switch is active
+    // 5. UNRESOLVED SETTLEMENT — a fill is not financially complete until the
+    // canonical settlement event is completed and integrity-verified.
+    const settlementEvents = await sr.entities.SettlementEvent.filter({ user_id: user.id });
+    for (const event of settlementEvents.filter((candidate) => candidate.status !== 'completed' || candidate.integrity_verified !== true)) {
+      issues.push({
+        severity: ['failed', 'dead_letter'].includes(event.status) ? 'critical' : 'warning',
+        check: 'settlement_unresolved',
+        message: `${event.symbol} settlement ${event.event_id} is ${event.status || 'unknown'} and not integrity-verified`,
+        trade_intent_id: event.trade_intent_id,
+        settlement_event_id: event.event_id,
+      });
+    }
+
+    // 6. KILL SWITCH — check if kill switch is active
     if (user.kill_switch_reset_required) {
       issues.push({
         severity: 'info',
@@ -120,7 +137,9 @@ export default async function(req) {
           message: issue.message,
           details: JSON.stringify(issue),
         });
-      } catch (e) {}
+      } catch (e) {
+        inspectionErrors.push({ check: 'health_audit_persistence', message: e.message, event_type: `health_check_${issue.check}` });
+      }
     }
 
     // Send alert if there are critical OR warning issues — warnings like
@@ -156,9 +175,10 @@ export default async function(req) {
     }
 
     return Response.json({
-      ok: true,
-      healthy: alertableIssues.length === 0,
+      ok: inspectionErrors.length === 0,
+      healthy: alertableIssues.length === 0 && inspectionErrors.length === 0,
       issues,
+      inspection_errors: inspectionErrors,
       summary: {
         critical: issues.filter((i) => i.severity === 'critical').length,
         warnings: issues.filter((i) => i.severity === 'warning').length,

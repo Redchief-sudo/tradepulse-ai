@@ -16,10 +16,22 @@
 // 4. If no requests and trading not active, skip
 
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
+import { isSuccessfulScanTerminal } from '../../shared/scanState.ts';
 
 const STALE_LEASE_MS = 5 * 60 * 1000; // 5 minutes
 
 function nowIso() { return new Date().toISOString(); }
+
+async function verifyPersistedScanCompletion(sr, userId, data) {
+  if (!data?.scan_run_id) throw new Error('SCAN_RUN_ID_MISSING');
+  const runs = await sr.entities.ScanRun.filter({ user_id: userId, scan_run_id: data.scan_run_id });
+  const run = runs[0];
+  if (!run) throw new Error(`SCAN_RUN_NOT_FOUND: ${data.scan_run_id}`);
+  if (!isSuccessfulScanTerminal(run)) {
+    throw new Error(`SCAN_RUN_NOT_TERMINAL_SUCCESS: ${run.status}${run.error ? `: ${run.error}` : ''}`);
+  }
+  return run;
+}
 
 export default async function(req) {
   const base44 = createClientFromRequest(req);
@@ -62,6 +74,8 @@ export default async function(req) {
         scan_request_id: oldest.id,
       });
       const data = result?.data || result;
+      if (!data || data.ok === false) throw new Error(data?.error || 'SCAN_RETURNED_UNSUCCESSFUL_RESULT');
+      await verifyPersistedScanCompletion(sr, user.id, data);
 
       await sr.entities.ScanRequest.update(oldest.id, {
         status: 'completed',
@@ -89,6 +103,8 @@ export default async function(req) {
         trigger_source: 'scheduled',
       });
       const data = result?.data || result;
+      if (!data || data.ok === false) throw new Error(data?.error || 'SCAN_RETURNED_UNSUCCESSFUL_RESULT');
+      await verifyPersistedScanCompletion(sr, user.id, data);
       return Response.json({ ok: true, source: 'scheduled', result: data });
     } catch (e) {
       return Response.json({ ok: false, source: 'scheduled', error: e.message }, { status: 500 });

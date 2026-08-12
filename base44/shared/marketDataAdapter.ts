@@ -26,6 +26,10 @@ export interface Quote {
   market?: string;
   source?: string;
   error?: string;
+  error_code?: string;
+  provider?: string;
+  operation?: string;
+  http_status?: number;
 }
 
 export interface Candle {
@@ -35,6 +39,15 @@ export interface Candle {
   low: number;
   close: number;
   volume: number;
+}
+
+export interface CandleResult {
+  candles: Candle[] | null;
+  provider: string;
+  symbol: string;
+  error_code?: string;
+  message?: string;
+  http_status?: number;
 }
 
 function safeNum(n: any): number {
@@ -62,42 +75,42 @@ export async function fetchQuote(symbol: string, assetClass: string, finnhubKey?
         fetch(`${COINBASE_STATS}/${encodeURIComponent(product)}/stats`),
         fetch(`${COINBASE_STATS}/${encodeURIComponent(product)}/ticker`),
       ]);
-      if (!statsRes.ok || !tickerRes.ok) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: `Coinbase HTTP stats=${statsRes.status} ticker=${tickerRes.status}` };
+      if (!statsRes.ok || !tickerRes.ok) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, provider: 'coinbase', operation: 'quote', error_code: 'PROVIDER_HTTP_ERROR', http_status: !statsRes.ok ? statsRes.status : tickerRes.status, error: `Coinbase HTTP stats=${statsRes.status} ticker=${tickerRes.status}` };
       const [d, ticker] = await Promise.all([statsRes.json(), tickerRes.json()]);
       const last = safeNum(d.last);
       const open = safeNum(d.open);
-      if (last <= 0) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: 'no price' };
+      if (last <= 0) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, provider: 'coinbase', operation: 'quote', error_code: 'NO_POSITIVE_PRICE', error: 'no price' };
       const dayChange = open > 0 ? ((last - open) / open) * 100 : 0;
       const providerTime = Date.parse(ticker.time);
-      if (!Number.isFinite(providerTime)) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: 'missing provider timestamp' };
+      if (!Number.isFinite(providerTime)) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, provider: 'coinbase', operation: 'quote', error_code: 'PROVIDER_TIMESTAMP_MISSING', error: 'missing provider timestamp' };
       return {
         symbol: sym, asset_class: ac, price: last, day_change_percent: dayChange,
         quote_timestamp: Math.floor(providerTime / 1000), bid: safeNum(ticker.bid), ask: safeNum(ticker.ask),
         volume: safeNum(d.volume), venue: 'coinbase', market: product, source: 'coinbase_exchange',
       };
     } catch (e: any) {
-      return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: e.message };
+      return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, provider: 'coinbase', operation: 'quote', error_code: 'PROVIDER_REQUEST_FAILED', error: e.message };
     }
   }
 
   if (ac !== 'stocks' && ac !== 'equities' && ac !== 'commodities' && ac !== 'fixed_income') {
-    return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: `unsupported asset class: ${ac}` };
+    return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, provider: 'none', operation: 'quote', error_code: 'UNSUPPORTED_ASSET_CLASS', error: `unsupported asset class: ${ac}` };
   }
   if ((ac === 'commodities' || ac === 'fixed_income') && (sym.includes('=') || sym.includes('/'))) {
-    return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: `unsupported native instrument: ${sym}` };
+    return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, provider: 'none', operation: 'quote', error_code: 'UNSUPPORTED_NATIVE_INSTRUMENT', error: `unsupported native instrument: ${sym}` };
   }
 
   // stocks (and other equity-like classes fall back to Finnhub)
   try {
-    if (!finnhubKey) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: 'no finnhub key' };
+    if (!finnhubKey) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, provider: 'finnhub', operation: 'quote', error_code: 'PROVIDER_CREDENTIAL_MISSING', error: 'no finnhub key' };
     const res = await fetch(`${FINNHUB_QUOTE}?symbol=${encodeURIComponent(sym)}&token=${finnhubKey}`);
-    if (!res.ok) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: `Finnhub HTTP ${res.status}` };
+    if (!res.ok) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, provider: 'finnhub', operation: 'quote', error_code: 'PROVIDER_HTTP_ERROR', http_status: res.status, error: `Finnhub HTTP ${res.status}` };
     const d = await res.json();
-    if (!d || typeof d.c !== 'number' || d.c === 0) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: 'no data' };
-    if (typeof d.t !== 'number' || d.t <= 0) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: 'missing provider timestamp' };
+    if (!d || typeof d.c !== 'number' || d.c === 0) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, provider: 'finnhub', operation: 'quote', error_code: 'NO_POSITIVE_PRICE', error: 'no data' };
+    if (typeof d.t !== 'number' || d.t <= 0) return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, provider: 'finnhub', operation: 'quote', error_code: 'PROVIDER_TIMESTAMP_MISSING', error: 'missing provider timestamp' };
     return { symbol: sym, asset_class: ac, price: d.c, day_change_percent: typeof d.dp === 'number' ? d.dp : 0, quote_timestamp: d.t, venue: 'finnhub', market: 'US', source: 'finnhub' };
   } catch (e: any) {
-    return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, error: e.message };
+    return { symbol: sym, asset_class: ac, price: 0, day_change_percent: 0, provider: 'finnhub', operation: 'quote', error_code: 'PROVIDER_REQUEST_FAILED', error: e.message };
   }
 }
 
@@ -108,7 +121,7 @@ export async function fetchQuotes(items: { symbol: string; asset_class?: string 
 
 // Fetch daily OHLCV candles for any asset class.
 // `from`/`to` are unix seconds.
-export async function fetchCandles(symbol: string, assetClass: string, from: number, to: number, finnhubKey?: string): Promise<Candle[] | null> {
+export async function fetchCandlesResult(symbol: string, assetClass: string, from: number, to: number, finnhubKey?: string): Promise<CandleResult> {
   const sym = String(symbol).toUpperCase();
   const ac = (assetClass || 'stocks').toLowerCase();
 
@@ -118,10 +131,10 @@ export async function fetchCandles(symbol: string, assetClass: string, from: num
       const startIso = new Date(from * 1000).toISOString();
       const endIso = new Date(to * 1000).toISOString();
       const res = await fetch(`${COINBASE_STATS}/${encodeURIComponent(product)}/candles?granularity=86400&start=${startIso}&end=${endIso}`);
-      if (!res.ok) return null;
+      if (!res.ok) return { candles: null, provider: 'coinbase', symbol: sym, error_code: 'PROVIDER_HTTP_ERROR', message: `Coinbase candles HTTP ${res.status}`, http_status: res.status };
       const rows = await res.json();
       // Coinbase candle format: [time, low, high, open, close, volume] (oldest-first or newest-first varies)
-      if (!Array.isArray(rows) || rows.length < 30) return null;
+      if (!Array.isArray(rows) || rows.length < 30) return { candles: null, provider: 'coinbase', symbol: sym, error_code: 'INSUFFICIENT_HISTORY', message: `Coinbase returned ${Array.isArray(rows) ? rows.length : 0} candles; 30 required` };
       const candles = rows.map((k: any[]) => ({
         date: new Date(Number(k[0]) * 1000).toISOString().slice(0, 10),
         open: safeNum(k[3]),
@@ -132,28 +145,30 @@ export async function fetchCandles(symbol: string, assetClass: string, from: num
       })).filter((c: Candle) => c.close > 0);
       // Ensure chronological order
       candles.sort((a, b) => a.date.localeCompare(b.date));
-      return candles.length >= 30 ? candles : null;
-    } catch (e) {
-      return null;
+      return candles.length >= 30
+        ? { candles, provider: 'coinbase', symbol: sym }
+        : { candles: null, provider: 'coinbase', symbol: sym, error_code: 'INVALID_CANDLES', message: `${candles.length} valid candles; 30 required` };
+    } catch (e: any) {
+      return { candles: null, provider: 'coinbase', symbol: sym, error_code: 'PROVIDER_REQUEST_FAILED', message: e.message };
     }
   }
 
   // Only equity-like spot/ETF instruments are supported by the Yahoo candle
   // adapter. Native forex and futures must not silently inherit equity data
   // semantics merely because Yahoo recognizes a similarly formatted symbol.
-  if (ac !== 'stocks' && ac !== 'equities' && ac !== 'commodities' && ac !== 'fixed_income') return null;
-  if ((ac === 'commodities' || ac === 'fixed_income') && (sym.includes('=') || sym.includes('/'))) return null;
+  if (ac !== 'stocks' && ac !== 'equities' && ac !== 'commodities' && ac !== 'fixed_income') return { candles: null, provider: 'none', symbol: sym, error_code: 'UNSUPPORTED_ASSET_CLASS', message: ac };
+  if ((ac === 'commodities' || ac === 'fixed_income') && (sym.includes('=') || sym.includes('/'))) return { candles: null, provider: 'yahoo', symbol: sym, error_code: 'UNSUPPORTED_NATIVE_INSTRUMENT', message: sym };
 
   // stocks → Yahoo Finance (no key needed; Finnhub free tier has no historical candles)
   try {
     const url = `${YAHOO_CHART}/${encodeURIComponent(sym)}?period1=${from}&period2=${to}&interval=1d`;
     const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-    if (!res.ok) return null;
+    if (!res.ok) return { candles: null, provider: 'yahoo', symbol: sym, error_code: 'PROVIDER_HTTP_ERROR', message: `Yahoo candles HTTP ${res.status}`, http_status: res.status };
     const j = await res.json();
     const result = j?.chart?.result?.[0];
     const ts = result?.timestamp;
     const quote = result?.indicators?.quote?.[0];
-    if (!ts || !quote || !quote.close || ts.length < 30) return null;
+    if (!ts || !quote || !quote.close || ts.length < 30) return { candles: null, provider: 'yahoo', symbol: sym, error_code: 'INSUFFICIENT_HISTORY', message: `${ts?.length || 0} candles; 30 required` };
     const candles: Candle[] = [];
     for (let i = 0; i < ts.length; i++) {
       const c = quote.close[i];
@@ -167,8 +182,14 @@ export async function fetchCandles(symbol: string, assetClass: string, from: num
         volume: quote.volume[i] ?? 0,
       });
     }
-    return candles.length >= 30 ? candles : null;
-  } catch (e) {
-    return null;
+    return candles.length >= 30
+      ? { candles, provider: 'yahoo', symbol: sym }
+      : { candles: null, provider: 'yahoo', symbol: sym, error_code: 'INVALID_CANDLES', message: `${candles.length} valid candles; 30 required` };
+  } catch (e: any) {
+    return { candles: null, provider: 'yahoo', symbol: sym, error_code: 'PROVIDER_REQUEST_FAILED', message: e.message };
   }
+}
+
+export async function fetchCandles(symbol: string, assetClass: string, from: number, to: number, finnhubKey?: string): Promise<Candle[] | null> {
+  return (await fetchCandlesResult(symbol, assetClass, from, to, finnhubKey)).candles;
 }

@@ -38,6 +38,10 @@ export default async function(req) {
     let captured = 0;
     let failed = 0;
     const failures = [];
+    for (const quote of quotes.filter((quote) => quote.error || quote.price <= 0)) {
+      failed++;
+      failures.push({ symbol: quote.symbol, error: quote.error || 'Provider returned no positive price' });
+    }
     await Promise.all(quotes.filter((q) => !q.error && q.price > 0).map(async (q) => {
       try {
         // Record the provider's authoritative observation time, not the database
@@ -69,13 +73,15 @@ export default async function(req) {
           event_type: 'snapshot_capture_failed',
           severity: 'warning',
           entity_type: 'PriceSnapshot',
-          message: `${failed}/${quotes.filter((q) => !q.error && q.price > 0).length} snapshots failed`,
+          message: `${failed}/${symbols.length} snapshots failed`,
           details: JSON.stringify(failures.slice(0, 10)),
         });
       } catch (e) { /* audit itself failed — nothing more we can do */ }
     }
 
-    return Response.json({ ok: true, captured, failed, symbols: symbols.length });
+    const accounted = captured + failed;
+    const ok = failed === 0 && accounted === symbols.length;
+    return Response.json({ ok, captured, failed, symbols: symbols.length, accounted, failures }, { status: ok ? 200 : 502 });
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });
   }

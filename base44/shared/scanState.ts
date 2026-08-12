@@ -5,3 +5,7 @@ export function nextScanGeneration(runs: any[]) {
 export function hasNewerScanGeneration(runs: any[], generation: number) {
   return runs.some((run) => Number(run.scan_generation) > generation);
 }
+
+export function isSuccessfulScanTerminal(run: any) {
+  return Boolean(run && ['completed', 'no_candidates'].includes(run.status));
+}

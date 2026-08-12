@@ -31,6 +31,25 @@ import { executionSessionDecision } from './sessionState.ts';
 const FILL_TIMEOUT_MS = 20000;
 const POLL_INTERVAL_MS = 1000;
 
+async function settleAndVerify(base44, sr, userId, tradeIntentId) {
+  let invocationError = null;
+  try {
+    const response = await base44.functions.invoke('processSettlementQueue', {});
+    const data = response?.data || response;
+    if (data?.ok === false) invocationError = data.error || `Settlement processor has ${data.unresolved || 0} unresolved event(s)`;
+  } catch (error) {
+    invocationError = error.message;
+  }
+  const events = await sr.entities.SettlementEvent.filter({ user_id: userId, trade_intent_id: tradeIntentId });
+  if (!events.length) return { status: 'failed', error: invocationError || 'SETTLEMENT_EVENT_MISSING' };
+  const failed = events.filter((event) => ['failed', 'dead_letter'].includes(event.status));
+  if (failed.length) return { status: 'failed', error: failed.map((event) => event.error || event.status).join('; ') };
+  if (events.every((event) => event.status === 'completed' && event.integrity_verified === true)) {
+    return { status: 'completed', error: null };
+  }
+  return { status: 'pending', error: invocationError || 'SETTLEMENT_NOT_TERMINAL' };
+}
+
 function isTerminalFailure(status) {
   return ['rejected', 'canceled', 'expired', 'replaced'].includes(status);
 }
@@ -575,9 +594,7 @@ export async function executeIntent(base44, user, input) {
     // Invoke the settlement processor to project lots, cash, holding, trade.
     // For internal_paper this is synchronous (immediate feedback). The processor
     // is idempotent — a retry or scheduled invocation won't double-project.
-    try {
-      await base44.functions.invoke('processSettlementQueue', {});
-    } catch (e) { /* non-fatal — scheduled processor will retry */ }
+    const settlement = await settleAndVerify(base44, sr, userId, tradeIntentId);
 
     return {
       status: 'paper_filled',
@@ -588,6 +605,10 @@ export async function executeIntent(base44, user, input) {
       filled_avg_price: filledPrice,
       total_value: filledQty * filledPrice,
       execution_mode: executionMode,
+      broker_status: 'broker_filled',
+      settlement_status: settlement.status,
+      settlement_error: settlement.error,
+      lifecycle_status: settlement.status === 'completed' ? 'settlement_completed' : settlement.status === 'failed' ? 'settlement_failed' : 'settlement_pending',
       symbol,
       action: side,
     };
@@ -760,8 +781,7 @@ async function pollAndSettle(base44, sr, userId, intentRecord, creds, alpacaMode
         unfilled_quantity: Math.max(0, intentRecord.requested_quantity - cumulativeFilled),
       });
       // Invoke the settlement processor to project all pending events for this order.
-      try { await base44.functions.invoke('processSettlementQueue', {}); }
-      catch (e) { /* non-fatal — scheduled processor will retry */ }
+      const settlement = await settleAndVerify(base44, sr, userId, tradeIntentId);
       return {
         status: executionMode === 'live' ? 'filled' : 'paper_filled',
         intentId: intentRecord.id, trade_intent_id: tradeIntentId,
@@ -769,6 +789,10 @@ async function pollAndSettle(base44, sr, userId, intentRecord, creds, alpacaMode
         filled_qty: cumulativeFilled, filled_avg_price: cumulativeAvgPrice,
         total_value: cumulativeFilled * cumulativeAvgPrice,
         execution_mode: executionMode, symbol, action: side,
+        broker_status: 'broker_filled',
+        settlement_status: settlement.status,
+        settlement_error: settlement.error,
+        lifecycle_status: settlement.status === 'completed' ? 'settlement_completed' : settlement.status === 'failed' ? 'settlement_failed' : 'settlement_pending',
       };
     }
 
@@ -783,14 +807,17 @@ async function pollAndSettle(base44, sr, userId, intentRecord, creds, alpacaMode
           released_cash: Math.max(0, (intentRecord.reserved_cash || 0) - (intentRecord.consumed_cash || 0)),
           reservation_status: 'released',
         });
-        try { await base44.functions.invoke('processSettlementQueue', {}); }
-        catch (e) { /* non-fatal — scheduled processor will retry */ }
+        const settlement = await settleAndVerify(base44, sr, userId, tradeIntentId);
         return {
           status: 'partially_filled',
           intentId: intentRecord.id, trade_intent_id: tradeIntentId,
           brokerOrderId, clientOrderId,
           filled_qty: cumulativeFilled, filled_avg_price: cumulativeAvgPrice,
           execution_mode: executionMode, symbol, action: side,
+          broker_status: 'broker_partially_filled',
+          settlement_status: settlement.status,
+          settlement_error: settlement.error,
+          lifecycle_status: settlement.status === 'completed' ? 'settlement_completed' : settlement.status === 'failed' ? 'settlement_failed' : 'settlement_pending',
         };
       }
       // No fill at all — reject and release the full reservation.

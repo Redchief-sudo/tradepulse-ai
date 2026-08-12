@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { hasNewerScanGeneration, nextScanGeneration } from '../base44/shared/scanState.ts';
+import { hasNewerScanGeneration, isSuccessfulScanTerminal, nextScanGeneration } from '../base44/shared/scanState.ts';
 
 describe('scan generation invalidation', () => {
   it('allocates a monotonically increasing generation', () => {
@@ -11,5 +11,12 @@ describe('scan generation invalidation', () => {
     const runs = [{ scan_generation: 4 }, { scan_generation: 5 }];
     expect(hasNewerScanGeneration(runs, 4)).toBe(true);
     expect(hasNewerScanGeneration(runs, 5)).toBe(false);
+  });
+
+  it('accepts only persisted successful terminal scan states', () => {
+    expect(isSuccessfulScanTerminal({ status: 'completed' })).toBe(true);
+    expect(isSuccessfulScanTerminal({ status: 'no_candidates' })).toBe(true);
+    expect(isSuccessfulScanTerminal({ status: 'running' })).toBe(false);
+    expect(isSuccessfulScanTerminal({ status: 'failed' })).toBe(false);
   });
 });

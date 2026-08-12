@@ -7,6 +7,7 @@ import {
   isSettlementProcessable,
   runSettlementStages,
   selectLeaseWinner,
+  summarizeSettlementBatch,
 } from '../base44/shared/settlementState.ts';
 
 function handlers(log: string[], failAt?: string) {
@@ -168,5 +169,11 @@ describe('SettlementEvent stage recovery', () => {
     );
     expect(summary.orderStatus).toBe('partially_filled');
     expect(summary.settlementState).toBe('current_fills_settled');
+  });
+
+  it('reports batch failure while any result or settlement remains unresolved', () => {
+    expect(summarizeSettlementBatch([{ status: 'completed' }], 0).ok).toBe(true);
+    expect(summarizeSettlementBatch([{ status: 'retryable_failed' }], 1)).toMatchObject({ ok: false, failed: 1, unresolved: 1 });
+    expect(summarizeSettlementBatch([], 1).ok).toBe(false);
   });
 });

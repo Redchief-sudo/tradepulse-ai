@@ -5,8 +5,8 @@ import { computeRealFactors, weightedComposite, signalFromComposite } from '../.
 import { classifyRegimeFromSnapshots } from '../../shared/regime.ts';
 import { netEdge } from '../../shared/costModel.ts';
 import { effectiveGovernedWeights, getChampion } from '../../shared/modelGovernance.ts';
-import { getAlpacaAccount, getAlpacaClock, cancelAlpacaOrder } from '../../shared/alpaca.ts';
-import { fetchCandles as fetchMultiAssetCandles, fetchQuote as fetchMultiAssetQuote } from '../../shared/marketDataAdapter.ts';
+import { getAlpacaAccount, getAlpacaClock, getAlpacaOrder, cancelAlpacaOrder } from '../../shared/alpaca.ts';
+import { fetchCandlesResult as fetchMultiAssetCandlesResult, fetchQuote as fetchMultiAssetQuote } from '../../shared/marketDataAdapter.ts';
 import { sendTelegramMessage } from '../../shared/telegram.ts';
 import { riskLimitsForProfile, checkMaxDrawdown } from '../../shared/riskEngine.ts';
 import { getPaperEquity } from '../../shared/cashLedger.ts';
@@ -329,7 +329,9 @@ export default async function(req) {
           if (clock && !clock.is_open) {
             await updateSessionState(sr, user.id, SESSION_STATES.MARKET_CLOSED, 'Alpaca clock reports market closed');
           }
-        } catch (e) { /* non-fatal — fall back to local time gate in execution */ }
+        } catch (e) {
+          try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'broker_clock_unavailable', severity: 'warning', message: `Alpaca clock unavailable; execution gateway remains authoritative: ${e.message}` }); } catch (auditError) { /* execution gate still applies */ }
+        }
       } catch (e) {
         await finishRun({ status: 'broker_unavailable', error: `BROKER_UNREACHABLE: ${e.message}`, market_regime: regime.market_regime, model_version: champion?.version || 'default' });
         return Response.json({ ok: false, error: `BROKER_UNREACHABLE: ${e.message}` }, { status: 503 });
@@ -409,7 +411,7 @@ export default async function(req) {
     });
     if (!candidates.length) {
       await finishRun({ status: 'no_candidates', market_summary: p1.market_summary, market_regime: regime.market_regime, model_version: champion?.version || 'default' });
-      return Response.json({ ok: true, message: 'No executable candidates', opportunities, market_summary: p1.market_summary, champion_version: champion?.version });
+      return Response.json({ ok: true, scan_run_id: runId, message: 'No executable candidates', opportunities, market_summary: p1.market_summary, champion_version: champion?.version });
     }
 
     // Enrich each candidate with REAL indicators
@@ -418,12 +420,12 @@ export default async function(req) {
     const candleFrom = candleTo - 220 * 86400;
     for (const c of candidates) {
       const ac = c.asset_class;
-      const candles = await fetchMultiAssetCandles(c.symbol, ac, candleFrom, candleTo, key);
+      const candleResult = await fetchMultiAssetCandlesResult(c.symbol, ac, candleFrom, candleTo, key);
       await heartbeat();
       await verifyOwnership();
       assertScanHealthy();
-      const factors = candles ? computeRealFactors(candles) : null;
-      enriched.push({ ...c, asset_class: ac, realFactors: factors, realPrice: factors?.price || c.price });
+      const factors = candleResult.candles ? computeRealFactors(candleResult.candles) : null;
+      enriched.push({ ...c, asset_class: ac, realFactors: factors, marketDataError: candleResult.candles ? null : `${candleResult.error_code || 'UNKNOWN'}: ${candleResult.message || 'No candles'}`, realPrice: factors?.price || c.price });
     }
 
     // PASS 2 — Portfolio fit & risk-aware sizing (Claude Sonnet 5)
@@ -455,7 +457,7 @@ export default async function(req) {
       if (!['STRONG_BUY', 'BUY'].includes(candidate.recommendation)) return `recommendation_${String(candidate.recommendation || 'missing').toLowerCase()}`;
       if ((candidate.confidence || 0) < pp.min_confidence) return `confidence_below_${pp.min_confidence}`;
       const factors = candidate.realFactors;
-      if (!factors) return 'market_candles_unavailable';
+      if (!factors) return `market_candles_unavailable:${candidate.marketDataError || 'UNKNOWN'}`;
       if (factors.rsi != null && factors.rsi > 72) return 'rsi_overbought';
       if (factors.rsi != null && factors.rsi < 30) return 'rsi_oversold_falling_knife';
       if (factors.ma50 != null && factors.price > factors.ma50 * 1.07) return 'price_extended_above_sma50';
@@ -706,6 +708,7 @@ export default async function(req) {
     // unfilled entry orders, continue protective sells only, mark session
     // risk-stopped, send alert, require manual reset.)
     if (circuitBreakerTripped) {
+      const cancellationSummary = { targeted: 0, confirmed: 0, already_terminal: 0, failed: 0, unknown: 0 };
       // FAIL-CLOSED: try to persist the kill switch state. If the update fails,
       // try a direct User update as fallback. If both fail, throw to abort the
       // scan — never continue with an unpersisted kill switch. (Fixes Rev.12 #25:
@@ -722,8 +725,10 @@ export default async function(req) {
         }
       }
       try {
-        await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'daily_loss_breach', severity: 'critical', message: `Daily loss limit reached (${pp.max_daily_loss_pct}%). Kill switch activated — new buys blocked, pending orders canceled.` });
-      } catch (e) {}
+        await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'daily_loss_breach', severity: 'critical', message: `Daily loss limit reached (${pp.max_daily_loss_pct}%). Kill switch activated — new buys blocked and broker cancellation reconciliation started.` });
+      } catch (e) {
+        try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'daily_loss_breach_audit_failed', severity: 'error', message: e.message }); } catch (auditError) { /* observability exhausted */ }
+      }
       // Cancel unfilled entry (buy) orders via Alpaca
       if (brokerCreds[0]?.broker === 'alpaca') {
         try {
@@ -731,20 +736,47 @@ export default async function(req) {
           const pending = pendingIntents.filter((i) => ['submitted', 'accepted'].includes(i.status));
           for (const intent of pending) {
             if (intent.broker_order_id) {
+              cancellationSummary.targeted++;
               try {
                 await cancelAlpacaOrder({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode }, intent.broker_order_id);
-                await sr.entities.TradeIntent.update(intent.id, { status: 'canceled', rejection_reason: 'KILL_SWITCH_CANCELED', broker_terminal_status: 'canceled' });
-              } catch (e) { /* order may already be terminal */ }
+                const confirmed = await getAlpacaOrder({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode }, intent.broker_order_id);
+                if (['canceled', 'expired', 'rejected', 'filled', 'done_for_day'].includes(confirmed.status)) {
+                  const canceled = confirmed.status === 'canceled';
+                  cancellationSummary[canceled ? 'confirmed' : 'already_terminal']++;
+                  await sr.entities.TradeIntent.update(intent.id, {
+                    ...(canceled ? { status: 'canceled', rejection_reason: 'KILL_SWITCH_CANCELED' } : {}),
+                    broker_terminal_status: confirmed.status,
+                    last_broker_update_at: new Date().toISOString(),
+                  });
+                } else {
+                  cancellationSummary.unknown++;
+                  throw new Error(`Cancellation not terminal; Alpaca status=${confirmed.status || 'unknown'}`);
+                }
+              } catch (e) {
+                if (!String(e.message).startsWith('Cancellation not terminal')) cancellationSummary.failed++;
+                try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'kill_switch_cancel_failed', severity: 'critical', correlation_id: intent.trade_intent_id, entity_type: 'TradeIntent', entity_id: intent.id, message: `Could not confirm cancellation for ${intent.symbol}: ${e.message}` }); } catch (auditError) { /* observability exhausted */ }
+              }
             }
           }
-        } catch (e) { /* non-fatal */ }
+          if (cancellationSummary.already_terminal > 0) {
+            try {
+              const reconciliation = await base44.functions.invoke('runOrderReconciliation', {});
+              const reconciliationData = reconciliation?.data || reconciliation;
+              if (reconciliationData?.ok === false) throw new Error(reconciliationData.error || 'Order reconciliation returned unsuccessful result');
+            } catch (error) {
+              try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'kill_switch_order_reconciliation_failed', severity: 'critical', message: error.message }); } catch (auditError) { /* observability exhausted */ }
+            }
+          }
+        } catch (e) {
+          try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'kill_switch_pending_order_query_failed', severity: 'critical', message: e.message }); } catch (auditError) { /* observability exhausted */ }
+        }
       }
       // Send alert
       try {
         await sr.integrations.Core.SendEmail({
           to: user.email,
           subject: 'TradePulse KILL SWITCH: Daily loss limit reached',
-          body: `The daily loss circuit breaker has tripped. All new buys are blocked and pending orders have been canceled.\n\nDaily loss limit: ${pp.max_daily_loss_pct}%\n\nTrading will remain stopped until you manually reset it from the dashboard.`,
+          body: `The daily loss circuit breaker has tripped. All new buys are blocked.\n\nOrder cancellation reconciliation: ${cancellationSummary.confirmed} canceled, ${cancellationSummary.already_terminal} already terminal, ${cancellationSummary.failed} failed, ${cancellationSummary.unknown} unknown, ${cancellationSummary.targeted} targeted.\n\nDaily loss limit: ${pp.max_daily_loss_pct}%\n\nTrading will remain stopped until you manually reset it from the dashboard.`,
         });
       } catch (e) {
         try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'notification_failed', severity: 'warning', message: `Kill switch email failed: ${e.message}` }); } catch (ae) {}
@@ -760,7 +792,10 @@ export default async function(req) {
         maxDrawdownBreached = true;
         await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'max_drawdown_breach', severity: 'critical', message: `Max drawdown limit reached: ${ddCheck.drawdown_pct}% (limit ${ddCheck.limit}%, peak $${ddCheck.peak_equity.toFixed(0)})` });
       }
-    } catch (e) { /* non-fatal — drawdown check is best-effort */ }
+    } catch (e) {
+      maxDrawdownBreached = true;
+      try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'max_drawdown_check_failed', severity: 'critical', message: `New buys blocked because drawdown state is unavailable: ${e.message}` }); } catch (auditError) { /* financial gate remains closed */ }
+    }
 
     // DYNAMIC SIZING — compute recent win rate from the last 20 sell trades.
     // Position size scales with conviction AND recent performance: bet bigger
@@ -882,7 +917,12 @@ export default async function(req) {
     // attempts as executions.)
     const filledTrades = executed.filter((e) => {
       const s = e.settlement?.status;
-      return s === 'filled' || s === 'paper_filled';
+      return (s === 'filled' || s === 'paper_filled') && e.settlement?.settlement_status === 'completed';
+    });
+    const unsettledFills = executed.filter((e) => {
+      const s = e.settlement?.status;
+      return (s === 'filled' || s === 'paper_filled' || s === 'partially_filled')
+        && e.settlement?.settlement_status !== 'completed';
     });
 
     if (filledTrades.length) {
@@ -914,7 +954,8 @@ export default async function(req) {
     }
 
     await finishRun({
-      status: 'completed',
+      status: unsettledFills.length ? 'failed' : 'completed',
+      error: unsettledFills.length ? `SETTLEMENT_UNRESOLVED: ${unsettledFills.map((entry) => entry.symbol).join(',')}` : null,
       market_summary: p1.market_summary,
       market_regime: regime.market_regime,
       model_version: champion?.version || 'default',
@@ -931,10 +972,14 @@ export default async function(req) {
     // failure here never affects the scan result.
     try {
       await base44.functions.invoke('checkAutoPromotion', {});
-    } catch (e) { /* non-fatal — promotion is best-effort */ }
+    } catch (e) {
+      try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'auto_promotion_check_failed', severity: 'warning', message: e.message }); } catch (auditError) { /* scan result remains authoritative */ }
+    }
 
     return Response.json({
-      ok: true,
+      ok: unsettledFills.length === 0,
+      scan_run_id: runId,
+      error: unsettledFills.length ? `SETTLEMENT_UNRESOLVED: ${unsettledFills.map((entry) => entry.symbol).join(',')}` : null,
       market_summary: p1.market_summary,
       risk_assessment: p2.risk_assessment,
       regime,
@@ -945,7 +990,8 @@ export default async function(req) {
       proposals_after_veto: approved.length,
       executed,
       ml_weights: weights,
-    });
+      unsettled_fills: unsettledFills.map((entry) => ({ symbol: entry.symbol, settlement_status: entry.settlement?.settlement_status, error: entry.settlement?.settlement_error })),
+    }, { status: unsettledFills.length ? 409 : 200 });
   } catch (error) {
     // Stop the periodic heartbeat
     if (heartbeatIntervalRef) clearInterval(heartbeatIntervalRef);

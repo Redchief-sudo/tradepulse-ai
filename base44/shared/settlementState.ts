@@ -43,6 +43,18 @@ export function deriveOrderSettlementSummary(intent: any, fills: any[]) {
   };
 }
 
+export function summarizeSettlementBatch(results: any[], unresolvedCount: number) {
+  const failed = results.filter((result) => result.status !== 'completed').length;
+  return {
+    ok: failed === 0 && unresolvedCount === 0,
+    processed: results.length,
+    completed: results.length - failed,
+    failed,
+    unresolved: unresolvedCount,
+    results,
+  };
+}
+
 export function retryDelayMs(attempt: number) {
   return Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1));
 }

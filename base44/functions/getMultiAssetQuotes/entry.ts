@@ -1,6 +1,6 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { secrets } from 'base44:runtime';
-import { fetchCandles, fetchQuotes } from '../../shared/marketDataAdapter.ts';
+import { fetchCandlesResult, fetchQuotes } from '../../shared/marketDataAdapter.ts';
 
 // Multi-asset quote endpoint. Accepts a list of { symbol, asset_class } and
 // returns live prices routed by asset class (stocks → Finnhub, crypto → Coinbase).
@@ -26,10 +26,10 @@ export default async function (req) {
       series = await Promise.all(items.map(async (item) => {
         const symbol = String(item.symbol || '').toUpperCase();
         const assetClass = item.asset_class || 'stocks';
-        const candles = await fetchCandles(symbol, assetClass, from, to, key);
-        return candles
-          ? { symbol, asset_class: assetClass, candles }
-          : { symbol, asset_class: assetClass, candles: [], error: 'No provider candles returned' };
+        const result = await fetchCandlesResult(symbol, assetClass, from, to, key);
+        return result.candles
+          ? { symbol, asset_class: assetClass, candles: result.candles, provider: result.provider }
+          : { symbol, asset_class: assetClass, candles: [], provider: result.provider, error_code: result.error_code, error: result.message || 'No provider candles returned', http_status: result.http_status };
       }));
     }
 
