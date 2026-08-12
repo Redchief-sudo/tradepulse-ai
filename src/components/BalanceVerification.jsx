@@ -23,6 +23,8 @@ export default function BalanceVerification({ onSynced }) {
   const [error, setError] = useState(null);
   const [events, setEvents] = useState([]);
   const [eventsError, setEventsError] = useState(null);
+  const [recovering, setRecovering] = useState(false);
+  const [recoveryMessage, setRecoveryMessage] = useState(null);
 
   const loadEvents = useCallback(async () => {
     try {
@@ -59,6 +61,31 @@ export default function BalanceVerification({ onSynced }) {
       }
     }
     setVerifying(false);
+  };
+
+  const recover = async () => {
+    setRecovering(true);
+    setError(null);
+    setRecoveryMessage(null);
+    try {
+      const reconciliationResponse = await base44.functions.invoke('runOrderReconciliation', {});
+      const reconciliation = reconciliationResponse.data || reconciliationResponse;
+      if (reconciliation?.ok === false) throw new Error(`Broker-fill reconciliation failed: ${reconciliation.results?.filter((item) => item.error).map((item) => item.error).join('; ') || 'unknown error'}`);
+
+      const settlementResponse = await base44.functions.invoke('processSettlementQueue', {});
+      const settlement = settlementResponse.data || settlementResponse;
+      if (settlement?.ok === false) throw new Error(`Canonical settlement incomplete: ${settlement.unresolved || 0} unresolved event(s)`);
+
+      setRecoveryMessage(`Reconciliation checked ${reconciliation.checked || 0} pending order(s); settlement completed ${settlement.completed || 0} event(s). Re-comparing positions…`);
+      await verify();
+    } catch (e) {
+      const payload = responsePayload(e);
+      const detail = payload?.results?.filter((item) => item.error).map((item) => item.error).join('; ');
+      const unresolved = Number.isFinite(payload?.unresolved) ? `Canonical settlement incomplete: ${payload.unresolved} unresolved event(s)` : null;
+      setError(payload?.error || detail || unresolved || e.message || 'Recovery failed');
+    } finally {
+      setRecovering(false);
+    }
   };
 
   const summary = result?.summary || {};
@@ -161,15 +188,25 @@ export default function BalanceVerification({ onSynced }) {
                   {summary.financial_writes || 0} direct financial writes
                 </div>
                 {result.blocked?.length > 0 && (
-                  <div className="text-xs text-muted-foreground mt-1">
-                    Blocked symbols: {result.blocked.join(', ')}. Run broker-order reconciliation and canonical settlement before re-enabling new exposure.
-                  </div>
+                  <>
+                    <div className="text-xs text-muted-foreground mt-1">
+                      Blocked symbols: {result.blocked.join(', ')}. Reconcile authoritative Alpaca fills and process canonical settlement before re-enabling new exposure.
+                    </div>
+                    <Button size="sm" className="mt-3 gap-2" onClick={recover} disabled={recovering || verifying}>
+                      {recovering ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+                      {recovering ? 'Reconciling…' : 'Reconcile Broker Fills'}
+                    </Button>
+                  </>
                 )}
               </div>
             </div>
           </motion.div>
         )}
       </AnimatePresence>
+
+      {recoveryMessage && !error && (
+        <div className="text-xs text-emerald-500 mb-3">{recoveryMessage}</div>
+      )}
 
       {eventsError && (
         <div className="text-xs text-red-500 mb-3">Reconciliation history unavailable: {eventsError}</div>

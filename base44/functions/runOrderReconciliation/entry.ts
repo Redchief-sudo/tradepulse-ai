@@ -425,8 +425,9 @@ export default async function(req) {
       }
     }
 
-    return Response.json({
-      ok: true,
+    const reconciliationErrors = results.filter((result) => ['error', 'external_activity_error'].includes(result.status));
+    const response = {
+      ok: reconciliationErrors.length === 0,
       run_timestamp: runTs,
       checked: pending.length,
       settled: results.filter((r) => r.status === 'settled').length,
@@ -434,9 +435,10 @@ export default async function(req) {
       still_pending: results.filter((r) => r.status === 'still_pending').length,
       already_claimed: results.filter((r) => r.status === 'already_claimed').length,
       stale_orders: staleOrders.length,
-      errors: results.filter((r) => r.status === 'error').length,
+      errors: reconciliationErrors.length,
       results,
-    });
+    };
+    return Response.json(response, { status: response.ok ? 200 : 502 });
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });
   }
