@@ -59,10 +59,10 @@ export function retryDelayMs(attempt: number) {
   return Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1));
 }
 
-export function isSettlementProcessable(event: any, nowMs: number, staleLeaseMs: number) {
+export function isSettlementProcessable(event: any, nowMs: number, staleLeaseMs: number, forceRetry = false) {
   if (event.status === 'pending') return true;
   if (event.status === 'retryable_failed') {
-    return !event.next_retry_at || new Date(event.next_retry_at).getTime() <= nowMs;
+    return forceRetry || !event.next_retry_at || new Date(event.next_retry_at).getTime() <= nowMs;
   }
   return event.status === 'processing' && event.processing_started_at &&
     nowMs - new Date(event.processing_started_at).getTime() > staleLeaseMs;

@@ -109,6 +109,10 @@ describe('SettlementEvent stage recovery', () => {
     expect(isSettlementProcessable({ status: 'retryable_failed', next_retry_at: '2026-01-01T00:00:10Z' }, Date.parse('2026-01-01T00:00:10Z'), 100)).toBe(true);
   });
 
+  it('allows explicit operator recovery to bypass retry backoff', () => {
+    expect(isSettlementProcessable({ status: 'retryable_failed', next_retry_at: '2026-01-01T00:00:10Z' }, Date.parse('2026-01-01T00:00:09Z'), 100, true)).toBe(true);
+  });
+
   it('reclaims stale leases but not active leases', () => {
     const event = { status: 'processing', processing_started_at: '2026-01-01T00:00:00Z' };
     expect(isSettlementProcessable(event, Date.parse('2026-01-01T00:00:06Z'), 5_000)).toBe(true);

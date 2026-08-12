@@ -462,6 +462,9 @@ export default async function(req) {
   const user = await base44.auth.me();
   if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 });
 
+  const requestBody = await req.json().catch(() => ({}));
+  const forceRetry = requestBody?.force_retry === true;
+
   const sr = base44.asServiceRole;
   const userId = user.id;
   const workerId = `settlement-${crypto.randomUUID()}`;
@@ -493,7 +496,7 @@ export default async function(req) {
     // Find pending, due retryable failures, or stale processing events.
     const allEvents = await sr.entities.SettlementEvent.filter({ user_id: userId });
     const processable = allEvents
-      .filter((event) => isSettlementProcessable(event, now, STALE_LEASE_MS)
+      .filter((event) => isSettlementProcessable(event, now, STALE_LEASE_MS, forceRetry)
         || (['terminal_failed', 'integrity_blocked'].includes(event.status)
           && String(event.error || '').startsWith('SELL_FILL_EXCEEDS_ACCOUNTED_POSITION')))
       .sort((a, b) => new Date(a.occurred_at) - new Date(b.occurred_at));
@@ -556,7 +559,18 @@ export default async function(req) {
       });
     }
 
-    const response = summarizeSettlementBatch(results, unresolved.length);
+    const response = {
+      ...summarizeSettlementBatch(results, unresolved.length),
+      unresolved_events: unresolved.map((event) => ({
+        event_id: event.event_id,
+        symbol: event.symbol,
+        side: event.side,
+        quantity: event.quantity,
+        status: event.status,
+        error: event.error || null,
+        next_retry_at: event.next_retry_at || null,
+      })),
+    };
     return Response.json(response, { status: response.ok ? 200 : 409 });
   } finally {
     clearInterval(heartbeatTimer);

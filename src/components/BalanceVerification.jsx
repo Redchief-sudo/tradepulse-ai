@@ -72,17 +72,27 @@ export default function BalanceVerification({ onSynced }) {
       const reconciliation = reconciliationResponse.data || reconciliationResponse;
       if (reconciliation?.ok === false) throw new Error(`Broker-fill reconciliation failed: ${reconciliation.results?.filter((item) => item.error).map((item) => item.error).join('; ') || 'unknown error'}`);
 
-      const settlementResponse = await base44.functions.invoke('processSettlementQueue', {});
+      const settlementResponse = await base44.functions.invoke('processSettlementQueue', { force_retry: true });
       const settlement = settlementResponse.data || settlementResponse;
-      if (settlement?.ok === false) throw new Error(`Canonical settlement incomplete: ${settlement.unresolved || 0} unresolved event(s)`);
+      if (settlement?.ok === false) {
+        const details = (settlement.results || settlement.unresolved_events || [])
+          .filter((item) => item.status !== 'completed')
+          .map((item) => `${item.symbol || item.event_id || 'event'} [${item.status || 'unresolved'}]: ${item.error || 'retry still pending'}`)
+          .join('; ');
+        throw new Error(details || `Canonical settlement incomplete: ${settlement.unresolved || 0} unresolved event(s)`);
+      }
 
       setRecoveryMessage(`Reconciliation checked ${reconciliation.checked || 0} pending order(s); settlement completed ${settlement.completed || 0} event(s). Re-comparing positions…`);
       await verify();
     } catch (e) {
       const payload = responsePayload(e);
       const detail = payload?.results?.filter((item) => item.error).map((item) => item.error).join('; ');
+      const eventDetail = (payload?.results || payload?.unresolved_events || [])
+        .filter((item) => item.status !== 'completed')
+        .map((item) => `${item.symbol || item.event_id || 'event'} [${item.status || 'unresolved'}]: ${item.error || 'retry still pending'}`)
+        .join('; ');
       const unresolved = Number.isFinite(payload?.unresolved) ? `Canonical settlement incomplete: ${payload.unresolved} unresolved event(s)` : null;
-      setError(payload?.error || detail || unresolved || e.message || 'Recovery failed');
+      setError(payload?.error || detail || eventDetail || unresolved || e.message || 'Recovery failed');
     } finally {
       setRecovering(false);
     }
