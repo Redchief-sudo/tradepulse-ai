@@ -108,21 +108,20 @@ export function computeStrategyAttribution(
     }
   }
 
-  // Open P&L attribution: for each held symbol, find the strategy of the most
-  // recent buy fill (the strategy that opened / added to the current position)
-  // and attribute the unrealized P&L to it.
-  const buyFillsBySymbol: Record<string, any[]> = {};
+  // Open P&L attribution: use the opening-side fill for the current direction
+  // (buy for longs, sell for shorts) and attribute unrealized P&L to it.
+  const fillsBySymbol: Record<string, any[]> = {};
   for (const f of fills) {
-    if (f.side !== 'buy') continue;
     const sym = String(f.symbol).toUpperCase();
-    if (!buyFillsBySymbol[sym]) buyFillsBySymbol[sym] = [];
-    buyFillsBySymbol[sym].push(f);
+    if (!fillsBySymbol[sym]) fillsBySymbol[sym] = [];
+    fillsBySymbol[sym].push(f);
   }
   for (const h of holdings) {
     const sym = String(h.symbol).toUpperCase();
-    const buys = buyFillsBySymbol[sym];
-    if (!buys || !buys.length) continue;
-    const latest = buys.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())[buys.length - 1];
+    const openingSide = safeNum(h.shares) < 0 ? 'sell' : 'buy';
+    const openingFills = (fillsBySymbol[sym] || []).filter((f) => f.side === openingSide);
+    if (!openingFills.length) continue;
+    const latest = openingFills.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())[openingFills.length - 1];
     const strat = latest.strategy_id || 'manual';
     const cur = safeNum(h.current_price || h.avg_price);
     const openPnl = safeNum(h.shares) * (cur - safeNum(h.avg_price));

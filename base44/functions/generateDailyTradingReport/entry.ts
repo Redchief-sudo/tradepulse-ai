@@ -88,9 +88,9 @@ export default async function(req) {
     }
 
     // --- Equity calculations ---
-    const appPositionValue = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
-    const costBasis = holdings.reduce((s, h) => s + h.shares * h.avg_price, 0);
-    const unrealizedPnl = appPositionValue - costBasis;
+    const appPositionValue = holdings.reduce((s, h) => s + Math.abs(h.shares) * (h.current_price || h.avg_price), 0);
+    const costBasis = holdings.reduce((s, h) => s + Math.abs(h.shares) * h.avg_price, 0);
+    const unrealizedPnl = holdings.reduce((s, h) => s + h.shares * ((h.current_price || h.avg_price) - h.avg_price), 0);
 
     let brokerEquity = null;
     let brokerPrevCloseEquity = null;
@@ -195,7 +195,7 @@ export default async function(req) {
     const sectorMap = {};
     let totalExposure = 0;
     holdings.forEach((h) => {
-      const val = h.shares * (h.current_price || h.avg_price);
+      const val = Math.abs(h.shares) * (h.current_price || h.avg_price);
       const s = h.sector || 'Other';
       sectorMap[s] = (sectorMap[s] || 0) + val;
       totalExposure += val;

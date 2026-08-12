@@ -56,14 +56,23 @@ export default async function(req) {
     const trailingUpdates = [];
     for (const h of holdings) {
       const live = priceMap[h.symbol] || h.current_price || h.avg_price;
-      const gainPct = h.avg_price > 0 ? ((live - h.avg_price) / h.avg_price) * 100 : 0;
+      const isShort = Number(h.shares) < 0;
+      const gainPct = h.avg_price > 0 ? (isShort ? ((h.avg_price - live) / h.avg_price) * 100 : ((live - h.avg_price) / h.avg_price) * 100) : 0;
       if (gainPct < 5) continue;
       let trailStop = h.stop_loss || 0;
-      if (gainPct >= 15) trailStop = Math.max(trailStop, h.avg_price * 1.10);
-      else if (gainPct >= 10) trailStop = Math.max(trailStop, h.avg_price * 1.05);
-      else if (gainPct >= 5) trailStop = Math.max(trailStop, h.avg_price * 1.00);
+      const candidateStop = gainPct >= 15
+        ? h.avg_price * (isShort ? 0.90 : 1.10)
+        : gainPct >= 10
+          ? h.avg_price * (isShort ? 0.95 : 1.05)
+          : h.avg_price;
+      trailStop = isShort
+        ? (trailStop > 0 ? Math.min(trailStop, candidateStop) : candidateStop)
+        : Math.max(trailStop, candidateStop);
       trailStop = Math.round(trailStop * 100) / 100;
-      if (trailStop > (h.stop_loss || 0)) {
+      const stopImproved = isShort
+        ? (h.stop_loss || 0) <= 0 || trailStop < h.stop_loss
+        : trailStop > (h.stop_loss || 0);
+      if (stopImproved) {
         trailingUpdates.push({ id: h.id, stop_loss: trailStop });
         h.stop_loss = trailStop; // update in-memory for trigger detection below
       }
@@ -75,9 +84,10 @@ export default async function(req) {
     // scan cycle), falling back to the fixed % threshold if not set.
     const triggered = holdings.filter((h) => {
       const live = priceMap[h.symbol] || h.current_price || h.avg_price;
-      const drop = h.avg_price > 0 ? ((h.avg_price - live) / h.avg_price) * 100 : 0;
-      const hitTarget = h.target_price && live > 0 && live >= h.target_price;
-      const hitStop = h.stop_loss > 0 ? live <= h.stop_loss : drop >= stopThreshold;
+      const isShort = Number(h.shares) < 0;
+      const lossPct = h.avg_price > 0 ? (isShort ? ((live - h.avg_price) / h.avg_price) * 100 : ((h.avg_price - live) / h.avg_price) * 100) : 0;
+      const hitTarget = h.target_price && live > 0 && (isShort ? live <= h.target_price : live >= h.target_price);
+      const hitStop = h.stop_loss > 0 ? (isShort ? live >= h.stop_loss : live <= h.stop_loss) : lossPct >= stopThreshold;
       return hitStop || hitTarget;
     });
 
@@ -90,21 +100,22 @@ export default async function(req) {
     const results = [];
     for (const h of triggered) {
       const live = priceMap[h.symbol] || h.current_price || h.avg_price;
-      const dropPct = h.avg_price > 0 ? ((h.avg_price - live) / h.avg_price) * 100 : 0;
-      const gainPct = h.avg_price > 0 ? ((live - h.avg_price) / h.avg_price) * 100 : 0;
-      const isTakeProfit = h.target_price && live >= h.target_price;
+      const isShort = Number(h.shares) < 0;
+      const dropPct = h.avg_price > 0 ? (isShort ? ((live - h.avg_price) / h.avg_price) * 100 : ((h.avg_price - live) / h.avg_price) * 100) : 0;
+      const gainPct = h.avg_price > 0 ? (isShort ? ((h.avg_price - live) / h.avg_price) * 100 : ((live - h.avg_price) / h.avg_price) * 100) : 0;
+      const isTakeProfit = h.target_price && (isShort ? live <= h.target_price : live >= h.target_price);
 
       // ADAPTIVE EXITS — partial profit-taking with trailing stops.
       // On take-profit: sell 50% of the position, raise stop to breakeven
       // on the rest, and set a higher target for the remaining shares.
       // On stop-loss: sell all remaining (full exit).
       // (Per user request: smarter adaptive exits with scale-outs.)
-      let exitQty = h.shares;
+      let exitQty = Math.abs(h.shares);
       let partialExit = false;
-      if (isTakeProfit && h.shares > 1) {
-        exitQty = Math.round((h.shares * 0.5) * 1000) / 1000;
+      if (isTakeProfit && Math.abs(h.shares) > 1) {
+        exitQty = Math.round((Math.abs(h.shares) * 0.5) * 1000) / 1000;
         partialExit = true;
-        if (exitQty < 0.001) { exitQty = h.shares; partialExit = false; }
+        if (exitQty < 0.001) { exitQty = Math.abs(h.shares); partialExit = false; }
       }
 
       const exitReason = isTakeProfit
@@ -117,9 +128,9 @@ export default async function(req) {
       // projected only by the settlement processor after financial integrity
       // verification. The stop-loss caller must not mutate the Holding based
       // merely on an order/fill response.
-      const targetDistance = partialExit ? h.target_price - h.avg_price : null;
+      const targetDistance = partialExit ? Math.abs(h.target_price - h.avg_price) : null;
       const postSettlementStop = partialExit ? h.avg_price : null;
-      const postSettlementTarget = partialExit ? h.target_price + targetDistance : null;
+      const postSettlementTarget = partialExit ? (isShort ? h.target_price - targetDistance : h.target_price + targetDistance) : null;
 
       // ASSET-CLASS-AWARE MARKET HOURS GATE — crypto trades 24/7, so only
       // stock positions are gated by the US regular session. Crypto positions
@@ -136,7 +147,7 @@ export default async function(req) {
       // Route through the canonical execution boundary.
       const result = await settleTrade(base44, user, {
         symbol: h.symbol,
-        action: 'sell',
+        action: isShort ? 'buy' : 'sell',
         qty: exitQty,
         price: live,
         company_name: h.company_name || h.symbol,

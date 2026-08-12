@@ -61,7 +61,7 @@ export async function buildPortfolioSnapshot(sr, userId, accountEquity = null, b
   const sectorMap = {};
   holdings.forEach((h) => {
     const sec = h.sector || 'Other';
-    sectorMap[sec] = (sectorMap[sec] || 0) + h.shares * (h.current_price || h.avg_price);
+    sectorMap[sec] = (sectorMap[sec] || 0) + Math.abs(h.shares * (h.current_price || h.avg_price));
   });
   // Filter trades server-side by date to avoid fetching entire trade history on every risk check.
   // Use NY market session midnight, not server-local midnight — a trade at 8 PM ET
@@ -88,7 +88,7 @@ export async function buildPortfolioSnapshot(sr, userId, accountEquity = null, b
   }
 
   // Total invested exposure and outstanding orders — for the new risk controls.
-  const totalExposure = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
+  const totalExposure = holdings.reduce((s, h) => s + Math.abs(h.shares * (h.current_price || h.avg_price)), 0);
   const totalExposurePct = totalEquity > 0 ? (totalExposure / totalEquity) * 100 : 0;
   const allIntents = await sr.entities.TradeIntent.filter({ user_id: userId });
   const outstandingOrders = allIntents.filter((i) => ['submitted', 'accepted', 'partially_filled'].includes(i.status)).length;
@@ -111,7 +111,7 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
   const price = Number(intent.limit_price || intent.price) || 0;
   const side = intent.side;
 
-  if (opts.killSwitch) {
+  if (opts.killSwitch && !opts.protectiveExit) {
     return { approved: false, approvedQuantity: 0, reasons: ['KILL_SWITCH_ACTIVE'], snapshot };
   }
 
@@ -150,11 +150,17 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
   // (Fixes Rev.14 #13: max drawdown was only enforced in the scan cycle, not
   // in the canonical risk engine. Other trade surfaces could bypass it.)
   // Sells are always permitted (risk management always runs).
-  if (side === 'buy' && opts.maxDrawdownBreached) {
+  if (side === 'buy' && !opts.protectiveExit && opts.maxDrawdownBreached) {
     reasons.push('MAX_DRAWDOWN_BREACHED');
   }
 
-  if (side === 'sell') {
+  if (opts.protectiveExit) {
+    return reasons.length
+      ? { approved: false, approvedQuantity: 0, reasons, snapshot }
+      : { approved: true, approvedQuantity: qty, reasons: ['PROTECTIVE_EXIT'], snapshot };
+  }
+
+  if (side === 'sell' && !opts.protectiveExit) {
     const existing = holdings.find((h) => String(h.symbol).toUpperCase() === symbol);
     if (!existing || existing.shares < qty) {
       const held = existing ? existing.shares : 0;
@@ -169,7 +175,7 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
   if (tradesToday >= limits.max_daily_trades) {
     reasons.push(`MAX_DAILY_TRADES_REACHED (${tradesToday}/${limits.max_daily_trades})`);
   }
-  if (openPositions >= limits.max_open_positions) {
+  if (!opts.protectiveExit && openPositions >= limits.max_open_positions) {
     reasons.push(`MAX_OPEN_POSITIONS_REACHED (${openPositions}/${limits.max_open_positions})`);
   }
   if (dailyPnlPct <= -limits.max_daily_loss_pct) {
@@ -193,7 +199,7 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
   }
 
   let approvedQty = qty;
-  if (totalEquity > 0 && price > 0) {
+  if (!opts.protectiveExit && totalEquity > 0 && price > 0) {
     // RISK-BASED SIZING — size from risk budget / (entry - stop), not from
     // a blind position percentage. This limits loss by stop distance.
     // (Per the audit: shares = risk_budget / risk_per_share, then cap by

@@ -139,6 +139,25 @@ describe('evaluateRisk — sell validation', () => {
   });
 });
 
+describe('evaluateRisk — protective short cover', () => {
+  it('allows a classified buy-to-cover through a kill switch without applying new-exposure caps', () => {
+    const limits = riskLimitsForProfile('balanced');
+    const snapshot = {
+      holdings: [{ symbol: 'MSFT', shares: -13 }], totalEquity: 10000,
+      sectorMap: { Technology: 6500 }, openPositions: limits.max_open_positions,
+      tradesToday: limits.max_daily_trades, dailyPnlPct: -10,
+      totalExposure: 6500, totalExposurePct: 65, outstandingOrders: limits.max_simultaneous_orders,
+    };
+    const result = evaluateRisk(
+      { symbol: 'MSFT', side: 'buy', requested_quantity: 13, price: 500, limit_price: 500, sector: 'Technology' },
+      snapshot,
+      limits,
+      { protectiveExit: true, killSwitch: true, bid: 499.9, ask: 500, estimated_slippage_pct: 0.01 }
+    );
+    expect(result).toMatchObject({ approved: true, approvedQuantity: 13, reasons: ['PROTECTIVE_EXIT'] });
+  });
+});
+
 describe('evaluateRisk — position sizing caps', () => {
   const limits = riskLimitsForProfile('balanced');
   const snapshot = {

@@ -38,6 +38,12 @@
       "type": "string",
       "description": "Fill ID that opened this lot"
     },
+    "position_side": {
+      "type": "string",
+      "enum": ["long", "short"],
+      "default": "long",
+      "description": "Direction of the open lot. Legacy lots without this field are long."
+    },
     "quantity_opened": {
       "type": "number"
     },

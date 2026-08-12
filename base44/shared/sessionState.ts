@@ -74,8 +74,8 @@ export function isTradeable(sessionState) {
 // Canonical execution-session guard. New exposure requires an explicitly
 // active, integrity-healthy session. Protective sells remain available while
 // stopped so risk can be reduced without reopening exposure.
-export function executionSessionDecision(user, side, assetClass = 'stocks') {
-  if (side === 'sell') return { allowed: true, reason: 'PROTECTIVE_EXIT_ALLOWED' };
+export function executionSessionDecision(user, side, assetClass = 'stocks', protectiveExit = false) {
+  if (protectiveExit || side === 'sell') return { allowed: true, reason: 'PROTECTIVE_EXIT_ALLOWED' };
   if (user?.financial_integrity_manual_reenable_required ||
       user?.trading_session_state === SESSION_STATES.FINANCIAL_INTEGRITY_BLOCKED) {
     return { allowed: false, reason: 'FINANCIAL_INTEGRITY_BLOCKED' };

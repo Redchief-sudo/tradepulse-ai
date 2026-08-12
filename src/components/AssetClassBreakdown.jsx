@@ -28,9 +28,9 @@ export default function AssetClassBreakdown({ holdings }) {
   for (const h of holdings) {
     const ac = h.asset_class || 'stocks';
     if (!byClass[ac]) byClass[ac] = { value: 0, invested: 0, dayPL: 0, count: 0 };
-    const value = h.shares * (h.current_price || h.avg_price);
-    const invested = h.shares * h.avg_price;
-    const dayPL = value * ((h.day_change_percent || 0) / 100);
+    const value = Math.abs(h.shares) * (h.current_price || h.avg_price);
+    const invested = Math.abs(h.shares) * h.avg_price;
+    const dayPL = h.shares * (h.current_price || h.avg_price) * ((h.day_change_percent || 0) / 100);
     byClass[ac].value += value;
     byClass[ac].invested += invested;
     byClass[ac].dayPL += dayPL;
@@ -43,7 +43,7 @@ export default function AssetClassBreakdown({ holdings }) {
   const rows = ASSET_CLASSES.filter((ac) => byClass[ac.key]);
   if (rows.length === 0) return null;
 
-  const totalPL = totalValue - totalInvested;
+  const totalPL = holdings.reduce((sum, holding) => sum + holding.shares * ((holding.current_price || holding.avg_price) - holding.avg_price), 0);
 
   return (
     <motion.div

@@ -17,7 +17,13 @@
       "type": "string"
     },
     "shares": {
-      "type": "number"
+      "type": "number",
+      "description": "Signed position quantity: positive long, negative short"
+    },
+    "position_side": {
+      "type": "string",
+      "enum": ["long", "short"],
+      "description": "Derived from the signed lot quantity"
     },
     "avg_price": {
       "type": "number"

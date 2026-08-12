@@ -69,14 +69,16 @@ export default function StopLossScanner({ holdings, stopLossPct, onStopLossPctCh
       const stillAtRisk = [];
       for (const h of holdings) {
         const livePrice = priceMap[String(h.symbol).toUpperCase()] || h.current_price || h.avg_price;
-        const dropPct =
-          h.avg_price > 0 ? ((h.avg_price - livePrice) / h.avg_price) * 100 : 0;
+        const isShort = Number(h.shares) < 0;
+        const dropPct = h.avg_price > 0
+          ? (isShort ? ((livePrice - h.avg_price) / h.avg_price) * 100 : ((h.avg_price - livePrice) / h.avg_price) * 100)
+          : 0;
         if (dropPct >= localPct) {
           try {
             const result = await base44.functions.invoke('executeTrade', {
               symbol: h.symbol,
-              action: 'sell',
-              qty: h.shares,
+              action: isShort ? 'buy' : 'sell',
+              qty: Math.abs(h.shares),
               price: livePrice,
               company_name: h.company_name,
               ai_recommended: true,

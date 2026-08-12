@@ -25,6 +25,7 @@ import { recordBuySettlement, recordSellSettlement, getCashBalance } from '../..
 import { updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
 import { nowIso, genId, parseClosureFills } from '../../shared/lotAccounting.ts';
 import { classifySettlementFailure, deriveOrderSettlementSummary, isSettlementProcessable, runSettlementStages, selectLeaseWinner, summarizeSettlementBatch } from '../../shared/settlementState.ts';
+import { lotDirection, planSignedLotFill, signedLotQuantity } from '../../shared/signedLots.ts';
 
 const STALE_LEASE_MS = 5 * 60 * 1000; // 5 minutes
 const PROCESSOR_LEASE_MS = 10 * 60 * 1000;
@@ -95,10 +96,10 @@ async function claimEvent(sr, userId, event, workerId) {
   return { claimed: false, reason: 'LOST_RACE' };
 }
 
-// Create a PositionLot for a buy fill
-async function createPositionLot(sr, userId, event) {
+async function createPositionLot(sr, userId, event, positionSide, quantity) {
+  if (quantity <= 0.0001) return;
   const existing = await sr.entities.PositionLot.filter({ user_id: userId, originating_fill_id: event.event_id });
-  if (existing.length > 0) return;
+  if (existing.some((lot) => lotDirection(lot) === positionSide)) return;
   await sr.entities.PositionLot.create({
     user_id: userId,
     portfolio_id: event.portfolio_id || null,
@@ -108,8 +109,9 @@ async function createPositionLot(sr, userId, event) {
     sector: event.sector || '',
     asset_class: event.asset_class || 'stocks',
     originating_fill_id: event.event_id,
-    quantity_opened: event.quantity,
-    quantity_remaining: event.quantity,
+    position_side: positionSide,
+    quantity_opened: quantity,
+    quantity_remaining: quantity,
     acquisition_price: event.price,
     acquisition_timestamp: event.occurred_at || nowIso(),
     status: 'open',
@@ -121,54 +123,24 @@ async function createPositionLot(sr, userId, event) {
   });
 }
 
-// Close lots FIFO for a sell fill — returns realized P&L
-async function closeLotsFifo(sr, userId, event) {
+// Apply any buy/sell fill to signed FIFO lots. Opposite-direction lots close
+// first; any residual opens a new long (buy) or short (sell) lot.
+async function projectSignedLots(sr, userId, event) {
   const lots = await sr.entities.PositionLot.filter({ user_id: userId, symbol: event.symbol });
-  let alreadyAllocated = 0;
-  let realizedPnl = 0;
-  for (const lot of lots) {
-    for (const allocation of parseClosureFills(lot.closure_fill_ids)) {
-      if (allocation.fill_id === event.event_id) {
-        alreadyAllocated += Number(allocation.qty) || 0;
-        realizedPnl += (event.price - lot.acquisition_price) * (Number(allocation.qty) || 0);
-      }
-    }
-  }
-  if (alreadyAllocated > event.quantity + 0.0001) {
-    throw new Error(`INTEGRITY_VIOLATION: SELL_EVENT_OVERALLOCATED ${alreadyAllocated} > ${event.quantity}`);
-  }
-
-  const openLots = lots
-    .filter((l) => l.status === 'open' || l.status === 'partially_closed')
-    .sort((a, b) => new Date(a.acquisition_timestamp) - new Date(b.acquisition_timestamp));
-
-  const remainingRequired = event.quantity - alreadyAllocated;
-  const availableQty = openLots.reduce((s, l) => s + l.quantity_remaining, 0);
-  if (remainingRequired > availableQty + 0.0001) {
-    throw new Error(`SELL_FILL_EXCEEDS_ACCOUNTED_POSITION: remaining ${remainingRequired}, available ${availableQty} for ${event.symbol}`);
-  }
-
-  let remainingQty = remainingRequired;
-
-  for (const lot of openLots) {
-    if (remainingQty <= 0.0001) break;
-    const closeQty = Math.min(lot.quantity_remaining, remainingQty);
-    const lotPnl = (event.price - lot.acquisition_price) * closeQty;
-    realizedPnl += lotPnl;
-
-    const newRemaining = lot.quantity_remaining - closeQty;
-    const closureAllocations = parseClosureFills(lot.closure_fill_ids);
-    closureAllocations.push({ fill_id: event.event_id, qty: closeQty });
-
-    await sr.entities.PositionLot.update(lot.id, {
+  const plan = planSignedLotFill(lots, event);
+  for (const closure of plan.closures) {
+    const newRemaining = closure.lot.quantity_remaining - closure.quantity;
+    const closureAllocations = parseClosureFills(closure.lot.closure_fill_ids);
+    closureAllocations.push({ fill_id: event.event_id, qty: closure.quantity });
+    await sr.entities.PositionLot.update(closure.lot.id, {
       quantity_remaining: newRemaining,
       status: newRemaining <= 0.0001 ? 'closed' : 'partially_closed',
-      realized_pnl: (lot.realized_pnl || 0) + lotPnl,
+      realized_pnl: (closure.lot.realized_pnl || 0) + closure.pnl,
       closure_fill_ids: JSON.stringify(closureAllocations),
     });
-    remainingQty -= closeQty;
   }
-  return realizedPnl;
+  await createPositionLot(sr, userId, event, plan.openingDirection, plan.openingQuantity);
+  return plan.realizedPnl;
 }
 
 // Derive Holding from open PositionLots — the lot ledger is the source of truth.
@@ -184,13 +156,16 @@ async function updateHoldingProjection(sr, userId, event) {
     return;
   }
 
-  const totalShares = openLots.reduce((s, l) => s + l.quantity_remaining, 0);
-  const totalCost = openLots.reduce((s, l) => s + l.quantity_remaining * l.acquisition_price, 0);
-  const avgPrice = totalShares > 0 ? totalCost / totalShares : 0;
+  const totalShares = openLots.reduce((sum, lot) => sum + signedLotQuantity(lot), 0);
+  const absoluteShares = openLots.reduce((sum, lot) => sum + (Number(lot.quantity_remaining) || 0), 0);
+  const totalCost = openLots.reduce((sum, lot) => sum + (Number(lot.quantity_remaining) || 0) * lot.acquisition_price, 0);
+  const avgPrice = absoluteShares > 0 ? totalCost / absoluteShares : 0;
+  const positionSide = totalShares < 0 ? 'short' : 'long';
 
   if (existing) {
     await sr.entities.Holding.update(existing.id, {
       shares: totalShares,
+      position_side: positionSide,
       avg_price: avgPrice,
       current_price: event.price,
     });
@@ -201,6 +176,7 @@ async function updateHoldingProjection(sr, userId, event) {
       symbol: event.symbol,
       company_name: event.company_name || event.symbol,
       shares: totalShares,
+      position_side: positionSide,
       avg_price: avgPrice,
       current_price: event.price,
       sector: event.sector || '',
@@ -235,7 +211,7 @@ async function createOrUpdateTrade(sr, userId, event, realizedPnl) {
       order_status: summary.orderStatus,
       first_fill_at: summary.firstFillAt,
       last_fill_at: summary.lastFillAt,
-      realized_pnl: event.side === 'sell' ? realizedPnl : existingTrades[0].realized_pnl,
+      realized_pnl: realizedPnl != null ? realizedPnl : existingTrades[0].realized_pnl,
     });
     return existingTrades[0].id;
   }
@@ -257,7 +233,7 @@ async function createOrUpdateTrade(sr, userId, event, realizedPnl) {
     order_status: summary.orderStatus,
     commission: event.commission || 0,
     source: event.strategy_id,
-    realized_pnl: event.side === 'sell' ? realizedPnl : null,
+    realized_pnl: realizedPnl,
     record_type: 'order_summary',
     fill_count: fills.length,
     first_fill_at: summary.firstFillAt,
@@ -351,7 +327,7 @@ async function updateTradeIntent(sr, userId, event, realizedPnl) {
   }
 
   // Accumulate realized P&L for sells
-  if (event.side === 'sell' && realizedPnl != null) {
+  if (realizedPnl != null) {
     const settlementEvents = await sr.entities.SettlementEvent.filter({ user_id: userId, trade_intent_id: event.trade_intent_id });
     patch.realized_pnl = settlementEvents
       .filter((candidate) => candidate.lot_projected)
@@ -376,7 +352,7 @@ async function verifyIntegrity(sr, userId, event) {
   // 2. Holding quantity equals sum of open PositionLots
   const lots = await sr.entities.PositionLot.filter({ user_id: userId, symbol: event.symbol });
   const openLots = lots.filter((l) => l.status === 'open' || l.status === 'partially_closed');
-  const lotQty = openLots.reduce((s, l) => s + l.quantity_remaining, 0);
+  const lotQty = openLots.reduce((sum, lot) => sum + signedLotQuantity(lot), 0);
 
   const holdings = await sr.entities.Holding.filter({ user_id: userId });
   const holding = holdings.find((h) => String(h.symbol).toUpperCase() === event.symbol.toUpperCase());
@@ -411,7 +387,6 @@ async function verifyIntegrity(sr, userId, event) {
 // integrity check has succeeded. This makes adaptive exit changes recoverable:
 // a failure leaves the event incomplete and the scheduled processor retries it.
 async function projectPostSettlementMetadata(sr, userId, event) {
-  if (event.side !== 'sell') return;
   const intents = await sr.entities.TradeIntent.filter({
     user_id: userId,
     trade_intent_id: event.trade_intent_id,
@@ -435,8 +410,7 @@ async function projectPostSettlementMetadata(sr, userId, event) {
 async function processEvent(sr, userId, event, beforeStage) {
   const handlers = {
     projectLot: async (state) => {
-      const realizedPnl = state.side === 'buy' ? null : await closeLotsFifo(sr, userId, state);
-      if (state.side === 'buy') await createPositionLot(sr, userId, state);
+      const realizedPnl = await projectSignedLots(sr, userId, state);
       return { patch: { realized_pnl: realizedPnl } };
     },
     projectCash: async (state) => {
@@ -519,7 +493,9 @@ export default async function(req) {
     // Find pending, due retryable failures, or stale processing events.
     const allEvents = await sr.entities.SettlementEvent.filter({ user_id: userId });
     const processable = allEvents
-      .filter((event) => isSettlementProcessable(event, now, STALE_LEASE_MS))
+      .filter((event) => isSettlementProcessable(event, now, STALE_LEASE_MS)
+        || (['terminal_failed', 'integrity_blocked'].includes(event.status)
+          && String(event.error || '').startsWith('SELL_FILL_EXCEEDS_ACCOUNTED_POSITION')))
       .sort((a, b) => new Date(a.occurred_at) - new Date(b.occurred_at));
 
     const results = [];

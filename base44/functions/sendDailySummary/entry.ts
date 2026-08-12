@@ -27,9 +27,9 @@ export default async function(req) {
     // (Fixes Rev.9 defect #18: daily summary was calculated only from holdings,
     // which can diverge from actual broker equity due to stale prices, cash,
     // fees, and unreconciled fills.)
-    const portfolioValue = holdings.reduce((s, h) => s + h.shares * (h.current_price || h.avg_price), 0);
-    const costBasis = holdings.reduce((s, h) => s + h.shares * h.avg_price, 0);
-    const totalPL = portfolioValue - costBasis;
+    const portfolioValue = holdings.reduce((s, h) => s + Math.abs(h.shares) * (h.current_price || h.avg_price), 0);
+    const costBasis = holdings.reduce((s, h) => s + Math.abs(h.shares) * h.avg_price, 0);
+    const totalPL = holdings.reduce((s, h) => s + h.shares * ((h.current_price || h.avg_price) - h.avg_price), 0);
     const totalPLPct = costBasis > 0 ? (totalPL / costBasis) * 100 : 0;
     const dayPL = calculatePositionDayPnl(holdings);
     const prevValue = portfolioValue - dayPL;

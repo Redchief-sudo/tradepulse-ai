@@ -27,7 +27,7 @@ function sectorExposure(holdings) {
   const sectors = {};
   let total = 0;
   holdings.forEach((h) => {
-    const value = h.shares * (h.current_price || h.avg_price);
+    const value = Math.abs(h.shares * (h.current_price || h.avg_price));
     const s = h.sector || 'Other';
     sectors[s] = (sectors[s] || 0) + value;
     total += value;

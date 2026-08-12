@@ -230,7 +230,11 @@ export async function executeIntent(base44, user, input) {
   } catch (error) {
     return { status: 'rejected', error: `SESSION_STATE_UNAVAILABLE: ${error.message}`, symbol, side, requestedQty };
   }
-  const sessionDecision = executionSessionDecision(authoritativeUser, side, input.asset_class);
+  const symbolHoldings = await sr.entities.Holding.filter({ user_id: userId, symbol });
+  const signedHeldQuantity = Number(symbolHoldings[0]?.shares) || 0;
+  const protectiveExit = (side === 'sell' && signedHeldQuantity > 0 && requestedQty <= signedHeldQuantity + 0.0001)
+    || (side === 'buy' && signedHeldQuantity < 0 && requestedQty <= Math.abs(signedHeldQuantity) + 0.0001);
+  const sessionDecision = executionSessionDecision(authoritativeUser, side, input.asset_class, protectiveExit);
   if (!sessionDecision.allowed) {
     return { status: 'rejected', reasons: [sessionDecision.reason], symbol, side, requestedQty };
   }
@@ -440,7 +444,7 @@ export async function executeIntent(base44, user, input) {
   // in the canonical risk engine, not just the scan cycle.
   // (Fixes Rev.14 #13: other trade surfaces bypassed the scan-level drawdown guard.)
   let maxDrawdownBreached = false;
-  if (side === 'buy' && limits.max_drawdown_pct && snapshot.totalEquity > 0) {
+  if (side === 'buy' && !protectiveExit && limits.max_drawdown_pct && snapshot.totalEquity > 0) {
     try {
       const ddCheck = await checkMaxDrawdown(sr, userId, snapshot.totalEquity, limits);
       if (ddCheck.breached) {
@@ -465,6 +469,7 @@ export async function executeIntent(base44, user, input) {
     {
       killSwitch: !!user.kill_switch_reset_required || user.trading_session_state === 'risk_stopped',
       maxDrawdownBreached,
+      protectiveExit,
       skipMarketDataChecks,
       bid: executableQuote?.bid,
       ask: executableQuote?.ask,
@@ -505,7 +510,7 @@ export async function executeIntent(base44, user, input) {
     await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: `SESSION_STATE_UNAVAILABLE: ${error.message}` });
     return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: `SESSION_STATE_UNAVAILABLE: ${error.message}`, symbol, side, requestedQty };
   }
-  const preSubmissionDecision = executionSessionDecision(preSubmissionUser, side, input.asset_class);
+  const preSubmissionDecision = executionSessionDecision(preSubmissionUser, side, input.asset_class, protectiveExit);
   if (!preSubmissionDecision.allowed) {
     await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: preSubmissionDecision.reason });
     return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, reasons: [preSubmissionDecision.reason], symbol, side, requestedQty };

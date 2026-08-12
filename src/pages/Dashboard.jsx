@@ -221,8 +221,8 @@ export default function Dashboard() {
     try {
       await base44.functions.invoke('executeTrade', {
         symbol: holding.symbol,
-        action: 'sell',
-        qty: holding.shares,
+        action: holding.shares < 0 ? 'buy' : 'sell',
+        qty: Math.abs(holding.shares),
         price: exitPrice,
         company_name: holding.company_name,
         asset_class: holding.asset_class || 'stocks',
@@ -240,10 +240,10 @@ export default function Dashboard() {
   };
 
   const openPositionValue = holdings.reduce(
-    (sum, h) => sum + (h.broker_authoritative ? h.market_value : h.shares * (h.current_price || h.avg_price)),
+    (sum, h) => sum + Math.abs(h.broker_authoritative ? h.market_value : h.shares * (h.current_price || h.avg_price)),
     0
   );
-  const openCostBasis = holdings.reduce((sum, h) => sum + h.shares * h.avg_price, 0);
+  const openCostBasis = holdings.reduce((sum, h) => sum + Math.abs(h.shares) * h.avg_price, 0);
   const unrealizedPL = holdings.reduce(
     (sum, h) => sum + (h.broker_authoritative ? h.unrealized_pl : h.shares * ((h.current_price || h.avg_price) - h.avg_price)),
     0
@@ -259,7 +259,7 @@ export default function Dashboard() {
 
   const pieData = holdings.map((h) => ({
     name: h.symbol,
-    value: h.broker_authoritative ? h.market_value : h.shares * (h.current_price || h.avg_price),
+    value: Math.abs(h.broker_authoritative ? h.market_value : h.shares * (h.current_price || h.avg_price)),
   }));
 
   if (loading) {
@@ -422,7 +422,7 @@ export default function Dashboard() {
                       : h.shares * ((h.current_price || h.avg_price) - h.avg_price);
                     const plPercent = h.broker_authoritative
                       ? h.unrealized_pl_percent
-                      : h.avg_price > 0 ? (pl / (h.shares * h.avg_price)) * 100 : 0;
+                      : h.avg_price > 0 ? (pl / (Math.abs(h.shares) * h.avg_price)) * 100 : 0;
                     return (
                       <tr
                         key={h.id}
@@ -436,7 +436,7 @@ export default function Dashboard() {
                             </div>
                           )}
                         </td>
-                        <td className="text-right p-4">{h.shares}</td>
+                        <td className="text-right p-4">{Math.abs(h.shares)} {h.shares < 0 ? 'short' : 'long'}</td>
                         <td className="text-right p-4 hidden md:table-cell">
                           {formatCurrency(h.avg_price)}
                         </td>

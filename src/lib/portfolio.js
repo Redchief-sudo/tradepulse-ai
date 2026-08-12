@@ -3,7 +3,7 @@ export function computeSectorExposure(holdings) {
   let total = 0;
   holdings.forEach((h) => {
     const sector = h.sector || 'Other';
-    const value = h.shares * (h.current_price || h.avg_price);
+    const value = Math.abs(h.shares * (h.current_price || h.avg_price));
     sectors[sector] = (sectors[sector] || 0) + value;
     total += value;
   });
@@ -20,7 +20,7 @@ export function computeSectorExposure(holdings) {
 }
 
 export function computePortfolioValue(holdings) {
-  return holdings.reduce((sum, h) => sum + h.shares * (h.current_price || h.avg_price), 0);
+  return holdings.reduce((sum, h) => sum + Math.abs(h.shares * (h.current_price || h.avg_price)), 0);
 }
 
 export function computeCappedPositionSize(
