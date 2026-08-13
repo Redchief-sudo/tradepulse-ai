@@ -4,6 +4,7 @@ import { BookOpen, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import TradingSessionCard from '@/components/TradingSessionCard';
 import TradingSessionDetail from '@/components/TradingSessionDetail';
+import { newYorkDateString } from '@/lib/tradingDate';
 
 export default function TradingJournal() {
   const [sessions, setSessions] = useState([]);
@@ -18,8 +19,9 @@ export default function TradingJournal() {
       setLoading(true);
       const data = await base44.entities.TradingSession.list('-session_date', 30);
       setSessions(data);
-      if (data.length > 0 && !selectedSession) {
-        setSelectedSession(data[0]);
+      if (!selectedSession) {
+        const today = newYorkDateString();
+        setSelectedSession(data.find((session) => session.session_date === today) || null);
       }
     } catch (e) {
       setError(e.message);
@@ -37,7 +39,7 @@ export default function TradingJournal() {
       setGenerating(true);
       setError(null);
       const result = await base44.functions.invoke('generateDailyTradingReport', {
-        date: date || new Date().toISOString().slice(0, 10),
+        date: date || newYorkDateString(),
         final: false,
       });
       const data = result?.data || result;
@@ -60,16 +62,19 @@ export default function TradingJournal() {
 
   const loadSessionDetail = async (session) => {
     setSelectedSession(session);
+    setReportData(null);
     try {
       const result = await base44.functions.invoke('generateDailyTradingReport', {
         date: session.session_date,
       });
       const data = result?.data || result;
-      if (data && data.ok) {
+      if (data && data.ok && data.session?.session_date === session.session_date) {
         setReportData(data);
+      } else if (data?.session?.session_date && data.session.session_date !== session.session_date) {
+        throw new Error(`Report date mismatch: requested ${session.session_date}, received ${data.session.session_date}`);
       }
     } catch (e) {
-      // Non-fatal — the summary card still shows
+      setError(e.message || `Unable to load ${session.session_date} report`);
     }
   };
 
@@ -148,8 +153,9 @@ export default function TradingJournal() {
             <div className="p-8 rounded-xl border border-border bg-card text-center">
               <BookOpen className="w-12 h-12 text-muted-foreground mx-auto mb-3 opacity-50" />
               <p className="text-sm text-muted-foreground">
-                Select a session to view its detailed trading journal.
+                No New York trading-session report exists for {newYorkDateString()}.
               </p>
+              <p className="text-xs text-muted-foreground mt-1">Generate today&apos;s snapshot, or select a clearly dated historical session.</p>
             </div>
           )}
         </div>

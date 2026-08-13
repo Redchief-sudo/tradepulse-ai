@@ -48,6 +48,9 @@ export default async function(req) {
     // Use NY session date — the report date represents the US market trading day.
     // (Fixes Rev.13 #26.)
     const reportDate = body.date || nySessionDateStr();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(reportDate)) {
+      return Response.json({ error: 'INVALID_REPORT_DATE: expected YYYY-MM-DD in America/New_York' }, { status: 400 });
+    }
     const sessionId = `session-${reportDate}`;
     const isFinal = body.final === true;
 
@@ -440,6 +443,9 @@ export default async function(req) {
 
     return Response.json({
       ok: !isFinal || canFinalize,
+      report_date: reportDate,
+      report_type: isFinal ? 'final' : 'intraday',
+      generated_at: session.generated_at,
       session,
       trades: tradeLog,
       scan_runs: dayScans.map((s) => ({
