@@ -1,9 +1,9 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
-import { getAlpacaAccount, getAlpacaPositions } from '../../shared/alpaca.ts';
+import { getAlpacaAccount, getAlpacaActivities, getAlpacaPositions } from '../../shared/alpaca.ts';
 import { getCashBalance } from '../../shared/cashLedger.ts';
-import { nySessionDateStr } from '../../shared/marketHours.ts';
+import { nyDayStart, nySessionDateStr } from '../../shared/marketHours.ts';
 import { calculateDailyReturn, indexClosedLotsByFillId } from '../../shared/dailyPerformance.ts';
-import { dailyReportStatus } from '../../shared/operationalTruth.ts';
+import { brokerFillConservation, dailyReportStatus, reconciliationIsFresh } from '../../shared/operationalTruth.ts';
 
 // Generates a comprehensive daily trading report — one TradingSession record
 // per trading day that ties together trades, fills, scan runs, audit events,
@@ -102,20 +102,27 @@ export default async function(req) {
     let brokerOpenPositions = null;
     let brokerDataStatus = 'not_applicable';
     let cashBalance = null;
+    let brokerFills = [];
+    let brokerMarketCloseAt = null;
+    let brokerPositionSymbols = [];
     const brokerCreds = await sr.entities.BrokerCredential.filter({ user_id: user.id, status: 'active' });
     if (brokerCreds[0] && brokerCreds[0].broker === 'alpaca') {
       brokerDataStatus = 'available';
       try {
         const connection = { apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret, mode: brokerCreds[0].mode };
-        const [acct, brokerPositions] = await Promise.all([
+        const [acct, brokerPositions, activities] = await Promise.all([
           getAlpacaAccount(connection),
           getAlpacaPositions(connection),
+          getAlpacaActivities({ ...connection, sinceDate: nyDayStart(new Date(`${reportDate}T12:00:00Z`)).toISOString(), pageSize: 100, direction: 'asc', paginate: true }),
         ]);
         brokerEquity = Number(acct.equity);
         brokerPrevCloseEquity = Number(acct.last_equity) || null;
         buyingPower = Number(acct.buying_power) || Number(acct.cash) || null;
         cashBalance = Number(acct.cash);
         brokerOpenPositions = brokerPositions.length;
+        brokerPositionSymbols = brokerPositions.map((position) => String(position.symbol).toUpperCase());
+        brokerFills = activities.filter((activity) => inNySessionDay(activity.transaction_time || activity.date || activity.created_at, reportDate));
+        brokerMarketCloseAt = new Date(nyDayStart(new Date(`${reportDate}T12:00:00Z`)).getTime() + 16 * 60 * 60 * 1000).toISOString();
       } catch (e) {
         // BROKER-UNREACHABLE: mark the report as degraded so it's not mistaken
         // for an authoritative broker-sourced report. (Fixes Rev.13 #27.)
@@ -185,8 +192,19 @@ export default async function(req) {
       }
     }
     const driftEvents = Object.values(latestReconciliationBySymbol).filter((e) => e.event_type !== 'matched');
+    const latestReconciliationAt = dayReconciliation.reduce((latest, event) => {
+      const timestamp = event.run_timestamp || event.created_date;
+      return !latest || new Date(timestamp) > new Date(latest) ? timestamp : latest;
+    }, null);
+    const lastBrokerFillAt = brokerFills.reduce((latest, fill) => {
+      const timestamp = fill.transaction_time || fill.date || fill.created_at;
+      return timestamp && (!latest || new Date(timestamp) > new Date(latest)) ? timestamp : latest;
+    }, null);
+    const reconciliationFresh = !brokerCreds[0] || reconciliationIsFresh(latestReconciliationAt, lastBrokerFillAt, isFinal ? brokerMarketCloseAt : null);
+    const relevantBrokerSymbols = new Set([...brokerPositionSymbols, ...brokerFills.map((fill) => String(fill.symbol || '').toUpperCase()).filter(Boolean)]);
+    const missingReconciliationSymbols = [...relevantBrokerSymbols].filter((symbol) => !latestReconciliationBySymbol[symbol]);
     const hasReconciliationEvidence = brokerCreds[0]
-      ? dayReconciliation.length > 0 || (holdings.length === 0 && dayIntents.length === 0)
+      ? dayReconciliation.length > 0 && reconciliationFresh && missingReconciliationSymbols.length === 0
       : daySettlements.length > 0 || dayIntents.length === 0;
     const reconciliationStatus = blockedHoldings.length > 0
       ? `${blockedHoldings.length} blocked position(s): ${blockedHoldings.map((h) => h.symbol).join(', ')}`
@@ -197,7 +215,10 @@ export default async function(req) {
           : hasReconciliationEvidence ? 'clean' : 'not_verified';
 
     const dispositionValues = dayScans.flatMap((scan) => {
-      try { return Object.values(JSON.parse(scan.candidate_dispositions || '{}')); }
+      try {
+        const parsed = JSON.parse(scan.candidate_dispositions || '[]');
+        return Array.isArray(parsed) ? parsed.map((entry) => entry.disposition) : Object.values(parsed);
+      }
       catch (error) { return []; }
     });
     const candidatesDiscovered = dayScans.reduce((sum, scan) => sum + (Number(scan.candidates_found) || 0), 0);
@@ -211,6 +232,7 @@ export default async function(req) {
     const settlementFailed = daySettlements.filter((event) => ['terminal_failed'].includes(event.status)).length;
     const settlementEventKeys = new Set(daySettlements.flatMap((event) => [event.event_id, event.broker_fill_id].filter(Boolean)));
     const unaccountedBrokerFills = dayFills.filter((fill) => !settlementEventKeys.has(fill.fill_id) && !settlementEventKeys.has(fill.broker_fill_id)).length;
+    const brokerFillSummary = brokerCreds[0] ? brokerFillConservation(brokerFills, dayFills) : { alpaca_fill_count: 0, ledger_fill_count: dayFills.length, missing_ledger_fills: 0, extra_ledger_fills: 0, ok: true };
     const financialIntegrityBlocked = user.trading_session_state === 'financial_integrity_blocked' || user.financial_integrity_manual_reenable_required === true || settlementIntegrityBlocked > 0;
     const scanCyclesCompleted = dayScans.filter((scan) => ['completed', 'no_candidates'].includes(scan.status)).length;
     const scanCyclesFailed = dayScans.filter((scan) => ['failed', 'broker_unavailable'].includes(scan.status)).length;
@@ -221,7 +243,7 @@ export default async function(req) {
     }
     const reportStatus = dailyReportStatus({
       financialIntegrityBlocked, settlementIntegrityBlocked, reconciliationStatus,
-      unaccountedBrokerFills, positionDriftCount: driftEvents.length,
+      unaccountedBrokerFills, missingLedgerFills: brokerFillSummary.missing_ledger_fills, extraLedgerFills: brokerFillSummary.extra_ledger_fills, positionDriftCount: driftEvents.length,
       brokerDataUnavailable: brokerDataStatus === 'unavailable', cashDataUnavailable: cashDataStatus === 'unavailable',
       settlementPending, settlementFailed, unexplainedCandidates, healthCheckFailures,
     });
@@ -480,7 +502,14 @@ export default async function(req) {
       candidates_filtered: candidatesFiltered,
       candidates_vetoed: candidatesVetoed,
       signals_ineligible: signalsIneligible,
-      broker_fill_count: dayFills.length,
+      broker_fill_count: brokerFillSummary.alpaca_fill_count,
+      alpaca_fill_count: brokerFillSummary.alpaca_fill_count,
+      ledger_fill_count: brokerFillSummary.ledger_fill_count,
+      missing_ledger_fills: brokerFillSummary.missing_ledger_fills,
+      extra_ledger_fills: brokerFillSummary.extra_ledger_fills,
+      latest_reconciliation_at: latestReconciliationAt,
+      reconciliation_fresh: reconciliationFresh,
+      missing_reconciliation_symbols: JSON.stringify(missingReconciliationSymbols),
       settlement_completed: settlementCompleted,
       settlement_pending: settlementPending,
       settlement_failed: settlementFailed,

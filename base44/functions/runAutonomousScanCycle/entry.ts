@@ -12,6 +12,7 @@ import { summarizeCandidateDispositions, summarizeFillSettlement } from '../../s
 import { riskLimitsForProfile, checkMaxDrawdown } from '../../shared/riskEngine.ts';
 import { getPaperEquity } from '../../shared/cashLedger.ts';
 import { executionSessionDecision, updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
+import { isOpenBrokerOrder } from '../../shared/operationalTruth.ts';
 import { nyDayStart } from '../../shared/marketHours.ts';
 import { hasNewerScanGeneration, nextScanGeneration } from '../../shared/scanState.ts';
 import { canonicalizeOpportunity, normalizeAssetClass } from '../../shared/opportunity.ts';
@@ -758,7 +759,7 @@ export default async function(req) {
       if (brokerCreds[0]?.broker === 'alpaca') {
         try {
           const pendingIntents = await sr.entities.TradeIntent.filter({ user_id: user.id, side: 'buy' });
-          const pending = pendingIntents.filter((i) => ['submitted', 'accepted'].includes(i.status));
+          const pending = pendingIntents.filter(isOpenBrokerOrder);
           for (const intent of pending) {
             if (intent.broker_order_id) {
               cancellationSummary.targeted++;
@@ -983,7 +984,7 @@ export default async function(req) {
     const filledTrades = executed.filter((e) => e.settlement?.financially_complete === true);
     const unsettledFills = executed.filter((e) =>
       ['filled', 'partially_filled'].includes(e.settlement?.broker_status)
-      && e.settlement?.financially_complete !== true
+      && e.settlement?.fills_settlement_complete !== true
     );
 
     if (filledTrades.length) {

@@ -15,7 +15,13 @@ describe('scan candidate conservation', () => {
   it('fails when a candidate disappears between stages', () => {
     const result = summarizeCandidateDispositions([{ symbol: 'MSFT' }, { symbol: 'NVDA' }], new Map([['MSFT', 'filtered:rsi_overbought']]));
     expect(result.ok).toBe(false);
-    expect(result.missing).toEqual(['NVDA']);
+    expect(result.missing).toEqual(['NVDA#2']);
+  });
+
+  it('preserves duplicate symbols as distinct candidate identities', () => {
+    const result = summarizeCandidateDispositions([{ symbol: 'MSFT' }, { symbol: 'MSFT' }], new Map([['MSFT', 'filtered:risk']]));
+    expect(result).toMatchObject({ ok: true, total: 2, accounted: 2 });
+    expect(result.dispositions.map((entry) => entry.candidate_id)).toEqual(['MSFT#1', 'MSFT#2']);
   });
 });
 

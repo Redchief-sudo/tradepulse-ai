@@ -3,7 +3,7 @@ import { secrets } from 'base44:runtime';
 import { getAlpacaAccount } from '../../shared/alpaca.ts';
 import { AlpacaError } from '../../shared/alpacaErrors.ts';
 import { sendTelegramMessage } from '../../shared/telegram.ts';
-import { healthStatus } from '../../shared/operationalTruth.ts';
+import { healthStatus, isOpenBrokerOrder, settlementHealthSeverity } from '../../shared/operationalTruth.ts';
 
 // System health check — monitors the autonomous trading system for degradation.
 // Called on a schedule (every 5 minutes) or manually from the dashboard.
@@ -48,14 +48,14 @@ export default async function(req) {
       }
     }
 
-    // 2. PENDING ORDERS — TradeIntents stuck in submitted/accepted for > 5 minutes.
+    // 2. PENDING ORDERS — any broker order with a live remainder for > 5 minutes.
     // Uses submitted_at (broker submission time), not decision_timestamp (which
     // precedes AI/risk processing and can make orders appear older than they are).
     // (Fixes Rev.12 #22: health check used decision_timestamp for order age.)
     const intents = await sr.entities.TradeIntent.filter({ user_id: user.id });
     const PENDING_TIMEOUT_MS = 5 * 60 * 1000;
     const pendingIntents = intents.filter((i) => {
-      if (!['submitted', 'accepted'].includes(i.status)) return false;
+      if (!isOpenBrokerOrder(i)) return false;
       // Use submitted_at if available, fall back to last_broker_update_at, then created_date
       const ageRef = i.submitted_at || i.last_broker_update_at || i.created_date;
       if (!ageRef) return false;
@@ -111,7 +111,7 @@ export default async function(req) {
     const settlementEvents = await sr.entities.SettlementEvent.filter({ user_id: user.id });
     for (const event of settlementEvents.filter((candidate) => candidate.status !== 'completed' || candidate.integrity_verified !== true)) {
       issues.push({
-        severity: ['failed', 'dead_letter'].includes(event.status) ? 'critical' : 'warning',
+        severity: settlementHealthSeverity(event),
         check: 'settlement_unresolved',
         message: `${event.symbol} settlement ${event.event_id} is ${event.status || 'unknown'} and not integrity-verified`,
         trade_intent_id: event.trade_intent_id,

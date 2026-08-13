@@ -1,19 +1,18 @@
 export function summarizeCandidateDispositions(candidates: any[], dispositions: Map<string, string>) {
-  const symbols = candidates.map((candidate) => String(candidate.symbol).toUpperCase());
-  const missing = symbols.filter((symbol) => !dispositions.has(symbol));
+  const entries = candidates.map((candidate, index) => ({ candidate_id: candidate.candidate_id || candidate.id || `${String(candidate.symbol).toUpperCase()}#${index + 1}`, symbol: String(candidate.symbol).toUpperCase(), disposition: dispositions.get(String(candidate.symbol).toUpperCase()) }));
+  const missing = entries.filter((entry) => !entry.disposition).map((entry) => entry.candidate_id);
   const counts: Record<string, number> = {};
-  for (const symbol of symbols) {
-    const disposition = dispositions.get(symbol);
+  for (const { disposition } of entries) {
     if (!disposition) continue;
     counts[disposition] = (counts[disposition] || 0) + 1;
   }
   return {
-    ok: missing.length === 0 && Object.values(counts).reduce((sum, count) => sum + count, 0) === symbols.length,
-    total: symbols.length,
-    accounted: symbols.length - missing.length,
+    ok: missing.length === 0 && Object.values(counts).reduce((sum, count) => sum + count, 0) === entries.length,
+    total: entries.length,
+    accounted: entries.length - missing.length,
     missing,
     counts,
-    dispositions: Object.fromEntries(symbols.filter((symbol) => dispositions.has(symbol)).map((symbol) => [symbol, dispositions.get(symbol)])),
+    dispositions: entries.filter((entry) => entry.disposition),
   };
 }
 

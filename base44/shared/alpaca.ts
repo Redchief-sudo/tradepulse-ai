@@ -152,15 +152,22 @@ export async function getAlpacaActivities({
   sinceDate,
   pageSize,
   direction,
+  paginate = false,
 }) {
-  const params = new URLSearchParams({ activity_types: activityType });
-  if (sinceDate) params.set('after', sinceDate);
-  if (pageSize) params.set('page_size', String(pageSize));
-  if (direction) params.set('direction', direction);
-  const res = await fetch(`${baseUrl(mode)}/account/activities?${params.toString()}`, {
-    headers: headers(apiKey, secretKey),
-  });
-  if (!res.ok) await throwAlpacaError(res, 'getActivities');
-  const data = await res.json().catch(() => ({}));
-  return Array.isArray(data) ? data : [];
+  const activities = [];
+  let pageToken = null;
+  do {
+    const params = new URLSearchParams({ activity_types: activityType });
+    if (sinceDate) params.set('after', sinceDate);
+    if (pageSize) params.set('page_size', String(pageSize));
+    if (direction) params.set('direction', direction);
+    if (pageToken) params.set('page_token', pageToken);
+    const res = await fetch(`${baseUrl(mode)}/account/activities?${params.toString()}`, { headers: headers(apiKey, secretKey) });
+    if (!res.ok) await throwAlpacaError(res, 'getActivities');
+    const data = await res.json().catch(() => []);
+    const page = Array.isArray(data) ? data : [];
+    activities.push(...page);
+    pageToken = paginate && pageSize && page.length === Number(pageSize) ? String(page[page.length - 1]?.id || page[page.length - 1]?.activity_id || '') : null;
+  } while (pageToken);
+  return activities;
 }

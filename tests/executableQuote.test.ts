@@ -28,9 +28,12 @@ describe('executableQuoteMetrics', () => {
 
 describe('execution lifecycle truth', () => {
   it('keeps a broker fill financially incomplete while settlement is pending', () => {
-    expect(executionLifecycle('filled', 'pending')).toEqual({ status: 'settlement_pending', broker_status: 'filled', settlement_status: 'pending', financially_complete: false });
+    expect(executionLifecycle('filled', 'pending')).toMatchObject({ status: 'settlement_pending', broker_status: 'filled', settlement_status: 'pending', financially_complete: false, order_execution_complete: true, fills_settlement_complete: false });
   });
   it('marks completion only after completed settlement', () => {
     expect(executionLifecycle('filled', 'completed').financially_complete).toBe(true);
+  });
+  it('separates settled partial fills from terminal order completion', () => {
+    expect(executionLifecycle('partially_filled', 'completed')).toMatchObject({ financially_complete: false, order_execution_complete: false, fills_settlement_complete: true });
   });
 });

@@ -51,12 +51,16 @@ async function settleAndVerify(base44, sr, userId, tradeIntentId) {
 }
 
 export function executionLifecycle(brokerStatus, settlementStatus) {
-  const financiallyComplete = brokerStatus === 'filled' && settlementStatus === 'completed';
+  const fillsSettlementComplete = settlementStatus === 'completed';
+  const orderExecutionComplete = brokerStatus === 'filled';
+  const financiallyComplete = orderExecutionComplete && fillsSettlementComplete;
   return {
     status: financiallyComplete ? 'settlement_completed' : `settlement_${settlementStatus || 'pending'}`,
     broker_status: brokerStatus,
     settlement_status: settlementStatus || 'pending',
     financially_complete: financiallyComplete,
+    order_execution_complete: orderExecutionComplete,
+    fills_settlement_complete: fillsSettlementComplete,
   };
 }
 
