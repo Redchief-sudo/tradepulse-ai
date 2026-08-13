@@ -3,6 +3,7 @@ import { secrets } from 'base44:runtime';
 import { getAlpacaAccount } from '../../shared/alpaca.ts';
 import { AlpacaError } from '../../shared/alpacaErrors.ts';
 import { sendTelegramMessage } from '../../shared/telegram.ts';
+import { healthStatus } from '../../shared/operationalTruth.ts';
 
 // System health check — monitors the autonomous trading system for degradation.
 // Called on a schedule (every 5 minutes) or manually from the dashboard.
@@ -177,6 +178,7 @@ export default async function(req) {
     return Response.json({
       ok: inspectionErrors.length === 0,
       healthy: alertableIssues.length === 0 && inspectionErrors.length === 0,
+      health_status: healthStatus(issues, inspectionErrors),
       issues,
       inspection_errors: inspectionErrors,
       summary: {
@@ -187,6 +189,6 @@ export default async function(req) {
       },
     });
   } catch (error) {
-    return Response.json({ error: error.message }, { status: 500 });
+    return Response.json({ ok: false, healthy: false, health_status: 'health_unknown', issues: [], inspection_errors: [{ check: 'health_check_execution', message: error.message }], error: error.message }, { status: 503 });
   }
 }

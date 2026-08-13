@@ -163,7 +163,7 @@ export default async function(req) {
       const rStatus = result?.status || result?.settlement?.status;
       // Classify the result status — only confirmed fills are "sold".
       let status = 'submitted';
-      if (rStatus === 'filled' || rStatus === 'paper_filled') status = 'filled';
+      if (result?.financially_complete === true) status = 'filled';
       else if (rStatus === 'rejected' || rStatus === 'failed') status = 'rejected';
       else if (rStatus === 'canceled' || rStatus === 'expired') status = 'canceled';
       else if (rStatus === 'partially_filled') status = 'partially_filled';

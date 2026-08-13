@@ -24,6 +24,7 @@
       "default": "open",
       "description": "open = market still in session or report generated mid-day; closed = end-of-day final report (immutable once closed)"
     },
+    "report_status": { "type": "string", "enum": ["healthy", "reconciliation_required", "incomplete", "financial_integrity_blocked"] },
     "starting_equity": {
       "type": "number",
       "description": "Equity at the start of the session (broker last_equity or app estimate)"
@@ -188,7 +189,30 @@
     "generated_at": {
       "type": "string",
       "format": "date-time"
-    }
+    },
+    "broker_day_pnl": { "type": "number" },
+    "broker_cash": { "type": "number" },
+    "broker_position_count": { "type": "number" },
+    "ledger_position_count": { "type": "number" },
+    "candidates_discovered": { "type": "number" },
+    "candidates_filtered": { "type": "number" },
+    "candidates_vetoed": { "type": "number" },
+    "signals_ineligible": { "type": "number" },
+    "broker_fill_count": { "type": "number" },
+    "settlement_completed": { "type": "number" },
+    "settlement_pending": { "type": "number" },
+    "settlement_failed": { "type": "number" },
+    "settlement_integrity_blocked": { "type": "number" },
+    "unaccounted_broker_fills": { "type": "number" },
+    "unexplained_candidates": { "type": "number" },
+    "position_drift_count": { "type": "number" },
+    "cash_reconciliation_status": { "type": "string" },
+    "financial_integrity_status": { "type": "string" },
+    "scan_cycles_started": { "type": "number" },
+    "scan_cycles_completed": { "type": "number" },
+    "scan_cycles_failed": { "type": "number" },
+    "health_check_failures": { "type": "number" },
+    "provider_failure_counts": { "type": "string" }
   },
   "required": [
     "user_id",

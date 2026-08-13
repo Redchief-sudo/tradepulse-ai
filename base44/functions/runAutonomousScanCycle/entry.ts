@@ -8,7 +8,7 @@ import { effectiveGovernedWeights, getChampion } from '../../shared/modelGoverna
 import { getAlpacaAccount, getAlpacaClock, getAlpacaOrder, cancelAlpacaOrder } from '../../shared/alpaca.ts';
 import { fetchCandlesResult as fetchMultiAssetCandlesResult, fetchQuote as fetchMultiAssetQuote } from '../../shared/marketDataAdapter.ts';
 import { sendTelegramMessage } from '../../shared/telegram.ts';
-import { summarizeCandidateDispositions } from '../../shared/scanConservation.ts';
+import { summarizeCandidateDispositions, summarizeFillSettlement } from '../../shared/scanConservation.ts';
 import { riskLimitsForProfile, checkMaxDrawdown } from '../../shared/riskEngine.ts';
 import { getPaperEquity } from '../../shared/cashLedger.ts';
 import { executionSessionDecision, updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
@@ -796,6 +796,17 @@ export default async function(req) {
           try { await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'kill_switch_pending_order_query_failed', severity: 'critical', message: e.message }); } catch (auditError) { /* observability exhausted */ }
         }
       }
+      try {
+        await sr.entities.AuditEvent.create({
+          user_id: user.id,
+          event_type: 'kill_switch_cancellation_summary',
+          severity: cancellationSummary.failed > 0 || cancellationSummary.unknown > 0 ? 'critical' : 'warning',
+          message: `Kill-switch cancellation outcome: ${cancellationSummary.confirmed} confirmed, ${cancellationSummary.already_terminal} already terminal, ${cancellationSummary.failed} failed, ${cancellationSummary.unknown} unknown of ${cancellationSummary.targeted} targeted`,
+          details: JSON.stringify(cancellationSummary),
+        });
+      } catch (error) {
+        throw new Error(`KILL_SWITCH_CANCELLATION_AUDIT_FAILED: ${error.message}`);
+      }
       // Send alert
       try {
         await sr.integrations.Core.SendEmail({
@@ -952,6 +963,14 @@ export default async function(req) {
     if (!conservation.ok) {
       throw new Error(`SCAN_CANDIDATE_CONSERVATION_FAILED: missing ${conservation.missing.join(',')}`);
     }
+    const executedIntentIds = new Set(executed.map((entry) => entry.settlement?.trade_intent_id).filter(Boolean));
+    const [allFills, allSettlementEvents] = await Promise.all([
+      sr.entities.Fill.filter({ user_id: user.id }),
+      sr.entities.SettlementEvent.filter({ user_id: user.id }),
+    ]);
+    const scanFills = allFills.filter((fill) => executedIntentIds.has(fill.trade_intent_id));
+    const scanSettlementEvents = allSettlementEvents.filter((event) => executedIntentIds.has(event.trade_intent_id));
+    const settlementConservation = summarizeFillSettlement(scanFills, scanSettlementEvents);
 
     // NOTE: Self-learning weight evolution is now handled by the separate
     // Model Governance workflow (runModelGovernance). This cycle only executes
@@ -961,15 +980,11 @@ export default async function(req) {
     // rejected attempts. (Fixes Rev.9 defects #15 + #16: persisted fill count
     // was inflated by counting non-rejected as filled; notifications mislabeled
     // attempts as executions.)
-    const filledTrades = executed.filter((e) => {
-      const s = e.settlement?.status;
-      return (s === 'filled' || s === 'paper_filled') && e.settlement?.settlement_status === 'completed';
-    });
-    const unsettledFills = executed.filter((e) => {
-      const s = e.settlement?.status;
-      return (s === 'filled' || s === 'paper_filled' || s === 'partially_filled')
-        && e.settlement?.settlement_status !== 'completed';
-    });
+    const filledTrades = executed.filter((e) => e.settlement?.financially_complete === true);
+    const unsettledFills = executed.filter((e) =>
+      ['filled', 'partially_filled'].includes(e.settlement?.broker_status)
+      && e.settlement?.financially_complete !== true
+    );
 
     if (filledTrades.length) {
       try {
@@ -1000,8 +1015,8 @@ export default async function(req) {
     }
 
     await finishRun({
-      status: unsettledFills.length ? 'failed' : 'completed',
-      error: unsettledFills.length ? `SETTLEMENT_UNRESOLVED: ${unsettledFills.map((entry) => entry.symbol).join(',')}` : null,
+      status: settlementConservation.ok ? 'completed' : 'failed',
+      error: settlementConservation.ok ? null : `SETTLEMENT_CONSERVATION_FAILED: ${JSON.stringify(settlementConservation)}`,
       market_summary: p1.market_summary,
       market_regime: regime.market_regime,
       model_version: champion?.version || 'default',
@@ -1013,6 +1028,7 @@ export default async function(req) {
       trades_rejected: tradesRejected,
       candidates_accounted: conservation.accounted,
       candidate_dispositions: JSON.stringify(conservation.dispositions),
+      ...settlementConservation,
     });
 
     // AUTO-PROMOTION CHECK — after trades settle, evaluate paper performance
@@ -1025,9 +1041,9 @@ export default async function(req) {
     }
 
     return Response.json({
-      ok: unsettledFills.length === 0,
+      ok: settlementConservation.ok,
       scan_run_id: runId,
-      error: unsettledFills.length ? `SETTLEMENT_UNRESOLVED: ${unsettledFills.map((entry) => entry.symbol).join(',')}` : null,
+      error: settlementConservation.ok ? null : `SETTLEMENT_CONSERVATION_FAILED: ${JSON.stringify(settlementConservation)}`,
       market_summary: p1.market_summary,
       risk_assessment: p2.risk_assessment,
       regime,
@@ -1038,9 +1054,10 @@ export default async function(req) {
       proposals_after_veto: approved.length,
       executed,
       candidate_conservation: conservation,
+      settlement_conservation: settlementConservation,
       ml_weights: weights,
       unsettled_fills: unsettledFills.map((entry) => ({ symbol: entry.symbol, settlement_status: entry.settlement?.settlement_status, error: entry.settlement?.settlement_error })),
-    }, { status: unsettledFills.length ? 409 : 200 });
+    }, { status: settlementConservation.ok ? 200 : 409 });
   } catch (error) {
     // Stop the periodic heartbeat
     if (heartbeatIntervalRef) clearInterval(heartbeatIntervalRef);

@@ -43,13 +43,20 @@ export function deriveOrderSettlementSummary(intent: any, fills: any[]) {
   };
 }
 
-export function summarizeSettlementBatch(results: any[], unresolvedCount: number) {
+export function summarizeSettlementBatch(results: any[], unresolvedEvents: any[] | number) {
+  const unresolved = Array.isArray(unresolvedEvents) ? unresolvedEvents : [];
+  const unresolvedCount = Array.isArray(unresolvedEvents) ? unresolvedEvents.length : unresolvedEvents;
   const failed = results.filter((result) => result.status !== 'completed').length;
+  const count = (status: string) => unresolved.filter((event) => event.status === status).length;
   return {
     ok: failed === 0 && unresolvedCount === 0,
     processed: results.length,
     completed: results.length - failed,
     failed,
+    pending: count('pending') + count('processing'),
+    retryable_failed: count('retryable_failed'),
+    integrity_blocked: count('integrity_blocked'),
+    terminal_failed: count('terminal_failed'),
     unresolved: unresolvedCount,
     results,
   };
@@ -62,8 +69,11 @@ export function shouldMarkSettlementRecovered(user: any, unresolvedCount: number
   return recoveryRequired && unresolvedCount === 0;
 }
 
+export const SIGNED_FIFO_MIGRATION_VERSION = 'signed_fifo_v1';
+
 export function legacySignedSettlementReplayPatch(event: any) {
-  if (!String(event?.error || '').startsWith('SELL_FILL_EXCEEDS_ACCOUNTED_POSITION')) return null;
+  if (event?.status === 'completed' || event?.integrity_verified === true) return null;
+  if (!/^SELL_FILL_EXCEEDS_ACCOUNTED_POSITION: remaining [0-9.]+, available [0-9.]+ for [A-Z0-9.-]+$/.test(String(event?.error || ''))) return null;
   return {
     status: 'pending',
     lot_projected: false,

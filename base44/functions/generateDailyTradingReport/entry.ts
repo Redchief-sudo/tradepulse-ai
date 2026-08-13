@@ -3,6 +3,7 @@ import { getAlpacaAccount, getAlpacaPositions } from '../../shared/alpaca.ts';
 import { getCashBalance } from '../../shared/cashLedger.ts';
 import { nySessionDateStr } from '../../shared/marketHours.ts';
 import { calculateDailyReturn, indexClosedLotsByFillId } from '../../shared/dailyPerformance.ts';
+import { dailyReportStatus } from '../../shared/operationalTruth.ts';
 
 // Generates a comprehensive daily trading report — one TradingSession record
 // per trading day that ties together trades, fills, scan runs, audit events,
@@ -87,7 +88,7 @@ export default async function(req) {
     const daySettlements = settlementEvents.filter((e) => inNySessionDay(e.occurred_at || e.created_date, reportDate));
     const dayReconciliation = reconciliationEvents.filter((e) => inNySessionDay(e.run_timestamp || e.created_date, reportDate));
     if (isFinal && !dayAudit.some((e) => e.event_type === 'market_open_bot_started')) {
-      return Response.json({ ok: true, skipped: true, reason: 'No broker-authorized market-open marker for session date' });
+      return Response.json({ ok: false, skipped: true, report_type: 'final', report_status: 'incomplete', reason: 'No broker-authorized market-open marker for session date' }, { status: 409 });
     }
 
     // --- Equity calculations ---
@@ -100,6 +101,7 @@ export default async function(req) {
     let buyingPower = null;
     let brokerOpenPositions = null;
     let brokerDataStatus = 'not_applicable';
+    let cashBalance = null;
     const brokerCreds = await sr.entities.BrokerCredential.filter({ user_id: user.id, status: 'active' });
     if (brokerCreds[0] && brokerCreds[0].broker === 'alpaca') {
       brokerDataStatus = 'available';
@@ -112,6 +114,7 @@ export default async function(req) {
         brokerEquity = Number(acct.equity);
         brokerPrevCloseEquity = Number(acct.last_equity) || null;
         buyingPower = Number(acct.buying_power) || Number(acct.cash) || null;
+        cashBalance = Number(acct.cash);
         brokerOpenPositions = brokerPositions.length;
       } catch (e) {
         // BROKER-UNREACHABLE: mark the report as degraded so it's not mistaken
@@ -123,7 +126,6 @@ export default async function(req) {
     // Cash balance (internal paper mode) — fail visibly, not silently.
     // (Fixes Rev.13 #28: cash balance loading failure was silently swallowed,
     // proceeding with null cash and making equity look authoritative.)
-    let cashBalance = null;
     let cashDataStatus = brokerCreds[0] ? 'not_applicable' : 'available';
     if (!brokerCreds[0]) {
       try { cashBalance = await getCashBalance(sr, user.id); }
@@ -193,6 +195,36 @@ export default async function(req) {
         : driftEvents.length > 0
           ? `${driftEvents.length} reconciliation drift event(s)`
           : hasReconciliationEvidence ? 'clean' : 'not_verified';
+
+    const dispositionValues = dayScans.flatMap((scan) => {
+      try { return Object.values(JSON.parse(scan.candidate_dispositions || '{}')); }
+      catch (error) { return []; }
+    });
+    const candidatesDiscovered = dayScans.reduce((sum, scan) => sum + (Number(scan.candidates_found) || 0), 0);
+    const candidatesFiltered = dispositionValues.filter((value) => String(value).startsWith('filtered:')).length;
+    const candidatesVetoed = dispositionValues.filter((value) => String(value).startsWith('vetoed:')).length;
+    const signalsIneligible = dispositionValues.filter((value) => String(value).startsWith('ineligible:') || String(value).startsWith('skipped:')).length;
+    const unexplainedCandidates = Math.max(0, candidatesDiscovered - dispositionValues.length);
+    const settlementCompleted = daySettlements.filter((event) => event.status === 'completed' && event.integrity_verified === true).length;
+    const settlementPending = daySettlements.filter((event) => ['pending', 'processing', 'retryable_failed'].includes(event.status)).length;
+    const settlementIntegrityBlocked = daySettlements.filter((event) => event.status === 'integrity_blocked').length;
+    const settlementFailed = daySettlements.filter((event) => ['terminal_failed'].includes(event.status)).length;
+    const settlementEventKeys = new Set(daySettlements.flatMap((event) => [event.event_id, event.broker_fill_id].filter(Boolean)));
+    const unaccountedBrokerFills = dayFills.filter((fill) => !settlementEventKeys.has(fill.fill_id) && !settlementEventKeys.has(fill.broker_fill_id)).length;
+    const financialIntegrityBlocked = user.trading_session_state === 'financial_integrity_blocked' || user.financial_integrity_manual_reenable_required === true || settlementIntegrityBlocked > 0;
+    const scanCyclesCompleted = dayScans.filter((scan) => ['completed', 'no_candidates'].includes(scan.status)).length;
+    const scanCyclesFailed = dayScans.filter((scan) => ['failed', 'broker_unavailable'].includes(scan.status)).length;
+    const healthCheckFailures = dayAudit.filter((event) => String(event.event_type).startsWith('health_check_') && ['warning', 'critical', 'error'].includes(event.severity)).length;
+    const providerFailureMap = {};
+    for (const event of dayAudit.filter((candidate) => /provider|market_data|snapshot_capture_failed/.test(String(candidate.event_type)))) {
+      providerFailureMap[event.event_type] = (providerFailureMap[event.event_type] || 0) + 1;
+    }
+    const reportStatus = dailyReportStatus({
+      financialIntegrityBlocked, settlementIntegrityBlocked, reconciliationStatus,
+      unaccountedBrokerFills, positionDriftCount: driftEvents.length,
+      brokerDataUnavailable: brokerDataStatus === 'unavailable', cashDataUnavailable: cashDataStatus === 'unavailable',
+      settlementPending, settlementFailed, unexplainedCandidates, healthCheckFailures,
+    });
 
     // --- Sector exposure ---
     const sectorMap = {};
@@ -343,6 +375,7 @@ export default async function(req) {
 
       // Execution latency from fills
       const tradeFills = fills.filter((f) => f.broker_order_id === t.broker_order_id || f.client_order_id === t.client_order_id);
+      const tradeSettlements = settlementEvents.filter((event) => event.broker_order_id === t.broker_order_id || event.client_order_id === t.client_order_id || event.trade_intent_id === matchedIntent?.trade_intent_id);
       const avgLatency = tradeFills.length > 0
         ? Math.round(tradeFills.reduce((s, f) => s + (f.fill_latency_ms || 0), 0) / tradeFills.length)
         : null;
@@ -363,6 +396,18 @@ export default async function(req) {
         execution_latency_ms: avgLatency,
         commission: t.commission || 0,
         broker_order_id: t.broker_order_id,
+        scan_run_id: matchedIntent?.idempotency_key?.startsWith('autonomous-')
+          ? matchedIntent.idempotency_key.slice('autonomous-'.length, -(`-${t.symbol}-${t.action}`.length))
+          : null,
+        trade_intent_id: matchedIntent?.trade_intent_id || null,
+        requested_quantity: matchedIntent?.requested_quantity || null,
+        filled_quantity: matchedIntent?.filled_quantity || t.filled_qty || t.shares,
+        average_fill_price: matchedIntent?.filled_avg_price || null,
+        fill_ids: tradeFills.map((fill) => fill.fill_id),
+        settlement_event_ids: tradeSettlements.map((event) => event.event_id),
+        broker_status: matchedIntent?.broker_terminal_status || matchedIntent?.status || null,
+        settlement_status: tradeSettlements.length > 0 && tradeSettlements.every((event) => event.status === 'completed' && event.integrity_verified === true) ? 'completed' : tradeSettlements[0]?.status || 'missing',
+        fees: tradeFills.reduce((sum, fill) => sum + (Number(fill.fees) || 0), 0),
         decision_id: aiDecision?.id || matchedIntent?.decision_id || null,
         ai_confidence: aiDecision?.confidence || null,
         ml_score: aiDecision?.ml_score || null,
@@ -379,11 +424,12 @@ export default async function(req) {
       || reconciliationStatus !== 'clean'
       || tradesPending > 0
       || malformedLotIds.length > 0;
-    const canFinalize = isFinal && !reportDegraded;
+    const canFinalize = isFinal && reportStatus === 'healthy' && !reportDegraded;
     const sessionData = {
       session_id: sessionId,
       session_date: reportDate,
-      status: canFinalize ? 'closed' : 'open',
+      status: isFinal ? 'closed' : 'open',
+      report_status: reportStatus,
       starting_equity: startingEquity,
       ending_equity: endingEquity,
       broker_equity: brokerEquity,
@@ -426,6 +472,29 @@ export default async function(req) {
       trade_ids: JSON.stringify(sortedDayTrades.map((t) => t.id)),
       scan_run_ids: JSON.stringify(dayScans.map((s) => s.id)),
       generated_at: new Date().toISOString(),
+      broker_day_pnl: startingEquity != null && endingEquity != null ? endingEquity - startingEquity : null,
+      broker_cash: brokerCreds[0] ? cashBalance : null,
+      broker_position_count: brokerOpenPositions,
+      ledger_position_count: holdings.length,
+      candidates_discovered: candidatesDiscovered,
+      candidates_filtered: candidatesFiltered,
+      candidates_vetoed: candidatesVetoed,
+      signals_ineligible: signalsIneligible,
+      broker_fill_count: dayFills.length,
+      settlement_completed: settlementCompleted,
+      settlement_pending: settlementPending,
+      settlement_failed: settlementFailed,
+      settlement_integrity_blocked: settlementIntegrityBlocked,
+      unaccounted_broker_fills: unaccountedBrokerFills,
+      unexplained_candidates: unexplainedCandidates,
+      position_drift_count: driftEvents.length,
+      cash_reconciliation_status: brokerCreds[0] ? 'broker_authoritative' : cashDataStatus,
+      financial_integrity_status: financialIntegrityBlocked ? 'blocked' : unresolvedSettlements.length > 0 ? 'unresolved' : 'healthy',
+      scan_cycles_started: dayScans.length,
+      scan_cycles_completed: scanCyclesCompleted,
+      scan_cycles_failed: scanCyclesFailed,
+      health_check_failures: healthCheckFailures,
+      provider_failure_counts: JSON.stringify(providerFailureMap),
     };
 
     // --- Create or update (idempotent for open sessions only) ---

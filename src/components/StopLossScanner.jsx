@@ -85,7 +85,7 @@ export default function StopLossScanner({ holdings, stopLossPct, onStopLossPctCh
               source: 'stoploss_ui',
               notes: `Auto stop-loss triggered at -${dropPct.toFixed(1)}% (threshold: ${localPct}%)`,
             });
-            if (result?.data?.status === 'filled' || result?.data?.status === 'paper_filled') {
+            if (result?.data?.financially_complete === true) {
               executed.push({ ...h, current_price: livePrice, dropPct });
             }
           } catch (e) {

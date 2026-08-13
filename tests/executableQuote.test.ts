@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { executableQuoteMetrics } from '../base44/shared/execution.ts';
+import { executableQuoteMetrics, executionLifecycle } from '../base44/shared/execution.ts';
 
 describe('executableQuoteMetrics', () => {
   const now = Date.parse('2026-08-07T17:00:01.000Z');
@@ -23,5 +23,14 @@ describe('executableQuoteMetrics', () => {
 
   it('does not invent a timestamp when the provider omits it', () => {
     expect(executableQuoteMetrics({ bid: 99, ask: 100 }, 'buy', now)?.ageMs).toBeNull();
+  });
+});
+
+describe('execution lifecycle truth', () => {
+  it('keeps a broker fill financially incomplete while settlement is pending', () => {
+    expect(executionLifecycle('filled', 'pending')).toEqual({ status: 'settlement_pending', broker_status: 'filled', settlement_status: 'pending', financially_complete: false });
+  });
+  it('marks completion only after completed settlement', () => {
+    expect(executionLifecycle('filled', 'completed').financially_complete).toBe(true);
   });
 });

@@ -3,6 +3,8 @@ import { motion } from 'framer-motion';
 import IntentLifecycle from '@/components/operations/IntentLifecycle';
 import ReconciliationLog from '@/components/operations/ReconciliationLog';
 import DataFreshness from '@/components/operations/DataFreshness';
+import CleanRunStatus from '@/components/operations/CleanRunStatus';
+import ScanRunStatus from '@/components/ScanRunStatus';
 
 export default function Operations() {
   return (
@@ -11,6 +13,8 @@ export default function Operations() {
         <h1 className="text-2xl font-bold font-heading">Operations</h1>
         <p className="text-sm text-muted-foreground mt-1">Execution pipeline health, broker reconciliation, and data freshness.</p>
       </motion.div>
+      <CleanRunStatus />
+      <ScanRunStatus />
       <IntentLifecycle />
       <ReconciliationLog />
       <DataFreshness />

@@ -42,12 +42,22 @@ async function settleAndVerify(base44, sr, userId, tradeIntentId) {
   }
   const events = await sr.entities.SettlementEvent.filter({ user_id: userId, trade_intent_id: tradeIntentId });
   if (!events.length) return { status: 'failed', error: invocationError || 'SETTLEMENT_EVENT_MISSING' };
-  const failed = events.filter((event) => ['failed', 'dead_letter'].includes(event.status));
-  if (failed.length) return { status: 'failed', error: failed.map((event) => event.error || event.status).join('; ') };
+  const priority = ['integrity_blocked', 'terminal_failed', 'retryable_failed', 'processing', 'pending'];
+  const unresolvedStatus = priority.find((status) => events.some((event) => event.status === status));
   if (events.every((event) => event.status === 'completed' && event.integrity_verified === true)) {
     return { status: 'completed', error: null };
   }
-  return { status: 'pending', error: invocationError || 'SETTLEMENT_NOT_TERMINAL' };
+  return { status: unresolvedStatus || 'pending', error: invocationError || events.find((event) => event.error)?.error || 'SETTLEMENT_NOT_TERMINAL' };
+}
+
+export function executionLifecycle(brokerStatus, settlementStatus) {
+  const financiallyComplete = brokerStatus === 'filled' && settlementStatus === 'completed';
+  return {
+    status: financiallyComplete ? 'settlement_completed' : `settlement_${settlementStatus || 'pending'}`,
+    broker_status: brokerStatus,
+    settlement_status: settlementStatus || 'pending',
+    financially_complete: financiallyComplete,
+  };
 }
 
 function isTerminalFailure(status) {
@@ -255,8 +265,25 @@ export async function executeIntent(base44, user, input) {
       intentRecord = existing[0];
       // If already settled/filled, return the existing result (idempotent retry).
       if (['settled', 'filled', 'rejected', 'canceled', 'expired', 'failed'].includes(intentRecord.status)) {
+        if (intentRecord.status === 'settled' || intentRecord.status === 'filled') {
+          const settlement = await settleAndVerify(base44, sr, userId, intentRecord.trade_intent_id);
+          const lifecycle = executionLifecycle('filled', settlement.status);
+          return {
+            ...lifecycle,
+            intentId: intentRecord.id,
+            trade_intent_id: intentRecord.trade_intent_id,
+            brokerOrderId: intentRecord.broker_order_id,
+            clientOrderId: intentRecord.client_order_id,
+            filled_qty: intentRecord.filled_quantity,
+            filled_avg_price: intentRecord.filled_avg_price,
+            execution_mode: intentRecord.execution_mode,
+            settlement_error: settlement.error,
+            lifecycle_status: lifecycle.status,
+            symbol, action: side, resumed: true,
+          };
+        }
         return {
-          status: intentRecord.status === 'settled' || intentRecord.status === 'filled' ? 'filled' : 'rejected',
+          status: 'rejected',
           intentId: intentRecord.id,
           trade_intent_id: intentRecord.trade_intent_id,
           brokerOrderId: intentRecord.broker_order_id,
@@ -596,8 +623,9 @@ export async function executeIntent(base44, user, input) {
     // is idempotent — a retry or scheduled invocation won't double-project.
     const settlement = await settleAndVerify(base44, sr, userId, tradeIntentId);
 
+    const lifecycle = executionLifecycle('filled', settlement.status);
     return {
-      status: 'paper_filled',
+      ...lifecycle,
       intentId: intentRecord.id,
       trade_intent_id: tradeIntentId,
       clientOrderId,
@@ -605,10 +633,8 @@ export async function executeIntent(base44, user, input) {
       filled_avg_price: filledPrice,
       total_value: filledQty * filledPrice,
       execution_mode: executionMode,
-      broker_status: 'broker_filled',
-      settlement_status: settlement.status,
       settlement_error: settlement.error,
-      lifecycle_status: settlement.status === 'completed' ? 'settlement_completed' : settlement.status === 'failed' ? 'settlement_failed' : 'settlement_pending',
+      lifecycle_status: lifecycle.status,
       symbol,
       action: side,
     };
@@ -782,17 +808,16 @@ async function pollAndSettle(base44, sr, userId, intentRecord, creds, alpacaMode
       });
       // Invoke the settlement processor to project all pending events for this order.
       const settlement = await settleAndVerify(base44, sr, userId, tradeIntentId);
+      const lifecycle = executionLifecycle('filled', settlement.status);
       return {
-        status: executionMode === 'live' ? 'filled' : 'paper_filled',
+        ...lifecycle,
         intentId: intentRecord.id, trade_intent_id: tradeIntentId,
         brokerOrderId, clientOrderId,
         filled_qty: cumulativeFilled, filled_avg_price: cumulativeAvgPrice,
         total_value: cumulativeFilled * cumulativeAvgPrice,
         execution_mode: executionMode, symbol, action: side,
-        broker_status: 'broker_filled',
-        settlement_status: settlement.status,
         settlement_error: settlement.error,
-        lifecycle_status: settlement.status === 'completed' ? 'settlement_completed' : settlement.status === 'failed' ? 'settlement_failed' : 'settlement_pending',
+        lifecycle_status: lifecycle.status,
       };
     }
 
@@ -808,16 +833,15 @@ async function pollAndSettle(base44, sr, userId, intentRecord, creds, alpacaMode
           reservation_status: 'released',
         });
         const settlement = await settleAndVerify(base44, sr, userId, tradeIntentId);
+        const lifecycle = executionLifecycle('partially_filled', settlement.status);
         return {
-          status: 'partially_filled',
+          ...lifecycle,
           intentId: intentRecord.id, trade_intent_id: tradeIntentId,
           brokerOrderId, clientOrderId,
           filled_qty: cumulativeFilled, filled_avg_price: cumulativeAvgPrice,
           execution_mode: executionMode, symbol, action: side,
-          broker_status: 'broker_partially_filled',
-          settlement_status: settlement.status,
           settlement_error: settlement.error,
-          lifecycle_status: settlement.status === 'completed' ? 'settlement_completed' : settlement.status === 'failed' ? 'settlement_failed' : 'settlement_pending',
+          lifecycle_status: lifecycle.status,
         };
       }
       // No fill at all — reject and release the full reservation.

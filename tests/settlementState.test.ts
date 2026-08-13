@@ -148,6 +148,7 @@ describe('SettlementEvent stage recovery', () => {
       error: null,
     });
     expect(legacySignedSettlementReplayPatch({ error: 'INTEGRITY_VIOLATION: mismatch' })).toBeNull();
+    expect(legacySignedSettlementReplayPatch({ status: 'completed', integrity_verified: true, error: 'SELL_FILL_EXCEEDS_ACCOUNTED_POSITION: remaining 26, available 13 for MSFT' })).toBeNull();
   });
 
   it('reclaims stale leases but not active leases', () => {
@@ -214,7 +215,7 @@ describe('SettlementEvent stage recovery', () => {
 
   it('reports batch failure while any result or settlement remains unresolved', () => {
     expect(summarizeSettlementBatch([{ status: 'completed' }], 0).ok).toBe(true);
-    expect(summarizeSettlementBatch([{ status: 'retryable_failed' }], 1)).toMatchObject({ ok: false, failed: 1, unresolved: 1 });
+    expect(summarizeSettlementBatch([{ status: 'retryable_failed' }], [{ status: 'retryable_failed' }])).toMatchObject({ ok: false, failed: 1, unresolved: 1, retryable_failed: 1 });
     expect(summarizeSettlementBatch([], 1).ok).toBe(false);
   });
 });

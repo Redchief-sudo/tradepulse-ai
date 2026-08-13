@@ -24,7 +24,7 @@ import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { recordBuySettlement, recordSellSettlement, getCashBalance } from '../../shared/cashLedger.ts';
 import { updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
 import { nowIso, genId, parseClosureFills } from '../../shared/lotAccounting.ts';
-import { classifySettlementFailure, deriveOrderSettlementSummary, isSettlementProcessable, legacySignedSettlementReplayPatch, runSettlementStages, selectLeaseWinner, shouldMarkSettlementRecovered, summarizeSettlementBatch } from '../../shared/settlementState.ts';
+import { classifySettlementFailure, deriveOrderSettlementSummary, isSettlementProcessable, legacySignedSettlementReplayPatch, runSettlementStages, selectLeaseWinner, shouldMarkSettlementRecovered, SIGNED_FIFO_MIGRATION_VERSION, summarizeSettlementBatch } from '../../shared/settlementState.ts';
 import { lotDirection, planSignedLotFill, signedLotQuantity } from '../../shared/signedLots.ts';
 
 const STALE_LEASE_MS = 5 * 60 * 1000; // 5 minutes
@@ -472,7 +472,14 @@ export default async function(req) {
 
   const processorLease = await acquireProcessorLease(sr, userId, workerId);
   if (!processorLease) {
-    return Response.json({ ok: true, processed: 0, skipped: 'processor_already_running' });
+    try {
+      const events = await sr.entities.SettlementEvent.filter({ user_id: userId });
+      const unresolved = events.filter((event) => event.status !== 'completed' || event.integrity_verified !== true);
+      const response = { ...summarizeSettlementBatch([], unresolved), skipped: 'processor_already_running' };
+      return Response.json(response, { status: response.ok ? 200 : 409 });
+    } catch (error) {
+      return Response.json({ ok: false, processed: 0, completed: 0, unresolved: null, inspection_error: error.message }, { status: 503 });
+    }
   }
 
   // Keep the processor lease alive independently of event duration. A failed
@@ -495,15 +502,25 @@ export default async function(req) {
   try {
     // Find pending, due retryable failures, or stale processing events.
     let allEvents = await sr.entities.SettlementEvent.filter({ user_id: userId });
+    const migratedEventIds = new Set();
     for (const event of allEvents) {
       const migrationPatch = legacySignedSettlementReplayPatch(event);
       if (!migrationPatch) continue;
+      const oldError = event.error;
       await sr.entities.SettlementEvent.update(event.id, migrationPatch);
+      migratedEventIds.add(event.id);
       await audit(sr, userId, 'legacy_signed_settlement_migrated', 'warning', {
         correlation_id: event.trade_intent_id,
         entity_type: 'SettlementEvent',
         entity_id: event.id,
         message: `Reset legacy long-only settlement checkpoints for signed replay: ${event.symbol} ${event.side} ${event.quantity}`,
+        details: {
+          old_error: oldError,
+          checkpoints_reset: Object.keys(migrationPatch).filter((key) => key.endsWith('_projected') || key === 'integrity_verified'),
+          checkpoints_preserved: ['cash_projected', 'fill_received'],
+          migration_version: SIGNED_FIFO_MIGRATION_VERSION,
+          replay_result: 'pending',
+        },
       });
     }
     if (allEvents.some((event) => legacySignedSettlementReplayPatch(event))) {
@@ -533,6 +550,14 @@ export default async function(req) {
           }
         });
         results.push({ event_id: event.event_id, status: 'completed', ...result });
+        if (migratedEventIds.has(event.id)) {
+          await audit(sr, userId, 'legacy_signed_settlement_replay_completed', 'info', {
+            correlation_id: event.trade_intent_id,
+            entity_type: 'SettlementEvent', entity_id: event.id,
+            message: `Signed FIFO migration replay completed and integrity verified for ${event.symbol}`,
+            details: { migration_version: SIGNED_FIFO_MIGRATION_VERSION, replay_result: 'completed', integrity_verified: true },
+          });
+        }
       } catch (error) {
         settlementFailureSeen = true;
         const failure = classifySettlementFailure(claimResult.event, error);
@@ -572,7 +597,7 @@ export default async function(req) {
     }
 
     const response = {
-      ...summarizeSettlementBatch(results, unresolved.length),
+      ...summarizeSettlementBatch(results, unresolved),
       unresolved_events: unresolved.map((event) => ({
         event_id: event.event_id,
         symbol: event.symbol,

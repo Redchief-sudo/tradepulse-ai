@@ -2,6 +2,7 @@ import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { secrets } from 'base44:runtime';
 import { fetchQuotes } from '../../shared/marketDataAdapter.ts';
 import { usMarketSession, isUsMarketOpen } from '../../shared/marketHours.ts';
+import { snapshotConservation } from '../../shared/operationalTruth.ts';
 
 // Scheduled price-snapshot capture. Records a point-in-time price for every
 // symbol that has an open AI buy decision (plus current holdings + SPY benchmark),
@@ -36,11 +37,12 @@ export default async function(req) {
     const marketOpen = isUsMarketOpen();
     const quotes = await fetchQuotes(items, key);
     let captured = 0;
-    let failed = 0;
+    let providerFailed = 0;
+    let persistenceFailed = 0;
     const failures = [];
     for (const quote of quotes.filter((quote) => quote.error || quote.price <= 0)) {
-      failed++;
-      failures.push({ symbol: quote.symbol, error: quote.error || 'Provider returned no positive price' });
+      providerFailed++;
+      failures.push({ symbol: quote.symbol, failure_kind: 'provider_failed', provider: quote.provider, error_code: quote.error_code, http_status: quote.http_status, error: quote.error || 'Provider returned no positive price' });
     }
     await Promise.all(quotes.filter((q) => !q.error && q.price > 0).map(async (q) => {
       try {
@@ -60,8 +62,8 @@ export default async function(req) {
       } catch (e) {
         // Persist the failure instead of silently skipping — operations needs
         // to know which symbols failed and why. (Fixes Rev.10 defect #19.)
-        failed++;
-        failures.push({ symbol: q.symbol, error: e.message });
+        persistenceFailed++;
+        failures.push({ symbol: q.symbol, failure_kind: 'persistence_failed', error: e.message });
       }
     }));
 
@@ -73,15 +75,14 @@ export default async function(req) {
           event_type: 'snapshot_capture_failed',
           severity: 'warning',
           entity_type: 'PriceSnapshot',
-          message: `${failed}/${symbols.length} snapshots failed`,
+          message: `${providerFailed + persistenceFailed}/${symbols.length} snapshots failed`,
           details: JSON.stringify(failures.slice(0, 10)),
         });
       } catch (e) { /* audit itself failed — nothing more we can do */ }
     }
 
-    const accounted = captured + failed;
-    const ok = failed === 0 && accounted === symbols.length;
-    return Response.json({ ok, captured, failed, symbols: symbols.length, accounted, failures }, { status: ok ? 200 : 502 });
+    const summary = snapshotConservation(symbols.length, captured, providerFailed, persistenceFailed);
+    return Response.json({ ...summary, failures }, { status: summary.ok ? 200 : 502 });
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });
   }

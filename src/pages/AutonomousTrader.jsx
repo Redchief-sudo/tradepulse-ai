@@ -243,7 +243,7 @@ export default function AutonomousTrader() {
         risk_score: proposal.risk_score,
         recordDecision: true,
       });
-      if (result?.data?.status === 'filled' || result?.data?.status === 'paper_filled') {
+      if (result?.data?.financially_complete === true) {
         setExecutedIds((prev) => new Set([...prev, index]));
       }
     } catch (e) {

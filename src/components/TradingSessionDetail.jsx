@@ -43,6 +43,11 @@ export default function TradingSessionDetail({ session, trades, scanRuns, auditE
                 Immutable historical snapshot
               </span>
             )}
+            {session.report_status && (
+              <span className={cn('px-2 py-0.5 rounded text-xs font-medium', session.report_status === 'healthy' ? 'bg-primary/10 text-primary' : 'bg-destructive/10 text-destructive')}>
+                {session.report_status.replace(/_/g, ' ')}
+              </span>
+            )}
             {session.market_regime && (
               <span className="px-2 py-0.5 rounded text-xs bg-muted text-muted-foreground">
                 {session.market_regime}
@@ -205,7 +210,15 @@ export default function TradingSessionDetail({ session, trades, scanRuns, auditE
                     <td className="py-2 pr-3 text-muted-foreground">
                       {new Date(t.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}
                     </td>
-                    <td className="py-2 pr-3 font-medium">{t.symbol}</td>
+                    <td className="py-2 pr-3 font-medium">
+                      <div>{t.symbol}</div>
+                      <div className="text-[10px] font-normal text-muted-foreground max-w-56 break-all">
+                        {t.trade_intent_id || 'No intent ID'} · {t.broker_order_id || 'No broker order ID'}
+                      </div>
+                      <div className="text-[10px] font-normal text-muted-foreground">
+                        Broker: {t.broker_status || 'unknown'} · Settlement: {t.settlement_status || 'unknown'}
+                      </div>
+                    </td>
                     <td className={cn('py-2 pr-3 font-medium', t.side === 'buy' ? 'text-primary' : 'text-destructive')}>
                       {t.side.toUpperCase()}
                     </td>
