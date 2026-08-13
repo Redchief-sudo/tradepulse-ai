@@ -6,8 +6,8 @@
 //
 // Key integrity guarantees:
 // 1. STABLE IDEMPOTENCY: The caller provides an idempotency_key (or one is derived from
-//    decision_id + signal_timestamp + symbol + side). The intent is persisted BEFORE
-//    broker submission. A retried call resumes the SAME intent — never submits a second order.
+//    decision_id + signal_timestamp + symbol + side). Execution prerequisites are checked
+//    before intent creation; an eligible intent is persisted before broker submission.
 // 2. PARTIAL FILL SAFETY: Partial fills are recorded incrementally. The intent stays
 //    partially_filled until the broker reaches a terminal state (filled/canceled/done_for_day).
 //    Each incremental fill gets its own unique fill_id and is idempotent.
@@ -279,7 +279,9 @@ export async function executeIntent(base44, user, input) {
   const tradeIntentId = intentRecord?.trade_intent_id || genId('tpi');
   const clientOrderId = intentRecord?.client_order_id || genId('tp');
 
-  // 1a. PROPOSED — persist the canonical intent (or update existing).
+  // Build the canonical intent, but do not persist it until market-session,
+  // executable-quote, and broker-account prerequisites have succeeded. A
+  // non-executable signal is scan evidence, not a rejected trade intent.
   const intentData = {
     user_id: userId,
     trade_intent_id: tradeIntentId,
@@ -316,13 +318,7 @@ export async function executeIntent(base44, user, input) {
     regime: input.regime || null,
   };
 
-  if (intentRecord) {
-    await sr.entities.TradeIntent.update(intentRecord.id, intentData);
-  } else {
-    intentRecord = await sr.entities.TradeIntent.create(intentData);
-  }
-
-  // 1b. MARKET HOURS GATE for equities in every execution mode. The backend independently
+  // 1a. MARKET HOURS GATE for equities in every execution mode. The backend independently
   // verifies the US regular session is open before submitting a broker order.
   // Cron timing alone is insufficient — the gateway is the authoritative gate.
   // A day order submitted after hours can queue and fill at a gapped next open.
@@ -331,12 +327,8 @@ export async function executeIntent(base44, user, input) {
   if (String(input.asset_class || 'stocks').toLowerCase() !== 'crypto') {
     if (!isUsMarketOpen()) {
       const session = usMarketSession();
-      await sr.entities.TradeIntent.update(intentRecord.id, {
-        status: 'rejected',
-        rejection_reason: `MARKET_CLOSED (${session})`,
-      });
-      await audit(sr, userId, 'stale_data_block', 'warning', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Rejected ${side} ${requestedQty} ${symbol}: market closed (${session})`, details: { symbol, side, session } });
-      return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, reasons: [`MARKET_CLOSED (${session})`], symbol, side, requestedQty };
+      await audit(sr, userId, 'signal_ineligible', 'info', { correlation_id: tradeIntentId, entity_type: 'Signal', entity_id: idempotencyKey, message: `Skipped ${side} ${requestedQty} ${symbol}: market closed (${session})`, details: { symbol, side, session, disposition: 'session_ineligible' } });
+      return { status: 'skipped', disposition: 'session_ineligible', reasons: [`MARKET_CLOSED (${session})`], symbol, side, requestedQty };
     }
   }
 
@@ -381,27 +373,21 @@ export async function executeIntent(base44, user, input) {
         });
       } catch (e) { /* non-fatal — execution still uses the verified quote */ }
     } catch (e) {
-      await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: `NO_EXECUTABLE_QUOTE: ${e.message}` });
-      return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: `No executable broker quote: ${e.message}`, symbol, side, requestedQty };
+      await audit(sr, userId, 'signal_ineligible', 'warning', { correlation_id: tradeIntentId, entity_type: 'Signal', entity_id: idempotencyKey, message: `Skipped ${side} ${requestedQty} ${symbol}: no executable broker quote`, details: { symbol, side, disposition: 'data_invalid', provider: 'alpaca', operation: 'latest_quote', error: e.message } });
+      return { status: 'skipped', disposition: 'data_invalid', error: `No executable broker quote: ${e.message}`, symbol, side, requestedQty };
     }
   } else {
     const quote = await fetchAuthoritativeQuote(sr, userId, symbol, input.asset_class, input.finnhub_key);
     if (!quote.ok) {
-      await sr.entities.TradeIntent.update(intentRecord.id, {
-        status: 'rejected',
-        rejection_reason: `${quote.reason}: no fresh executable quote for ${symbol}`,
-      });
-      await audit(sr, userId, 'stale_data_block', 'warning', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Rejected ${side} ${requestedQty} ${symbol}: ${quote.reason}`, details: { symbol, side, reason: quote.reason } });
-      return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, reasons: [`${quote.reason}: ${symbol}`], symbol, side, requestedQty };
+      await audit(sr, userId, 'signal_ineligible', 'warning', { correlation_id: tradeIntentId, entity_type: 'Signal', entity_id: idempotencyKey, message: `Skipped ${side} ${requestedQty} ${symbol}: ${quote.reason}`, details: { symbol, side, disposition: 'data_invalid', reason: quote.reason } });
+      return { status: 'skipped', disposition: 'data_invalid', reasons: [`${quote.reason}: ${symbol}`], symbol, side, requestedQty };
     }
     // Override the reference price with the authoritative quote. All downstream
     // sizing, risk caps, and order metadata use this price.
     refPrice = quote.price;
   }
-  await sr.entities.TradeIntent.update(intentRecord.id, {
-    requested_notional: requestedQty * refPrice,
-    limit_price: (intentRecord.order_type === 'limit' || input.order_type === 'limit') ? refPrice : null,
-  });
+  intentData.requested_notional = requestedQty * refPrice;
+  intentData.limit_price = input.order_type === 'limit' ? refPrice : null;
 
   // 1c. Fetch real account equity for risk sizing (broker_paper/live only).
   // FAIL-CLOSED: if account is unreachable or has no equity, reject before risk
@@ -414,14 +400,23 @@ export async function executeIntent(base44, user, input) {
     try {
       brokerAccount = await getAlpacaAccount({ apiKey: brokerCred.api_key, secretKey: brokerCred.api_secret, mode: brokerCred.mode });
       if (!brokerAccount || Number(brokerAccount.equity) <= 0) {
-        await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: 'BROKER_ACCOUNT_INVALID: no equity' });
-        return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: 'Broker account invalid', symbol, side, requestedQty };
+        await audit(sr, userId, 'signal_ineligible', 'error', { correlation_id: tradeIntentId, entity_type: 'Signal', entity_id: idempotencyKey, message: `Skipped ${side} ${requestedQty} ${symbol}: broker account has no valid equity`, details: { symbol, side, disposition: 'broker_unavailable' } });
+        return { status: 'skipped', disposition: 'broker_unavailable', error: 'Broker account invalid', symbol, side, requestedQty };
       }
       accountEquity = Number(brokerAccount.equity);
     } catch (e) {
-      await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: `BROKER_UNREACHABLE: ${e.message}` });
-      return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: `Broker unreachable: ${e.message}`, symbol, side, requestedQty };
+      await audit(sr, userId, 'signal_ineligible', 'error', { correlation_id: tradeIntentId, entity_type: 'Signal', entity_id: idempotencyKey, message: `Skipped ${side} ${requestedQty} ${symbol}: broker account unavailable`, details: { symbol, side, disposition: 'broker_unavailable', error: e.message } });
+      return { status: 'skipped', disposition: 'broker_unavailable', error: `Broker unreachable: ${e.message}`, symbol, side, requestedQty };
     }
+  }
+
+  // 1c. PROPOSED — prerequisites passed. Persist before risk evaluation and
+  // broker submission so all subsequent retries resume the same intent.
+  if (intentRecord) {
+    await sr.entities.TradeIntent.update(intentRecord.id, intentData);
+    intentRecord = { ...intentRecord, ...intentData };
+  } else {
+    intentRecord = await sr.entities.TradeIntent.create(intentData);
   }
 
   // 2. RISK evaluation — deterministic, veto authority. DENIED ⇒ zero order, zero mutation.

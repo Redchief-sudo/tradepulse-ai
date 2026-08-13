@@ -8,6 +8,7 @@ import { effectiveGovernedWeights, getChampion } from '../../shared/modelGoverna
 import { getAlpacaAccount, getAlpacaClock, getAlpacaOrder, cancelAlpacaOrder } from '../../shared/alpaca.ts';
 import { fetchCandlesResult as fetchMultiAssetCandlesResult, fetchQuote as fetchMultiAssetQuote } from '../../shared/marketDataAdapter.ts';
 import { sendTelegramMessage } from '../../shared/telegram.ts';
+import { summarizeCandidateDispositions } from '../../shared/scanConservation.ts';
 import { riskLimitsForProfile, checkMaxDrawdown } from '../../shared/riskEngine.ts';
 import { getPaperEquity } from '../../shared/cashLedger.ts';
 import { executionSessionDecision, updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
@@ -413,6 +414,7 @@ export default async function(req) {
       await finishRun({ status: 'no_candidates', market_summary: p1.market_summary, market_regime: regime.market_regime, model_version: champion?.version || 'default' });
       return Response.json({ ok: true, scan_run_id: runId, message: 'No executable candidates', opportunities, market_summary: p1.market_summary, champion_version: champion?.version });
     }
+    const candidateDispositions = new Map();
 
     // Enrich each candidate with REAL indicators
     const enriched = [];
@@ -529,6 +531,7 @@ export default async function(req) {
     for (const candidate of enriched) {
       if (proposedSymbols.has(String(candidate.symbol).toUpperCase())) continue;
       const reason = buyFilterReason(candidate) || 'not_an_actionable_held_sell';
+      candidateDispositions.set(String(candidate.symbol).toUpperCase(), `filtered:${reason}`);
       try {
         await sr.entities.AuditEvent.create({
           user_id: user.id,
@@ -562,6 +565,7 @@ export default async function(req) {
     // PASS 3a — prompted LLM panel. The archetypes are perspectives requested
     // from one model, not independent committee members or separate agents.
     if (proposals.length) {
+      const committeeInput = [...proposals];
       const committee = await sr.integrations.Core.InvokeLLM({
         model: 'claude_sonnet_4_6',
         prompt: `You are AlphaTrade AI's INVESTMENT COMMITTEE — 4 archetypes debate each candidate.\nProposals:\n${JSON.stringify(proposals.map((p) => ({ symbol: p.symbol, action: p.action, sector: p.sector, confidence: p.confidence, reasoning: p.reasoning })), null, 2)}\nFor each, 4 archetypes (Value/Utility Specialist, Macro Contrarian, Quant Statistician, Tail-Risk Hedger) each give vote (bullish/bearish/neutral) + one-line argument + conviction (0-100). consensus_votes = count of bullish (of 4). consensus = true if >= 3 bullish. Return debates.`,
@@ -585,6 +589,11 @@ export default async function(req) {
       // Missing/undefined reviews are rejected, not passed. (Fixes Rev.9
       // defect #4: the old `!== false` let undefined pass as approved.)
       proposals = proposals.filter((p) => consensusMap[p.symbol.toUpperCase()] === true);
+      for (const proposal of committeeInput) {
+        if (!proposals.some((candidate) => candidate.symbol === proposal.symbol)) {
+          candidateDispositions.set(String(proposal.symbol).toUpperCase(), 'vetoed:committee_no_consensus');
+        }
+      }
     }
     await heartbeat();
     await verifyOwnership();
@@ -606,9 +615,15 @@ export default async function(req) {
     await verifyOwnership();
     assertScanHealthy();
     let approved = scored.filter((p) => p.ml_score >= 55);
+    for (const proposal of proposals) {
+      if (!approved.some((candidate) => candidate.symbol === proposal.symbol)) {
+        candidateDispositions.set(String(proposal.symbol).toUpperCase(), 'vetoed:quant_score_below_55');
+      }
+    }
 
     // PASS 4 — Adversarial Risk Officer veto
     if (approved.length) {
+      const riskOfficerInput = [...approved];
       const p4 = await sr.integrations.Core.InvokeLLM({
         model: 'claude_sonnet_4_6',
         prompt: `You are the ADVERSARIAL RISK OFFICER. Veto dangerous trades.\nPortfolio:\n${pCtx}\nSector exposure:\n${secCtx}\n\nProposals:\n${JSON.stringify(approved.map((p) => ({ symbol: p.symbol, action: p.action, sector: p.sector, confidence: p.confidence, ml_score: p.ml_score, suggested_position_pct: p.suggested_position_pct })), null, 2)}\nFor each, return verdict "approved"/"flagged"/"vetoed" + one-line note. Veto on hidden correlation, liquidity trap, concentration breach, or regime mismatch.`,
@@ -632,6 +647,11 @@ export default async function(req) {
       // Missing/undefined reviews are rejected. (Fixes Rev.9 defect #4: the
       // old `|| 'approved'` let absent reviews pass as approved.)
       approved = approved.filter((p) => vetoMap[p.symbol.toUpperCase()] === 'approved');
+      for (const proposal of riskOfficerInput) {
+        if (!approved.some((candidate) => candidate.symbol === proposal.symbol)) {
+          candidateDispositions.set(String(proposal.symbol).toUpperCase(), `vetoed:risk_officer_${vetoMap[proposal.symbol.toUpperCase()] || 'missing_review'}`);
+        }
+      }
     }
     await heartbeat();
     await verifyOwnership();
@@ -662,6 +682,11 @@ export default async function(req) {
     if (contagion?.items) {
       const crMap = {};
       contagion.items.forEach((c) => { crMap[c.symbol.toUpperCase()] = c.contagion_risk || 0; });
+      for (const proposal of approved) {
+        if ((crMap[proposal.symbol.toUpperCase()] || 0) >= 80) {
+          candidateDispositions.set(String(proposal.symbol).toUpperCase(), 'vetoed:contagion_risk');
+        }
+      }
       approved = approved.filter((p) => (crMap[p.symbol.toUpperCase()] || 0) < 80);
     }
 
@@ -844,24 +869,36 @@ export default async function(req) {
     for (const pr of approved) {
       // Capability gate — skip unsupported asset classes (research-only)
       if (!isAssetClassSupported(pr.asset_class || 'stocks')) {
-        tradesRejected++;
+        candidateDispositions.set(String(pr.symbol).toUpperCase(), 'ineligible:broker_asset_class');
         continue;
       }
       if (!assetSessionDecision(pr.asset_class || 'stocks').allowed) {
-        tradesRejected++;
+        candidateDispositions.set(String(pr.symbol).toUpperCase(), 'ineligible:market_session');
         continue;
       }
       // Circuit breaker — block new buys, allow sells (risk management always runs)
-      if (pr.action === 'buy' && circuitBreakerTripped) continue;
+      if (pr.action === 'buy' && circuitBreakerTripped) {
+        candidateDispositions.set(String(pr.symbol).toUpperCase(), 'ineligible:daily_loss_limit');
+        continue;
+      }
       // MAX DRAWDOWN GATE — block new buys when drawdown exceeds the profile
       // limit. (Fixes Rev.13 #15: max_drawdown_pct was defined but never enforced.)
-      if (pr.action === 'buy' && maxDrawdownBreached) continue;
+      if (pr.action === 'buy' && maxDrawdownBreached) {
+        candidateDispositions.set(String(pr.symbol).toUpperCase(), 'ineligible:max_drawdown');
+        continue;
+      }
       const price = pr.realPrice || pr.current_price;
       let shares;
       if (pr.action === 'buy') {
-        if (regime.position_multiplier <= 0) continue;
+        if (regime.position_multiplier <= 0) {
+          candidateDispositions.set(String(pr.symbol).toUpperCase(), 'ineligible:regime_multiplier');
+          continue;
+        }
         const grossReturnPct = pr.target_price && price > 0 ? ((pr.target_price - price) / price) * 100 : null;
-        if (grossReturnPct !== null && netEdge(grossReturnPct, pr.asset_class || 'stocks') <= 0) continue;
+        if (grossReturnPct !== null && netEdge(grossReturnPct, pr.asset_class || 'stocks') <= 0) {
+          candidateDispositions.set(String(pr.symbol).toUpperCase(), 'ineligible:no_net_edge');
+          continue;
+        }
         const maxPos = (pp.max_position_pct / 100) * accountEquity;
         const sectorVal = sec.sectors.find((s) => s.sector === (pr.sector || 'Other'))?.value || 0;
         const sectorCap = Math.max(0, (pp.max_sector_pct / 100) * accountEquity - sectorVal);
@@ -881,7 +918,10 @@ export default async function(req) {
         const existing = holdings.find((h) => h.symbol === pr.symbol);
         shares = existing ? existing.shares : 0;
       }
-      if (shares <= 0) continue;
+      if (shares <= 0) {
+        candidateDispositions.set(String(pr.symbol).toUpperCase(), 'ineligible:zero_position_size');
+        continue;
+      }
 
       const f = pr.realFactors || {};
       const result = await settleTrade(base44, user, {
@@ -904,7 +944,13 @@ export default async function(req) {
       assertScanHealthy();
       const rStatus = result?.status || result?.settlement?.status;
       if (rStatus === 'rejected' || rStatus === 'failed' || rStatus === 'canceled') tradesRejected++;
+      candidateDispositions.set(String(pr.symbol).toUpperCase(), `${rStatus || 'unknown'}:${result?.disposition || result?.settlement_status || 'execution_result'}`);
       executed.push({ symbol: pr.symbol, action: pr.action, qty: shares, price, ml_score: pr.ml_score, settlement: result });
+    }
+
+    const conservation = summarizeCandidateDispositions(candidates, candidateDispositions);
+    if (!conservation.ok) {
+      throw new Error(`SCAN_CANDIDATE_CONSERVATION_FAILED: missing ${conservation.missing.join(',')}`);
     }
 
     // NOTE: Self-learning weight evolution is now handled by the separate
@@ -965,6 +1011,8 @@ export default async function(req) {
       trades_attempted: executed.length,
       trades_filled: filledTrades.length,
       trades_rejected: tradesRejected,
+      candidates_accounted: conservation.accounted,
+      candidate_dispositions: JSON.stringify(conservation.dispositions),
     });
 
     // AUTO-PROMOTION CHECK — after trades settle, evaluate paper performance
@@ -989,6 +1037,7 @@ export default async function(req) {
       proposals_after_committee: proposals.length,
       proposals_after_veto: approved.length,
       executed,
+      candidate_conservation: conservation,
       ml_weights: weights,
       unsettled_fills: unsettledFills.map((entry) => ({ symbol: entry.symbol, settlement_status: entry.settlement?.settlement_status, error: entry.settlement?.settlement_error })),
     }, { status: unsettledFills.length ? 409 : 200 });

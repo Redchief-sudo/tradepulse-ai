@@ -24,7 +24,7 @@ import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { recordBuySettlement, recordSellSettlement, getCashBalance } from '../../shared/cashLedger.ts';
 import { updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
 import { nowIso, genId, parseClosureFills } from '../../shared/lotAccounting.ts';
-import { classifySettlementFailure, deriveOrderSettlementSummary, isSettlementProcessable, runSettlementStages, selectLeaseWinner, shouldMarkSettlementRecovered, summarizeSettlementBatch } from '../../shared/settlementState.ts';
+import { classifySettlementFailure, deriveOrderSettlementSummary, isSettlementProcessable, legacySignedSettlementReplayPatch, runSettlementStages, selectLeaseWinner, shouldMarkSettlementRecovered, summarizeSettlementBatch } from '../../shared/settlementState.ts';
 import { lotDirection, planSignedLotFill, signedLotQuantity } from '../../shared/signedLots.ts';
 
 const STALE_LEASE_MS = 5 * 60 * 1000; // 5 minutes
@@ -494,11 +494,24 @@ export default async function(req) {
 
   try {
     // Find pending, due retryable failures, or stale processing events.
-    const allEvents = await sr.entities.SettlementEvent.filter({ user_id: userId });
+    let allEvents = await sr.entities.SettlementEvent.filter({ user_id: userId });
+    for (const event of allEvents) {
+      const migrationPatch = legacySignedSettlementReplayPatch(event);
+      if (!migrationPatch) continue;
+      await sr.entities.SettlementEvent.update(event.id, migrationPatch);
+      await audit(sr, userId, 'legacy_signed_settlement_migrated', 'warning', {
+        correlation_id: event.trade_intent_id,
+        entity_type: 'SettlementEvent',
+        entity_id: event.id,
+        message: `Reset legacy long-only settlement checkpoints for signed replay: ${event.symbol} ${event.side} ${event.quantity}`,
+      });
+    }
+    if (allEvents.some((event) => legacySignedSettlementReplayPatch(event))) {
+      allEvents = await sr.entities.SettlementEvent.filter({ user_id: userId });
+    }
     const processable = allEvents
       .filter((event) => isSettlementProcessable(event, now, STALE_LEASE_MS, forceRetry)
-        || (['terminal_failed', 'integrity_blocked'].includes(event.status)
-          && String(event.error || '').startsWith('SELL_FILL_EXCEEDS_ACCOUNTED_POSITION')))
+      )
       .sort((a, b) => new Date(a.occurred_at) - new Date(b.occurred_at));
 
     const results = [];

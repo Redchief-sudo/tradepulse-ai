@@ -74,6 +74,14 @@
       "type": "number",
       "default": 0
     },
+    "candidates_accounted": {
+      "type": "number",
+      "default": 0
+    },
+    "candidate_dispositions": {
+      "type": "string",
+      "description": "JSON map of every executable candidate symbol to its terminal scan disposition"
+    },
     "market_regime": {
       "type": "string"
     },

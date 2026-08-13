@@ -62,6 +62,25 @@ export function shouldMarkSettlementRecovered(user: any, unresolvedCount: number
   return recoveryRequired && unresolvedCount === 0;
 }
 
+export function legacySignedSettlementReplayPatch(event: any) {
+  if (!String(event?.error || '').startsWith('SELL_FILL_EXCEEDS_ACCOUNTED_POSITION')) return null;
+  return {
+    status: 'pending',
+    lot_projected: false,
+    holding_projected: false,
+    trade_projected: false,
+    decision_projected: false,
+    intent_projected: false,
+    integrity_verified: false,
+    post_settlement_projected: false,
+    realized_pnl: 0,
+    error: null,
+    next_retry_at: null,
+    processing_owner: null,
+    processing_started_at: null,
+  };
+}
+
 export function retryDelayMs(attempt: number) {
   return Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1));
 }

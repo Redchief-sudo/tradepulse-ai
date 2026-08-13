@@ -5,6 +5,7 @@ import {
   classifySettlementFailure,
   deriveOrderSettlementSummary,
   isSettlementProcessable,
+  legacySignedSettlementReplayPatch,
   runSettlementStages,
   selectLeaseWinner,
   shouldMarkSettlementRecovered,
@@ -130,6 +131,23 @@ describe('SettlementEvent stage recovery', () => {
       trading_session_state: 'financial_integrity_blocked',
       financial_integrity_manual_reenable_required: true,
     }, 1, true)).toBe(false);
+  });
+
+  it('resets only legacy long-only settlement checkpoints for signed replay', () => {
+    const event = {
+      error: 'SELL_FILL_EXCEEDS_ACCOUNTED_POSITION: remaining 26, available 13 for MSFT',
+      lot_projected: true,
+      cash_projected: true,
+    };
+    expect({ ...event, ...legacySignedSettlementReplayPatch(event) }).toMatchObject({
+      status: 'pending',
+      lot_projected: false,
+      cash_projected: true,
+      holding_projected: false,
+      integrity_verified: false,
+      error: null,
+    });
+    expect(legacySignedSettlementReplayPatch({ error: 'INTEGRITY_VIOLATION: mismatch' })).toBeNull();
   });
 
   it('reclaims stale leases but not active leases', () => {
