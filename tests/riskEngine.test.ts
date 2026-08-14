@@ -184,6 +184,16 @@ describe('evaluateRisk — position sizing caps', () => {
     expect(result.approvedQuantity * 150).toBeLessThanOrEqual(maxNotional + 0.01);
   });
 
+  it('retains eight-decimal crypto quantities below one equity thousandth', () => {
+    const cryptoIntent = {
+      symbol: 'BTC/USD', asset_class: 'crypto', side: 'buy', requested_quantity: 0.0005,
+      limit_price: 100000, price: 100000, sector: 'Crypto', confidence: 90, stop_loss: 90000,
+    };
+    const result = evaluateRisk(cryptoIntent, snapshot, limits, { bid: 99990, ask: 100010, estimated_slippage_pct: 0.01 });
+    expect(result.approved).toBe(true);
+    expect(result.approvedQuantity).toBe(0.0005);
+  });
+
   it('caps position by risk-based sizing (risk budget / stop distance)', () => {
     // Request 10 shares with a tight stop — risk-based qty would be 30 shares
     // but max_position_pct caps it to ~4.67 shares

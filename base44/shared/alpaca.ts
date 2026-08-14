@@ -24,6 +24,31 @@ export function normalizeAlpacaActivitySide(side) {
   return null;
 }
 
+const CRYPTO_QUOTE_CURRENCIES = ['USDT', 'USDC', 'USD', 'BTC'];
+
+// Alpaca uses different pair renderings across market-data, order, activity,
+// and position responses (for example BTC/USD and BTCUSD). Keep one app-side
+// identity so fills and broker positions reconcile to the originating intent.
+export function normalizeAlpacaSymbol(symbol, assetClass = 'stocks') {
+  const raw = String(symbol || '').trim().toUpperCase().replace(/-/g, '/');
+  if (String(assetClass || '').toLowerCase() !== 'crypto' || raw.includes('/')) return raw;
+  for (const quote of CRYPTO_QUOTE_CURRENCIES) {
+    if (raw.length > quote.length && raw.endsWith(quote)) {
+      return `${raw.slice(0, -quote.length)}/${quote}`;
+    }
+  }
+  return raw;
+}
+
+export function inferAlpacaAssetClass(symbol, declaredAssetClass = null) {
+  if (String(declaredAssetClass || '').toLowerCase() === 'crypto') return 'crypto';
+  const raw = String(symbol || '').toUpperCase();
+  if (raw.includes('/') || raw.includes('-')) return 'crypto';
+  return /^(BTC|ETH|SOL|DOGE|AVAX|LINK|LTC|BCH|UNI|AAVE|DOT|SHIB)(USD|USDT|USDC|BTC)$/.test(raw)
+    ? 'crypto'
+    : 'stocks';
+}
+
 // Submit an order. Respects order_type (market/limit/stop/stop_limit), limit_price,
 // stop_price, and time_in_force from the TradeIntent — no longer hardcodes market/day.
 // client_order_id provides idempotency so a retried submit cannot duplicate a fill.
@@ -136,6 +161,27 @@ export async function getAlpacaLatestQuote({ apiKey, secretKey }, symbol, assetC
     throw new Error(`ALPACA_QUOTE_INVALID: ${normalized}`);
   }
   return { bid, ask, timestamp, symbol: normalized, source: isCrypto ? 'alpaca_crypto' : 'alpaca_iex' };
+}
+
+export async function getAlpacaCryptoBars({ apiKey, secretKey }, symbol, from, to) {
+  const normalized = String(symbol).toUpperCase().replace(/-/g, '/');
+  const params = new URLSearchParams({
+    symbols: normalized,
+    timeframe: '1Day',
+    start: new Date(from * 1000).toISOString(),
+    end: new Date(to * 1000).toISOString(),
+    limit: '1000',
+    sort: 'asc',
+  });
+  const res = await fetch(`${DATA_BASE}/v1beta3/crypto/us/bars?${params.toString()}`, { headers: headers(apiKey, secretKey) });
+  if (!res.ok) await throwAlpacaError(res, 'getCryptoBars');
+  const data = await res.json().catch(() => ({}));
+  const rows = data?.bars?.[normalized];
+  if (!Array.isArray(rows) || rows.length < 30) throw new Error(`ALPACA_CRYPTO_BARS_INSUFFICIENT: ${normalized} returned ${Array.isArray(rows) ? rows.length : 0}`);
+  return rows.map((bar) => ({
+    date: new Date(bar.t).toISOString().slice(0, 10),
+    open: Number(bar.o), high: Number(bar.h), low: Number(bar.l), close: Number(bar.c), volume: Number(bar.v) || 0,
+  })).filter((bar) => Number.isFinite(bar.close) && bar.close > 0);
 }
 
 // Cancel an open order — used by the kill switch to cancel unfilled entry orders.

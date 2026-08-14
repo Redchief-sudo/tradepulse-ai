@@ -1,6 +1,7 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { updateSessionState, SESSION_STATES } from '../../shared/sessionState.ts';
 import { nowIso } from '../../shared/lotAccounting.ts';
+import { normalizeAlpacaSymbol, inferAlpacaAssetClass } from '../../shared/alpaca.ts';
 
 // Broker-position reconciliation is deliberately read-only with respect to the
 // financial ledger. Broker fills are ingested by runOrderReconciliation and all
@@ -12,20 +13,22 @@ import { nowIso } from '../../shared/lotAccounting.ts';
 // from a broker position snapshot.
 
 function normalizeBrokerPosition(position) {
+  const assetClass = inferAlpacaAssetClass(position.symbol, position.asset_class);
   return {
     asset_id: position.asset_id || null,
-    symbol: String(position.symbol || '').toUpperCase(),
+    symbol: normalizeAlpacaSymbol(position.symbol, assetClass),
     shares: Number(position.qty),
     avg_price: Number(position.avg_entry_price),
     current_price: Number(position.current_price),
     market_value: Number(position.market_value),
     unrealized_pl: Number(position.unrealized_pl),
     unrealized_pl_percent: Number(position.unrealized_plpc) * 100,
-    asset_class: position.asset_class === 'crypto' ? 'crypto' : 'stocks',
+    asset_class: assetClass,
   };
 }
 
 function normalizeBrokerOrder(order) {
+  const assetClass = inferAlpacaAssetClass(order.symbol, order.asset_class);
   const requestedQuantity = Number(order.qty);
   const filledQuantity = Number(order.filled_qty);
   const filledPrice = Number(order.filled_avg_price);
@@ -33,7 +36,7 @@ function normalizeBrokerOrder(order) {
     id: order.id,
     broker_order_id: order.id,
     client_order_id: order.client_order_id || null,
-    symbol: String(order.symbol || '').toUpperCase(),
+    symbol: normalizeAlpacaSymbol(order.symbol, assetClass),
     action: String(order.side || '').toLowerCase(),
     shares: requestedQuantity,
     filled_qty: filledQuantity,
@@ -158,6 +161,17 @@ export default async function(req) {
     const symbols = new Set([...brokerMap.keys(), ...holdingMap.keys()]);
     const events = [];
     const blocked = [];
+
+    if (symbols.size === 0) {
+      events.push({
+        event_type: 'matched',
+        symbol: '*',
+        broker_qty: 0,
+        app_qty: 0,
+        action_taken: 'none',
+        details: 'Account-level reconciliation: broker and ledger both have zero open positions.',
+      });
+    }
 
     for (const symbol of symbols) {
       const broker = brokerMap.get(symbol);

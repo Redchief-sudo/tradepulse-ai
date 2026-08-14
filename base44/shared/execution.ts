@@ -20,7 +20,7 @@
 // 7. CREDENTIAL ISOLATION: Broker secrets are read from the BrokerCredential entity
 //    (RLS-locked, service-role only) — never from the User object.
 
-import { placeAlpacaOrder, getAlpacaOrder, getAlpacaAccount, getAlpacaLatestQuote } from './alpaca.ts';
+import { placeAlpacaOrder, getAlpacaOrder, getAlpacaAccount, getAlpacaLatestQuote, normalizeAlpacaSymbol } from './alpaca.ts';
 import { evaluateRisk, riskLimitsForProfile, buildPortfolioSnapshot, checkDataFreshness, checkMaxDrawdown } from './riskEngine.ts';
 import { fetchQuote } from './marketDataAdapter.ts';
 import { isUsMarketOpen, usMarketSession } from './marketHours.ts';
@@ -62,6 +62,10 @@ export function executionLifecycle(brokerStatus, settlementStatus) {
     order_execution_complete: orderExecutionComplete,
     fills_settlement_complete: fillsSettlementComplete,
   };
+}
+
+export function defaultTimeInForce(assetClass = 'stocks') {
+  return String(assetClass).toLowerCase() === 'crypto' ? 'gtc' : 'day';
 }
 
 function isTerminalFailure(status) {
@@ -225,7 +229,8 @@ async function audit(sr, userId, eventType, severity, details) {
 export async function executeIntent(base44, user, input) {
   const sr = base44.asServiceRole;
   const userId = user.id;
-  const symbol = String(input.symbol || '').toUpperCase();
+  const assetClass = String(input.asset_class || 'stocks').toLowerCase();
+  const symbol = normalizeAlpacaSymbol(input.symbol, assetClass);
   const side = input.action || input.side;
   const requestedQty = Number(input.qty || input.requested_quantity);
   if (!symbol || (side !== 'buy' && side !== 'sell') || !requestedQty || requestedQty <= 0) {
@@ -320,7 +325,7 @@ export async function executeIntent(base44, user, input) {
     strategy_id: strategyId,
     decision_id: input.decision_id || intentRecord?.decision_id || null,
     portfolio_id: input.portfolio_id || null,
-    asset_class: input.asset_class || 'stocks',
+    asset_class: assetClass,
     symbol,
     native_asset_id: input.native_asset_id || symbol,
     broker: brokerCred ? brokerCred.broker : 'internal',
@@ -330,7 +335,7 @@ export async function executeIntent(base44, user, input) {
     requested_notional: requestedQty * refPrice,
     limit_price: input.limit_price || (input.order_type === 'limit' ? refPrice : null),
     stop_price: input.stop_price || null,
-    time_in_force: input.time_in_force || 'day',
+    time_in_force: input.time_in_force || defaultTimeInForce(assetClass),
     execution_mode: executionMode,
     status: 'proposed',
     signal_timestamp: signalTs,

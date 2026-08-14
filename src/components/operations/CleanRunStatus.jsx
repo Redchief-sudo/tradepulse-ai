@@ -30,7 +30,7 @@ export default function CleanRunStatus() {
   if (error) return <div className="rounded-2xl border border-destructive/40 bg-destructive/5 p-4 text-sm text-destructive">Health unknown: {error}</div>;
   if (!state) return null;
   const { user, latest, unresolved, providerFailures, healthFailures, reconciliation, next } = state;
-  const dispositions = (() => { try { return JSON.parse(latest?.candidate_dispositions || '{}'); } catch { return {}; } })();
+  const dispositions = (() => { try { return JSON.parse(latest?.candidate_dispositions || '[]'); } catch { return []; } })();
   const integrity = user?.trading_session_state === 'financial_integrity_blocked' || unresolved.length ? 'blocked/unresolved' : 'healthy';
   return (
     <div className="rounded-2xl border border-border bg-card p-5">
@@ -47,7 +47,8 @@ export default function CleanRunStatus() {
         <div><div className="text-xs text-muted-foreground">Health failures</div><div>{healthFailures.length}</div></div>
         <div><div className="text-xs text-muted-foreground">Provider degradation</div><div>{providerFailures.length}</div></div>
       </div>
-      {Object.keys(dispositions).length > 0 && <div className="mt-3 text-xs text-muted-foreground break-words">Candidate dispositions: {Object.entries(dispositions).map(([symbol, value]) => `${symbol}=${value}`).join(' · ')}</div>}
+      {dispositions.length > 0 && <div className="mt-3 text-xs text-muted-foreground break-words">Candidate dispositions: {dispositions.map((entry) => `${entry.symbol}=${entry.disposition}`).join(' · ')}</div>}
+      {latest?.no_trade_reason && <div className="mt-2 text-xs text-amber-500 break-words">{latest.no_trade_reason}</div>}
     </div>
   );
 }

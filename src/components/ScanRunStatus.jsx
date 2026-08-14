@@ -153,6 +153,9 @@ export default function ScanRunStatus() {
       {latest?.error && (
         <p className="text-xs text-red-500 mt-3 break-words">{latest.error}</p>
       )}
+      {!latest?.error && latest?.no_trade_reason && (
+        <p className="text-xs text-amber-500 mt-3 break-words">{latest.no_trade_reason}</p>
+      )}
     </motion.div>
   );
 }

@@ -82,6 +82,10 @@
       "type": "string",
       "description": "JSON map of every executable candidate symbol to its terminal scan disposition"
     },
+    "no_trade_reason": {
+      "type": "string",
+      "description": "Explicit aggregate reason when a terminal scan places no trade"
+    },
     "accepted_fills": { "type": "number", "default": 0 },
     "settlement_completed": { "type": "number", "default": 0 },
     "settlement_pending": { "type": "number", "default": 0 },

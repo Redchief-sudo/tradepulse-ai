@@ -95,11 +95,11 @@ export async function buildPortfolioSnapshot(sr, userId, accountEquity = null, b
   return { holdings, totalEquity, sectorMap, openPositions: holdings.length, tradesToday: tradesToday.length, dailyPnlPct, totalExposure, totalExposurePct, outstandingOrders };
 }
 
-// Round to 3 decimal places for fractional share support. Alpaca accepts
-// fractional quantities (e.g. 0.035 shares of AAPL), so a $100 account can
-// buy a $200 stock. Rounds to 0.001 — the smallest practical fraction.
-function roundQty(q) {
-  return Math.round(q * 1000) / 1000;
+// Floor at asset-appropriate precision so a cap never increases the requested
+// notional. Equities use thousandths; crypto uses eight decimal places.
+function roundQty(q, assetClass = 'stocks') {
+  const precision = String(assetClass).toLowerCase() === 'crypto' ? 100000000 : 1000;
+  return Math.floor(Math.max(0, q) * precision) / precision;
 }
 
 // evaluateRisk → { approved, approvedQuantity, reasons, snapshot }
@@ -110,6 +110,8 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
   const qty = Number(intent.requested_quantity) || 0;
   const price = Number(intent.limit_price || intent.price) || 0;
   const side = intent.side;
+  const assetClass = intent.asset_class || 'stocks';
+  const minimumQuantity = String(assetClass).toLowerCase() === 'crypto' ? 0.00000001 : 0.001;
 
   if (opts.killSwitch && !opts.protectiveExit) {
     return { approved: false, approvedQuantity: 0, reasons: ['KILL_SWITCH_ACTIVE'], snapshot };
@@ -208,7 +210,7 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
       const riskBudget = (limits.max_risk_per_trade_pct / 100) * totalEquity;
       const riskPerShare = price - intent.stop_loss;
       if (riskPerShare > 0) {
-        const riskBasedQty = roundQty(riskBudget / riskPerShare);
+        const riskBasedQty = roundQty(riskBudget / riskPerShare, assetClass);
         if (riskBasedQty < approvedQty) {
           approvedQty = riskBasedQty;
           reasons.push(`POSITION_CAPPED_TO_${approvedQty}_BY_RISK_BASED_SIZING`);
@@ -217,7 +219,7 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
     }
     const maxPositionNotional = (limits.max_position_pct / 100) * totalEquity;
     if (approvedQty * price > maxPositionNotional) {
-      approvedQty = roundQty(maxPositionNotional / price);
+      approvedQty = roundQty(maxPositionNotional / price, assetClass);
       reasons.push(`POSITION_CAPPED_TO_${approvedQty}_BY_MAX_POSITION_PCT`);
     }
     const sector = intent.sector || 'Other';
@@ -225,7 +227,7 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
     const maxSectorNotional = (limits.max_sector_pct / 100) * totalEquity;
     const remainingSector = maxSectorNotional - currentSector;
     if (approvedQty * price > remainingSector) {
-      const cappedBySector = price > 0 ? roundQty(remainingSector / price) : 0;
+      const cappedBySector = price > 0 ? roundQty(remainingSector / price, assetClass) : 0;
       if (cappedBySector < approvedQty) {
         approvedQty = cappedBySector;
         reasons.push(`POSITION_CAPPED_TO_${approvedQty}_BY_MAX_SECTOR_PCT`);
@@ -235,7 +237,7 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
     if (limits.max_total_exposure_pct && snapshot.totalExposurePct != null) {
       const remainingExposure = ((limits.max_total_exposure_pct / 100) * totalEquity) - (snapshot.totalExposure || 0);
       if (approvedQty * price > remainingExposure) {
-        const cappedByExposure = price > 0 ? roundQty(remainingExposure / price) : 0;
+        const cappedByExposure = price > 0 ? roundQty(remainingExposure / price, assetClass) : 0;
         if (cappedByExposure < approvedQty) {
           approvedQty = cappedByExposure;
           reasons.push(`POSITION_CAPPED_TO_${approvedQty}_BY_MAX_TOTAL_EXPOSURE`);
@@ -244,7 +246,7 @@ export function evaluateRisk(intent, snapshot, limits, opts = {}) {
     }
   }
 
-  if (approvedQty < 0.001) {
+  if (approvedQty < minimumQuantity) {
     reasons.push('INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT');
     return { approved: false, approvedQuantity: 0, reasons, snapshot };
   }

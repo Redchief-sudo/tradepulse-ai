@@ -5,7 +5,7 @@ import { computeRealFactors, weightedComposite, signalFromComposite } from '../.
 import { classifyRegimeFromSnapshots } from '../../shared/regime.ts';
 import { netEdge } from '../../shared/costModel.ts';
 import { effectiveGovernedWeights, getChampion } from '../../shared/modelGovernance.ts';
-import { getAlpacaAccount, getAlpacaClock, getAlpacaOrder, cancelAlpacaOrder } from '../../shared/alpaca.ts';
+import { getAlpacaAccount, getAlpacaClock, getAlpacaCryptoBars, getAlpacaLatestQuote, getAlpacaOrder, cancelAlpacaOrder, normalizeAlpacaSymbol } from '../../shared/alpaca.ts';
 import { fetchCandlesResult as fetchMultiAssetCandlesResult, fetchQuote as fetchMultiAssetQuote } from '../../shared/marketDataAdapter.ts';
 import { sendTelegramMessage } from '../../shared/telegram.ts';
 import { summarizeCandidateDispositions, summarizeFillSettlement } from '../../shared/scanConservation.ts';
@@ -389,9 +389,20 @@ export default async function(req) {
       : [];
     for (const candidate of allCandidates) {
       const assetClass = normalizeAssetClass(candidate.asset_class);
-      const quote = assetClass === 'unsupported'
-        ? { error: `unsupported asset class: ${candidate.asset_class}` }
-        : await fetchMultiAssetQuote(candidate.symbol, assetClass, key);
+      let quote;
+      if (assetClass === 'unsupported') {
+        quote = { error: `unsupported asset class: ${candidate.asset_class}` };
+      } else if (brokerCreds[0]?.broker === 'alpaca' && ['equities', 'crypto'].includes(assetClass)) {
+        try {
+          const brokerQuote = await getAlpacaLatestQuote({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret }, candidate.symbol, assetClass);
+          quote = { price: (brokerQuote.bid + brokerQuote.ask) / 2, bid: brokerQuote.bid, ask: brokerQuote.ask, quote_timestamp: Math.floor(new Date(brokerQuote.timestamp).getTime() / 1000), venue: brokerQuote.source, market: assetClass === 'crypto' ? 'continuous' : 'US', source: brokerQuote.source };
+        } catch (alpacaError) {
+          quote = await fetchMultiAssetQuote(candidate.symbol, assetClass, key);
+          if (quote?.error) quote.error = `Alpaca: ${alpacaError.message}; fallback: ${quote.error}`;
+        }
+      } else {
+        quote = await fetchMultiAssetQuote(candidate.symbol, assetClass, key);
+      }
       await heartbeat();
       await verifyOwnership();
       assertScanHealthy();
@@ -412,8 +423,12 @@ export default async function(req) {
       market_summary: p1.market_summary,
     });
     if (!candidates.length) {
-      await finishRun({ status: 'no_candidates', market_summary: p1.market_summary, market_regime: regime.market_regime, model_version: champion?.version || 'default' });
-      return Response.json({ ok: true, scan_run_id: runId, message: 'No executable candidates', opportunities, market_summary: p1.market_summary, champion_version: champion?.version });
+      const reasons = opportunities.map((opportunity) => opportunity.provider_error
+        ? `${opportunity.native_symbol}:provider:${opportunity.provider_error}`
+        : `${opportunity.native_symbol}:${opportunity.execution_capability}:${assetSessionDecision(opportunity.asset_class, now).session}`);
+      const noTradeReason = `NO_EXECUTABLE_CANDIDATES: ${reasons.join(' | ') || 'LLM returned no opportunities'}`;
+      await finishRun({ status: 'no_candidates', no_trade_reason: noTradeReason, market_summary: p1.market_summary, market_regime: regime.market_regime, model_version: champion?.version || 'default' });
+      return Response.json({ ok: true, scan_run_id: runId, message: 'No executable candidates', no_trade_reason: noTradeReason, opportunities, market_summary: p1.market_summary, champion_version: champion?.version });
     }
     const candidateDispositions = new Map();
 
@@ -423,7 +438,17 @@ export default async function(req) {
     const candleFrom = candleTo - 220 * 86400;
     for (const c of candidates) {
       const ac = c.asset_class;
-      const candleResult = await fetchMultiAssetCandlesResult(c.symbol, ac, candleFrom, candleTo, key);
+      let candleResult;
+      if (ac === 'crypto' && brokerCreds[0]?.broker === 'alpaca') {
+        try {
+          candleResult = { candles: await getAlpacaCryptoBars({ apiKey: brokerCreds[0].api_key, secretKey: brokerCreds[0].api_secret }, c.symbol, candleFrom, candleTo), provider: 'alpaca', symbol: c.symbol };
+        } catch (alpacaError) {
+          candleResult = await fetchMultiAssetCandlesResult(c.symbol, ac, candleFrom, candleTo, key);
+          if (!candleResult.candles) candleResult.message = `Alpaca: ${alpacaError.message}; Coinbase fallback: ${candleResult.message || 'unavailable'}`;
+        }
+      } else {
+        candleResult = await fetchMultiAssetCandlesResult(c.symbol, ac, candleFrom, candleTo, key);
+      }
       await heartbeat();
       await verifyOwnership();
       assertScanHealthy();
@@ -431,31 +456,7 @@ export default async function(req) {
       enriched.push({ ...c, asset_class: ac, realFactors: factors, marketDataError: candleResult.candles ? null : `${candleResult.error_code || 'UNKNOWN'}: ${candleResult.message || 'No candles'}`, realPrice: factors?.price || c.price });
     }
 
-    // PASS 2 — Portfolio fit & risk-aware sizing (Claude Sonnet 5)
-    // The LLM provides a risk assessment; proposals are constructed DETERMINISTICALLY
-    // from the Pass 1 candidates. The LLM's structured-array output is unreliable
-    // (it consistently returns empty arrays for nested object arrays), so we build
-    // proposals from candidate data directly — the candidates already carry
-    // confidence, target_price, stop_loss, and recommendation from Pass 1.
-    const p2 = await sr.integrations.Core.InvokeLLM({
-      model: 'claude_sonnet_4_6',
-      prompt: `You are AlphaTrade AI. PASS 2 — Portfolio fit & risk assessment.\nCurrent portfolio:\n${pCtx}\n\nSector exposure:\n${secCtx}\nTotal portfolio value: $${accountEquity.toFixed(0)} (available capital)\n\nCandidates:\n${JSON.stringify(enriched.map((e) => ({ symbol: e.symbol, sector: e.sector, current_price: e.realPrice, recommendation: e.recommendation, confidence: e.confidence, summary: e.summary })), null, 2)}\n\nProvide a BRIEF risk assessment (2-3 sentences) of these candidates for a ${user.trade_profile || 'balanced'} risk profile. Which are strongest? Any concentration or correlation concerns?`,
-      response_json_schema: {
-        type: 'object',
-        properties: {
-          risk_assessment: { type: 'string' },
-        },
-        required: ['risk_assessment'],
-      },
-    });
-
-    await heartbeat();
-    await verifyOwnership();
-    assertScanHealthy();
-    // Construct proposals deterministically from candidates.
-    // BUY candidates: STRONG_BUY/BUY with confidence >= min_confidence, sorted by confidence.
-    // SELL candidates: SELL/STRONG_SELL for symbols currently held.
-    const heldSymbols = new Set(holdings.map((h) => h.symbol.toUpperCase()));
+    const heldSymbols = new Set(holdings.map((h) => normalizeAlpacaSymbol(h.symbol, h.asset_class || 'stocks')));
     const buyFilterReason = (candidate) => {
       if (!['STRONG_BUY', 'BUY'].includes(candidate.recommendation)) return `recommendation_${String(candidate.recommendation || 'missing').toLowerCase()}`;
       if ((candidate.confidence || 0) < pp.min_confidence) return `confidence_below_${pp.min_confidence}`;
@@ -468,6 +469,33 @@ export default async function(req) {
       if (factors.momentum_score != null && factors.momentum_score < 50) return 'momentum_score_below_50';
       return null;
     };
+    const hasActionableCandidate = enriched.some((candidate) => buyFilterReason(candidate) === null)
+      || enriched.some((candidate) => ['STRONG_SELL', 'SELL'].includes(candidate.recommendation) && heldSymbols.has(String(candidate.symbol).toUpperCase()));
+
+    // PASS 2 — Portfolio fit & risk-aware sizing (Claude Sonnet 5)
+    // The LLM provides a risk assessment; proposals are constructed DETERMINISTICALLY
+    // from the Pass 1 candidates. The LLM's structured-array output is unreliable
+    // (it consistently returns empty arrays for nested object arrays), so we build
+    // proposals from candidate data directly — the candidates already carry
+    // confidence, target_price, stop_loss, and recommendation from Pass 1.
+    const p2 = hasActionableCandidate ? await sr.integrations.Core.InvokeLLM({
+      model: 'claude_sonnet_4_6',
+      prompt: `You are AlphaTrade AI. PASS 2 — Portfolio fit & risk assessment.\nCurrent portfolio:\n${pCtx}\n\nSector exposure:\n${secCtx}\nTotal portfolio value: $${accountEquity.toFixed(0)} (available capital)\n\nCandidates:\n${JSON.stringify(enriched.map((e) => ({ symbol: e.symbol, sector: e.sector, current_price: e.realPrice, recommendation: e.recommendation, confidence: e.confidence, summary: e.summary })), null, 2)}\n\nProvide a BRIEF risk assessment (2-3 sentences) of these candidates for a ${user.trade_profile || 'balanced'} risk profile. Which are strongest? Any concentration or correlation concerns?`,
+      response_json_schema: {
+        type: 'object',
+        properties: {
+          risk_assessment: { type: 'string' },
+        },
+        required: ['risk_assessment'],
+      },
+    }) : { risk_assessment: 'No candidate passed deterministic market-data and technical eligibility; downstream LLM review was skipped.' };
+
+    await heartbeat();
+    await verifyOwnership();
+    assertScanHealthy();
+    // Construct proposals deterministically from candidates.
+    // BUY candidates: STRONG_BUY/BUY with confidence >= min_confidence, sorted by confidence.
+    // SELL candidates: SELL/STRONG_SELL for symbols currently held.
     const buyCandidates = enriched
       .filter((candidate) => buyFilterReason(candidate) === null)
       .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
@@ -542,7 +570,7 @@ export default async function(req) {
           entity_type: 'Opportunity',
           entity_id: candidate.symbol,
           message: `${candidate.symbol} filtered before proposal: ${reason}`,
-          details: JSON.stringify({ symbol: candidate.symbol, reason, recommendation: candidate.recommendation || null, confidence: candidate.confidence || 0 }),
+          details: JSON.stringify({ symbol: candidate.symbol, reason, recommendation: candidate.recommendation || null, confidence: candidate.confidence || 0, provider: candidate.source || null, market_data_error: candidate.marketDataError || null, factors: candidate.realFactors || null }),
         });
       } catch (error) {
         try {
@@ -923,11 +951,13 @@ export default async function(req) {
         const winRateFactor = 0.7 + 0.3 * recentWinRate;
         const aiVal = ((pr.suggested_position_pct || 5) / 100) * accountEquity * convictionFactor * winRateFactor * growthMultiplier;
         const positionValue = Math.min(aiVal, maxPos, sectorCap) * regime.position_multiplier;
-        // FRACTIONAL SHARES — round to 0.001 so a $100 account can buy 0.035
-        // shares of a $200 stock. Alpaca accepts fractional quantities.
-        shares = price > 0 && positionValue > 0 ? Math.round((positionValue / price) * 1000) / 1000 : 0;
+        // Crypto needs finer quantity precision than equities. Floor rather
+        // than round so sizing never exceeds the calculated risk budget.
+        const quantityPrecision = canonicalAssetClass(pr.asset_class) === 'crypto' ? 100000000 : 1000;
+        shares = price > 0 && positionValue > 0 ? Math.floor((positionValue / price) * quantityPrecision) / quantityPrecision : 0;
       } else {
-        const existing = holdings.find((h) => h.symbol === pr.symbol);
+        const proposalSymbol = normalizeAlpacaSymbol(pr.symbol, pr.asset_class || 'stocks');
+        const existing = holdings.find((h) => normalizeAlpacaSymbol(h.symbol, h.asset_class || 'stocks') === proposalSymbol);
         shares = existing ? existing.shares : 0;
       }
       if (shares <= 0) {
@@ -972,6 +1002,9 @@ export default async function(req) {
     const scanFills = allFills.filter((fill) => executedIntentIds.has(fill.trade_intent_id));
     const scanSettlementEvents = allSettlementEvents.filter((event) => executedIntentIds.has(event.trade_intent_id));
     const settlementConservation = summarizeFillSettlement(scanFills, scanSettlementEvents);
+    const noTradeReason = executed.length === 0
+      ? `NO_TRADE: ${Object.entries(conservation.counts).map(([reason, count]) => `${reason}=${count}`).join(', ') || 'no execution attempted'}`
+      : null;
 
     // NOTE: Self-learning weight evolution is now handled by the separate
     // Model Governance workflow (runModelGovernance). This cycle only executes
@@ -1029,6 +1062,7 @@ export default async function(req) {
       trades_rejected: tradesRejected,
       candidates_accounted: conservation.accounted,
       candidate_dispositions: JSON.stringify(conservation.dispositions),
+      no_trade_reason: noTradeReason,
       ...settlementConservation,
     });
 
@@ -1055,6 +1089,7 @@ export default async function(req) {
       proposals_after_veto: approved.length,
       executed,
       candidate_conservation: conservation,
+      no_trade_reason: noTradeReason,
       settlement_conservation: settlementConservation,
       ml_weights: weights,
       unsettled_fills: unsettledFills.map((entry) => ({ symbol: entry.symbol, settlement_status: entry.settlement?.settlement_status, error: entry.settlement?.settlement_error })),

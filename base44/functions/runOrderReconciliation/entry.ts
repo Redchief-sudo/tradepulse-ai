@@ -1,5 +1,5 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
-import { getAlpacaActivities, getAlpacaOrder, normalizeAlpacaActivitySide } from '../../shared/alpaca.ts';
+import { getAlpacaActivities, getAlpacaOrder, normalizeAlpacaActivitySide, normalizeAlpacaSymbol, inferAlpacaAssetClass } from '../../shared/alpaca.ts';
 import { recordFill } from '../../shared/execution.ts';
 import { nowIso } from '../../shared/lotAccounting.ts';
 
@@ -68,7 +68,8 @@ export default async function(req) {
     }
     for (const activity of activities) {
       const activityId = activity.id || activity.activity_id;
-      const symbol = String(activity.symbol || '').toUpperCase();
+      const assetClass = inferAlpacaAssetClass(activity.symbol, activity.asset_class);
+      const symbol = normalizeAlpacaSymbol(activity.symbol, assetClass);
       const side = normalizeAlpacaActivitySide(activity.side);
       const quantity = Number(activity.qty);
       const price = Number(activity.price);
@@ -120,7 +121,7 @@ export default async function(req) {
         broker_terminal_status: 'filled',
         unfilled_quantity: 0,
         company_name: symbol,
-        asset_class: 'stocks',
+        asset_class: assetClass,
       });
       const executionMode = externalIntent.execution_mode;
       const inserted = await recordFill(sr, {
@@ -141,7 +142,7 @@ export default async function(req) {
         venue: cred.mode === 'live' ? 'alpaca' : 'alpaca_paper',
         strategy_id: 'broker_external',
         execution_mode: executionMode,
-        asset_class: 'stocks',
+        asset_class: assetClass,
       });
       if (inserted) {
         await sr.entities.SettlementEvent.create({
@@ -159,7 +160,7 @@ export default async function(req) {
           occurred_at: new Date(occurredAt).toISOString(),
           status: 'pending',
           execution_mode: executionMode,
-          asset_class: 'stocks',
+          asset_class: assetClass,
           company_name: symbol,
           strategy_id: 'broker_external',
           venue: cred.mode === 'live' ? 'alpaca' : 'alpaca_paper',
@@ -425,7 +426,21 @@ export default async function(req) {
       }
     }
 
-    const reconciliationErrors = results.filter((result) => ['error', 'external_activity_error'].includes(result.status));
+    let positionReconciliation = null;
+    try {
+      const invoked = await base44.functions.invoke('syncBrokerPositions', {});
+      positionReconciliation = invoked?.data || invoked;
+      if (!positionReconciliation || positionReconciliation.ok === false) {
+        results.push({ status: 'position_reconciliation_error', error: positionReconciliation?.error || `Position drift: ${(positionReconciliation?.blocked || []).join(',')}` });
+      }
+    } catch (error) {
+      results.push({ status: 'position_reconciliation_error', error: error.message });
+      try {
+        await sr.entities.AuditEvent.create({ user_id: user.id, event_type: 'position_reconciliation_invocation_failed', severity: 'error', message: error.message });
+      } catch (auditError) { /* response remains explicit */ }
+    }
+
+    const reconciliationErrors = results.filter((result) => ['error', 'external_activity_error', 'position_reconciliation_error'].includes(result.status));
     const response = {
       ok: reconciliationErrors.length === 0,
       run_timestamp: runTs,
@@ -436,6 +451,7 @@ export default async function(req) {
       already_claimed: results.filter((r) => r.status === 'already_claimed').length,
       stale_orders: staleOrders.length,
       errors: reconciliationErrors.length,
+      position_reconciliation: positionReconciliation,
       results,
     };
     return Response.json(response, { status: response.ok ? 200 : 502 });

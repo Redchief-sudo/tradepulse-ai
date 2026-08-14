@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { executableQuoteMetrics, executionLifecycle } from '../base44/shared/execution.ts';
-import { normalizeAlpacaActivitySide } from '../base44/shared/alpaca.ts';
+import { executableQuoteMetrics, executionLifecycle, defaultTimeInForce } from '../base44/shared/execution.ts';
+import { inferAlpacaAssetClass, normalizeAlpacaActivitySide, normalizeAlpacaSymbol } from '../base44/shared/alpaca.ts';
 
 describe('executableQuoteMetrics', () => {
   const now = Date.parse('2026-08-07T17:00:01.000Z');
@@ -43,5 +43,23 @@ describe('Alpaca activity direction', () => {
   it('maps short and cover activities to canonical signed-ledger sides', () => {
     expect(normalizeAlpacaActivitySide('sell_short')).toBe('sell');
     expect(normalizeAlpacaActivitySide('buy_to_cover')).toBe('buy');
+  });
+});
+
+describe('Alpaca crypto execution identity', () => {
+  it('normalizes scan and broker pair formats to one symbol', () => {
+    expect(normalizeAlpacaSymbol('BTC-USD', 'crypto')).toBe('BTC/USD');
+    expect(normalizeAlpacaSymbol('BTCUSD', 'crypto')).toBe('BTC/USD');
+    expect(normalizeAlpacaSymbol('AAPL', 'stocks')).toBe('AAPL');
+  });
+
+  it('recognizes compact Alpaca crypto activity symbols', () => {
+    expect(inferAlpacaAssetClass('ETHUSD')).toBe('crypto');
+    expect(inferAlpacaAssetClass('MSFT')).toBe('stocks');
+  });
+
+  it('uses a crypto-valid persistent time in force by default', () => {
+    expect(defaultTimeInForce('crypto')).toBe('gtc');
+    expect(defaultTimeInForce('stocks')).toBe('day');
   });
 });

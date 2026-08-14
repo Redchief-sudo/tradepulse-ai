@@ -30,7 +30,7 @@
       "trigger_type": "scheduled",
       "events": [],
       "schedule_mode": "recurring",
-      "cron_expression": "*/5 9-16 * * 1-5",
+      "cron_expression": "*/5 * * * *",
       "one_time_date": null,
       "timezone": "America/New_York",
       "interval_value": null,
