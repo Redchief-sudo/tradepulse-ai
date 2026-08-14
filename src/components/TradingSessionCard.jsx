@@ -1,6 +1,7 @@
 import React from 'react';
 import { TrendingUp, TrendingDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { formatDateOnly } from '@/lib/tradingDate';
 
 export default function TradingSessionCard({ session, isSelected, onClick }) {
   const dailyReturn = session.daily_return_pct;
@@ -20,7 +21,7 @@ export default function TradingSessionCard({ session, isSelected, onClick }) {
       <div className="flex items-center justify-between mb-3">
         <div>
           <div className="font-heading font-semibold text-sm">
-            {new Date(session.session_date).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}
+            {formatDateOnly(session.session_date, { weekday: 'short', month: 'short', day: 'numeric' })}
           </div>
           <div className="text-xs text-muted-foreground mt-0.5">
             {session.status === 'closed' ? 'Final Report' : 'Intraday Snapshot'}

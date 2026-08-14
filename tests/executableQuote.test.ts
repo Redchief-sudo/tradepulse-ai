@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { executableQuoteMetrics, executionLifecycle } from '../base44/shared/execution.ts';
+import { normalizeAlpacaActivitySide } from '../base44/shared/alpaca.ts';
 
 describe('executableQuoteMetrics', () => {
   const now = Date.parse('2026-08-07T17:00:01.000Z');
@@ -35,5 +36,12 @@ describe('execution lifecycle truth', () => {
   });
   it('separates settled partial fills from terminal order completion', () => {
     expect(executionLifecycle('partially_filled', 'completed')).toMatchObject({ financially_complete: false, order_execution_complete: false, fills_settlement_complete: true });
+  });
+});
+
+describe('Alpaca activity direction', () => {
+  it('maps short and cover activities to canonical signed-ledger sides', () => {
+    expect(normalizeAlpacaActivitySide('sell_short')).toBe('sell');
+    expect(normalizeAlpacaActivitySide('buy_to_cover')).toBe('buy');
   });
 });

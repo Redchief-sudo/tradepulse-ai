@@ -17,6 +17,13 @@ function headers(apiKey, secretKey) {
   };
 }
 
+export function normalizeAlpacaActivitySide(side) {
+  const normalized = String(side || '').toLowerCase();
+  if (normalized === 'buy' || normalized === 'buy_to_cover') return 'buy';
+  if (normalized === 'sell' || normalized === 'sell_short') return 'sell';
+  return null;
+}
+
 // Submit an order. Respects order_type (market/limit/stop/stop_limit), limit_price,
 // stop_price, and time_in_force from the TradeIntent — no longer hardcodes market/day.
 // client_order_id provides idempotency so a retried submit cannot duplicate a fill.

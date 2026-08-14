@@ -5,3 +5,9 @@ export function newYorkDateString(date = new Date()) {
   const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
   return `${value.year}-${value.month}-${value.day}`;
 }
+
+export function formatDateOnly(dateString, options = {}) {
+  const [year, month, day] = String(dateString || '').split('-').map(Number);
+  if (!year || !month || !day) return 'Invalid date';
+  return new Date(year, month - 1, day).toLocaleDateString('en-US', options);
+}

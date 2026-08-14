@@ -1,5 +1,5 @@
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
-import { getAlpacaActivities, getAlpacaOrder } from '../../shared/alpaca.ts';
+import { getAlpacaActivities, getAlpacaOrder, normalizeAlpacaActivitySide } from '../../shared/alpaca.ts';
 import { recordFill } from '../../shared/execution.ts';
 import { nowIso } from '../../shared/lotAccounting.ts';
 
@@ -69,7 +69,7 @@ export default async function(req) {
     for (const activity of activities) {
       const activityId = activity.id || activity.activity_id;
       const symbol = String(activity.symbol || '').toUpperCase();
-      const side = String(activity.side || '').toLowerCase();
+      const side = normalizeAlpacaActivitySide(activity.side);
       const quantity = Number(activity.qty);
       const price = Number(activity.price);
       const occurredAt = activity.transaction_time || activity.date;

@@ -1,6 +1,7 @@
 import React from 'react';
 import { TrendingUp, TrendingDown, AlertTriangle, CheckCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { formatDateOnly } from '@/lib/tradingDate';
 
 const fmt = (n) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n || 0);
 const fmtPct = (n) => `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
@@ -29,7 +30,7 @@ export default function TradingSessionDetail({ session, trades, scanRuns, auditE
       <div className="flex items-center justify-between">
         <div>
           <h3 className="font-heading font-bold text-lg">
-            {new Date(session.session_date).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}
+            {formatDateOnly(session.session_date, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}
           </h3>
           <div className="flex items-center gap-2 mt-1">
             <span className={cn(

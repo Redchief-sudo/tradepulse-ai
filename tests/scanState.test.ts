@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { hasNewerScanGeneration, isSuccessfulScanTerminal, nextScanGeneration } from '../base44/shared/scanState.ts';
+import { hasNewerScanGeneration, isScheduledScanDue, isSuccessfulScanTerminal, nextScanGeneration } from '../base44/shared/scanState.ts';
 
 describe('scan generation invalidation', () => {
   it('allocates a monotonically increasing generation', () => {
@@ -18,5 +18,11 @@ describe('scan generation invalidation', () => {
     expect(isSuccessfulScanTerminal({ status: 'no_candidates' })).toBe(true);
     expect(isSuccessfulScanTerminal({ status: 'running' })).toBe(false);
     expect(isSuccessfulScanTerminal({ status: 'failed' })).toBe(false);
+  });
+
+  it('runs after elapsed cadence instead of requiring an exact clock minute', () => {
+    const now = Date.parse('2026-08-13T15:16:20Z');
+    expect(isScheduledScanDue(now, [{ started_at: '2026-08-13T15:00:42Z' }])).toBe(true);
+    expect(isScheduledScanDue(now, [{ started_at: '2026-08-13T15:05:00Z' }])).toBe(false);
   });
 });

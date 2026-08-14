@@ -16,7 +16,7 @@
 // 4. If no requests and trading not active, skip
 
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
-import { isSuccessfulScanTerminal } from '../../shared/scanState.ts';
+import { isScheduledScanDue, isSuccessfulScanTerminal } from '../../shared/scanState.ts';
 
 const STALE_LEASE_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -96,7 +96,8 @@ export default async function(req) {
 
   // 2. The coordinator polls every minute for manual requests, but autonomous
   // scheduled scans retain the 15-minute cadence.
-  const scheduledSlotDue = new Date().getUTCMinutes() % 15 === 0;
+  const recentRuns = await sr.entities.ScanRun.filter({ user_id: user.id });
+  const scheduledSlotDue = isScheduledScanDue(now, recentRuns);
   if (user.trading_active && scheduledSlotDue) {
     try {
       const result = await base44.functions.invoke('runAutonomousScanCycle', {
