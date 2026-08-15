@@ -93,6 +93,11 @@ export default function Settings() {
   const [showSecret, setShowSecret] = useState(false);
   const [testingTelegram, setTestingTelegram] = useState(false);
   const [telegramTestResult, setTelegramTestResult] = useState(null);
+  const [marketDataStatus, setMarketDataStatus] = useState({});
+  const [marketDataKeys, setMarketDataKeys] = useState({ coingecko: '', coinmarketcap: '' });
+  const [savingMarketData, setSavingMarketData] = useState(null);
+  const [marketDataResult, setMarketDataResult] = useState(null);
+  const [visibleMarketDataKey, setVisibleMarketDataKey] = useState(null);
   const [form, setForm] = useState({
     broker: '',
     broker_api_key: '',
@@ -114,6 +119,9 @@ export default function Settings() {
       // Load broker status from the secure backend function (no secrets returned)
       const status = await base44.functions.invoke('getBrokerStatus', {});
       setBrokerStatus(status);
+      const marketCredentialResponse = await base44.functions.invoke('getMarketDataCredentialStatus', {});
+      const marketCredentialData = marketCredentialResponse?.data || marketCredentialResponse;
+      setMarketDataStatus(marketCredentialData?.providers || {});
       setForm({
         broker: status?.broker || me.broker || '',
         broker_api_key: '',
@@ -220,6 +228,24 @@ export default function Settings() {
       setTelegramTestResult({ ok: false, error: e.message || 'Failed to send test message.' });
     }
     setTestingTelegram(false);
+  };
+
+  const saveMarketDataKey = async (provider) => {
+    const apiKey = marketDataKeys[provider].trim();
+    if (!apiKey) return;
+    setSavingMarketData(provider);
+    setMarketDataResult(null);
+    try {
+      const response = await base44.functions.invoke('saveMarketDataCredentials', { provider, api_key: apiKey });
+      const result = response?.data || response;
+      if (result?.error || result?.ok === false) throw new Error(result?.error || 'Credential validation failed');
+      setMarketDataKeys((current) => ({ ...current, [provider]: '' }));
+      setMarketDataResult({ ok: true, message: `${provider === 'coingecko' ? 'CoinGecko' : 'CoinMarketCap'} key validated and saved.` });
+      await loadUser();
+    } catch (error) {
+      setMarketDataResult({ ok: false, message: error.message || 'Unable to save market-data key.' });
+    }
+    setSavingMarketData(null);
   };
 
   const isConnected = !!brokerStatus?.connected;
@@ -691,6 +717,61 @@ export default function Settings() {
             </Button>
           )}
         </div>
+      </motion.div>
+
+      <motion.div
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="mt-6 rounded-2xl border border-border bg-card p-5 space-y-5"
+      >
+        <div>
+          <h2 className="font-semibold flex items-center gap-2"><Key className="w-4 h-4 text-primary" />Crypto Market Data Providers</h2>
+          <p className="text-xs text-muted-foreground mt-1">Keys are validated server-side and stored in the protected credential vault. Saving a key does not weaken scan eligibility or enable partial-data trading.</p>
+        </div>
+        {[
+          { id: 'coingecko', name: 'CoinGecko', placeholder: 'Enter Demo or Pro API key' },
+          { id: 'coinmarketcap', name: 'CoinMarketCap', placeholder: 'Enter API key' },
+        ].map((provider) => {
+          const status = marketDataStatus[provider.id];
+          const visible = visibleMarketDataKey === provider.id;
+          return (
+            <div key={provider.id} className="rounded-xl border border-border/70 p-4 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">{provider.name}</div>
+                  <div className="text-xs text-muted-foreground">
+                    {status?.configured ? `Configured ${status.key_suffix}${status.api_plan ? ` · ${status.api_plan}` : ''}` : 'Not configured'}
+                  </div>
+                </div>
+                {status?.configured && <ShieldCheck className="w-4 h-4 text-emerald-500" />}
+              </div>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <div className="relative flex-1">
+                  <Input
+                    type={visible ? 'text' : 'password'}
+                    value={marketDataKeys[provider.id]}
+                    onChange={(event) => setMarketDataKeys((current) => ({ ...current, [provider.id]: event.target.value }))}
+                    placeholder={status?.configured ? 'Enter a new key to replace the saved key' : provider.placeholder}
+                    className="pr-10 font-mono"
+                  />
+                  <button type="button" onClick={() => setVisibleMarketDataKey(visible ? null : provider.id)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                    {visible ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+                <Button onClick={() => saveMarketDataKey(provider.id)} disabled={savingMarketData !== null || !marketDataKeys[provider.id].trim()} className="gap-2 sm:w-36">
+                  {savingMarketData === provider.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                  Validate & Save
+                </Button>
+              </div>
+            </div>
+          );
+        })}
+        {marketDataResult && (
+          <div className={cn('rounded-lg p-3 text-xs flex items-center gap-2', marketDataResult.ok ? 'bg-emerald-500/10 text-emerald-500' : 'bg-red-500/10 text-red-500')}>
+            {marketDataResult.ok ? <CheckCircle2 className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
+            {marketDataResult.message}
+          </div>
+        )}
       </motion.div>
 
       {/* Security note */}
