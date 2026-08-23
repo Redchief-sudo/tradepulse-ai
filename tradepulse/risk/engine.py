@@ -1,0 +1,311 @@
+"""Deterministic, strategy-independent risk engine -- port of
+base44/shared/riskEngine.ts. A DENIED result means ZERO units, never "at
+least one unit". The risk engine has veto authority over every strategy and
+AI signal.
+
+Includes ONE addition beyond the port: check_cash_sufficiency(), called
+unconditionally for BUY orders inside evaluate_risk(). The audited Base44
+system had a fully-implemented cash-reservation function (reserveCash() in
+cashLedger.ts) that was never called from anywhere in the execution path --
+a confirmed pre-trade risk gap. Here the equivalent check cannot be skipped.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from decimal import ROUND_FLOOR, Decimal
+from uuid import uuid4
+
+from tradepulse.models import AssetClass, PortfolioSnapshot, RiskLimits, Side, TradeIntentStatus
+from tradepulse.persistence import PersistenceRepositories, hydrate
+
+
+def _round_qty(qty: Decimal, asset_class: AssetClass) -> Decimal:
+    """Floor at asset-appropriate precision so a cap never increases the
+    requested notional. Equities use thousandths; crypto uses eight decimal
+    places."""
+    precision = Decimal("100000000") if asset_class == AssetClass.CRYPTO else Decimal("1000")
+    floored = (max(qty, Decimal("0")) * precision).to_integral_value(rounding=ROUND_FLOOR)
+    return floored / precision
+
+
+def _minimum_quantity(asset_class: AssetClass) -> Decimal:
+    return Decimal("0.00000001") if asset_class == AssetClass.CRYPTO else Decimal("0.001")
+
+
+@dataclass(frozen=True, slots=True)
+class RiskCheckInput:
+    symbol: str
+    asset_class: AssetClass
+    side: Side
+    requested_quantity: Decimal
+    price: Decimal
+    confidence: Decimal | None = None
+    stop_loss: Decimal | None = None
+    sector: str = "Other"
+
+
+@dataclass(frozen=True, slots=True)
+class RiskEvalOptions:
+    kill_switch: bool = False
+    protective_exit: bool = False
+    bid: Decimal | None = None
+    ask: Decimal | None = None
+    estimated_slippage_pct: Decimal | None = None
+    max_drawdown_breached: bool = False
+    skip_market_data_checks: bool = False
+    held_quantity: Decimal = Decimal("0")
+    available_cash: Decimal | None = None
+    estimated_fees: Decimal = Decimal("0")
+
+
+@dataclass(frozen=True, slots=True)
+class RiskDecision:
+    approved: bool
+    approved_quantity: Decimal
+    reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class CashCheck:
+    approved: bool
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DrawdownCheck:
+    breached: bool
+    drawdown_pct: Decimal | None
+    peak_equity: Decimal | None
+    limit_pct: Decimal | None
+
+
+def check_cash_sufficiency(
+    cash_balance: Decimal,
+    requested_notional: Decimal,
+    estimated_fees: Decimal,
+    buffer_pct: Decimal = Decimal("1"),
+) -> CashCheck:
+    required = requested_notional + estimated_fees
+    buffered_cash = cash_balance * (Decimal("1") - buffer_pct / Decimal("100"))
+    if required > buffered_cash:
+        return CashCheck(False, f"INSUFFICIENT_CASH (required {required}, available {buffered_cash})")
+    return CashCheck(True, None)
+
+
+def evaluate_risk(
+    intent: RiskCheckInput, snapshot: PortfolioSnapshot, limits: RiskLimits, opts: RiskEvalOptions | None = None
+) -> RiskDecision:
+    opts = opts or RiskEvalOptions()
+    reasons: list[str] = []
+    qty = intent.requested_quantity
+    price = intent.price
+    minimum_quantity = _minimum_quantity(intent.asset_class)
+
+    if opts.kill_switch and not opts.protective_exit:
+        return RiskDecision(False, Decimal("0"), ["KILL_SWITCH_ACTIVE"])
+
+    # Spread limit -- fail closed if bid/ask unavailable or spread excessive.
+    # internal_paper/shadow_live have no real market data (skip_market_data_checks).
+    if intent.side == Side.BUY and limits.spread_limit_pct and not opts.skip_market_data_checks:
+        if opts.bid is None or opts.ask is None:
+            reasons.append("NO_QUOTE_DATA_FOR_SPREAD_CHECK")
+        else:
+            mid = (opts.bid + opts.ask) / 2
+            if mid > 0:
+                spread_pct = ((opts.ask - opts.bid) / mid) * 100
+                if spread_pct > limits.spread_limit_pct:
+                    reasons.append(f"SPREAD_EXCEEDS_LIMIT ({spread_pct:.2f}% > {limits.spread_limit_pct}%)")
+
+    # Slippage limit -- fail closed if no estimate supplied.
+    if intent.side == Side.BUY and limits.slippage_limit_pct and not opts.skip_market_data_checks:
+        if opts.estimated_slippage_pct is None:
+            reasons.append("NO_SLIPPAGE_ESTIMATE")
+        elif opts.estimated_slippage_pct > limits.slippage_limit_pct:
+            reasons.append(
+                f"SLIPPAGE_EXCEEDS_LIMIT ({opts.estimated_slippage_pct:.2f}% > {limits.slippage_limit_pct}%)"
+            )
+
+    if intent.side == Side.BUY and not opts.protective_exit and opts.max_drawdown_breached:
+        reasons.append("MAX_DRAWDOWN_BREACHED")
+
+    if opts.protective_exit:
+        if reasons:
+            return RiskDecision(False, Decimal("0"), reasons)
+        return RiskDecision(True, qty, ["PROTECTIVE_EXIT"])
+
+    if intent.side == Side.SELL:
+        if opts.held_quantity < qty:
+            return RiskDecision(
+                False, Decimal("0"),
+                [f"INSUFFICIENT_POSITION_TO_SELL (held {opts.held_quantity}, requested {qty})"],
+            )
+        return RiskDecision(True, qty, ["OK"])
+
+    if intent.confidence is not None and intent.confidence < limits.min_confidence:
+        reasons.append(f"CONFIDENCE_BELOW_MIN ({intent.confidence} < {limits.min_confidence})")
+    if snapshot.trades_today >= limits.max_daily_trades:
+        reasons.append(f"MAX_DAILY_TRADES_REACHED ({snapshot.trades_today}/{limits.max_daily_trades})")
+    if snapshot.open_positions >= limits.max_open_positions:
+        reasons.append(f"MAX_OPEN_POSITIONS_REACHED ({snapshot.open_positions}/{limits.max_open_positions})")
+    if snapshot.daily_pnl_pct <= -limits.max_daily_loss_pct:
+        reasons.append(f"MAX_DAILY_LOSS_EXCEEDED ({snapshot.daily_pnl_pct:.2f}% <= -{limits.max_daily_loss_pct}%)")
+
+    total_equity = snapshot.total_equity
+    if limits.max_total_exposure_pct and total_equity > 0:
+        current_exposure_pct = (snapshot.holdings_value / total_equity) * 100
+        new_exposure_pct = current_exposure_pct + (qty * price / total_equity) * 100
+        if new_exposure_pct > limits.max_total_exposure_pct:
+            reasons.append(
+                f"MAX_TOTAL_EXPOSURE_EXCEEDED ({new_exposure_pct:.1f}% > {limits.max_total_exposure_pct}%)"
+            )
+
+    if limits.max_simultaneous_orders and snapshot.outstanding_orders >= limits.max_simultaneous_orders:
+        reasons.append(
+            f"MAX_SIMULTANEOUS_ORDERS_REACHED ({snapshot.outstanding_orders}/{limits.max_simultaneous_orders})"
+        )
+
+    # Pre-trade cash sufficiency -- mandatory for buys. This is the confirmed
+    # Base44 gap being closed: not optional, not a separate call site nobody
+    # reaches.
+    if opts.available_cash is not None:
+        cash_check = check_cash_sufficiency(opts.available_cash, qty * price, opts.estimated_fees)
+        if not cash_check.approved and cash_check.reason:
+            reasons.append(cash_check.reason)
+
+    if reasons:
+        return RiskDecision(False, Decimal("0"), reasons)
+
+    approved_qty = qty
+    if total_equity > 0 and price > 0:
+        # Risk-based sizing: shares = risk_budget / risk_per_share, then cap
+        # by max_position_pct, max_sector_pct, and total exposure.
+        if intent.stop_loss is not None and intent.stop_loss > 0 and limits.max_risk_per_trade_pct:
+            risk_budget = (limits.max_risk_per_trade_pct / 100) * total_equity
+            risk_per_share = price - intent.stop_loss
+            if risk_per_share > 0:
+                risk_based_qty = _round_qty(risk_budget / risk_per_share, intent.asset_class)
+                if risk_based_qty < approved_qty:
+                    approved_qty = risk_based_qty
+                    reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_RISK_BASED_SIZING")
+
+        max_position_notional = (limits.max_position_pct / 100) * total_equity
+        if approved_qty * price > max_position_notional:
+            approved_qty = _round_qty(max_position_notional / price, intent.asset_class)
+            reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_MAX_POSITION_PCT")
+
+        current_sector = snapshot.sector_exposure.get(intent.sector, Decimal("0"))
+        max_sector_notional = (limits.max_sector_pct / 100) * total_equity
+        remaining_sector = max_sector_notional - current_sector
+        if approved_qty * price > remaining_sector:
+            capped_by_sector = _round_qty(remaining_sector / price, intent.asset_class) if price > 0 else Decimal("0")
+            if capped_by_sector < approved_qty:
+                approved_qty = capped_by_sector
+                reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_MAX_SECTOR_PCT")
+
+        if limits.max_total_exposure_pct:
+            remaining_exposure = ((limits.max_total_exposure_pct / 100) * total_equity) - snapshot.holdings_value
+            if approved_qty * price > remaining_exposure:
+                capped_by_exposure = (
+                    _round_qty(remaining_exposure / price, intent.asset_class) if price > 0 else Decimal("0")
+                )
+                if capped_by_exposure < approved_qty:
+                    approved_qty = capped_by_exposure
+                    reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_MAX_TOTAL_EXPOSURE")
+
+    if approved_qty < minimum_quantity:
+        reasons.append("INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT")
+        return RiskDecision(False, Decimal("0"), reasons)
+
+    if approved_qty >= qty:
+        reasons.append("OK")
+    return RiskDecision(True, max(Decimal("0"), approved_qty), reasons)
+
+
+async def build_portfolio_snapshot(
+    repositories: PersistenceRepositories,
+    *,
+    cash_balance: Decimal,
+    account_equity: Decimal | None = None,
+    broker_prev_close_equity: Decimal | None = None,
+    mark_prices: Mapping[str, Decimal] | None = None,
+    now: datetime | None = None,
+) -> PortfolioSnapshot:
+    """Caller supplies cash_balance (from the broker account or the local
+    cash ledger -- this function has no opinion on which) and, for
+    broker-backed accounts, account_equity/broker_prev_close_equity so daily
+    P&L uses the SAME definition the execution gateway uses, matching the
+    audited Base44 fix for scan/execution using contradictory equity sources.
+
+    Note: "today" is the caller's UTC calendar day, not an NY-session
+    trading day -- a known simplification versus the audited system's
+    nyDayStart() handling, acceptable for MVP scope.
+    """
+    now = now or datetime.now(UTC)
+    mark_prices = mark_prices or {}
+
+    holding_rows = await repositories.holdings.list_all()
+    holdings = [hydrate("holdings", row["payload"]) for row in holding_rows]
+
+    holdings_value = Decimal("0")
+    sector_exposure: dict[str, Decimal] = {}
+    for holding in holdings:
+        mark = mark_prices.get(holding.asset.symbol, holding.average_price)
+        notional = abs(holding.quantity) * mark
+        holdings_value += notional
+        sector = holding.sector or "Other"
+        sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + notional
+
+    total_equity = account_equity if account_equity and account_equity > 0 else holdings_value
+
+    intent_rows = await repositories.trade_intents.list_all(limit=1000)
+    outstanding_values = {TradeIntentStatus.SUBMITTED.value, TradeIntentStatus.ACCEPTED.value, TradeIntentStatus.PARTIALLY_FILLED.value}
+    outstanding_orders = sum(1 for row in intent_rows if row["status"] in outstanding_values)
+
+    fill_rows = await repositories.fills.list_all(limit=1000)
+    fills = [hydrate("fills", row["payload"]) for row in fill_rows]
+    today = now.date()
+    trades_today = sum(1 for f in fills if f.filled_at.date() == today)
+
+    if broker_prev_close_equity and broker_prev_close_equity > 0 and account_equity and account_equity > 0:
+        daily_pnl_pct = ((account_equity - broker_prev_close_equity) / broker_prev_close_equity) * 100
+        source = "broker"
+    else:
+        pnl_rows = await repositories.pnl_records.list_all(limit=1000)
+        pnl_records = [hydrate("pnl_records", row["payload"]) for row in pnl_rows]
+        daily_realized = sum((p.realized for p in pnl_records if p.as_of.date() == today), Decimal("0"))
+        daily_pnl_pct = (daily_realized / total_equity) * 100 if total_equity > 0 else Decimal("0")
+        source = "holdings"
+
+    return PortfolioSnapshot(
+        snapshot_id=str(uuid4()),
+        as_of=now,
+        total_equity=total_equity,
+        cash_balance=cash_balance,
+        holdings_value=holdings_value,
+        sector_exposure=sector_exposure,
+        open_positions=len(holdings),
+        outstanding_orders=outstanding_orders,
+        trades_today=trades_today,
+        daily_pnl_pct=daily_pnl_pct,
+        source=source,
+    )
+
+
+async def check_max_drawdown(
+    repositories: PersistenceRepositories, current_equity: Decimal, limits: RiskLimits
+) -> DrawdownCheck:
+    if not limits.max_drawdown_pct or limits.max_drawdown_pct <= 0:
+        return DrawdownCheck(False, None, None, limits.max_drawdown_pct)
+    rows = await repositories.equity_snapshots.list_all(limit=1000)
+    peak = current_equity
+    for row in rows:
+        equity = Decimal(str(row["payload"]["total_equity"]))
+        if equity > peak:
+            peak = equity
+    if peak <= 0:
+        return DrawdownCheck(False, None, peak, limits.max_drawdown_pct)
+    drawdown_pct = ((peak - current_equity) / peak) * 100
+    return DrawdownCheck(drawdown_pct >= limits.max_drawdown_pct, drawdown_pct, peak, limits.max_drawdown_pct)

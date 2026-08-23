@@ -1,0 +1,152 @@
+from datetime import UTC, datetime
+from decimal import Decimal
+
+from tradepulse.models import (
+    AssetClass,
+    AssetIdentity,
+    AuditEvent,
+    CashLedgerEntry,
+    ExecutionMode,
+    Fill,
+    Holding,
+    MarketQuote,
+    Opportunity,
+    Order,
+    OrderStatus,
+    PnlRecord,
+    PortfolioSnapshot,
+    PositionLot,
+    ReconciliationOutcome,
+    ReconciliationRecord,
+    ScanRun,
+    ScanRunStatus,
+    ScanTrigger,
+    SessionState,
+    SettlementEvent,
+    SettlementStatus,
+    Side,
+    TradeIntent,
+    TradingSession,
+)
+from tradepulse.persistence import hydrate
+from tradepulse.persistence.codec import decode_payload, encode_payload
+
+
+NOW = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+
+
+def asset() -> AssetIdentity:
+    return AssetIdentity("BTC/USD", AssetClass.CRYPTO, "alpaca:BTC/USD", "alpaca", {"quote": "USD"})
+
+
+def quote() -> MarketQuote:
+    return MarketQuote(asset(), Decimal("65000.50"), NOW, NOW, "alpaca", 7, bid=Decimal("65000"), ask=Decimal("65001"))
+
+
+def roundtrip(table: str, instance: object) -> object:
+    payload = decode_payload(encode_payload(instance))
+    return hydrate(table, payload)
+
+
+def test_opportunity_roundtrips() -> None:
+    original = Opportunity("opp-1", "gen-1", asset(), quote(), "scanner", NOW, confidence=72.5, metadata={"note": "x"})
+    assert roundtrip("opportunities", original) == original
+
+
+def test_trade_intent_roundtrips() -> None:
+    original = TradeIntent(
+        "ti-1", "idem-1", "corr-1", asset(), Side.BUY, ExecutionMode.PAPER, "momentum", NOW,
+        requested_quantity=Decimal("0.001"), reference_price=Decimal("65000"), confidence=80,
+        risk_snapshot={"profile": "balanced"},
+    )
+    assert roundtrip("trade_intents", original) == original
+
+
+def test_order_roundtrips() -> None:
+    original = Order(
+        "order-1", "ti-1", "idem-1", asset(), Side.BUY, ExecutionMode.PAPER, OrderStatus.PARTIALLY_FILLED,
+        Decimal("0.010"), NOW, broker_order_id="broker-1", filled_quantity=Decimal("0.004"),
+        average_fill_price=Decimal("65010"),
+    )
+    assert roundtrip("orders", original) == original
+
+
+def test_fill_roundtrips() -> None:
+    original = Fill(
+        "fill-1", "ti-1", "order-1", asset(), Side.BUY, ExecutionMode.PAPER,
+        Decimal("0.001"), Decimal("65010"), Decimal("0.05"), Decimal("0.01"), NOW, broker_fill_id="bf-1",
+    )
+    assert roundtrip("fills", original) == original
+
+
+def test_settlement_roundtrips() -> None:
+    original = SettlementEvent(
+        "se-1", "fill-1", "ti-1", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("0.001"), Decimal("65010"), NOW,
+        status=SettlementStatus.COMPLETED, fees=Decimal("0.05"), broker_order_id="bo-1", broker_fill_id="bf-1",
+        client_order_id="co-1", lot_projected=True, cash_projected=True, holding_projected=True,
+        trade_projected=True, integrity_verified=True, realized_pnl=Decimal("1.25"), attempt_count=1,
+    )
+    assert roundtrip("settlements", original) == original
+
+
+def test_holding_roundtrips() -> None:
+    original = Holding(asset(), Decimal("0.5"), Decimal("64000"), NOW, sector="Technology")
+    assert roundtrip("holdings", original) == original
+
+
+def test_position_lot_roundtrips() -> None:
+    original = PositionLot(
+        "lot-1", "fill-1", asset(), "long", Decimal("0.5"), Decimal("0.3"), Decimal("64000"), NOW,
+        closures={"fill-2": Decimal("0.2")}, realized_pnl=Decimal("3.40"),
+    )
+    assert roundtrip("position_lots", original) == original
+
+
+def test_cash_ledger_entry_roundtrips() -> None:
+    original = CashLedgerEntry("entry-1", "idem-cash-1", Decimal("-65.01"), "USD", NOW, "buy settlement")
+    assert roundtrip("cash_ledger", original) == original
+
+
+def test_pnl_record_roundtrips() -> None:
+    original = PnlRecord("pnl-1", asset(), Decimal("12.50"), Decimal("-3.20"), NOW)
+    assert roundtrip("pnl_records", original) == original
+
+
+def test_reconciliation_record_roundtrips() -> None:
+    original = ReconciliationRecord(
+        "rec-1", "position", "BTC/USD", ReconciliationOutcome.DRIFT_DETECTED,
+        {"quantity": "0.5"}, {"quantity": "0.48"}, NOW,
+    )
+    assert roundtrip("reconciliation_records", original) == original
+
+
+def test_trading_session_roundtrips() -> None:
+    original = TradingSession(
+        "session-1", SessionState.RISK_STOPPED, False, NOW,
+        kill_switch_reason="daily loss limit breached", kill_switch_at=NOW, kill_switch_reset_required=True,
+    )
+    assert roundtrip("trading_sessions", original) == original
+
+
+def test_audit_event_roundtrips() -> None:
+    original = AuditEvent(
+        "evt-1", "kill_switch_tripped", "critical", "daily loss limit breached", NOW,
+        correlation_id="corr-1", entity_type="trading_session", entity_id="session-1", details={"pct": "-1.2"},
+    )
+    assert roundtrip("audit_events", original) == original
+
+
+def test_scan_run_roundtrips() -> None:
+    original = ScanRun(
+        "scan-1", "gen-1", ScanTrigger.SCHEDULED, ScanRunStatus.COMPLETED, NOW, "owner-1",
+        completed_at=NOW, candidates_discovered=5, candidates_approved=2, orders_submitted=1,
+    )
+    assert roundtrip("scan_runs", original) == original
+
+
+def test_equity_snapshot_roundtrips() -> None:
+    original = PortfolioSnapshot(
+        "snap-1", NOW, Decimal("10500.25"), Decimal("4000"), Decimal("6500.25"),
+        {"technology": Decimal("2500"), "crypto": Decimal("4000.25")}, 3, 1, 2, Decimal("0.75"), "broker",
+    )
+    assert roundtrip("equity_snapshots", original) == original
