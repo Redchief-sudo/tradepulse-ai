@@ -50,6 +50,11 @@ class TradeIntentStatus(StrEnum):
     CANCELED = "canceled"
     EXPIRED = "expired"
     FAILED = "failed"
+    # Broker submission outcome could not be established (network/timeout/
+    # 5xx/429 -- anything short of a definitive rejection). Never treat this
+    # as a rejection or silently resubmit; it requires recovery via
+    # get_order_by_client_order_id before any further action.
+    SUBMISSION_UNKNOWN = "submission_unknown"
 
 
 class SessionState(StrEnum):

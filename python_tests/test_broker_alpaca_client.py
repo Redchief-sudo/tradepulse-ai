@@ -5,7 +5,7 @@ import httpx
 import pytest
 import respx
 
-from tradepulse.broker import AlpacaClient, AlpacaError
+from tradepulse.broker import AlpacaClient, AlpacaError, is_definitive_rejection
 from tradepulse.models import AssetClass
 
 
@@ -79,6 +79,29 @@ async def test_non_success_response_raises_typed_alpaca_error() -> None:
         await client.aclose()
     assert exc_info.value.status_code == 403
     assert exc_info.value.is_insufficient_buying_power()
+
+
+def _alpaca_error(status_code: int) -> AlpacaError:
+    return AlpacaError("boom", status_code, "req-1", None, "placeOrder")
+
+
+def test_is_definitive_rejection_true_for_a_clear_4xx_business_rejection() -> None:
+    assert is_definitive_rejection(_alpaca_error(422)) is True
+    assert is_definitive_rejection(_alpaca_error(403)) is True
+
+
+def test_is_definitive_rejection_false_for_rate_limit() -> None:
+    assert is_definitive_rejection(_alpaca_error(429)) is False
+
+
+def test_is_definitive_rejection_false_for_server_errors() -> None:
+    assert is_definitive_rejection(_alpaca_error(500)) is False
+    assert is_definitive_rejection(_alpaca_error(503)) is False
+
+
+def test_is_definitive_rejection_false_for_non_alpaca_exceptions() -> None:
+    assert is_definitive_rejection(httpx.ConnectError("connection refused")) is False
+    assert is_definitive_rejection(httpx.TimeoutException("timed out")) is False
 
 
 @pytest.mark.integration

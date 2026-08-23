@@ -40,3 +40,22 @@ async def test_list_all_orders_by_created_at_ascending(tmp_path) -> None:
         await repositories.holdings.create_once(f"holding-{i}", Holding(asset, Decimal(i + 1), Decimal("150"), NOW))
     rows = await repositories.holdings.list_all()
     assert [row["record_id"] for row in rows] == ["holding-0", "holding-1", "holding-2"]
+
+
+async def test_delete_is_permitted_on_holdings(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    asset = AssetIdentity("AAPL", AssetClass.EQUITY, "alpaca:AAPL")
+    await repositories.holdings.create_once("holding-1", Holding(asset, Decimal("10"), Decimal("150"), NOW))
+
+    assert await repositories.holdings.delete("holding-1") is True
+    assert await repositories.holdings.get("holding-1") is None
+
+
+async def test_delete_is_rejected_on_append_only_tables(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    with pytest.raises(ValueError, match="delete is not permitted"):
+        await repositories.fills.delete("fill-1")
+    with pytest.raises(ValueError, match="delete is not permitted"):
+        await repositories.settlements.delete("settlement-1")
+    with pytest.raises(ValueError, match="delete is not permitted"):
+        await repositories.trade_intents.delete("intent-1")

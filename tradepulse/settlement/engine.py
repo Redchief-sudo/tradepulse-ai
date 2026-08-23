@@ -2,12 +2,17 @@
 base44/functions/processSettlementQueue/entry.ts, simplified for this
 system's architecture:
 
-- No per-user processor lease: this system is single-operator, and the CLI's
-  own `locks` table (cli/locking.py) already serializes every invocation of
-  `tradepulse settle`, so no concurrent claimant of a SettlementEvent is
-  possible in the first place -- the elaborate lease-acquire/heartbeat/
-  ownership-reverify dance in the source exists only because Base44's BaaS
-  platform had no way to enforce that at the database level.
+- No per-user processor lease, and no dependency on an external CLI-level
+  lock for correctness: `process_pending` claims each event via
+  `RecordRepository.claim_if_processable`, an atomic read-decide-write
+  inside a single BEGIN IMMEDIATE transaction (see persistence/repositories.py).
+  That gives a real, DB-enforced compare-and-swap -- a concurrent second
+  caller (whether a second CLI invocation, in-process task, or, later, a
+  separate process) genuinely cannot claim the same event twice. This
+  replaces the source's elaborate lease-acquire/heartbeat/ownership-reverify
+  dance, which existed only because Base44's BaaS platform had no way to
+  enforce compare-and-swap at the database level -- SQLite's own
+  transaction serialization gives that for free here.
 - `cash_projected` is a structural no-op: this MVP's ExecutionGateway always
   submits through Alpaca (paper or live) -- there is no Base44-style
   internal_paper/shadow_live mode with a locally-simulated fill -- so
@@ -114,7 +119,7 @@ async def _project_holding(repositories: PersistenceRepositories, event: Settlem
     return None
 
 
-async def _project_trade(repositories: PersistenceRepositories, event: SettlementEvent, realized_pnl: Decimal | None) -> None:
+async def _project_trade(repositories: PersistenceRepositories, event: SettlementEvent) -> None:
     intent_row = await repositories.trade_intents.get(event.trade_intent_id)
     if intent_row is None:
         return None
@@ -128,9 +133,26 @@ async def _project_trade(repositories: PersistenceRepositories, event: Settlemen
     total_notional = sum((f.quantity * f.price for f in fills), Decimal("0"))
     avg_price = total_notional / cumulative_qty if cumulative_qty > 0 else None
 
-    patch: dict[str, Any] = {"filled_quantity": cumulative_qty, "filled_avg_price": avg_price}
-    if realized_pnl is not None:
-        patch["realized_pnl"] = (intent.realized_pnl or Decimal("0")) + realized_pnl
+    # realized_pnl is RECOMPUTED from all SettlementEvents for this intent,
+    # not accumulated onto the current TradeIntent value -- matches how
+    # filled_quantity/filled_avg_price above are already recomputed, not
+    # accumulated. Each event's own realized_pnl is stable/idempotent once
+    # set (settlement/lots.py's closures-dict prevents a lot from being
+    # double-closed by a replayed event), so summing them fresh every time
+    # makes this safe to replay after a crash between this write and the
+    # stage checkpoint, instead of double-counting on resume. (Fixes a
+    # confirmed defect: the previous `intent.realized_pnl + event.realized_pnl`
+    # form double-counted exactly that crash window.)
+    settlement_rows = await repositories.settlements.list_all(limit=10000)
+    own_events = [
+        hydrate("settlements", row["payload"]) for row in settlement_rows
+        if row["payload"]["trade_intent_id"] == event.trade_intent_id
+    ]
+    total_realized_pnl = sum((e.realized_pnl or Decimal("0") for e in own_events), Decimal("0"))
+
+    patch: dict[str, Any] = {
+        "filled_quantity": cumulative_qty, "filled_avg_price": avg_price, "realized_pnl": total_realized_pnl,
+    }
     updated_intent = replace(intent, **patch)
     await repositories.trade_intents.update(event.trade_intent_id, updated_intent, status=updated_intent.status.value)
     return None
@@ -203,7 +225,7 @@ class SettlementProcessor:
             return None
 
         async def project_trade(state: SettlementEvent) -> None:
-            await _project_trade(self._repositories, state, state.realized_pnl)
+            await _project_trade(self._repositories, state)
             return None
 
         async def verify_integrity(state: SettlementEvent) -> None:
@@ -234,8 +256,18 @@ class SettlementProcessor:
         outcome_counts = {status: 0 for status in ("retryable_failed", "integrity_blocked", "terminal_failed")}
 
         for event in due:
-            claimed = replace(event, status=SettlementStatus.PROCESSING, processing_owner="settle", processing_started_at=now)
-            await self._checkpoint(claimed)
+            def decide(current: SettlementEvent) -> SettlementEvent | None:
+                # Re-validated against the CURRENT row, inside the same
+                # atomic transaction as the claim -- the `due` list above is
+                # only a candidate snapshot that may already be stale by the
+                # time we get here.
+                if not is_settlement_processable(current, now, stale_lease_seconds, force_retry):
+                    return None
+                return replace(current, status=SettlementStatus.PROCESSING, processing_owner="settle", processing_started_at=now)
+
+            claimed = await self._repositories.settlements.claim_if_processable(event.settlement_event_id, decide)
+            if claimed is None:
+                continue  # lost the race, or another caller already claimed/resolved it
             try:
                 final_state = await run_settlement_stages(claimed, self._handlers(), self._checkpoint)
                 done = replace(

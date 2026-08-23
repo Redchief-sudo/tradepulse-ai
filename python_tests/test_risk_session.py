@@ -37,9 +37,22 @@ def test_financial_integrity_block_also_bypasses_sell_shortcut() -> None:
     assert decision.reason == "FINANCIAL_INTEGRITY_BLOCKED"
 
 
-def test_sell_is_allowed_when_only_manually_stopped_not_kill_switched() -> None:
+def test_non_protective_sell_is_blocked_when_manually_stopped() -> None:
+    """Regression test: a sell is not automatically protective just because
+    it's a sell (e.g. opening/increasing a short). Only a caller-computed
+    protective_exit=True (from actual held-quantity coverage) may bypass the
+    plain 'session not active' check -- inferring it from side alone was the
+    same class of defect already fixed once in the Base44 port.
+    """
     session = _session(SessionState.MANUALLY_STOPPED, False)
     decision = execution_session_decision(session, Side.SELL, AssetClass.EQUITY, protective_exit=False)
+    assert not decision.allowed
+    assert "TRADING_SESSION_NOT_ACTIVE" in decision.reason
+
+
+def test_genuinely_protective_sell_is_allowed_when_manually_stopped() -> None:
+    session = _session(SessionState.MANUALLY_STOPPED, False)
+    decision = execution_session_decision(session, Side.SELL, AssetClass.EQUITY, protective_exit=True)
     assert decision.allowed
     assert decision.reason == "PROTECTIVE_EXIT_ALLOWED"
 

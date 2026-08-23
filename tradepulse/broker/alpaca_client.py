@@ -217,6 +217,23 @@ class AlpacaClient:
             raise_alpaca_error(response, "getOrder")
         return self._parse_order_response(response)
 
+    async def get_order_by_client_order_id(self, client_order_id: str) -> AlpacaOrderResponse | None:
+        """Recovery lookup for an ambiguous submission outcome (see
+        broker/errors.py::is_definitive_rejection). Returns None only for a
+        genuine 404 (Alpaca never received/created this order) -- any other
+        non-success response is still an ambiguous outcome and must raise,
+        not be silently treated as "not found"."""
+        response = await self._client.get(
+            f"{self._trading_base}/orders:by_client_order_id",
+            headers=self._headers,
+            params={"client_order_id": client_order_id},
+        )
+        if response.status_code == 404:
+            return None
+        if not response.is_success:
+            raise_alpaca_error(response, "getOrderByClientOrderId")
+        return self._parse_order_response(response)
+
     async def cancel_order(self, broker_order_id: str) -> None:
         response = await self._client.delete(f"{self._trading_base}/orders/{broker_order_id}", headers=self._headers)
         if not response.is_success:

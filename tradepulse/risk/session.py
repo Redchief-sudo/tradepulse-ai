@@ -56,7 +56,7 @@ def execution_session_decision(
     if session.state == SessionState.RISK_STOPPED or session.kill_switch_reset_required:
         return SessionDecision(False, "KILL_SWITCH_ACTIVE")
 
-    if protective_exit or side == Side.SELL:
+    if protective_exit:
         return SessionDecision(True, "PROTECTIVE_EXIT_ALLOWED")
 
     if session.trading_active and session.state == SessionState.MARKET_CLOSED and asset_class == AssetClass.CRYPTO:

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
 from .codec import decode_payload, encode_payload
 from .database import AsyncSQLiteDatabase
+from .hydration import hydrate
 
 
 TABLES = {
@@ -119,16 +121,58 @@ class RecordRepository:
         return await self.database.run(execute, write=True)
 
     async def delete(self, record_id: str) -> bool:
-        """Hard delete. Deliberately not restricted to a subset of tables at
-        this layer -- by convention only `holdings` uses it (a current-state
+        """Hard delete, restricted to `holdings` -- a current-state
         materialized view where a fully-closed position must not linger as a
-        stale row), never the audit-trail tables (fills, settlements,
-        audit_events, etc.), matching the source system's own practice."""
+        stale row. Every other table is append-only audit trail (fills,
+        settlements, audit_events, etc.), matching the source system's own
+        practice."""
+        if self.table != "holdings":
+            raise ValueError(f"delete is not permitted on {self.table} -- only holdings is a current-state view; all other tables are append-only audit trail")
 
         def execute(connection: sqlite3.Connection) -> bool:
             return connection.execute(f"DELETE FROM {self.table} WHERE record_id=?", (record_id,)).rowcount == 1
 
         return await self.database.run(execute, write=True)
+
+    async def claim_if_processable(self, record_id: str, decide: Callable[[Any], Any | None]) -> Any | None:
+        """Atomic read-decide-write. Within ONE write transaction: re-reads
+        and hydrates the row, calls `decide(current_typed_value)`. If
+        `decide` returns a new value (a model instance with a `.status`
+        enum attribute), BOTH the payload blob and the status column are
+        written together in a single UPDATE and the new value is returned.
+        If `decide` returns None, nothing is written and this returns None
+        (not eligible / lost the race to a concurrent claimant).
+
+        Writing payload and status together in one statement is deliberate:
+        an earlier version of this method updated only the status column,
+        leaving a window where a concurrent claimant's eligibility check --
+        which reads status from the (now stale) payload, not the column --
+        could still see the pre-claim state and wrongly claim the row too.
+
+        Relies on BEGIN IMMEDIATE (AsyncSQLiteDatabase.run(write=True))
+        serializing concurrent callers at the whole-database level -- a
+        second caller's transaction genuinely blocks until this one commits,
+        then re-reads the already-updated row and correctly finds it no
+        longer eligible via `decide`."""
+        if self.table not in STATUS_TABLES:
+            raise ValueError(f"claim_if_processable requires a status column: {self.table}")
+
+        def op(connection: sqlite3.Connection) -> Any | None:
+            row = connection.execute(f"SELECT * FROM {self.table} WHERE record_id=?", (record_id,)).fetchone()
+            if row is None:
+                return None
+            current = hydrate(self.table, decode_payload(row["payload"]))
+            new_value = decide(current)
+            if new_value is None:
+                return None
+            now = utc_now()
+            connection.execute(
+                f"UPDATE {self.table} SET payload=?, status=?, updated_at=? WHERE record_id=?",
+                (encode_payload(new_value), new_value.status.value, now, record_id),
+            )
+            return new_value
+
+        return await self.database.run(op, write=True)
 
     async def list_all(self, limit: int = 1000) -> list[Mapping[str, Any]]:
         if limit < 1 or limit > 10000:

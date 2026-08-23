@@ -159,3 +159,121 @@ async def test_kill_switch_active_rejects_buy_even_with_everything_else_valid(tm
     assert result.status == "rejected"
     assert result.reasons == ["KILL_SWITCH_ACTIVE"]
     assert order_route.call_count == 0
+
+
+@respx.mock
+async def test_ambiguous_submission_error_recovers_via_client_order_id_lookup(tmp_path) -> None:
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_quote()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=httpx.ConnectError("connection refused"))
+    lookup_route = respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(
+        return_value=httpx.Response(200, json=_order_json("accepted", "0", None))
+    )
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "filled"
+    assert result.filled_quantity == Decimal("5")
+    assert order_route.call_count == 1  # never resubmitted after the connection error
+    assert lookup_route.call_count == 1
+
+
+@respx.mock
+async def test_definitive_rejection_ends_rejected_without_recovery_lookup(tmp_path) -> None:
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_quote()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(
+        return_value=httpx.Response(422, json={"message": "invalid order", "code": 40010001})
+    )
+    lookup_route = respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(
+        return_value=httpx.Response(200, json=_order_json("accepted", "0", None))
+    )
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "rejected"
+    assert order_route.call_count == 1
+    assert lookup_route.call_count == 0  # a definitive rejection must never trigger a recovery lookup
+
+
+@respx.mock
+async def test_ambiguous_5xx_error_routes_through_recovery_not_straight_to_rejected(tmp_path) -> None:
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_quote()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(
+        return_value=httpx.Response(500, json={"message": "internal error"})
+    )
+    lookup_route = respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(
+        return_value=httpx.Response(200, json=_order_json("accepted", "0", None))
+    )
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "filled"  # proves it went through recovery, not straight to "rejected"
+    assert order_route.call_count == 1
+    assert lookup_route.call_count == 1
+
+
+@respx.mock
+async def test_recovery_lookup_404_ends_submission_unknown_and_never_resubmits(tmp_path) -> None:
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_quote()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=httpx.ConnectError("connection refused"))
+    lookup_route = respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(return_value=httpx.Response(404))
+
+    request = ExecutionRequest(
+        asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test",
+        decision_id="decision-unknown", confidence=Decimal("90"),
+    )
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "pending"
+    assert order_route.call_count == 1
+    assert lookup_route.call_count == 1
+
+    intent_row = await repositories.trade_intents.get(result.trade_intent_id)
+    assert intent_row["status"] == "submission_unknown"
+
+
+@respx.mock
+async def test_second_call_while_submission_unknown_retries_recovery_without_resubmitting(tmp_path) -> None:
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_quote()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=httpx.ConnectError("connection refused"))
+    lookup_route = respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(return_value=httpx.Response(404))
+
+    request = ExecutionRequest(
+        asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test",
+        decision_id="decision-retry", confidence=Decimal("90"),
+    )
+    first = await gateway.execute_intent(request)
+    second = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert first.status == "pending"
+    assert second.status == "pending"
+    assert first.trade_intent_id == second.trade_intent_id
+    assert order_route.call_count == 1  # never resubmitted while the outcome is unresolved
+    assert lookup_route.call_count == 2  # recovery re-attempted on the second call
+
+    intent_row = await repositories.trade_intents.get(first.trade_intent_id)
+    assert intent_row["status"] == "submission_unknown"

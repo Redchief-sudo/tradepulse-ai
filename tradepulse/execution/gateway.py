@@ -24,7 +24,7 @@ from typing import Literal
 from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter
-from tradepulse.broker import AlpacaClient, AlpacaError, AlpacaOrderRequest, default_time_in_force
+from tradepulse.broker import AlpacaClient, AlpacaError, AlpacaOrderRequest, default_time_in_force, is_definitive_rejection
 from tradepulse.models import (
     AssetIdentity,
     ExecutionMode,
@@ -125,6 +125,13 @@ class ExecutionGateway:
                     return self._result_from_intent(existing)
                 if existing.status in IN_FLIGHT_STATUSES and existing.broker_order_id:
                     return await self._poll_and_settle(existing)
+                if existing.status == TradeIntentStatus.SUBMISSION_UNKNOWN:
+                    # A prior call's broker outcome was never established.
+                    # Re-attempt resolution -- must NEVER fall through to a
+                    # fresh submission while the first attempt's outcome is
+                    # still unresolved (that's exactly how a duplicate order
+                    # would happen).
+                    return await self._recover_unknown_submission(existing, RuntimeError("retry after prior SUBMISSION_UNKNOWN"))
                 # RISK_APPROVED with no broker_order_id yet (crashed before
                 # submission) or PROPOSED -- fall through and continue below,
                 # reusing this intent's id instead of creating a new one.
@@ -226,15 +233,52 @@ class ExecutionGateway:
         await self._repositories.trade_intents.update(trade_intent_id, submitted, status=submitted.status.value)
         try:
             placed = await self._broker.place_order(order_request)
-        except AlpacaError as exc:
-            rejected = replace(submitted, status=TradeIntentStatus.REJECTED, rejection_reason=f"BROKER_SUBMIT_ERROR: {exc.message}")
-            await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
-            return ExecutionResult("rejected", trade_intent_id, [rejected.rejection_reason], Decimal("0"), None)
+        except Exception as exc:  # noqa: BLE001 - must classify every submission failure, never let one crash the cycle
+            if is_definitive_rejection(exc):
+                # A confirmed Alpaca business-logic rejection -- safe to
+                # reject outright, no recovery needed.
+                reason = f"BROKER_SUBMIT_ERROR: {exc.message}" if isinstance(exc, AlpacaError) else f"BROKER_SUBMIT_ERROR: {exc}"
+                rejected = replace(submitted, status=TradeIntentStatus.REJECTED, rejection_reason=reason)
+                await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
+                return ExecutionResult("rejected", trade_intent_id, [rejected.rejection_reason], Decimal("0"), None)
+            # Ambiguous outcome (429, 5xx, network/timeout/DNS error, etc.) --
+            # Alpaca's actual acceptance of the order cannot be established
+            # from this error alone. Never assume rejection or resubmit.
+            return await self._recover_unknown_submission(submitted, exc)
 
         accepted = replace(submitted, status=TradeIntentStatus.ACCEPTED, broker_order_id=placed.broker_order_id, client_order_id=trade_intent_id)
         await self._repositories.trade_intents.update(trade_intent_id, accepted, status=accepted.status.value)
 
         return await self._poll_and_settle(accepted)
+
+    async def _recover_unknown_submission(self, intent: TradeIntent, cause: Exception) -> ExecutionResult:
+        """Called whenever a broker submission's outcome is ambiguous (see
+        is_definitive_rejection), or when resuming a prior SUBMISSION_UNKNOWN
+        intent. Looks the order up by client_order_id (== trade_intent_id,
+        set at submission time) before concluding anything -- if Alpaca DID
+        receive it, resume as normal, never resubmit; if genuinely not
+        found, mark SUBMISSION_UNKNOWN and alert a human rather than guess."""
+        try:
+            order = await self._broker.get_order_by_client_order_id(intent.trade_intent_id)
+        except Exception:  # noqa: BLE001 - the recovery lookup itself failing is ALSO ambiguous, not "not found"
+            order = None
+
+        if order is not None:
+            accepted = replace(
+                intent, status=TradeIntentStatus.ACCEPTED, broker_order_id=order.broker_order_id,
+                client_order_id=intent.trade_intent_id,
+            )
+            await self._repositories.trade_intents.update(intent.trade_intent_id, accepted, status=accepted.status.value)
+            return await self._poll_and_settle(accepted)
+
+        unknown = replace(intent, status=TradeIntentStatus.SUBMISSION_UNKNOWN, rejection_reason=f"SUBMISSION_UNKNOWN: {cause}")
+        await self._repositories.trade_intents.update(intent.trade_intent_id, unknown, status=unknown.status.value)
+        await self._alerts.send(
+            "critical",
+            f"Broker submission outcome unknown for {intent.asset.symbol} {intent.side.value} {intent.requested_quantity} -- requires manual review",
+            {"trade_intent_id": intent.trade_intent_id, "cause": str(cause)},
+        )
+        return ExecutionResult("pending", intent.trade_intent_id, [unknown.rejection_reason], Decimal("0"), None)
 
     async def _held_quantity(self, symbol: str) -> Decimal:
         row = await self._repositories.holdings.get(symbol.upper())

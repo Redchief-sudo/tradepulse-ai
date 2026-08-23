@@ -52,6 +52,23 @@ class AlpacaError(RuntimeError):
         }
 
 
+def is_definitive_rejection(exc: Exception) -> bool:
+    """True only for a confirmed Alpaca business-logic rejection (a clear
+    4xx response other than 429 rate-limit) -- safe to mark an order
+    REJECTED without further recovery.
+
+    Everything else is an AMBIGUOUS outcome and must not be treated as a
+    rejection: a 429 or 5xx AlpacaError (Alpaca responded, but not with a
+    definitive business-logic decision), or any other exception at all
+    (AlpacaError is only ever raised from a definitive HTTP response --
+    network/timeout/DNS/connection failures never become one, they
+    propagate as raw httpx exceptions, and those are exactly the case where
+    Alpaca's actual acceptance of the order cannot be established from the
+    error alone). Ambiguous outcomes must go through the client-order-ID
+    recovery path, never straight to REJECTED or a blind resubmit."""
+    return isinstance(exc, AlpacaError) and exc.status_code != 429 and exc.status_code < 500
+
+
 def extract_request_id(response: httpx.Response) -> str | None:
     return response.headers.get("x-request-id")
 
