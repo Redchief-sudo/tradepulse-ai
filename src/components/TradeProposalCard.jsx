@@ -5,7 +5,6 @@ import { Button } from '@/components/ui/button';
 import RecommendationBadge from '@/components/RecommendationBadge';
 import MLScoreCard from '@/components/MLScoreCard';
 import CommitteeDebate from '@/components/CommitteeDebate';
-import ExecutionBreakdown from '@/components/ExecutionBreakdown';
 import CausalContagionGraph from '@/components/CausalContagionGraph';
 import { computePortfolioValue, computeSectorExposure, computeCappedPositionSize, formatCurrency } from '@/lib/portfolio';
 import { cn } from '@/lib/utils';
@@ -177,8 +176,7 @@ export default function TradeProposalCard({ proposal, index, isExecuted, isExecu
           <CommitteeDebate debate={proposal.committee_debate} />
         </div>
       )}
-      <div className="mb-3 space-y-2">
-        <ExecutionBreakdown proposal={proposal} />
+      <div className="mb-3">
         <CausalContagionGraph proposal={proposal} holdings={holdings} />
       </div>
 

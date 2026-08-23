@@ -23,7 +23,7 @@ describe('canonical opportunity contract', () => {
     expect(result).toMatchObject({ native_symbol: 'BTC-USD', canonical_symbol: 'BTCUSD', market_session: 'continuous', execution_capability: 'research_only', spread: 2 });
   });
 
-  it('marks crypto executable only when the caller declares that capability', () => {
+  it('marks crypto executable only when the caller declares that capability and the symbol is whitelisted', () => {
     const result = canonicalizeOpportunity(
       { asset_class: 'crypto', symbol: 'BTC-USD' },
       { price: 60000, quote_timestamp: Date.parse(receivedAt) / 1000, source: 'coinbase', venue: 'coinbase' },
@@ -32,6 +32,31 @@ describe('canonical opportunity contract', () => {
       ['crypto'],
     );
     expect(result.execution_capability).toBe('paper_executable');
+  });
+
+  it('keeps a non-whitelisted crypto symbol research-only even when the crypto capability is declared', () => {
+    // Regression guard: crypto previously had NO execution whitelist at all —
+    // any symbol was executable purely because 'crypto' was in
+    // executableAssetClasses. This must now stay research_only.
+    const result = canonicalizeOpportunity(
+      { asset_class: 'crypto', symbol: 'SHIB-USD' },
+      { price: 0.00002, quote_timestamp: Date.parse(receivedAt) / 1000, source: 'coinbase', venue: 'coinbase' },
+      receivedAt,
+      'paper',
+      ['crypto'],
+    );
+    expect(result.execution_capability).toBe('research_only');
+  });
+
+  it('keeps a whitelisted crypto symbol research-only when the crypto capability is not declared', () => {
+    const result = canonicalizeOpportunity(
+      { asset_class: 'crypto', symbol: 'BTC-USD' },
+      { price: 60000, quote_timestamp: Date.parse(receivedAt) / 1000, source: 'coinbase', venue: 'coinbase' },
+      receivedAt,
+      'paper',
+      [],
+    );
+    expect(result.execution_capability).toBe('research_only');
   });
 
   it.each([

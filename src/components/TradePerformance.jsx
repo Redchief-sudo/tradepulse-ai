@@ -19,31 +19,22 @@ export default function TradePerformance({ decisions }) {
     }
     setLoading(true);
     try {
+      // Real quotes via the same backend price endpoint StopLossScanner.jsx
+      // uses — not an LLM guess. Fixes a prior defect: this used to ask an
+      // LLM to "get the current stock prices," a hallucination-prone,
+      // non-authoritative source feeding a P&L figure shown to the user.
       const symbols = [...new Set(buyDecisions.map((d) => d.symbol))];
-      const result = await base44.integrations.Core.InvokeLLM({
-        prompt: `Get the current stock prices for these tickers: ${symbols.join(', ')}. Return accurate real-time prices.`,
-        add_context_from_internet: true,
-        model: 'gemini_3_flash',
-        response_json_schema: {
-          type: 'object',
-          properties: {
-            stocks: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  symbol: { type: 'string' },
-                  current_price: { type: 'number' },
-                },
-              },
-            },
-          },
-        },
-      });
+      const BATCH_SIZE = 40; // matches getMultiAssetQuotes/entry.ts's hard cap
       const prices = {};
-      (result.stocks || []).forEach((s) => {
-        prices[s.symbol.toUpperCase()] = s.current_price;
-      });
+      for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
+        const batch = symbols.slice(i, i + BATCH_SIZE);
+        const items = batch.map((symbol) => ({ symbol, asset_class: 'stocks' }));
+        const result = await base44.functions.invoke('getMultiAssetQuotes', { items });
+        const quotes = (result.data?.quotes || result.quotes || []).filter((q) => !q.error);
+        quotes.forEach((q) => {
+          prices[q.symbol.toUpperCase()] = q.price;
+        });
+      }
 
       const scored = buyDecisions.map((d) => {
         const current = prices[d.symbol.toUpperCase()] || d.price;

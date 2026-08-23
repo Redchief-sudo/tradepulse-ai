@@ -74,8 +74,14 @@ export function isTradeable(sessionState) {
 // Canonical execution-session guard. New exposure requires an explicitly
 // active, integrity-healthy session. Protective sells remain available while
 // stopped so risk can be reduced without reopening exposure.
+//
+// The financial-integrity and kill-switch checks are UNCONDITIONAL and run
+// FIRST — before the protective-exit/sell shortcut. (Fixes a prior defect:
+// `protectiveExit || side === 'sell'` used to short-circuit before these two
+// checks, so ANY sell — not just a genuine reduce-only exit — bypassed both
+// the kill switch and a financial-integrity block. The protective-exit
+// exemption must never override those two hard stops.)
 export function executionSessionDecision(user, side, assetClass = 'stocks', protectiveExit = false) {
-  if (protectiveExit || side === 'sell') return { allowed: true, reason: 'PROTECTIVE_EXIT_ALLOWED' };
   if (user?.financial_integrity_manual_reenable_required ||
       user?.trading_session_state === SESSION_STATES.FINANCIAL_INTEGRITY_BLOCKED) {
     return { allowed: false, reason: 'FINANCIAL_INTEGRITY_BLOCKED' };
@@ -83,6 +89,7 @@ export function executionSessionDecision(user, side, assetClass = 'stocks', prot
   if (user?.kill_switch_reset_required || user?.trading_session_state === SESSION_STATES.RISK_STOPPED) {
     return { allowed: false, reason: 'KILL_SWITCH_ACTIVE' };
   }
+  if (protectiveExit || side === 'sell') return { allowed: true, reason: 'PROTECTIVE_EXIT_ALLOWED' };
   if (user?.trading_active && user?.trading_session_state === SESSION_STATES.MARKET_CLOSED && String(assetClass).toLowerCase() === 'crypto') {
     return { allowed: true, reason: 'CONTINUOUS_ASSET_SESSION' };
   }

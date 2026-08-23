@@ -32,3 +32,18 @@ export function isExecutable(symbol) {
 export function filterExecutable(candidates) {
   return candidates.filter((c) => isExecutable(c.symbol));
 }
+
+// Crypto executable universe — a conservative, liquid-pair whitelist. Fixes a
+// prior defect: crypto candidates had NO whitelist at all (any crypto symbol
+// the LLM proposed was executable as long as the crypto asset class was
+// enabled), unlike equities/ETFs above.
+export const CRYPTO_EXECUTABLE_UNIVERSE = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'DOGE-USD', 'LTC-USD'];
+
+const CRYPTO_UNIVERSE_SET = new Set(CRYPTO_EXECUTABLE_UNIVERSE.map((s) => s.toUpperCase()));
+
+// Check if a crypto symbol is in the crypto executable universe. Kept as a
+// separate function (not an assetClass param on isExecutable) so the
+// existing equities call site is untouched.
+export function isExecutableCrypto(symbol) {
+  return CRYPTO_UNIVERSE_SET.has(String(symbol || '').toUpperCase());
+}

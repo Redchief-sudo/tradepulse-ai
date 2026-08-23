@@ -21,12 +21,13 @@
 //    (RLS-locked, service-role only) — never from the User object.
 
 import { placeAlpacaOrder, getAlpacaOrder, getAlpacaAccount, getAlpacaLatestQuote, normalizeAlpacaSymbol } from './alpaca.ts';
-import { evaluateRisk, riskLimitsForProfile, buildPortfolioSnapshot, checkDataFreshness, checkMaxDrawdown } from './riskEngine.ts';
+import { evaluateRisk, riskLimitsForProfile, buildPortfolioSnapshot, checkMaxDrawdown } from './riskEngine.ts';
 import { fetchQuote } from './marketDataAdapter.ts';
 import { isUsMarketOpen, usMarketSession } from './marketHours.ts';
 import { AlpacaError } from './alpacaErrors.ts';
 import { nowIso, genId } from './lotAccounting.ts';
 import { executionSessionDecision } from './sessionState.ts';
+import { reserveCash } from './cashLedger.ts';
 
 const FILL_TIMEOUT_MS = 20000;
 const POLL_INTERVAL_MS = 1000;
@@ -66,6 +67,31 @@ export function executionLifecycle(brokerStatus, settlementStatus) {
 
 export function defaultTimeInForce(assetClass = 'stocks') {
   return String(assetClass).toLowerCase() === 'crypto' ? 'gtc' : 'day';
+}
+
+// Classify a broker order-submission error into a TradeIntent rejection_reason.
+// Distinguishes insufficient-buying-power rejections from other broker errors
+// so they're identifiable in the TradeIntent record and audit log — fixes a
+// prior defect where AlpacaError.isInsufficientBuyingPower() was fully
+// implemented but had zero call sites anywhere in the codebase.
+export function classifyBrokerSubmitError(e) {
+  if (e instanceof AlpacaError && e.isInsufficientBuyingPower()) return 'BROKER_INSUFFICIENT_BUYING_POWER';
+  return `BROKER_SUBMIT_ERROR: ${e.message}`;
+}
+
+// Attempt a pre-trade internal_paper cash reservation, returning a plain
+// { ok, error } result rather than throwing — keeps the reservation-or-reject
+// decision testable in isolation from the rest of executeIntent. Fixes a
+// prior defect: reserveCash() (cashLedger.ts) was fully implemented but had
+// zero call sites anywhere in this file, so a buy could reach risk_approved
+// and a simulated fill with no pre-trade cash-sufficiency check at all.
+export async function attemptCashReservation(sr, userId, { symbol, tradeIntentId, portfolioId, amount }) {
+  try {
+    await reserveCash(sr, userId, { symbol, amount, trade_intent_id: tradeIntentId, portfolio_id: portfolioId || null });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
 function isTerminalFailure(status) {
@@ -520,6 +546,25 @@ export async function executeIntent(base44, user, input) {
 
   const approvedQty = risk.approvedQuantity;
   const estimatedNotional = approvedQty * refPrice;
+
+  // PRE-TRADE CASH CHECK — internal_paper only. broker_paper/live rely on
+  // Alpaca's own buying-power check at submission (see classifyBrokerSubmitError
+  // in the broker-submit catch block below).
+  if (side === 'buy' && executionMode === 'internal_paper') {
+    const reservationAmount = estimatedNotional + (input.commission || 0) + (input.fees || 0);
+    const reservation = await attemptCashReservation(sr, userId, {
+      symbol,
+      tradeIntentId,
+      portfolioId: intentRecord.portfolio_id || input.portfolio_id || null,
+      amount: reservationAmount,
+    });
+    if (!reservation.ok) {
+      await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: reservation.error });
+      await audit(sr, userId, 'order_rejected', 'warning', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Cash reservation rejected ${side} ${approvedQty} ${symbol}: ${reservation.error}`, details: { symbol, side, qty: approvedQty, error: reservation.error } });
+      return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: reservation.error, symbol, side, requestedQty: approvedQty };
+    }
+  }
+
   await sr.entities.TradeIntent.update(intentRecord.id, {
     status: 'risk_approved',
     requested_quantity: approvedQty,
@@ -676,7 +721,8 @@ export async function executeIntent(base44, user, input) {
       await audit(sr, userId, 'order_submitted', 'info', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Order ${brokerOrderId} accepted: ${side} ${approvedQty} ${symbol}`, details: { symbol, side, qty: approvedQty, broker_order_id: brokerOrderId } });
     } catch (e) {
       const errorDetail = e instanceof AlpacaError ? e.toAuditDetail() : { message: e.message };
-      await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: `BROKER_SUBMIT_ERROR: ${e.message}` });
+      const rejectionReason = classifyBrokerSubmitError(e);
+      await sr.entities.TradeIntent.update(intentRecord.id, { status: 'rejected', rejection_reason: rejectionReason });
       await audit(sr, userId, 'order_rejected', 'error', { correlation_id: tradeIntentId, entity_type: 'TradeIntent', entity_id: intentRecord.id, message: `Broker submit error: ${e.message}`, details: { ...errorDetail, symbol, side, qty: approvedQty } });
       return { status: 'rejected', intentId: intentRecord.id, trade_intent_id: tradeIntentId, error: e.message, symbol, side, requestedQty: approvedQty };
     }

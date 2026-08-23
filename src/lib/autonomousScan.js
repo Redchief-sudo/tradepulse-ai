@@ -530,23 +530,3 @@ Return the contagion path as an ordered array of nodes (root cause first, target
   });
 }
 
-// Predictive Algorithmic Execution — asset-specific order slicing (pure compute, no LLM)
-export function computeExecutionParams(proposal) {
-  const assetClass = proposal.asset_class || 'stocks';
-  const positionValue = proposal.position_value || (proposal.suggested_position_pct || 5) * 1000;
-  const base = {
-    stocks: { algorithm: 'VWAP', venue: 'Smart-router (NYSE/NASDAQ dark)', slices: Math.max(4, Math.round(positionValue / 25000)), latency: 'Medium', slippage: 0.08 },
-    crypto: { algorithm: 'TWAP + DEX routing', venue: 'CEX + on-chain DEX pools', slices: Math.max(6, Math.round(positionValue / 15000)), latency: 'Low', slippage: 0.15 },
-    forex: { algorithm: 'TWAP', venue: 'ECN (Hotspot/FXAll)', slices: Math.max(5, Math.round(positionValue / 50000)), latency: 'Low', slippage: 0.02 },
-    commodities: { algorithm: 'VWAP', venue: 'Futures + ETF smart-router', slices: Math.max(4, Math.round(positionValue / 30000)), latency: 'Medium', slippage: 0.10 },
-    fixed_income: { algorithm: 'TWAP', venue: 'Bond ETF + dealer RFQ', slices: Math.max(3, Math.round(positionValue / 50000)), latency: 'High', slippage: 0.05 },
-  };
-  const cfg = base[assetClass] || base.stocks;
-  return {
-    algorithm: cfg.algorithm,
-    venue: cfg.venue,
-    slice_count: cfg.slices,
-    latency_sensitivity: cfg.latency,
-    expected_slippage_pct: cfg.slippage,
-  };
-}

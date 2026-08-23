@@ -17,6 +17,41 @@ function headers(apiKey, secretKey) {
   };
 }
 
+const RETRY_DELAYS_MS = [250, 500, 1000];
+
+// Retry wrapper for read-only/idempotent GET calls only. Retries on network
+// errors and transient server-side failures (429 rate limit, 5xx) with a
+// short exponential backoff; never retries other 4xx responses (those are
+// business-logic rejections — bad params, auth failure, invalid order — that
+// must fail immediately, not be retried blindly).
+//
+// Deliberately NOT used for placeAlpacaOrder (a POST creating a new order —
+// retrying on an ambiguous failure risks submitting a duplicate order) or
+// cancelAlpacaOrder (left for a separate, later pass).
+export async function fetchWithRetry(url, options, { maxAttempts = 3 } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let res;
+    try {
+      res = await fetch(url, options);
+    } catch (e) {
+      lastError = e;
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt - 1]));
+        continue;
+      }
+      throw e;
+    }
+    if (res.ok || (res.status !== 429 && res.status < 500)) return res;
+    if (attempt < maxAttempts) {
+      await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt - 1]));
+      continue;
+    }
+    return res;
+  }
+  throw lastError;
+}
+
 export function normalizeAlpacaActivitySide(side) {
   const normalized = String(side || '').toLowerCase();
   if (normalized === 'buy' || normalized === 'buy_to_cover') return 'buy';
@@ -52,6 +87,7 @@ export function inferAlpacaAssetClass(symbol, declaredAssetClass = null) {
 // Submit an order. Respects order_type (market/limit/stop/stop_limit), limit_price,
 // stop_price, and time_in_force from the TradeIntent — no longer hardcodes market/day.
 // client_order_id provides idempotency so a retried submit cannot duplicate a fill.
+// Deliberately NOT wrapped in fetchWithRetry — see that helper's comment.
 export async function placeAlpacaOrder({ apiKey, secretKey, mode, symbol, qty, side, client_order_id, order_type = 'market', limit_price, stop_price, time_in_force = 'day' }) {
   const body = {
     symbol: String(symbol).toUpperCase(),
@@ -80,7 +116,7 @@ export async function placeAlpacaOrder({ apiKey, secretKey, mode, symbol, qty, s
 
 // Fetch the current state of an order — used to poll fills and detect rejections.
 export async function getAlpacaOrder({ apiKey, secretKey, mode }, orderId) {
-  const res = await fetch(`${baseUrl(mode)}/orders/${orderId}`, {
+  const res = await fetchWithRetry(`${baseUrl(mode)}/orders/${orderId}`, {
     headers: headers(apiKey, secretKey),
   });
   if (!res.ok) await throwAlpacaError(res, 'getOrder');
@@ -98,7 +134,7 @@ export async function getAlpacaOrders({ apiKey, secretKey, mode }, { limit = 10 
     direction: 'desc',
     nested: 'true',
   });
-  const res = await fetch(`${baseUrl(mode)}/orders?${params.toString()}`, {
+  const res = await fetchWithRetry(`${baseUrl(mode)}/orders?${params.toString()}`, {
     headers: headers(apiKey, secretKey),
   });
   if (!res.ok) await throwAlpacaError(res, 'getOrders');
@@ -108,7 +144,7 @@ export async function getAlpacaOrders({ apiKey, secretKey, mode }, { limit = 10 
 
 // Account state — authoritative equity / buying power / cash for position sizing.
 export async function getAlpacaAccount({ apiKey, secretKey, mode }) {
-  const res = await fetch(`${baseUrl(mode)}/account`, {
+  const res = await fetchWithRetry(`${baseUrl(mode)}/account`, {
     headers: headers(apiKey, secretKey),
   });
   if (!res.ok) await throwAlpacaError(res, 'getAccount');
@@ -120,7 +156,7 @@ export async function getAlpacaAccount({ apiKey, secretKey, mode }) {
 // reconciliation. This is a read-only snapshot; settlement remains the sole
 // owner of financial-ledger and Holding projection writes.
 export async function getAlpacaPositions({ apiKey, secretKey, mode }) {
-  const res = await fetch(`${baseUrl(mode)}/positions`, {
+  const res = await fetchWithRetry(`${baseUrl(mode)}/positions`, {
     headers: headers(apiKey, secretKey),
   });
   if (!res.ok) await throwAlpacaError(res, 'getPositions');
@@ -133,7 +169,7 @@ export async function getAlpacaPositions({ apiKey, secretKey, mode }) {
 // This is the authoritative source for whether the US regular session is open,
 // rather than relying on local time or cron schedules.
 export async function getAlpacaClock({ apiKey, secretKey, mode }) {
-  const res = await fetch(`${baseUrl(mode)}/clock`, {
+  const res = await fetchWithRetry(`${baseUrl(mode)}/clock`, {
     headers: headers(apiKey, secretKey),
   });
   if (!res.ok) await throwAlpacaError(res, 'getClock');
@@ -150,7 +186,7 @@ export async function getAlpacaLatestQuote({ apiKey, secretKey }, symbol, assetC
   const url = isCrypto
     ? `${DATA_BASE}/v1beta3/crypto/us/latest/quotes?symbols=${encodeURIComponent(normalized)}`
     : `${DATA_BASE}/v2/stocks/${encodeURIComponent(normalized)}/quotes/latest?feed=iex`;
-  const res = await fetch(url, { headers: headers(apiKey, secretKey) });
+  const res = await fetchWithRetry(url, { headers: headers(apiKey, secretKey) });
   if (!res.ok) await throwAlpacaError(res, 'getLatestQuote');
   const data = await res.json().catch(() => ({}));
   const quote = isCrypto ? data?.quotes?.[normalized] : data?.quote;
@@ -173,7 +209,7 @@ export async function getAlpacaCryptoBars({ apiKey, secretKey }, symbol, from, t
     limit: '1000',
     sort: 'asc',
   });
-  const res = await fetch(`${DATA_BASE}/v1beta3/crypto/us/bars?${params.toString()}`, { headers: headers(apiKey, secretKey) });
+  const res = await fetchWithRetry(`${DATA_BASE}/v1beta3/crypto/us/bars?${params.toString()}`, { headers: headers(apiKey, secretKey) });
   if (!res.ok) await throwAlpacaError(res, 'getCryptoBars');
   const data = await res.json().catch(() => ({}));
   const rows = data?.bars?.[normalized];
@@ -185,6 +221,9 @@ export async function getAlpacaCryptoBars({ apiKey, secretKey }, symbol, from, t
 }
 
 // Cancel an open order — used by the kill switch to cancel unfilled entry orders.
+// Deliberately NOT wrapped in fetchWithRetry for this pass — a duplicate
+// cancel is lower-risk than a duplicate order placement but not zero-risk
+// (could race a fill); left for a separate, later pass.
 export async function cancelAlpacaOrder({ apiKey, secretKey, mode }, orderId) {
   const res = await fetch(`${baseUrl(mode)}/orders/${orderId}`, {
     method: 'DELETE',
@@ -215,7 +254,7 @@ export async function getAlpacaActivities({
     if (pageSize) params.set('page_size', String(pageSize));
     if (direction) params.set('direction', direction);
     if (pageToken) params.set('page_token', pageToken);
-    const res = await fetch(`${baseUrl(mode)}/account/activities?${params.toString()}`, { headers: headers(apiKey, secretKey) });
+    const res = await fetchWithRetry(`${baseUrl(mode)}/account/activities?${params.toString()}`, { headers: headers(apiKey, secretKey) });
     if (!res.ok) await throwAlpacaError(res, 'getActivities');
     const data = await res.json().catch(() => []);
     const page = Array.isArray(data) ? data : [];

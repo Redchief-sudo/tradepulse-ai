@@ -34,20 +34,35 @@ describe('canonical execution session gate', () => {
     }, 'buy')).toEqual({ allowed: false, reason: 'KILL_SWITCH_ACTIVE' });
   });
 
-  it('allows protective sells while the session is blocked', () => {
+  it('rejects sells while financial integrity requires manual re-enable — the kill-switch/integrity hard stops are unconditional and run before the protective-exit shortcut', () => {
     expect(executionSessionDecision({
       trading_active: false,
       trading_session_state: 'financial_integrity_blocked',
       financial_integrity_manual_reenable_required: true,
-    }, 'sell')).toEqual({ allowed: true, reason: 'PROTECTIVE_EXIT_ALLOWED' });
+    }, 'sell')).toEqual({ allowed: false, reason: 'FINANCIAL_INTEGRITY_BLOCKED' });
   });
 
-  it('allows an explicitly classified buy-to-cover while integrity is blocked', () => {
+  it('rejects an explicitly classified buy-to-cover while integrity is blocked', () => {
     expect(executionSessionDecision({
       trading_active: false,
       trading_session_state: 'financial_integrity_blocked',
       financial_integrity_manual_reenable_required: true,
-    }, 'buy', 'stocks', true)).toEqual({ allowed: true, reason: 'PROTECTIVE_EXIT_ALLOWED' });
+    }, 'buy', 'stocks', true)).toEqual({ allowed: false, reason: 'FINANCIAL_INTEGRITY_BLOCKED' });
+  });
+
+  it('rejects sells while the kill switch requires reset — not just buys', () => {
+    expect(executionSessionDecision({
+      trading_active: false,
+      trading_session_state: 'risk_stopped',
+      kill_switch_reset_required: true,
+    }, 'sell')).toEqual({ allowed: false, reason: 'KILL_SWITCH_ACTIVE' });
+  });
+
+  it('still allows protective sells during a plain inactive/market-closed state (not integrity- or kill-switch-blocked)', () => {
+    expect(executionSessionDecision({
+      trading_active: false,
+      trading_session_state: 'manually_stopped',
+    }, 'sell')).toEqual({ allowed: true, reason: 'PROTECTIVE_EXIT_ALLOWED' });
   });
 
   it('allows crypto but not equities after the US market closes', () => {

@@ -75,6 +75,12 @@ export default function StopLossScanner({ holdings, stopLossPct, onStopLossPctCh
           : 0;
         if (dropPct >= localPct) {
           try {
+            // Same derivation as the backend's hourly runStopLossCycle
+            // (base44/functions/runStopLossCycle/entry.ts) — intentional
+            // collision so a manual click and the scheduled cron dedupe
+            // against each other for the same holding within the same
+            // clock hour, instead of each independently submitting a sell.
+            const idempotencyKey = `sl-${h.portfolio_id || 'default'}-${h.id}-${h.symbol}-${new Date().toISOString().slice(0, 13)}`;
             const result = await base44.functions.invoke('executeTrade', {
               symbol: h.symbol,
               action: isShort ? 'buy' : 'sell',
@@ -84,6 +90,8 @@ export default function StopLossScanner({ holdings, stopLossPct, onStopLossPctCh
               ai_recommended: true,
               source: 'stoploss_ui',
               notes: `Auto stop-loss triggered at -${dropPct.toFixed(1)}% (threshold: ${localPct}%)`,
+              idempotency_key: idempotencyKey,
+              signal_timestamp: new Date().toISOString(),
             });
             if (result?.data?.financially_complete === true) {
               executed.push({ ...h, current_price: livePrice, dropPct });

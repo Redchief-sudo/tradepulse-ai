@@ -34,12 +34,12 @@ const PILLARS = [
   },
   {
     icon: Brain,
-    title: 'Hybrid ML Architectures',
+    title: 'Multi-Pass LLM Committee',
     color: 'text-accent',
     items: [
-      { label: 'Transformer — time-series + NLP sentiment (Pass 1)', status: 'active' },
-      { label: 'RL / Deep Q-Network — execution & sizing (Pass 2)', status: 'active' },
-      { label: 'Graph Neural Network — sector contagion (Pass 3)', status: 'active' },
+      { label: 'Gemini 3.1 Pro — multi-asset market scan (Pass 1)', status: 'active' },
+      { label: 'Claude Sonnet — LLM committee panel assessment (Pass 2)', status: 'active' },
+      { label: 'Claude Sonnet — portfolio-fit & correlation assessment (Pass 3)', status: 'active' },
     ],
   },
   {
@@ -72,7 +72,7 @@ const ELITE_PILLARS = [
     color: 'text-violet-400',
     items: [
       { label: 'Continuous online learning', status: 'active' },
-      { label: 'Hidden Markov Model regime detection', status: 'active' },
+      { label: 'Deterministic regime classifier (RSI + realized volatility + trend slope)', status: 'active' },
       { label: 'Dynamic sub-model switching', status: 'active' },
     ],
   },
@@ -81,7 +81,7 @@ const ELITE_PILLARS = [
     title: 'Generative AI Simulation',
     color: 'text-blue-400',
     items: [
-      { label: 'GAN synthetic time-series generation', status: 'active' },
+      { label: 'LLM-generated synthetic stress scenarios', status: 'active' },
       { label: 'Black-swan stress-test scenarios', status: 'active' },
       { label: 'Pre-computed execution playbooks', status: 'active' },
     ],
@@ -119,7 +119,7 @@ const ROADMAP = [
 
 const BENCHMARK = [
   { feature: 'Data Ingestion', outstanding: 'News sentiment + historical ticks', elite: 'Live Level 3 order-book queues', ours: 'Multi-modal web search' },
-  { feature: 'Adaptability', outstanding: 'Suffers in market crashes', elite: 'Profits via regime detection', ours: 'HMM regime detection active' },
+  { feature: 'Adaptability', outstanding: 'Suffers in market crashes', elite: 'Profits via regime detection', ours: 'Deterministic regime classifier active' },
   { feature: 'Hardware', outstanding: 'Cloud GPU instances', elite: 'Co-located FPGA chips', ours: 'Cloud (FPGA planned)' },
   { feature: 'Execution', outstanding: 'Simple broker API', elite: 'Kernel-bypass sub-μs', ours: 'Paper (Builder+ for live)' },
   { feature: 'Simulations', outstanding: 'Backtests on past data', elite: 'Millions of GAN scenarios', ours: 'Synthetic stress tests' },

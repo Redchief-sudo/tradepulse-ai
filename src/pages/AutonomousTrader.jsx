@@ -1,43 +1,26 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { base44 } from '@/api/base44Client';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
 import {
-  Zap,
-  Loader2,
-  Brain,
   TrendingUp,
   TrendingDown,
   History,
-  Sparkles,
-  ChevronDown,
-  ChevronUp,
-  Shield,
-  Activity,
   Cpu,
   Layers,
-  Play,
-  AlertTriangle,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import TradePerformance from '@/components/TradePerformance';
-import TradeProposalCard from '@/components/TradeProposalCard';
-import CandidateCard from '@/components/CandidateCard';
 import StopLossScanner from '@/components/StopLossScanner';
-import { runPass1, runPass2, runPass3, runAdversarialReview, runCommitteeDebate } from '@/lib/autonomousScan';
-import {
-  computePortfolioValue,
-  computeSectorExposure,
-  computeCappedPositionSize,
-  formatCurrency,
-} from '@/lib/portfolio';
+import TradingSessionControl from '@/components/TradingSessionControl';
+import ScanRunStatus from '@/components/ScanRunStatus';
+import { formatCurrency } from '@/lib/portfolio';
 import { cn } from '@/lib/utils';
-import { getProfile, profileParams } from '@/lib/tradeProfiles';
+import { getProfile } from '@/lib/tradeProfiles';
 import ActiveProfileBanner from '@/components/ActiveProfileBanner';
 import ArchitectureOverview from '@/components/ArchitectureOverview';
 import RegimeBanner from '@/components/RegimeBanner';
 import StressTestSimulator from '@/components/StressTestSimulator';
 import BacktestPanel from '@/components/BacktestPanel';
-import AssetClassSelector from '@/components/AssetClassSelector';
 import SelfLearningMemory from '@/components/SelfLearningMemory';
 import OutcomeAnalytics from '@/components/OutcomeAnalytics';
 
@@ -52,37 +35,22 @@ function timeAgo(date) {
   return `${Math.floor(hrs / 24)}d ago`;
 }
 
-const SCAN_STAGES = [
-  { key: 'pass1', label: 'Pass 1: Multi-asset market scan', model: 'Gemini 3.1 Pro · Transformer' },
-  { key: 'pass2', label: 'Pass 2: LLM panel assessment', model: 'Claude Sonnet · Prompted archetypes' },
-  { key: 'pass3', label: 'Pass 3: LLM portfolio-fit assessment', model: 'Claude Sonnet · Structured analysis' },
-  { key: 'pass4', label: 'Pass 4: Multi-factor composite scoring', model: 'Deterministic weighted formula' },
-  { key: 'pass5', label: 'Pass 5: LLM risk review', model: 'Claude Sonnet · Prompted review' },
-];
-
+// NOTE: this page no longer runs its own client-side scan/execute pipeline.
+// All autonomous scanning and execution is coordinator-driven — this page
+// only queues a scan request (via TradingSessionControl / useStartTrader)
+// and displays the coordinator's persisted results (ScanRunStatus, Decision
+// History, AI Track Record). Fixes a prior defect: this page used to run a
+// separate, client-side 5-pass LLM pipeline and call executeTrade directly,
+// bypassing the ScanRequest queue, the coordinator's lock, and the autonomy
+// gate (user.trading_active) entirely.
 export default function AutonomousTrader() {
-  const [scanning, setScanning] = useState(false);
-  const [scanStageIndex, setScanStageIndex] = useState(-1);
-  const [executing, setExecuting] = useState(false);
-  const [fullCycle, setFullCycle] = useState(false);
-  const [marketSummary, setMarketSummary] = useState('');
-  const [riskAssessment, setRiskAssessment] = useState('');
-  const [candidates, setCandidates] = useState([]);
-  const [proposals, setProposals] = useState([]);
   const [holdings, setHoldings] = useState([]);
   const [decisions, setDecisions] = useState([]);
-  const [executedIds, setExecutedIds] = useState(new Set());
-  const [showCandidates, setShowCandidates] = useState(false);
   const [stopLossPct, setStopLossPct] = useState(8);
   const [tradeProfile, setTradeProfile] = useState('balanced');
-  const [filteredCount, setFilteredCount] = useState(0);
   const [showArchitecture, setShowArchitecture] = useState(false);
   const [marketRegime, setMarketRegime] = useState(null);
-  const [vetoedCount, setVetoedCount] = useState(0);
-  const [assetClasses, setAssetClasses] = useState([]);
   const [mlWeights, setMlWeights] = useState(null);
-  const [broker, setBroker] = useState(null);
-  const [scanError, setScanError] = useState(null);
 
   const loadData = useCallback(async () => {
     try {
@@ -95,7 +63,16 @@ export default function AutonomousTrader() {
       setDecisions(d || []);
       if (me.stop_loss_pct) setStopLossPct(me.stop_loss_pct);
       if (me.trade_profile) setTradeProfile(me.trade_profile);
-      if (me.broker === 'alpaca' && me.broker_api_key) setBroker({ mode: me.broker_mode || 'paper' });
+    } catch (e) {
+      console.error(e);
+    }
+  }, []);
+
+  const loadRegime = useCallback(async () => {
+    try {
+      const response = await base44.functions.invoke('getMarketRegime', {});
+      const data = response?.data || response;
+      if (data?.ok) setMarketRegime(data.regime);
     } catch (e) {
       console.error(e);
     }
@@ -103,7 +80,8 @@ export default function AutonomousTrader() {
 
   useEffect(() => {
     loadData();
-  }, [loadData]);
+    loadRegime();
+  }, [loadData, loadRegime]);
 
   const saveStopLossPct = async (pct) => {
     setStopLossPct(pct);
@@ -113,171 +91,6 @@ export default function AutonomousTrader() {
       console.error(e);
     }
   };
-
-  const runScan = async () => {
-    setScanning(true);
-    setProposals([]);
-    setCandidates([]);
-    setMarketSummary('');
-    setRiskAssessment('');
-    setExecutedIds(new Set());
-    setMarketRegime(null);
-    setVetoedCount(0);
-    setScanError(null);
-
-    try {
-      setScanStageIndex(0);
-      const p1 = await runPass1(holdings, assetClasses);
-      setMarketSummary(p1.market_summary || '');
-      setCandidates(p1.candidates || []);
-      setMarketRegime({
-        market_regime: p1.market_regime,
-        regime_confidence: p1.regime_confidence,
-        regime_strategy: p1.regime_strategy,
-      });
-      const candidateMap = {};
-      (p1.candidates || []).forEach((c) => { candidateMap[c.symbol.toUpperCase()] = c; });
-
-      // Pass 2: prompted LLM panel assessment (four requested archetypes)
-      setScanStageIndex(1);
-      const committee = await runCommitteeDebate(p1.candidates || []);
-      const debateMap = {};
-      (committee.debates || []).forEach((d) => { debateMap[d.symbol.toUpperCase()] = d; });
-      const consensusCandidates = (p1.candidates || []).filter(
-        (c) => debateMap[c.symbol.toUpperCase()]?.consensus
-      );
-
-      // Pass 3: Portfolio fit + cross-asset correlation
-      setScanStageIndex(2);
-      const pp = profileParams(tradeProfile);
-      const p2 = await runPass2(holdings, consensusCandidates, pp, p1);
-      setRiskAssessment(p2.risk_assessment || '');
-
-      // Pass 4: ML scoring with self-learning weights
-      setScanStageIndex(3);
-      const p3 = await runPass3(p2.proposals || [], consensusCandidates, mlWeights);
-      const scoreMap = {};
-      (p3.scores || []).forEach((s) => { scoreMap[s.symbol.toUpperCase()] = s; });
-      let merged = (p2.proposals || []).map((p) => ({
-        ...p,
-        asset_class: candidateMap[p.symbol.toUpperCase()]?.asset_class || 'stocks',
-        microstructure_signal: candidateMap[p.symbol.toUpperCase()]?.microstructure_signal,
-        committee_debate: debateMap[p.symbol.toUpperCase()],
-        ...(scoreMap[p.symbol.toUpperCase()] || {}),
-      }));
-
-      // Apply institutional confidence threshold + daily trade cap
-      const compliant = merged.filter((p) => (p.confidence || 0) >= pp.min_confidence);
-      setFilteredCount(merged.length - compliant.length);
-      merged = compliant.slice(0, pp.max_daily_trades);
-
-      // Pass 5: Adversarial Risk Officer veto layer
-      setScanStageIndex(4);
-      const adv = await runAdversarialReview(merged, holdings, p1);
-      const reviewMap = {};
-      (adv.reviews || []).forEach((r) => { reviewMap[r.symbol.toUpperCase()] = r; });
-      merged = merged.map((p) => ({
-        ...p,
-        adversarial_verdict: reviewMap[p.symbol.toUpperCase()]?.verdict || 'approved',
-        adversarial_note: reviewMap[p.symbol.toUpperCase()]?.note || '',
-      }));
-      const vetoed = merged.filter((p) => p.adversarial_verdict === 'vetoed');
-      setVetoedCount(vetoed.length);
-      const finalProposals = merged.filter((p) => p.adversarial_verdict !== 'vetoed');
-      setProposals(finalProposals);
-      return finalProposals;
-    } catch (e) {
-      console.error(e);
-      setScanError(e?.message || String(e) || 'Scan failed');
-      return [];
-    } finally {
-      setScanStageIndex(-1);
-      setScanning(false);
-    }
-  };
-
-  const executeProposal = async (proposal, index) => {
-    const portfolioValue = computePortfolioValue(holdings);
-    const sectorData = computeSectorExposure(holdings);
-    const currentSectorValue =
-      sectorData.sectors.find((s) => s.sector === (proposal.sector || 'Other'))?.value || 0;
-    const pp = profileParams(tradeProfile);
-
-    let qty;
-    if (proposal.action === 'buy') {
-      const sized = computeCappedPositionSize(
-        proposal.suggested_position_pct || 10,
-        proposal.current_price,
-        portfolioValue,
-        currentSectorValue,
-        pp.max_sector_pct / 100,
-        pp.max_position_pct / 100
-      );
-      qty = sized.shares;
-    } else {
-      const existing = holdings.find((h) => h.symbol === proposal.symbol);
-      qty = existing ? Math.min(proposal.shares || existing.shares, existing.shares) : 0;
-    }
-    if (qty <= 0) return;
-
-    // Single canonical execution boundary: the backend validates, submits to the
-    // broker, polls the fill, and settles accounting atomically. A rejected broker
-    // order returns non-2xx and mutates NOTHING — no silent paper downgrade.
-    try {
-      const result = await base44.functions.invoke('executeTrade', {
-        symbol: proposal.symbol,
-        action: proposal.action,
-        qty,
-        price: proposal.current_price,
-        company_name: proposal.company_name,
-        sector: proposal.sector,
-        confidence: proposal.confidence,
-        target_price: proposal.target_price,
-        stop_loss: proposal.stop_loss,
-        ai_recommended: true,
-        source: 'autonomous_ui',
-        reasoning: proposal.reasoning,
-        ml_score: proposal.ml_score,
-        technical_score: proposal.technical_score,
-        momentum_score: proposal.momentum_score,
-        risk_score: proposal.risk_score,
-        recordDecision: true,
-      });
-      if (result?.data?.financially_complete === true) {
-        setExecutedIds((prev) => new Set([...prev, index]));
-      }
-    } catch (e) {
-      console.error('Trade execution failed:', e);
-    }
-  };
-
-  const executeAll = async (proposalList) => {
-    const list = proposalList || proposals;
-    setExecuting(true);
-    for (let i = 0; i < list.length; i++) {
-      if (!executedIds.has(i)) {
-        await executeProposal(list[i], i);
-      }
-    }
-    await loadData();
-    setExecuting(false);
-  };
-
-  // Start Trader — runs the full autonomous cycle in one click:
-  // 5-pass AI scan → auto-execute all approved proposals → refresh portfolio.
-  const startFullCycle = async () => {
-    setFullCycle(true);
-    try {
-      const scannedProposals = await runScan();
-      if (scannedProposals && scannedProposals.length > 0) {
-        await executeAll(scannedProposals);
-      }
-    } finally {
-      setFullCycle(false);
-    }
-  };
-
-  const pendingCount = proposals.filter((_, i) => !executedIds.has(i)).length;
 
   return (
     <div className="p-4 md:p-8 pb-24 md:pb-8 max-w-7xl mx-auto">
@@ -290,74 +103,25 @@ export default function AutonomousTrader() {
             </span>
           </h1>
           <p className="text-muted-foreground text-sm mt-1">
-            3-pass AI: Gemini 3.1 Pro scan → Claude Sonnet 5 fit → ML multi-factor scoring
+            Coordinator-driven: scans run on a schedule (or on demand via Start Trading below) and
+            execute automatically once approved — this page monitors the results.
           </p>
         </div>
-        <div className="flex gap-2 flex-wrap">
-          <Button
-            onClick={() => setShowArchitecture(!showArchitecture)}
-            variant="outline"
-            size="sm"
-            className="gap-1.5"
-          >
-            <Layers className="w-4 h-4" />
-            {showArchitecture ? 'Hide' : 'Architecture'}
-          </Button>
-          {proposals.length > 0 && pendingCount > 0 && !fullCycle && (
-            <Button
-              onClick={executeAll}
-              disabled={executing}
-              className="gap-2 bg-gradient-to-r from-primary to-accent"
-            >
-              {executing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
-              Execute All ({pendingCount})
-            </Button>
-          )}
-          <Button
-            onClick={startFullCycle}
-            disabled={fullCycle || scanning || executing}
-            className="gap-2 bg-gradient-to-r from-primary to-accent"
-          >
-            {fullCycle ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-            {fullCycle ? 'Trading...' : 'Start Trader'}
-          </Button>
-          <Button
-            onClick={runScan}
-            disabled={scanning || fullCycle}
-            variant={scanning ? 'secondary' : 'default'}
-            className="gap-2"
-          >
-            {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Brain className="w-4 h-4" />}
-            {scanning ? 'Scanning...' : 'Run Market Scan'}
-          </Button>
-        </div>
+        <Button
+          onClick={() => setShowArchitecture(!showArchitecture)}
+          variant="outline"
+          size="sm"
+          className="gap-1.5"
+        >
+          <Layers className="w-4 h-4" />
+          {showArchitecture ? 'Hide' : 'Architecture'}
+        </Button>
       </div>
 
-      {/* Scan error feedback — surfaces why Start Trader produced nothing */}
-      {!scanning && scanError && (
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="rounded-2xl border border-red-500/30 bg-red-500/10 p-5 mb-6"
-        >
-          <div className="flex items-start gap-3">
-            <AlertTriangle className="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" />
-            <div className="min-w-0">
-              <h3 className="font-semibold text-red-500 mb-1">Scan failed to complete</h3>
-              <p className="text-sm text-muted-foreground break-words">
-                {scanError}
-              </p>
-              <p className="text-xs text-muted-foreground mt-2">
-                This is usually a credit limit, network, or LLM service issue. Check the browser
-                console for details, then try again. If you just connected Alpaca, the scan runs
-                AI passes first — broker keys are only used when executing the resulting trades.
-              </p>
-            </div>
-          </div>
-        </motion.div>
-      )}
-
-      <AssetClassSelector value={assetClasses} onChange={setAssetClasses} />
+      {/* Single coordinated start/stop control — same component and same
+          ScanRequest-queuing flow as the Dashboard. There is no longer a
+          separate, page-local trading trigger. */}
+      <TradingSessionControl onStart={loadData} onComplete={loadData} />
 
       <StopLossScanner
         holdings={holdings}
@@ -367,16 +131,17 @@ export default function AutonomousTrader() {
       />
 
       {/* Active risk profile */}
-      <ActiveProfileBanner profile={getProfile(tradeProfile)} filteredCount={filteredCount} />
+      <ActiveProfileBanner profile={getProfile(tradeProfile)} />
 
-      {/* Market regime detection */}
-      {marketRegime && <RegimeBanner regime={marketRegime} vetoedCount={vetoedCount} />}
+      {/* Market regime detection — real deterministic classification, not
+          pipeline output */}
+      {marketRegime && <RegimeBanner regime={marketRegime} />}
 
       {/* Institutional architecture overview */}
       {showArchitecture && <ArchitectureOverview onClose={() => setShowArchitecture(false)} />}
 
       {/* Generative stress-test simulation */}
-      {holdings.length > 0 && !scanning && <StressTestSimulator holdings={holdings} />}
+      {holdings.length > 0 && <StressTestSimulator holdings={holdings} />}
 
       {/* Self-learning model memory */}
       <SelfLearningMemory decisions={decisions} onWeights={setMlWeights} />
@@ -384,157 +149,11 @@ export default function AutonomousTrader() {
       {/* Deterministic strategy backtest + walk-forward */}
       <BacktestPanel />
 
-      {/* Scanning state with pass indicators */}
-      {scanning && (
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          className="rounded-2xl border border-accent/30 bg-gradient-to-br from-accent/10 to-primary/5 p-6 md:p-8 mb-6"
-        >
-          <div className="flex items-center gap-3 mb-4">
-            <motion.div
-              animate={{ scale: [1, 1.1, 1], opacity: [0.7, 1, 0.7] }}
-              transition={{ duration: 2, repeat: Infinity }}
-              className="w-12 h-12 rounded-xl bg-gradient-to-br from-accent to-primary flex items-center justify-center glow-accent"
-            >
-              <Brain className="w-6 h-6 text-white" />
-            </motion.div>
-            <div>
-              <h3 className="font-semibold">
-                {scanStageIndex >= 0 ? SCAN_STAGES[scanStageIndex].label : 'Initializing...'}
-              </h3>
-              <p className="text-xs text-muted-foreground">
-                {scanStageIndex >= 0 && `Model: ${SCAN_STAGES[scanStageIndex].model}`}
-              </p>
-            </div>
-          </div>
-          <div className="flex gap-2">
-            {SCAN_STAGES.map((s, i) => (
-              <div key={s.key} className="flex-1">
-                <div
-                  className={cn(
-                    'h-1.5 rounded-full transition-all',
-                    i < scanStageIndex
-                      ? 'bg-emerald-500'
-                      : i === scanStageIndex
-                      ? 'bg-accent animate-pulse'
-                      : 'bg-muted'
-                  )}
-                />
-                <p
-                  className={cn(
-                    'text-xs mt-1.5 transition-colors hidden md:block',
-                    i <= scanStageIndex ? 'text-foreground' : 'text-muted-foreground'
-                  )}
-                >
-                  {s.label.replace(/Pass \d: /, '')}
-                </p>
-              </div>
-            ))}
-          </div>
-        </motion.div>
-      )}
-
-      {/* Market summary */}
-      {!scanning && marketSummary && (
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="rounded-2xl border border-border bg-card p-5 mb-4"
-        >
-          <div className="flex items-center gap-2 mb-2">
-            <Sparkles className="w-4 h-4 text-accent" />
-            <h3 className="font-semibold text-sm">AI Market Summary</h3>
-          </div>
-          <p className="text-sm text-muted-foreground leading-relaxed">{marketSummary}</p>
-        </motion.div>
-      )}
-
-      {/* Risk assessment */}
-      {!scanning && riskAssessment && (
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="rounded-2xl border border-primary/20 bg-primary/5 p-5 mb-6"
-        >
-          <div className="flex items-center gap-2 mb-2">
-            <Shield className="w-4 h-4 text-primary" />
-            <h3 className="font-semibold text-sm">Risk Assessment & Rebalancing</h3>
-          </div>
-          <p className="text-sm text-muted-foreground leading-relaxed">{riskAssessment}</p>
-        </motion.div>
-      )}
-
-      {/* Candidates deep scan (collapsible) */}
-      {!scanning && candidates.length > 0 && (
-        <div className="mb-6">
-          <button
-            onClick={() => setShowCandidates(!showCandidates)}
-            className="flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors mb-3"
-          >
-            <Activity className="w-4 h-4" />
-            Deep Scan: {candidates.length} Candidates Analyzed
-            {showCandidates ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-          </button>
-          <AnimatePresence>
-            {showCandidates && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: 'auto' }}
-                exit={{ opacity: 0, height: 0 }}
-                className="overflow-hidden space-y-3"
-              >
-                {candidates.map((c, i) => (
-                  <CandidateCard key={i} candidate={c} index={i} />
-                ))}
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </div>
-      )}
-
-      {/* Trade proposals with multi-factor composite scores */}
-      {!scanning && proposals.length > 0 && (
-        <div className="space-y-4 mb-8">
-          <AnimatePresence>
-            {proposals.map((p, i) => (
-              <TradeProposalCard
-                key={i}
-                proposal={p}
-                index={i}
-                isExecuted={executedIds.has(i)}
-                isExecuting={executing}
-                holdings={holdings}
-                onExecute={executeProposal}
-              />
-            ))}
-          </AnimatePresence>
-        </div>
-      )}
-
-      {/* Empty state */}
-      {!scanning && proposals.length === 0 && decisions.length === 0 && (
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          className="rounded-2xl border border-border bg-card p-12 text-center mb-8"
-        >
-          <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-accent to-primary flex items-center justify-center mx-auto mb-4 glow-accent">
-            <Brain className="w-8 h-8 text-white" />
-          </div>
-          <h3 className="text-lg font-semibold mb-2">ML-Powered Autonomous Trading</h3>
-          <p className="text-muted-foreground text-sm mb-6 max-w-md mx-auto">
-            Three AI passes work together: Gemini 3.1 Pro scans the market with real-time data and
-            full technicals, Claude Sonnet 5 fits trades to your portfolio with risk-aware sizing,
-            then a multi-factor ML engine scores each trade across technical, fundamental,
-            sentiment, momentum, and risk factors.
-          </p>
-          <Button onClick={startFullCycle} disabled={fullCycle} className="gap-2 bg-gradient-to-r from-primary to-accent">
-            {fullCycle ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-            {fullCycle ? 'Starting...' : 'Start Trader'}
-          </Button>
-        </motion.div>
-      )}
+      {/* Coordinator scan status — authoritative persisted ScanRun/ScanRequest
+          state, not client-held pipeline state */}
+      <div className="mb-6">
+        <ScanRunStatus />
+      </div>
 
       {/* AI Track Record */}
       {decisions.length > 0 && <TradePerformance decisions={decisions} />}

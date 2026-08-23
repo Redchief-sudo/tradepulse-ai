@@ -1,4 +1,4 @@
-import { isExecutable } from './executableUniverse.ts';
+import { isExecutable, isExecutableCrypto } from './executableUniverse.ts';
 
 export const EXECUTION_CAPABILITIES = ['research_only', 'paper_executable', 'live_executable', 'unsupported'] as const;
 
@@ -39,7 +39,7 @@ export function canonicalizeOpportunity(candidate: any, quote: any, receivedAt: 
   const fresh = observationAgeMs >= 0 && observationAgeMs <= freshnessLimitMs;
   const hasAuthoritativeQuote = !quote?.error && Number(quote?.price) > 0 && Boolean(providerTimestamp) && fresh;
   const equityLikeEtf = (assetClass === 'commodities' || assetClass === 'fixed_income') && !nativeSymbol.includes('=') && isExecutable(nativeSymbol);
-  const explicitlyExecutable = (assetClass === 'crypto' && executableAssetClasses.includes('crypto'))
+  const explicitlyExecutable = (assetClass === 'crypto' && executableAssetClasses.includes('crypto') && isExecutableCrypto(nativeSymbol))
     || ((assetClass === 'equities' || equityLikeEtf) && isExecutable(nativeSymbol));
   let executionCapability = 'unsupported';
   if (hasAuthoritativeQuote) {
