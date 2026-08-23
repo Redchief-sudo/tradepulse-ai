@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS scan_runs (
 CREATE TABLE IF NOT EXISTS equity_snapshots (
   record_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ai_responses (
+  record_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS locks (
   lock_key TEXT PRIMARY KEY, owner_token TEXT NOT NULL,
   acquired_at TEXT NOT NULL, expires_at TEXT NOT NULL, command TEXT NOT NULL

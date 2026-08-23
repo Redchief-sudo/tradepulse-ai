@@ -14,7 +14,7 @@ from .hydration import hydrate
 TABLES = {
     "opportunities", "trade_intents", "orders", "fills", "settlements", "holdings",
     "position_lots", "cash_ledger", "pnl_records", "reconciliation_records",
-    "trading_sessions", "audit_events", "scan_runs", "equity_snapshots",
+    "trading_sessions", "audit_events", "scan_runs", "equity_snapshots", "ai_responses",
 }
 STATUS_TABLES = {"trade_intents", "orders", "settlements", "trading_sessions", "scan_runs"}
 UNIQUE_FIELDS = {
@@ -228,6 +228,7 @@ class PersistenceRepositories:
     audit_events: RecordRepository
     scan_runs: RecordRepository
     equity_snapshots: RecordRepository
+    ai_responses: RecordRepository
 
     @classmethod
     def create(cls, database: AsyncSQLiteDatabase) -> PersistenceRepositories:

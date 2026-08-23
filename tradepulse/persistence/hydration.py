@@ -19,6 +19,7 @@ from decimal import Decimal
 from typing import Any
 
 from tradepulse.models import (
+    AIResponse,
     AssetClass,
     AssetIdentity,
     AuditEvent,
@@ -331,6 +332,18 @@ def decode_equity_snapshot(d: Mapping[str, Any]) -> PortfolioSnapshot:
     )
 
 
+def decode_ai_response(d: Mapping[str, Any]) -> AIResponse:
+    return AIResponse(
+        request_id=d["request_id"],
+        provider=d["provider"],
+        model=d["model"],
+        schema_version=d["schema_version"],
+        completed_at=_datetime(d["completed_at"]),
+        result=d.get("result") or {},
+        latency_ms=d["latency_ms"],
+    )
+
+
 register("opportunities", decode_opportunity)
 register("trade_intents", decode_trade_intent)
 register("orders", decode_order)
@@ -345,3 +358,4 @@ register("trading_sessions", decode_trading_session)
 register("audit_events", decode_audit_event)
 register("scan_runs", decode_scan_run)
 register("equity_snapshots", decode_equity_snapshot)
+register("ai_responses", decode_ai_response)

@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from tradepulse.models import (
+    AIResponse,
     AssetClass,
     AssetIdentity,
     AuditEvent,
@@ -150,3 +151,12 @@ def test_equity_snapshot_roundtrips() -> None:
         {"technology": Decimal("2500"), "crypto": Decimal("4000.25")}, 3, 1, 2, Decimal("0.75"), "broker",
     )
     assert roundtrip("equity_snapshots", original) == original
+
+
+def test_ai_response_roundtrips() -> None:
+    original = AIResponse(
+        request_id="req-1", provider="anthropic", model="claude-haiku-4-5-20251001", schema_version="1.0",
+        completed_at=NOW, result={"candidates": [{"symbol": "AAPL", "recommendation": "BUY", "confidence": 82.0, "summary": "ok"}]},
+        latency_ms=420,
+    )
+    assert roundtrip("ai_responses", original) == original

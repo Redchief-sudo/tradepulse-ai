@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from tradepulse.models import AssetClass, AssetIdentity, Holding
+from tradepulse.models import AIResponse, AssetClass, AssetIdentity, Holding
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 
 
@@ -59,3 +59,19 @@ async def test_delete_is_rejected_on_append_only_tables(tmp_path) -> None:
         await repositories.settlements.delete("settlement-1")
     with pytest.raises(ValueError, match="delete is not permitted"):
         await repositories.trade_intents.delete("intent-1")
+
+
+async def test_ai_response_persists_for_audit_trail(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    response = AIResponse(
+        request_id="req-1", provider="anthropic", model="claude-haiku-4-5-20251001", schema_version="1.0",
+        completed_at=NOW, result={"candidates": []}, latency_ms=250,
+    )
+    assert await repositories.ai_responses.create_once("req-1", response)
+
+    row = await repositories.ai_responses.get("req-1")
+    assert row is not None
+    assert hydrate("ai_responses", row["payload"]) == response
+
+    # A retried scan with the same request_id must not duplicate the audit row.
+    assert await repositories.ai_responses.create_once("req-1", response) is False
