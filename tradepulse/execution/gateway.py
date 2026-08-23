@@ -48,14 +48,11 @@ from tradepulse.risk import (
 )
 from tradepulse.settlement import SettlementProcessor
 
-from .idempotency import derive_idempotency_key
+from .idempotency import IN_FLIGHT_STATUSES, derive_idempotency_key
 from .quotes import fetch_authoritative_quote
 
 TERMINAL_STATUSES = frozenset(
     {TradeIntentStatus.FILLED, TradeIntentStatus.REJECTED, TradeIntentStatus.CANCELED, TradeIntentStatus.EXPIRED, TradeIntentStatus.FAILED}
-)
-IN_FLIGHT_STATUSES = frozenset(
-    {TradeIntentStatus.SUBMITTED, TradeIntentStatus.ACCEPTED, TradeIntentStatus.PARTIALLY_FILLED, TradeIntentStatus.RISK_APPROVED}
 )
 TERMINAL_FAILURE_ORDER_STATUSES = frozenset({"rejected", "canceled", "expired", "replaced"})
 TERMINAL_ORDER_STATUSES = frozenset({"filled", "done_for_day"} | TERMINAL_FAILURE_ORDER_STATUSES)

@@ -17,6 +17,7 @@ import httpx
 from tradepulse.models import AssetClass, Side
 
 from .errors import extract_request_id, raise_alpaca_error
+from .symbols import infer_alpaca_asset_class, normalize_alpaca_symbol
 from .types import (
     AlpacaAccount,
     AlpacaActivity,
@@ -106,18 +107,21 @@ class AlpacaClient:
             raise_alpaca_error(response, "getPositions")
         data = response.json()
         rows = data if isinstance(data, list) else []
-        return [
-            AlpacaPosition(
-                symbol=str(row.get("symbol", "")),
-                asset_class=AssetClass.CRYPTO if row.get("asset_class") == "crypto" else AssetClass.EQUITY,
-                qty=_decimal(row.get("qty", "0")),
-                avg_entry_price=_decimal(row.get("avg_entry_price", "0")),
-                market_value=_decimal(row.get("market_value", "0")),
-                current_price=_decimal(row.get("current_price", "0")),
-                unrealized_pl=_decimal(row.get("unrealized_pl", "0")),
+        positions: list[AlpacaPosition] = []
+        for row in rows:
+            asset_class = AssetClass.CRYPTO if row.get("asset_class") == "crypto" else AssetClass.EQUITY
+            positions.append(
+                AlpacaPosition(
+                    symbol=normalize_alpaca_symbol(str(row.get("symbol", "")), asset_class),
+                    asset_class=asset_class,
+                    qty=_decimal(row.get("qty", "0")),
+                    avg_entry_price=_decimal(row.get("avg_entry_price", "0")),
+                    market_value=_decimal(row.get("market_value", "0")),
+                    current_price=_decimal(row.get("current_price", "0")),
+                    unrealized_pl=_decimal(row.get("unrealized_pl", "0")),
+                )
             )
-            for row in rows
-        ]
+        return positions
 
     async def get_latest_quote(self, symbol: str, asset_class: AssetClass) -> RawQuote:
         normalized = str(symbol).upper().replace("-", "/")
@@ -258,11 +262,16 @@ class AlpacaClient:
             for row in page:
                 side_raw = str(row.get("side") or "").lower()
                 side = Side.BUY if side_raw in ("buy", "buy_to_cover") else Side.SELL if side_raw in ("sell", "sell_short") else None
+                raw_symbol = str(row.get("symbol", ""))
+                # Activities responses don't carry an asset_class field the
+                # way positions do -- infer it from the ticker shape (same
+                # helper used wherever a caller only has a bare symbol).
+                inferred_class = infer_alpaca_asset_class(raw_symbol)
                 activities.append(
                     AlpacaActivity(
                         activity_id=str(row.get("id", "")),
                         activity_type=str(row.get("activity_type", "")),
-                        symbol=str(row.get("symbol", "")),
+                        symbol=normalize_alpaca_symbol(raw_symbol, inferred_class),
                         side=side,
                         qty=_decimal_or_none(row.get("qty")),
                         price=_decimal_or_none(row.get("price")),

@@ -1,4 +1,5 @@
-from datetime import UTC, datetime
+import math
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -63,6 +64,43 @@ def _order_json(status: str, filled_qty: str, filled_avg_price: str | None) -> d
     }
 
 
+def _synthetic_closes(n: int, trend: float, amplitude: float, period: float, phase: float) -> list[float]:
+    price = 100.0
+    closes = []
+    for i in range(n):
+        price += trend + amplitude * math.sin(i / period + phase)
+        closes.append(price)
+    return closes
+
+
+def _bars_json(closes: list[float]) -> dict:
+    """Daily bars, most-recent-first (matches the `sort=desc` the client
+    requests) -- oldest day first in `closes`, so build newest-first here."""
+    end = NOW
+    rows = []
+    for offset, close in enumerate(closes):
+        day = end - timedelta(days=len(closes) - 1 - offset)
+        rows.append({
+            "t": day.isoformat().replace("+00:00", "Z"), "o": close * 0.998, "h": close * 1.006,
+            "l": close * 0.994, "c": close, "v": 1_000_000.0,
+        })
+    return {"bars": list(reversed(rows))}  # newest-first
+
+
+# Empirically verified (via strategy.compute_real_factors/weighted_composite
+# with the default strategy weights) to produce a BUY deterministic signal.
+_BULLISH_CLOSES = _synthetic_closes(40, trend=0.4, amplitude=2.0, period=4.0, phase=0.5)
+# A choppy, mildly declining series -- deterministic signal lands in
+# HOLD/SELL/STRONG_SELL, never BUY/STRONG_BUY.
+_BEARISH_CLOSES = _synthetic_closes(40, trend=-0.3, amplitude=3.0, period=2.0, phase=0.0)
+
+
+def _mock_bars(closes: list[float]) -> None:
+    respx.get("https://data.alpaca.markets/v2/stocks/AAPL/bars").mock(
+        return_value=httpx.Response(200, json=_bars_json(closes))
+    )
+
+
 @respx.mock
 async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
@@ -74,6 +112,7 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
     )
     _mock_account()
     _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
 
@@ -98,6 +137,55 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
     opp_rows = await repositories.opportunities.list_all()
     assert len(opp_rows) == 1
     assert hydrate("opportunities", opp_rows[0]["payload"]).asset.symbol == "AAPL"
+
+
+@respx.mock
+async def test_deterministic_gate_rejects_ai_buy_when_composite_disagrees(tmp_path) -> None:
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "AI likes it."}])
+        )
+    )
+    _mock_account()
+    _mock_quote()
+    _mock_bars(_BEARISH_CLOSES)
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    assert summary.candidates_discovered == 1
+    assert summary.candidates_approved == 0  # AI said BUY, but the deterministic composite disagreed
+    assert order_route.call_count == 0
+    assert (await repositories.opportunities.list_all()) == []
+
+
+@respx.mock
+async def test_deterministic_gate_fails_closed_on_insufficient_candle_history(tmp_path) -> None:
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "AI likes it."}])
+        )
+    )
+    _mock_account()
+    _mock_quote()
+    respx.get("https://data.alpaca.markets/v2/stocks/AAPL/bars").mock(
+        return_value=httpx.Response(200, json={"bars": []})  # fewer than MIN_CANDLES
+    )
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.candidates_approved == 0
+    assert order_route.call_count == 0
 
 
 @respx.mock

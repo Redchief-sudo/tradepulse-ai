@@ -28,7 +28,8 @@ from typing import Any
 from uuid import uuid4
 
 from tradepulse.broker import AlpacaClient
-from tradepulse.execution import ExecutionGateway, ExecutionRequest, ExecutionResult
+from tradepulse.config import default_strategy_weights
+from tradepulse.execution import ExecutionGateway, ExecutionRequest, ExecutionResult, has_in_flight_intent
 from tradepulse.models import (
     AssetClass,
     AssetIdentity,
@@ -39,6 +40,7 @@ from tradepulse.models import (
     ScanTrigger,
     SessionState,
     Side,
+    StrategyWeights,
 )
 from tradepulse.persistence import PersistenceRepositories
 from tradepulse.providers import (
@@ -51,9 +53,16 @@ from tradepulse.providers import (
     build_scan_request,
 )
 from tradepulse.risk import load_session
-from tradepulse.strategy import ExecutableUniverse, is_executable
+from tradepulse.strategy import (
+    ExecutableUniverse,
+    compute_real_factors,
+    is_executable,
+    signal_from_composite,
+    weighted_composite,
+)
 
 _ACTIONABLE_RECOMMENDATIONS = frozenset({"STRONG_BUY", "BUY"})
+_DETERMINISTIC_ACTIONABLE_SIGNALS = frozenset({"STRONG_BUY", "BUY"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,8 +116,10 @@ async def run_scan_cycle(
     *,
     trigger: ScanTrigger = ScanTrigger.SCHEDULED,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    strategy_weights: StrategyWeights | None = None,
 ) -> ScanCycleSummary:
     now = clock()
+    strategy_weights = strategy_weights or default_strategy_weights(now)
     scan_run_id = str(uuid4())
     scan_generation = now.strftime("%Y%m%dT%H%M%SZ")
     scan_run = ScanRun(
@@ -161,6 +172,21 @@ async def run_scan_cycle(
         except ProviderError:
             continue  # one bad quote must not abort the rest of the scan
 
+        try:
+            candles = await market_data.fetch_candles(asset)
+        except ProviderError:
+            continue  # insufficient candle history or a data-fetch failure -- fail closed, same as every other provider boundary here
+        scores = compute_real_factors(candles)
+        if scores is None:
+            continue
+        composite = weighted_composite(scores, strategy_weights)
+        deterministic_signal = signal_from_composite(composite)
+        if deterministic_signal not in _DETERMINISTIC_ACTIONABLE_SIGNALS:
+            continue  # AI proposed it, but the deterministic technical/momentum/risk read disagrees
+
+        if await has_in_flight_intent(repositories, asset.symbol):
+            continue  # don't fight an order already in flight on this symbol (e.g. from the position monitor)
+
         if notional_budget <= 0 or quote.price <= 0:
             continue
         quantity = _round_quantity(notional_budget / quote.price, asset.asset_class)
@@ -171,8 +197,11 @@ async def run_scan_cycle(
             opportunity_id=str(uuid4()), scan_generation=scan_generation, asset=asset, quote=quote,
             source="anthropic_ai", created_at=clock(), confidence=candidate.confidence,
             metadata={
-                "recommendation": candidate.recommendation, "summary": candidate.summary,
+                "ai_recommendation": candidate.recommendation, "ai_summary": candidate.summary,
                 "ai_request_id": ai_response.request_id,
+                "deterministic_signal": deterministic_signal, "composite_score": str(composite),
+                "technical_score": str(scores.technical_score), "momentum_score": str(scores.momentum_score),
+                "risk_score": str(scores.risk_score),
             },
         )
         await repositories.opportunities.create_once(opportunity.opportunity_id, opportunity)

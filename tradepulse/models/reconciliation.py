@@ -7,8 +7,8 @@ from typing import Any, Literal, Mapping
 from .base import immutable_metadata, require_aware, require_text
 from .enums import ReconciliationOutcome
 
-ReconciliationType = Literal["order", "position"]
-_TYPES = {"order", "position"}
+ReconciliationType = Literal["order", "position", "position_view", "position_accounting", "fill"]
+_TYPES = {"order", "position", "position_view", "position_accounting", "fill"}
 
 
 @dataclass(frozen=True, slots=True)

@@ -67,6 +67,35 @@ async def test_get_account_parses_equity_and_cash() -> None:
 
 
 @respx.mock
+async def test_get_positions_normalizes_crypto_symbols() -> None:
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "symbol": "BTCUSD", "asset_class": "crypto", "qty": "0.5", "avg_entry_price": "60000",
+                    "market_value": "32500", "current_price": "65000", "unrealized_pl": "2500",
+                },
+                {
+                    "symbol": "AAPL", "asset_class": "us_equity", "qty": "10", "avg_entry_price": "150",
+                    "market_value": "1550", "current_price": "155", "unrealized_pl": "50",
+                },
+            ],
+        )
+    )
+    client = AlpacaClient("key", "secret", "paper", 10)
+    try:
+        positions = await client.get_positions()
+    finally:
+        await client.aclose()
+    by_symbol = {p.symbol: p for p in positions}
+    assert "BTC/USD" in by_symbol  # normalized from Alpaca's raw "BTCUSD"
+    assert by_symbol["BTC/USD"].asset_class == AssetClass.CRYPTO
+    assert "AAPL" in by_symbol
+    assert by_symbol["AAPL"].asset_class == AssetClass.EQUITY
+
+
+@respx.mock
 async def test_non_success_response_raises_typed_alpaca_error() -> None:
     respx.get("https://paper-api.alpaca.markets/v2/account").mock(
         return_value=httpx.Response(403, json={"message": "insufficient buying power", "code": 40310000})
@@ -97,6 +126,14 @@ def test_is_definitive_rejection_false_for_rate_limit() -> None:
 def test_is_definitive_rejection_false_for_server_errors() -> None:
     assert is_definitive_rejection(_alpaca_error(500)) is False
     assert is_definitive_rejection(_alpaca_error(503)) is False
+
+
+def test_is_definitive_rejection_false_below_400() -> None:
+    """A non-2xx response below 400 (e.g. a redirect an intermediary
+    surfaced as non-success) is not a 4xx business-logic rejection --
+    the docstring's own contract requires 400 <= status_code < 500."""
+    assert is_definitive_rejection(_alpaca_error(302)) is False
+    assert is_definitive_rejection(_alpaca_error(100)) is False
 
 
 def test_is_definitive_rejection_false_for_non_alpaca_exceptions() -> None:

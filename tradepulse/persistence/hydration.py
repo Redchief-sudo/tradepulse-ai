@@ -218,6 +218,8 @@ def decode_holding(d: Mapping[str, Any]) -> Holding:
         average_price=_decimal(d["average_price"]),
         updated_at=_datetime(d["updated_at"]),
         sector=d.get("sector"),
+        stop_loss=_decimal_or_none(d.get("stop_loss")),
+        target_price=_decimal_or_none(d.get("target_price")),
     )
 
 

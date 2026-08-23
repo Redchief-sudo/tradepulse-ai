@@ -1,5 +1,6 @@
 from .database import AsyncSQLiteDatabase, DatabaseError
 from .hydration import hydrate, register
+from .lock import acquire_lock, release_lock
 from .repositories import PersistenceRepositories, RecordRepository
 
 __all__ = [
@@ -7,6 +8,8 @@ __all__ = [
     "DatabaseError",
     "PersistenceRepositories",
     "RecordRepository",
+    "acquire_lock",
     "hydrate",
     "register",
+    "release_lock",
 ]

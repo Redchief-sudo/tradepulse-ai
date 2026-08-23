@@ -16,16 +16,26 @@ cp .env.example .env  # fill in ALPACA_API_KEY / ALPACA_API_SECRET, etc.
 .venv/bin/python -m pytest python_tests -q
 ```
 
-## Running a scan cycle
+## Running the runtime
 
-Each invocation performs one AI-driven scan cycle (discovery via Claude, then risk-gated execution through Alpaca) and exits -- there is no internal scheduling loop. Point cron (or a systemd timer) at it:
+No command runs its own scheduling loop -- each does its work once and exits. Point cron (or a systemd timer) at them:
 
 ```bash
-.venv/bin/tradepulse scan
+.venv/bin/tradepulse scan       # AI-driven candidate discovery + position monitor, run CONCURRENTLY
+.venv/bin/tradepulse monitor    # position monitor alone, for a tighter cadence than scan's
+.venv/bin/tradepulse reconcile  # after-the-fact audit against Alpaca's real positions/fills
 ```
 
-Requires `ALPACA_API_KEY`, `ALPACA_API_SECRET`, and `ANTHROPIC_API_KEY` set (see `.env.example`). Overlapping invocations are the operator's responsibility to prevent (e.g. `flock`) -- the process does not take an inter-process lock.
+`scan` requires `ALPACA_API_KEY`, `ALPACA_API_SECRET`, and `ANTHROPIC_API_KEY`; `monitor`/`reconcile` need only the Alpaca credentials (see `.env.example`). Example crontab:
+
+```
+*/15 9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse scan      >> /var/log/tradepulse.log 2>&1
+*/2  9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse monitor   >> /var/log/tradepulse.log 2>&1
+0    */6  * * *    cd /path/to/repo && .venv/bin/tradepulse reconcile >> /var/log/tradepulse.log 2>&1
+```
+
+An overlapping invocation of the same command is blocked at the application level by a per-command database-enforced lease (not by cron/flock discipline) -- a caller that loses the race exits cleanly (status 0) rather than racing the live run. `scan` runs discovery and position protection under separate leases in the same process, so a slow AI call never delays protective exits.
 
 ## Status
 
-The core runtime (models, persistence, broker client, risk engine, execution gateway, settlement pipeline, AI-driven scan cycle) is built and tested. Still missing before this is a fully unattended paper-trading system: a stop-loss/target monitor for open positions, and reconciliation against Alpaca's own activity feed. See `docs/` for the full audit history.
+The core runtime (models, persistence, broker client, risk engine, execution gateway, settlement pipeline, AI-driven scan cycle gated by both AI and deterministic technical/momentum/risk signals, position monitor, broker reconciliation) is built and tested. Known deferred items: replacing the execution gateway's synthetic `broker_fill_id` with Alpaca's real per-fill activity ID in the hot path (reconciliation already cross-references the real ID, but only after the fact), and wiring in the deterministic market-regime classifier once an intraday candle source exists (its volatility math currently assumes 5-minute bars; this codebase only fetches daily ones). See `docs/` for the full audit history.

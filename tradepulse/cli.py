@@ -1,14 +1,27 @@
 """CLI entrypoint -- the sole way into this runtime, invoked externally on a
-schedule (cron, systemd timer, etc.). This process does not run its own
-internal scheduling loop: each invocation performs exactly one scan cycle
-and exits, matching the CLI-driven, cron-external architecture decided for
-this system (see docs/). Point cron at it, e.g.:
+schedule (cron, systemd timer, etc.). No command runs its own internal
+scheduling loop: each invocation does its work once and exits, matching the
+CLI-driven, cron-external architecture decided for this system (see docs/).
 
-    */15 9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse scan >> /var/log/tradepulse.log 2>&1
+`tradepulse scan` runs AI-driven candidate discovery and the stop/target
+position monitor CONCURRENTLY (not sequentially) in one process, sharing a
+composition root but each independently lock-protected -- position
+protection latency is never tied to how long the AI discovery call takes.
+`tradepulse monitor` and `tradepulse reconcile` are also available standalone
+for operators who want a different cadence than the scan cycle's (position
+protection is typically wanted more often than discovery; reconciliation is
+an after-the-fact audit pass, typically wanted less often). Example crontab:
 
-Overlapping invocations are the operator's responsibility to prevent (e.g.
-via cron's own overlap handling, or `flock`) -- this process does not take
-an inter-process lock.
+    */15 9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse scan      >> /var/log/tradepulse.log 2>&1
+    */2  9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse monitor   >> /var/log/tradepulse.log 2>&1
+    0    */6  * * *    cd /path/to/repo && .venv/bin/tradepulse reconcile >> /var/log/tradepulse.log 2>&1
+
+An overlapping invocation of the SAME command (cron re-firing before a slow
+run finishes) is handled at the application level via a database-enforced
+lease per command (see persistence/lock.py) -- it does not depend on the
+operator's cron/flock configuration being correct. A caller that can't
+acquire its lease exits cleanly (status 0, logged as skipped), not as a
+failure.
 """
 
 from __future__ import annotations
@@ -17,76 +30,220 @@ import argparse
 import asyncio
 import logging
 import sys
+from datetime import UTC, datetime
+from typing import Any
+from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
-from tradepulse.config import Settings, SettingsError, risk_limits_for_profile
+from tradepulse.config import Settings, SettingsError, default_strategy_weights, risk_limits_for_profile
 from tradepulse.config.logging import configure_logging
 from tradepulse.execution import ExecutionGateway
 from tradepulse.models import ExecutionMode
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories
+from tradepulse.monitor import MonitorCycleSummary, run_position_monitor
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, release_lock
 from tradepulse.providers import AlpacaMarketDataProvider, AnthropicAIProvider
-from tradepulse.scanner import run_scan_cycle
+from tradepulse.reconciliation import run_reconciliation
+from tradepulse.scanner import ScanCycleSummary, run_scan_cycle
 from tradepulse.settlement import SettlementProcessor
 from tradepulse.strategy import load_executable_universe
 
 logger = logging.getLogger(__name__)
 
+SCAN_LOCK_KEY = "scan"
+MONITOR_LOCK_KEY = "monitor"
+RECONCILE_LOCK_KEY = "reconcile"
+# Generous ceilings above any realistic single run -- long enough to never
+# steal a live run's lease, short enough that a crashed process doesn't
+# block that command indefinitely. Monitor's is shorter since it's meant to
+# be cron'd more frequently than scan/reconcile.
+SCAN_LOCK_TTL_SECONDS = 600
+MONITOR_LOCK_TTL_SECONDS = 300
+RECONCILE_LOCK_TTL_SECONDS = 600
 
-def _require_scan_credentials(settings: Settings) -> None:
-    missing = [
-        name
-        for name, value in (
-            ("ALPACA_API_KEY", settings.alpaca_api_key),
-            ("ALPACA_API_SECRET", settings.alpaca_api_secret),
-            ("ANTHROPIC_API_KEY", settings.anthropic_api_key),
-        )
-        if not value
-    ]
+
+def _require_credentials(settings: Settings, *, require_anthropic: bool) -> None:
+    checks = [("ALPACA_API_KEY", settings.alpaca_api_key), ("ALPACA_API_SECRET", settings.alpaca_api_secret)]
+    if require_anthropic:
+        checks.append(("ANTHROPIC_API_KEY", settings.anthropic_api_key))
+    missing = [name for name, value in checks if not value]
     if missing:
-        raise SettingsError(f"scan requires {', '.join(missing)} to be set")
+        raise SettingsError(f"this command requires {', '.join(missing)} to be set")
+
+
+def _build_broker(settings: Settings) -> AlpacaClient:
+    assert settings.alpaca_api_key and settings.alpaca_api_secret
+    return AlpacaClient(settings.alpaca_api_key, settings.alpaca_api_secret, settings.execution_mode, settings.broker_timeout_seconds)
+
+
+def _build_gateway(
+    settings: Settings, repositories: PersistenceRepositories, broker: AlpacaClient,
+    market_data: AlpacaMarketDataProvider, alerts: TelegramAlerter,
+) -> ExecutionGateway:
+    settlement = SettlementProcessor(repositories, alerts)
+    risk_limits = risk_limits_for_profile(settings.risk_profile)
+    return ExecutionGateway(repositories, broker, market_data, settlement, alerts, risk_limits, ExecutionMode(settings.execution_mode))
+
+
+async def _run_scan_leg(
+    database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, ai_provider: AnthropicAIProvider,
+    market_data: AlpacaMarketDataProvider, broker: AlpacaClient, gateway: ExecutionGateway,
+    settings: Settings,
+) -> ScanCycleSummary | None:
+    owner_token = str(uuid4())
+    if not await acquire_lock(database, SCAN_LOCK_KEY, owner_token, "scan", SCAN_LOCK_TTL_SECONDS):
+        logger.info("scan_skipped_lock_held", extra={"event": "scan_skipped_lock_held"})
+        return None
+    try:
+        universe = load_executable_universe(settings)
+        risk_limits = risk_limits_for_profile(settings.risk_profile)
+        strategy_weights = default_strategy_weights(datetime.now(UTC))
+        return await run_scan_cycle(
+            repositories, ai_provider, market_data, broker, gateway, universe, risk_limits, strategy_weights=strategy_weights
+        )
+    finally:
+        await release_lock(database, SCAN_LOCK_KEY, owner_token)
+
+
+async def _run_monitor_leg(
+    database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, broker: AlpacaClient,
+    gateway: ExecutionGateway, alerts: TelegramAlerter,
+) -> MonitorCycleSummary | None:
+    owner_token = str(uuid4())
+    if not await acquire_lock(database, MONITOR_LOCK_KEY, owner_token, "monitor", MONITOR_LOCK_TTL_SECONDS):
+        logger.info("monitor_skipped_lock_held", extra={"event": "monitor_skipped_lock_held"})
+        return None
+    try:
+        return await run_position_monitor(repositories, broker, gateway, alerts)
+    finally:
+        await release_lock(database, MONITOR_LOCK_KEY, owner_token)
+
+
+def _log_scan_result(result: ScanCycleSummary | BaseException | None) -> bool:
+    """Returns True if this leg should fail the process's exit code."""
+    if result is None:
+        return False
+    if isinstance(result, BaseException):
+        logger.error("scan_cycle_crashed", extra={"event": "scan_cycle_crashed", "error": str(result)})
+        return True
+    logger.info(
+        "scan_cycle_finished",
+        extra={
+            "event": "scan_cycle_finished", "scan_generation": result.scan_run_id, "status": result.status.value,
+            "candidates_discovered": result.candidates_discovered, "candidates_approved": result.candidates_approved,
+            "orders_submitted": result.orders_submitted,
+        },
+    )
+    if result.error:
+        logger.error("scan_cycle_failed", extra={"event": "scan_cycle_failed", "error": result.error})
+        return True
+    return False
+
+
+def _log_monitor_result(result: MonitorCycleSummary | BaseException | None) -> bool:
+    if result is None:
+        return False
+    if isinstance(result, BaseException):
+        logger.error("monitor_cycle_crashed", extra={"event": "monitor_cycle_crashed", "error": str(result)})
+        return True
+    logger.info(
+        "monitor_cycle_finished",
+        extra={
+            "event": "monitor_cycle_finished", "status": result.status,
+            "positions_checked": result.positions_checked, "exits_triggered": result.exits_triggered,
+        },
+    )
+    if result.status == "degraded":
+        logger.error("monitor_cycle_degraded", extra={"event": "monitor_cycle_degraded", "error": result.error})
+        return True
+    return False
 
 
 async def _run_scan(settings: Settings) -> int:
-    _require_scan_credentials(settings)
-    assert settings.alpaca_api_key and settings.alpaca_api_secret and settings.anthropic_api_key
+    """`tradepulse scan`: discovery and position protection, concurrently."""
+    _require_credentials(settings, require_anthropic=True)
 
     database = AsyncSQLiteDatabase(settings.database_url)
     await database.initialize()
     repositories = PersistenceRepositories.create(database)
 
-    broker = AlpacaClient(settings.alpaca_api_key, settings.alpaca_api_secret, settings.execution_mode, settings.broker_timeout_seconds)
+    broker = _build_broker(settings)
+    assert settings.anthropic_api_key
     ai_provider = AnthropicAIProvider(
         settings.anthropic_api_key, settings.anthropic_model, settings.ai_timeout_seconds, settings.anthropic_base_url
     )
     try:
         market_data = AlpacaMarketDataProvider(broker)
         alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
-        settlement = SettlementProcessor(repositories, alerts)
-        risk_limits = risk_limits_for_profile(settings.risk_profile)
-        gateway = ExecutionGateway(
-            repositories, broker, market_data, settlement, alerts, risk_limits, ExecutionMode(settings.execution_mode)
-        )
-        universe = load_executable_universe(settings)
+        gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
 
-        summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, universe, risk_limits)
+        scan_result, monitor_result = await asyncio.gather(
+            _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings),
+            _run_monitor_leg(database, repositories, broker, gateway, alerts),
+            return_exceptions=True,
+        )
     finally:
         await broker.aclose()
         await ai_provider.aclose()
 
+    scan_failed = _log_scan_result(scan_result)
+    monitor_failed = _log_monitor_result(monitor_result)
+    return 1 if (scan_failed or monitor_failed) else 0
+
+
+async def _run_monitor(settings: Settings) -> int:
+    """`tradepulse monitor`: standalone, for a tighter cadence than scan's."""
+    _require_credentials(settings, require_anthropic=False)
+
+    database = AsyncSQLiteDatabase(settings.database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+
+    broker = _build_broker(settings)
+    try:
+        market_data = AlpacaMarketDataProvider(broker)
+        alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
+        gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
+        result = await _run_monitor_leg(database, repositories, broker, gateway, alerts)
+    finally:
+        await broker.aclose()
+
+    return 1 if _log_monitor_result(result) else 0
+
+
+async def _run_reconcile(settings: Settings) -> int:
+    """`tradepulse reconcile`: after-the-fact audit against Alpaca's real state."""
+    _require_credentials(settings, require_anthropic=False)
+
+    database = AsyncSQLiteDatabase(settings.database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+
+    broker = _build_broker(settings)
+    owner_token = str(uuid4())
+    try:
+        if not await acquire_lock(database, RECONCILE_LOCK_KEY, owner_token, "reconcile", RECONCILE_LOCK_TTL_SECONDS):
+            logger.info("reconcile_skipped_lock_held", extra={"event": "reconcile_skipped_lock_held"})
+            return 0
+        try:
+            alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
+            summary = await run_reconciliation(repositories, broker, alerts)
+        finally:
+            await release_lock(database, RECONCILE_LOCK_KEY, owner_token)
+    finally:
+        await broker.aclose()
+
     logger.info(
-        "scan_cycle_finished",
+        "reconciliation_finished",
         extra={
-            "event": "scan_cycle_finished",
-            "scan_generation": summary.scan_run_id,
-            "status": summary.status.value,
-            "candidates_discovered": summary.candidates_discovered,
-            "candidates_approved": summary.candidates_approved,
-            "orders_submitted": summary.orders_submitted,
+            "event": "reconciliation_finished", "status": summary.status,
+            "positions_checked": summary.positions_checked, "view_drift_corrected": summary.view_drift_corrected,
+            "accounting_drift_detected": summary.accounting_drift_detected, "fills_checked": summary.fills_checked,
+            "missed_fills_detected": summary.missed_fills_detected,
         },
     )
-    if summary.error:
-        logger.error("scan_cycle_failed", extra={"event": "scan_cycle_failed", "error": summary.error})
+    if summary.status == "degraded":
+        logger.error("reconciliation_degraded", extra={"event": "reconciliation_degraded", "error": summary.error})
         return 1
     return 0
 
@@ -94,8 +251,13 @@ async def _run_scan(settings: Settings) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tradepulse", description="TradePulse AI trading runtime")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("scan", help="run one AI-driven scan cycle and exit")
+    subparsers.add_parser("scan", help="run one AI-driven scan cycle and the position monitor concurrently, then exit")
+    subparsers.add_parser("monitor", help="run one stop/target position-protection pass and exit")
+    subparsers.add_parser("reconcile", help="run one reconciliation pass against Alpaca's real state and exit")
     return parser
+
+
+_COMMANDS: dict[str, Any] = {"scan": _run_scan, "monitor": _run_monitor, "reconcile": _run_reconcile}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -107,13 +269,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     configure_logging(settings.log_level)
 
-    if args.command == "scan":
-        try:
-            return asyncio.run(_run_scan(settings))
-        except SettingsError as exc:
-            print(f"tradepulse: {exc}", file=sys.stderr)
-            return 1
-    raise AssertionError(f"unhandled command: {args.command}")
+    try:
+        return asyncio.run(_COMMANDS[args.command](settings))
+    except SettingsError as exc:
+        print(f"tradepulse: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

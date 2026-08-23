@@ -19,6 +19,12 @@ class Holding:
     average_price: Decimal
     updated_at: datetime
     sector: str | None = None
+    # The entry that opened this position's own chosen protective levels --
+    # a TradePulse strategy decision, not a broker account fact, so unlike
+    # quantity/average_price this is never sourced from Alpaca. See
+    # settlement/engine.py::_project_holding for how these are derived.
+    stop_loss: Decimal | None = None
+    target_price: Decimal | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "quantity", decimal_value(self.quantity, "quantity"))
@@ -26,6 +32,10 @@ class Holding:
         object.__setattr__(self, "updated_at", require_aware(self.updated_at, "updated_at"))
         if self.quantity == 0:
             raise ValueError("zero quantity is not an open holding")
+        if self.stop_loss is not None:
+            object.__setattr__(self, "stop_loss", decimal_value(self.stop_loss, "stop_loss", positive=True))
+        if self.target_price is not None:
+            object.__setattr__(self, "target_price", decimal_value(self.target_price, "target_price", positive=True))
 
 
 @dataclass(frozen=True, slots=True)

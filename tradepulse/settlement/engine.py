@@ -88,6 +88,27 @@ def _holding_record_id(symbol: str) -> str:
     return symbol.upper()
 
 
+# Which fill's stop_loss/target_price govern an open position when it was
+# built from multiple fills. FIRST_ENTRY is the only policy implemented --
+# a future LATEST_ENTRY/WEIGHTED/TRAILING policy is a deliberate later choice,
+# not a silent behavior change.
+PROTECTIVE_THRESHOLD_POLICY = "first_entry"
+
+
+async def _entry_protective_levels(
+    repositories: PersistenceRepositories, lot: PositionLot
+) -> tuple[Decimal | None, Decimal | None]:
+    fill_row = await repositories.fills.get(lot.originating_fill_id)
+    if fill_row is None:
+        return None, None
+    fill = hydrate("fills", fill_row["payload"])
+    intent_row = await repositories.trade_intents.get(fill.trade_intent_id)
+    if intent_row is None:
+        return None, None
+    intent = hydrate("trade_intents", intent_row["payload"])
+    return intent.stop_loss, intent.target_price
+
+
 async def _project_holding(repositories: PersistenceRepositories, event: SettlementEvent) -> None:
     lot_rows = await repositories.position_lots.list_all(limit=10000)
     lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
@@ -108,9 +129,13 @@ async def _project_holding(repositories: PersistenceRepositories, event: Settlem
     total_cost = sum((lot.remaining_quantity * lot.acquisition_price for lot in open_lots), Decimal("0"))
     avg_price = total_cost / total_remaining  # total_remaining > 0 guaranteed by open_lots' status filter
 
+    oldest_lot = min(open_lots, key=lambda lot: lot.opened_at)  # PROTECTIVE_THRESHOLD_POLICY = "first_entry"
+    stop_loss, target_price = await _entry_protective_levels(repositories, oldest_lot)
+
     holding = Holding(
         asset=event.asset, quantity=total_signed, average_price=avg_price,
         updated_at=event.occurred_at, sector=event.sector,
+        stop_loss=stop_loss, target_price=target_price,
     )
     if existing_row is not None:
         await repositories.holdings.update(record_id, holding)

@@ -66,7 +66,7 @@ def is_definitive_rejection(exc: Exception) -> bool:
     Alpaca's actual acceptance of the order cannot be established from the
     error alone). Ambiguous outcomes must go through the client-order-ID
     recovery path, never straight to REJECTED or a blind resubmit."""
-    return isinstance(exc, AlpacaError) and exc.status_code != 429 and exc.status_code < 500
+    return isinstance(exc, AlpacaError) and 400 <= exc.status_code < 500 and exc.status_code != 429
 
 
 def extract_request_id(response: httpx.Response) -> str | None:

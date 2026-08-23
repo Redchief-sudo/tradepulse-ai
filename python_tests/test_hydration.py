@@ -91,7 +91,10 @@ def test_settlement_roundtrips() -> None:
 
 
 def test_holding_roundtrips() -> None:
-    original = Holding(asset(), Decimal("0.5"), Decimal("64000"), NOW, sector="Technology")
+    original = Holding(
+        asset(), Decimal("0.5"), Decimal("64000"), NOW, sector="Technology",
+        stop_loss=Decimal("60000"), target_price=Decimal("70000"),
+    )
     assert roundtrip("holdings", original) == original
 
 

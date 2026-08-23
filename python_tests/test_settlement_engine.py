@@ -307,3 +307,45 @@ async def test_process_pending_leaves_a_recently_claimed_processing_event_alone(
     assert summary.processed == 0
     event_row = await repositories.settlements.get("se-1")
     assert event_row["status"] == SettlementStatus.PROCESSING.value
+
+
+async def test_holding_protective_thresholds_are_first_entry_wins_across_a_second_fill(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+
+    first_intent = TradeIntent(
+        "ti-1", "idem-1", "corr-1", asset(), Side.BUY, ExecutionMode.PAPER, "manual", NOW,
+        requested_quantity=Decimal("10"), stop_loss=Decimal("140"), target_price=Decimal("170"),
+    )
+    await repositories.trade_intents.create_once("ti-1", first_intent, status=first_intent.status.value, unique_value=first_intent.idempotency_key)
+    first_fill = Fill("fill-1", "ti-1", "order-1", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-1", first_fill, unique_value=None)
+    first_event = SettlementEvent("se-1", "fill-1", "ti-1", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), NOW)
+    await repositories.settlements.create_once("se-1", first_event, status=first_event.status.value, unique_value="fill-1")
+
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending()
+
+    holding = hydrate("holdings", (await repositories.holdings.get("AAPL"))["payload"])
+    assert holding.stop_loss == Decimal("140")
+    assert holding.target_price == Decimal("170")
+
+    later = NOW + timedelta(minutes=5)
+    second_intent = TradeIntent(
+        "ti-2", "idem-2", "corr-2", asset(), Side.BUY, ExecutionMode.PAPER, "manual", later,
+        requested_quantity=Decimal("10"), stop_loss=Decimal("108"), target_price=Decimal("130"),
+    )
+    await repositories.trade_intents.create_once("ti-2", second_intent, status=second_intent.status.value, unique_value=second_intent.idempotency_key)
+    second_fill = Fill("fill-2", "ti-2", "order-2", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("120"), Decimal("0"), Decimal("0"), later)
+    await repositories.fills.create_once("fill-2", second_fill, unique_value=None)
+    second_event = SettlementEvent("se-2", "fill-2", "ti-2", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("120"), later)
+    await repositories.settlements.create_once("se-2", second_event, status=second_event.status.value, unique_value="fill-2")
+
+    processor2 = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: later)
+    await processor2.process_pending()
+
+    holding = hydrate("holdings", (await repositories.holdings.get("AAPL"))["payload"])
+    assert holding.quantity == Decimal("20")
+    assert holding.average_price == Decimal("135")
+    # first-entry-wins: the SECOND fill's thresholds must not overwrite the first's
+    assert holding.stop_loss == Decimal("140")
+    assert holding.target_price == Decimal("170")
