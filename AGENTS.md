@@ -2,33 +2,19 @@
 
 ## Project Context
 
-This is a Base44 app repository. Treat it as user-owned application code, keep changes focused on the user's request, and preserve existing project conventions.
+This is the TradePulse AI trading runtime: a standalone Python package (`tradepulse/`), not a Base44 app. There is no frontend and no hosted backend in this repo -- everything runs locally against SQLite and the Alpaca API.
 
-Start with `README.md` for local setup, environment variables, and publish workflow.
-
-## Base44 References
-
-- CLI overview: https://docs.base44.com/developers/references/cli/get-started/overview.md
-- Agent skills: https://docs.base44.com/developers/backend/overview/skills.md
-
-If your agent supports Agent Skills, install or update Base44 skills before Base44-specific work:
-
-```bash
-npx skills add base44/skills
-```
+Start with `README.md` for setup and test commands.
 
 ## Key Files
 
-- `src/`: frontend application source.
-- `src/api/base44Client.js`: frontend Base44 SDK client.
-- `vite.config.js`: Vite config and Base44 Vite plugin setup.
-- `.env.local`: local-only environment values; never commit secrets.
+- `tradepulse/`: the runtime package (models, persistence, broker client, risk engine, execution gateway, settlement pipeline).
+- `python_tests/`: pytest suite (`pytest-asyncio`, `respx` for HTTP mocking).
+- `.env.example`: template for local secrets; never commit `.env`.
+- `docs/`: audit history and design-decision records.
 
 ## Working Notes
 
-- Use `base44 dev` as the default local development command when you need the local Base44 backend. It can run the backend and frontend together.
-- When docs or code mention the frontend being started automatically, that usually means the Base44 project config includes `site.serveCommand`, for example `"serveCommand": "npm run dev"` in `base44/config.jsonc`.
-- Use `npm run dev` only for frontend-only work against the hosted Base44 backend.
-- Prefer the existing Base44 CLI workflow over adding new npm scripts for Base44-specific tasks.
-- Reuse the existing SDK client and Vite plugin patterns before adding new Base44 integration paths.
-- Run the relevant checks from `package.json` before finishing code changes.
+- Run `.venv/bin/python -m pytest python_tests -q` before finishing code changes.
+- Never print or log real API keys/secrets.
+- This system is paper-trading-first; live trading requires `TRADEPULSE_EXECUTION_MODE=live` and `TRADEPULSE_LIVE_TRADING_ENABLED=true` -- treat any change touching that gate as safety-critical.
