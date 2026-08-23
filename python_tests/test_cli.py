@@ -1,3 +1,5 @@
+from os import environ
+
 import httpx
 import pytest
 import respx
@@ -7,6 +9,7 @@ from tradepulse.cli import (
     RECONCILE_LOCK_KEY,
     SCAN_LOCK_KEY,
     _build_parser,
+    _load_dotenv,
     _require_credentials,
     _run_monitor,
     _run_reconcile,
@@ -51,6 +54,38 @@ def test_monitor_and_reconcile_do_not_require_anthropic_credentials() -> None:
     _require_credentials(Settings.from_env({"ALPACA_API_KEY": "key", "ALPACA_API_SECRET": "secret"}), require_anthropic=False)
     with pytest.raises(SettingsError, match="ALPACA_API_KEY"):
         _require_credentials(Settings.from_env({}), require_anthropic=False)
+
+
+def test_load_dotenv_populates_environ(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("TRADEPULSE_TEST_DOTENV_KEY", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "# a comment\n"
+        "\n"
+        "TRADEPULSE_TEST_DOTENV_KEY=from-file\n"
+        "TRADEPULSE_TEST_DOTENV_QUOTED=\"quoted-value\"\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("TRADEPULSE_TEST_DOTENV_QUOTED", raising=False)
+
+    _load_dotenv(env_file)
+
+    assert environ["TRADEPULSE_TEST_DOTENV_KEY"] == "from-file"
+    assert environ["TRADEPULSE_TEST_DOTENV_QUOTED"] == "quoted-value"
+
+
+def test_load_dotenv_never_overwrites_a_real_env_var(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TRADEPULSE_TEST_DOTENV_KEY", "from-shell")
+    env_file = tmp_path / ".env"
+    env_file.write_text("TRADEPULSE_TEST_DOTENV_KEY=from-file\n", encoding="utf-8")
+
+    _load_dotenv(env_file)
+
+    assert environ["TRADEPULSE_TEST_DOTENV_KEY"] == "from-shell"
+
+
+def test_load_dotenv_missing_file_is_a_no_op(tmp_path) -> None:
+    _load_dotenv(tmp_path / "does-not-exist.env")  # must not raise
 
 
 def _settings(database_url: str, **extra: str) -> Settings:

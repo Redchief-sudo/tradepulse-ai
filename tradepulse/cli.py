@@ -31,6 +31,8 @@ import asyncio
 import logging
 import sys
 from datetime import UTC, datetime
+from os import environ
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -260,8 +262,25 @@ def _build_parser() -> argparse.ArgumentParser:
 _COMMANDS: dict[str, Any] = {"scan": _run_scan, "monitor": _run_monitor, "reconcile": _run_reconcile}
 
 
+def _load_dotenv(path: Path = Path(".env")) -> None:
+    """KEY=VALUE lines, '#' comments and blanks skipped. Real environment
+    variables always win -- this only fills in values not already set, so
+    `ANTHROPIC_API_KEY=... tradepulse scan` still overrides the file."""
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key:
+            environ.setdefault(key, value.strip().strip('"').strip("'"))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    _load_dotenv()
     try:
         settings = Settings.from_env()
     except SettingsError as exc:

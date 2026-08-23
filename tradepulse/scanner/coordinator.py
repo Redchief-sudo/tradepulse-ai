@@ -42,7 +42,7 @@ from tradepulse.models import (
     Side,
     StrategyWeights,
 )
-from tradepulse.persistence import PersistenceRepositories
+from tradepulse.persistence import PersistenceRepositories, hydrate
 from tradepulse.providers import (
     AlpacaMarketDataProvider,
     AnthropicAIProvider,
@@ -63,6 +63,11 @@ from tradepulse.strategy import (
 
 _ACTIONABLE_RECOMMENDATIONS = frozenset({"STRONG_BUY", "BUY"})
 _DETERMINISTIC_ACTIONABLE_SIGNALS = frozenset({"STRONG_BUY", "BUY"})
+
+# Generous vs cli.py's SCAN_LOCK_TTL_SECONDS=600 -- the lock already prevents
+# real overlap; this only cleans up the audit trail after a crash left a
+# ScanRun stuck at RUNNING forever.
+STALE_SCAN_RUN_SECONDS = 900
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +92,18 @@ def _round_quantity(qty: Decimal, asset_class: AssetClass) -> Decimal:
     return floored / precision
 
 
+def _stop_loss_price(reference_price: Decimal, stop_loss_pct: Decimal, asset_class: AssetClass) -> Decimal:
+    """The scanner's only source of a protective stop -- there's no
+    signal-specific stop from the AI or the deterministic composite
+    (matching the discovery-only contract: they propose a symbol, never a
+    trade parameter), so this is derived from RiskLimits.stop_loss_pct, the
+    same per-profile value risk/engine.py's risk-per-share sizing already
+    expects a caller to supply."""
+    raw = reference_price * (Decimal("1") - stop_loss_pct / Decimal("100"))
+    precision = Decimal("0.00000001") if asset_class == AssetClass.CRYPTO else Decimal("0.01")
+    return raw.quantize(precision)
+
+
 def _build_scan_prompt(universe: ExecutableUniverse) -> str:
     symbols = sorted(universe.equities | universe.crypto)
     return (
@@ -105,6 +122,21 @@ def _asset_from_candidate(candidate: OpportunityCandidate) -> AssetIdentity:
     return AssetIdentity(symbol=candidate.symbol, asset_class=asset_class, native_asset_id=f"alpaca:{candidate.symbol}")
 
 
+async def _reclaim_stale_scan_runs(repositories: PersistenceRepositories, now: datetime) -> None:
+    """A crash mid-cycle leaves its ScanRun stuck at RUNNING forever -- not a
+    safety issue (the `locks`-table lease, not this row, is what actually
+    gates re-entry), but a permanently-stale audit record. Finalize any such
+    row as FAILED before starting a new cycle, mirroring the stale-lease
+    reclaim already used for settlement (is_settlement_processable) and the
+    CLI scan lock (SCAN_LOCK_TTL_SECONDS)."""
+    rows = await repositories.scan_runs.list_by_status(ScanRunStatus.RUNNING.value, limit=50)
+    for row in rows:
+        run = hydrate("scan_runs", row["payload"])
+        if (now - run.started_at).total_seconds() > STALE_SCAN_RUN_SECONDS:
+            finalized = replace(run, status=ScanRunStatus.FAILED, completed_at=now, error="CRASHED_STALE_SCAN_RUN")
+            await repositories.scan_runs.update(run.scan_run_id, finalized, status=finalized.status.value)
+
+
 async def run_scan_cycle(
     repositories: PersistenceRepositories,
     ai_provider: AnthropicAIProvider,
@@ -120,6 +152,7 @@ async def run_scan_cycle(
 ) -> ScanCycleSummary:
     now = clock()
     strategy_weights = strategy_weights or default_strategy_weights(now)
+    await _reclaim_stale_scan_runs(repositories, now)
     scan_run_id = str(uuid4())
     scan_generation = now.strftime("%Y%m%dT%H%M%SZ")
     scan_run = ScanRun(
@@ -193,6 +226,8 @@ async def run_scan_cycle(
         if quantity <= 0:
             continue
 
+        stop_loss = _stop_loss_price(quote.price, risk_limits.stop_loss_pct, asset.asset_class) if risk_limits.stop_loss_pct > 0 else None
+
         opportunity = Opportunity(
             opportunity_id=str(uuid4()), scan_generation=scan_generation, asset=asset, quote=quote,
             source="anthropic_ai", created_at=clock(), confidence=candidate.confidence,
@@ -202,6 +237,7 @@ async def run_scan_cycle(
                 "deterministic_signal": deterministic_signal, "composite_score": str(composite),
                 "technical_score": str(scores.technical_score), "momentum_score": str(scores.momentum_score),
                 "risk_score": str(scores.risk_score),
+                "stop_loss": str(stop_loss) if stop_loss is not None else None,
             },
         )
         await repositories.opportunities.create_once(opportunity.opportunity_id, opportunity)
@@ -210,6 +246,7 @@ async def run_scan_cycle(
         exec_request = ExecutionRequest(
             asset=asset, side=Side.BUY, requested_quantity=quantity, strategy="ai_scan",
             decision_id=opportunity.opportunity_id, confidence=Decimal(str(candidate.confidence)),
+            stop_loss=stop_loss,
         )
         result = await gateway.execute_intent(exec_request)
         execution_results.append(result)

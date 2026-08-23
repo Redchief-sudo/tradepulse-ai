@@ -9,7 +9,7 @@ from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
 from tradepulse.config import risk_limits_for_profile
 from tradepulse.execution import ExecutionGateway
-from tradepulse.models import ExecutionMode, ScanRunStatus, SessionState, TradingSession
+from tradepulse.models import ExecutionMode, ScanRun, ScanRunStatus, ScanTrigger, SessionState, TradingSession
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.providers import AlpacaMarketDataProvider, AnthropicAIProvider
 from tradepulse.providers.anthropic_ai import SCAN_TOOL_NAME
@@ -138,6 +138,14 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
     assert len(opp_rows) == 1
     assert hydrate("opportunities", opp_rows[0]["payload"]).asset.symbol == "AAPL"
 
+    # A protective stop must actually be set -- derived from the risk profile's
+    # stop_loss_pct (balanced=8%) against the scanner's own quote (mid of the
+    # mocked 199.50/199.60 bid/ask), since the AI/composite never supply one;
+    # without this the position monitor has nothing to protect.
+    holding_row = await repositories.holdings.get("AAPL")
+    holding = hydrate("holdings", holding_row["payload"])
+    assert holding.stop_loss == (Decimal("199.55") * Decimal("0.92")).quantize(Decimal("0.01"))
+
 
 @respx.mock
 async def test_deterministic_gate_rejects_ai_buy_when_composite_disagrees(tmp_path) -> None:
@@ -245,3 +253,48 @@ async def test_scan_cycle_marks_failed_when_ai_provider_errors(tmp_path) -> None
 
     scan_row = await repositories.scan_runs.get(summary.scan_run_id)
     assert scan_row["status"] == "failed"
+
+
+@respx.mock
+async def test_stale_running_scan_run_is_reclaimed_as_failed(tmp_path) -> None:
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(
+        repositories,
+        TradingSession("session", SessionState.RISK_STOPPED, False, NOW, kill_switch_reason="daily loss", kill_switch_reset_required=True),
+    )
+    stale = ScanRun(
+        scan_run_id="stale-1", scan_generation="gen-stale", trigger=ScanTrigger.SCHEDULED,
+        status=ScanRunStatus.RUNNING, started_at=NOW - timedelta(seconds=1000), lock_owner_token="owner-1",
+    )
+    await repositories.scan_runs.create_once("stale-1", stale, status=stale.status.value)
+
+    await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    stale_row = await repositories.scan_runs.get("stale-1")
+    assert stale_row["status"] == "failed"
+    stale_after = hydrate("scan_runs", stale_row["payload"])
+    assert stale_after.error == "CRASHED_STALE_SCAN_RUN"
+    assert stale_after.completed_at == NOW
+
+
+@respx.mock
+async def test_recent_running_scan_run_is_left_alone(tmp_path) -> None:
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(
+        repositories,
+        TradingSession("session", SessionState.RISK_STOPPED, False, NOW, kill_switch_reason="daily loss", kill_switch_reset_required=True),
+    )
+    recent = ScanRun(
+        scan_run_id="recent-1", scan_generation="gen-recent", trigger=ScanTrigger.SCHEDULED,
+        status=ScanRunStatus.RUNNING, started_at=NOW - timedelta(seconds=5), lock_owner_token="owner-1",
+    )
+    await repositories.scan_runs.create_once("recent-1", recent, status=recent.status.value)
+
+    await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    recent_row = await repositories.scan_runs.get("recent-1")
+    assert recent_row["status"] == "running"
