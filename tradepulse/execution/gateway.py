@@ -25,6 +25,7 @@ from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import (
+    AlpacaActivity,
     AlpacaClient,
     AlpacaError,
     AlpacaOrderRequest,
@@ -304,11 +305,74 @@ class ExecutionGateway:
             intent.filled_quantity, intent.filled_avg_price,
         )
 
+    @staticmethod
+    def _is_valid_fill_activity(activity: AlpacaActivity, current: TradeIntent) -> bool:
+        """A broker activity becoming a financial ledger record is an
+        accounting boundary -- validate every available field before
+        admitting it, rather than trusting order_id alone."""
+        if not activity.activity_id:
+            return False
+        if activity.symbol != current.asset.symbol:
+            return False
+        if activity.side != current.side:
+            return False
+        if activity.qty is None or activity.qty <= 0:
+            return False
+        if activity.price is None or activity.price <= 0:
+            return False
+        if activity.transaction_time is None:
+            return False
+        return True
+
+    async def _attribute_order_fills(self, current: TradeIntent) -> Decimal:
+        """Fetch this order's real FILL activities from Alpaca and create a
+        local Fill/SettlementEvent for each validated one not already
+        recorded, keyed by Alpaca's own activity_id -- the real broker fill
+        identity, not a locally-synthesized string. Returns the total
+        quantity attributed from validated activities so far, so the caller
+        can tell whether the Activities API has fully caught up with what
+        /orders reports."""
+        activities = await self._broker.get_activities(activity_type="FILL", since=current.created_at)
+        order_activities = [a for a in activities if str(a.raw.get("order_id") or "") == current.broker_order_id]
+
+        validated: list[AlpacaActivity] = []
+        for activity in order_activities:
+            if not self._is_valid_fill_activity(activity, current):
+                await self._alerts.send(
+                    "critical",
+                    f"BROKER_FILL_INTEGRITY_MISMATCH: Alpaca FILL activity {activity.activity_id} is linked to "
+                    f"order {current.broker_order_id} but its symbol/side/qty/price/timestamp don't match the "
+                    f"expected trade -- excluded from attribution, not recorded as a Fill.",
+                    {"trade_intent_id": current.trade_intent_id, "broker_order_id": current.broker_order_id, "activity_id": activity.activity_id},
+                )
+                continue
+            validated.append(activity)
+        validated.sort(key=lambda a: (a.transaction_time, a.activity_id))
+
+        for activity in validated:
+            fill = Fill(
+                fill_id=activity.activity_id, trade_intent_id=current.trade_intent_id, order_id=current.broker_order_id,
+                asset=current.asset, side=current.side, execution_mode=current.execution_mode,
+                quantity=activity.qty, price=activity.price, fees=Decimal("0"), slippage=Decimal("0"),
+                filled_at=activity.transaction_time, broker_fill_id=activity.activity_id,
+            )
+            created = await self._repositories.fills.create_once(fill.fill_id, fill, unique_value=fill.fill_id)
+            if created:
+                event = SettlementEvent(
+                    settlement_event_id=fill.fill_id, fill_id=fill.fill_id, trade_intent_id=current.trade_intent_id,
+                    asset=current.asset, side=current.side, execution_mode=current.execution_mode,
+                    quantity=fill.quantity, price=fill.price, occurred_at=activity.transaction_time,
+                    broker_order_id=current.broker_order_id, broker_fill_id=activity.activity_id,
+                    client_order_id=current.client_order_id, sector=current.sector,
+                )
+                await self._repositories.settlements.create_once(fill.fill_id, event, status=event.status.value, unique_value=fill.fill_id)
+
+        return sum((a.qty for a in validated), Decimal("0"))
+
     async def _poll_and_settle(self, intent: TradeIntent) -> ExecutionResult:
         assert intent.broker_order_id is not None
         current = intent
         last_filled_qty = intent.filled_quantity
-        last_filled_price = intent.filled_avg_price or Decimal("0")
         deadline = time.monotonic() + self.FILL_TIMEOUT_SECONDS
 
         while time.monotonic() < deadline:
@@ -321,47 +385,44 @@ class ExecutionGateway:
             cumulative_filled = order.filled_qty
             cumulative_avg_price = order.filled_avg_price or Decimal("0")
 
-            if cumulative_filled > last_filled_qty:
-                incremental_qty = cumulative_filled - last_filled_qty
-                # incremental_price derived from cumulative VWAP deltas, NOT
-                # naive filled_avg_price diffing -- see execution.ts's
-                # comment: Alpaca's filled_avg_price is the VWAP of ALL
-                # fills so far, so using it directly for each increment
-                # corrupts the ledger on the 2nd+ partial fill.
-                prev_notional = last_filled_qty * last_filled_price
-                curr_notional = cumulative_filled * cumulative_avg_price
-                incremental_notional = curr_notional - prev_notional
-                incremental_price = (
-                    incremental_notional / incremental_qty
-                    if incremental_qty > 0 and incremental_notional > 0
-                    else (cumulative_avg_price if cumulative_avg_price > 0 else (current.reference_price or Decimal("0")))
-                )
-
-                fill_id = f"{current.broker_order_id}:fill:{cumulative_filled}"
-                fill = Fill(
-                    fill_id=fill_id, trade_intent_id=current.trade_intent_id, order_id=current.broker_order_id,
-                    asset=current.asset, side=current.side, execution_mode=current.execution_mode,
-                    quantity=incremental_qty, price=incremental_price, fees=Decimal("0"), slippage=Decimal("0"),
-                    filled_at=self._clock(), broker_fill_id=fill_id,
-                )
-                created = await self._repositories.fills.create_once(fill_id, fill, unique_value=fill_id)
-                if created:
-                    event = SettlementEvent(
-                        settlement_event_id=fill_id, fill_id=fill_id, trade_intent_id=current.trade_intent_id,
-                        asset=current.asset, side=current.side, execution_mode=current.execution_mode,
-                        quantity=incremental_qty, price=incremental_price, occurred_at=self._clock(),
-                        broker_order_id=current.broker_order_id, broker_fill_id=fill_id,
-                        client_order_id=current.client_order_id, sector=current.sector,
+            attributed_qty = last_filled_qty
+            if cumulative_filled > 0:
+                attributed_qty = await self._attribute_order_fills(current)
+                if attributed_qty > cumulative_filled:
+                    # A broker-side data anomaly, not eventual-consistency
+                    # lag -- activities scoped to this order should never sum
+                    # to more than the order itself reports filled. Fail
+                    # closed rather than finalize on quantity that can't be
+                    # trusted.
+                    await self._alerts.send(
+                        "critical",
+                        f"BROKER_FILL_INTEGRITY_MISMATCH: attributed fill quantity ({attributed_qty}) exceeds "
+                        f"order.filled_qty ({cumulative_filled}) for {current.asset.symbol} order "
+                        f"{current.broker_order_id} -- halting for manual review.",
+                        {"trade_intent_id": current.trade_intent_id, "broker_order_id": current.broker_order_id,
+                         "attributed_qty": str(attributed_qty), "order_filled_qty": str(cumulative_filled)},
                     )
-                    await self._repositories.settlements.create_once(fill_id, event, status=event.status.value, unique_value=fill_id)
-
-                last_filled_qty = cumulative_filled
-                last_filled_price = cumulative_avg_price
-                current = replace(current, filled_quantity=cumulative_filled, filled_avg_price=cumulative_avg_price)
+                    return ExecutionResult(
+                        "pending", current.trade_intent_id, ["BROKER_FILL_INTEGRITY_MISMATCH"], attributed_qty, cumulative_avg_price or None
+                    )
+                if attributed_qty != last_filled_qty:
+                    current = replace(current, filled_quantity=attributed_qty, filled_avg_price=cumulative_avg_price)
+                    last_filled_qty = attributed_qty
 
             if order.status in TERMINAL_ORDER_STATUSES:
+                if cumulative_filled > 0 and attributed_qty < cumulative_filled:
+                    # /orders reports more filled quantity than the
+                    # Activities API has surfaced yet (eventual-consistency
+                    # lag). Do NOT finalize on unattributed quantity -- keep
+                    # polling within the existing timeout budget; a gap that
+                    # outlives the whole poll window falls through to the
+                    # timeout path below, which already leaves the intent
+                    # PARTIALLY_FILLED/pending for reconciliation to pick up
+                    # rather than fabricating anything.
+                    await asyncio.sleep(self.POLL_INTERVAL_SECONDS)
+                    continue
                 if order.status in TERMINAL_FAILURE_ORDER_STATUSES:
-                    terminal_status = TradeIntentStatus.PARTIALLY_FILLED if cumulative_filled > 0 else TradeIntentStatus.REJECTED
+                    terminal_status = TradeIntentStatus.PARTIALLY_FILLED if attributed_qty > 0 else TradeIntentStatus.REJECTED
                 else:
                     terminal_status = TradeIntentStatus.FILLED
                 current = replace(current, status=terminal_status)
@@ -372,7 +433,7 @@ class ExecutionGateway:
                     else "partially_filled" if terminal_status == TradeIntentStatus.PARTIALLY_FILLED
                     else "rejected"
                 )
-                return ExecutionResult(result_status, current.trade_intent_id, [], cumulative_filled, cumulative_avg_price or None)
+                return ExecutionResult(result_status, current.trade_intent_id, [], attributed_qty, cumulative_avg_price or None)
 
             if order.status == "partially_filled" and current.status != TradeIntentStatus.PARTIALLY_FILLED:
                 current = replace(current, status=TradeIntentStatus.PARTIALLY_FILLED)
@@ -384,4 +445,4 @@ class ExecutionGateway:
         # final state later.
         current = replace(current, status=TradeIntentStatus.PARTIALLY_FILLED if last_filled_qty > 0 else TradeIntentStatus.ACCEPTED)
         await self._repositories.trade_intents.update(current.trade_intent_id, current, status=current.status.value)
-        return ExecutionResult("pending", current.trade_intent_id, [], last_filled_qty, last_filled_price or None)
+        return ExecutionResult("pending", current.trade_intent_id, [], last_filled_qty, current.filled_avg_price)

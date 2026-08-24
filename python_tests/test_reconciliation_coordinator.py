@@ -62,8 +62,14 @@ async def _seed_holding(repositories: PersistenceRepositories, *, quantity: str,
     await repositories.holdings.create_once("AAPL", holding)
 
 
-async def _seed_fill(repositories: PersistenceRepositories, *, fill_id: str, quantity: str, price: str, filled_at: datetime = NOW, side: Side = Side.BUY) -> None:
-    fill = Fill(fill_id, "ti-1", "order-1", _aapl(), side, ExecutionMode.PAPER, Decimal(quantity), Decimal(price), Decimal("0"), Decimal("0"), filled_at)
+async def _seed_fill(
+    repositories: PersistenceRepositories, *, fill_id: str, quantity: str, price: str,
+    filled_at: datetime = NOW, side: Side = Side.BUY, broker_fill_id: str | None = None,
+) -> None:
+    fill = Fill(
+        fill_id, "ti-1", "order-1", _aapl(), side, ExecutionMode.PAPER, Decimal(quantity), Decimal(price),
+        Decimal("0"), Decimal("0"), filled_at, broker_fill_id=broker_fill_id,
+    )
     await repositories.fills.create_once(fill_id, fill, unique_value=None)
 
 
@@ -212,6 +218,33 @@ async def test_matched_fill_is_recorded_as_heuristic_match(tmp_path) -> None:
     assert len(fill_records) == 1
     assert fill_records[0].outcome == ReconciliationOutcome.MATCHED
     assert fill_records[0].actual["match_method"] == "heuristic"
+
+
+@respx.mock
+async def test_exact_activity_id_match_wins_even_when_heuristic_would_not_match(tmp_path) -> None:
+    """Once a local Fill carries Alpaca's real broker_fill_id (see
+    execution/gateway.py::_attribute_order_fills), reconciliation should
+    use it directly rather than falling back to the symbol/qty/price/time
+    heuristic -- proven here by seeding a Fill whose qty/price would NOT
+    satisfy the heuristic at all, yet still gets matched via the exact ID."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    await _seed_fill(repositories, fill_id="fill-1", quantity="5", price="150", broker_fill_id="activity-1")
+    _mock_positions([])
+    # Heuristic-incompatible on purpose: different qty/price than the seeded Fill.
+    _mock_activities([_activity_json("activity-1", "999", "1")])
+
+    summary = await run_reconciliation(repositories, broker, _alerts(), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.missed_fills_detected == 0
+    records = await repositories.reconciliation_records.list_all()
+    payloads = [hydrate("reconciliation_records", r["payload"]) for r in records]
+    fill_records = [p for p in payloads if p.reconciliation_type == "fill"]
+    assert len(fill_records) == 1
+    assert fill_records[0].outcome == ReconciliationOutcome.MATCHED
+    assert fill_records[0].expected["local_fill_id"] == "fill-1"
+    assert fill_records[0].actual["match_method"] == "exact_id"
 
 
 @respx.mock

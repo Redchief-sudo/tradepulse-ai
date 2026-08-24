@@ -78,6 +78,18 @@ def _order_json(status: str, filled_qty: str, filled_avg_price: str | None, side
     }
 
 
+def _mock_fill_activities(activity_id: str, qty: str, price: str, side: str = "sell", order_id: str = "order-1") -> None:
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
+        return_value=httpx.Response(
+            200,
+            json=[{
+                "id": activity_id, "activity_type": "FILL", "symbol": "AAPL", "side": side,
+                "qty": qty, "price": price, "transaction_time": QUOTE_TS, "order_id": order_id,
+            }],
+        )
+    )
+
+
 async def _seed_holding(repositories: PersistenceRepositories, *, quantity: str = "10", stop_loss: str | None = "140", target_price: str | None = "170") -> None:
     holding = Holding(
         asset=_aapl(), quantity=Decimal(quantity), average_price=Decimal("150"), updated_at=NOW,
@@ -96,6 +108,7 @@ async def test_long_position_breaching_stop_triggers_sell(tmp_path) -> None:
     _mock_quote()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "10", "135")))
+    _mock_fill_activities("act-1", "10", "135")
 
     summary = await run_position_monitor(repositories, broker, gateway, alerts, clock=lambda: NOW)
     await broker.aclose()
@@ -118,6 +131,7 @@ async def test_long_position_breaching_target_triggers_sell(tmp_path) -> None:
     _mock_quote()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "10", "175")))
+    _mock_fill_activities("act-1", "10", "175")
 
     summary = await run_position_monitor(repositories, broker, gateway, alerts, clock=lambda: NOW)
     await broker.aclose()
@@ -136,6 +150,7 @@ async def test_short_position_breaching_inverted_thresholds_triggers_buy(tmp_pat
     _mock_quote()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None, side="buy")))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "10", "165", side="buy")))
+    _mock_fill_activities("act-1", "10", "165", side="buy")
 
     summary = await run_position_monitor(repositories, broker, gateway, alerts, clock=lambda: NOW)
     await broker.aclose()

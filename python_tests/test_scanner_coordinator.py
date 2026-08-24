@@ -64,6 +64,18 @@ def _order_json(status: str, filled_qty: str, filled_avg_price: str | None) -> d
     }
 
 
+def _mock_fill_activities(activity_id: str, qty: str, price: str) -> None:
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
+        return_value=httpx.Response(
+            200,
+            json=[{
+                "id": activity_id, "activity_type": "FILL", "symbol": "AAPL", "side": "buy",
+                "qty": qty, "price": price, "transaction_time": QUOTE_TS, "order_id": "order-1",
+            }],
+        )
+    )
+
+
 def _synthetic_closes(n: int, trend: float, amplitude: float, period: float, phase: float) -> list[float]:
     price = 100.0
     closes = []
@@ -115,6 +127,7 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
     _mock_bars(_BULLISH_CLOSES)
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities("act-1", "5", "199.60")
 
     summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW)
     await broker.aclose()

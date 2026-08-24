@@ -90,6 +90,18 @@ def _order_json(status: str, filled_qty: str, filled_avg_price: str | None, orde
     }
 
 
+def _mock_fill_activities(activity_id: str, qty: str, price: str, order_id: str = "order-1", side: str = "buy") -> None:
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
+        return_value=httpx.Response(
+            200,
+            json=[{
+                "id": activity_id, "activity_type": "FILL", "symbol": "AAPL", "side": side,
+                "qty": qty, "price": price, "transaction_time": QUOTE_TS, "order_id": order_id,
+            }],
+        )
+    )
+
+
 def _tool_use_response(candidates: list[dict]) -> dict:
     return {
         "model": "claude-haiku-4-5",
@@ -151,6 +163,7 @@ async def test_resume_after_crash_before_broker_submission(tmp_path) -> None:
     _mock_quote()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities("act-1", "5", "199.60")
 
     # Process B: fresh gateway, same database file.
     _, _, broker_b, _, gateway_b, _, _ = await _fresh_gateway(db_url)
@@ -181,6 +194,7 @@ async def test_resume_after_crash_between_acceptance_and_fill_polling(tmp_path) 
 
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities("act-2", "5", "199.60")
 
     # Process B: fresh gateway, same database file, resumes polling the SAME broker order.
     _, repositories_b, broker_b, _, gateway_b, _, _ = await _fresh_gateway(db_url)
@@ -209,6 +223,7 @@ async def test_resume_after_crash_mid_settlement_stale_processing(tmp_path) -> N
     _mock_quote()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities("act-3", "5", "199.60")
 
     request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", decision_id="decision-3")
     first_result = await gateway_a.execute_intent(request)
@@ -293,6 +308,15 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
         return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60", order_id="order-1", side="buy"))
     )
+    activities_route = respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
+        return_value=httpx.Response(
+            200,
+            json=[{
+                "id": "activity-buy-1", "activity_type": "FILL", "symbol": "AAPL", "side": "buy",
+                "qty": "5", "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-1",
+            }],
+        )
+    )
 
     # ---- Process A: scan discovers AAPL and opens a long position. ----
     _, repositories_a, broker_a, market_data_a, gateway_a, _, limits_a = await _fresh_gateway(db_url)
@@ -330,6 +354,15 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
     )
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-2").mock(
         return_value=httpx.Response(200, json=_order_json("filled", str(bought_qty), breach_price, order_id="order-2", side="sell"))
+    )
+    activities_route.mock(
+        return_value=httpx.Response(
+            200,
+            json=[{
+                "id": "activity-sell-1", "activity_type": "FILL", "symbol": "AAPL", "side": "sell",
+                "qty": str(bought_qty), "price": breach_price, "transaction_time": QUOTE_TS, "order_id": "order-2",
+            }],
+        )
     )
 
     monitor_summary = await run_position_monitor(repositories_b, broker_b, gateway_b, alerts_b, clock=lambda: NOW)

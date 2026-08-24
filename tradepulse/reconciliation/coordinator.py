@@ -13,14 +13,18 @@ accounting drift -- the Holding is deliberately left alone and NOT claimed
 corrected, because fixing the view would hide a real problem in the
 fill/lot history underneath it; a human is alerted instead.
 
-Fill reconciliation matches Alpaca's real fill activities against local
-`Fill` records heuristically (symbol/qty/price/time-window) -- local fills
-don't carry Alpaca's real per-fill activity ID yet, so this is never
-presented as an authoritative match. An Alpaca activity with no local match
-at all is a genuinely missed fill; it is recorded and alerted, never
-auto-corrected by fabricating a local Fill/SettlementEvent after the fact --
-that would mean re-deriving lot allocation, PnL, and holding state outside
-the gateway's normal, tested flow.
+Fill reconciliation first tries an exact match on Alpaca's real per-fill
+activity ID (`Fill.broker_fill_id == activity.activity_id`) -- the
+execution gateway (execution/gateway.py::_attribute_order_fills) has
+carried that real ID since Fill records started being created from
+validated Alpaca FILL activities rather than a locally-synthesized ID. Only
+a local Fill with no activity-ID match at all (e.g. one predating that
+change) falls back to the older symbol/qty/price/time-window heuristic,
+which is never presented as an authoritative match. An Alpaca activity with
+no local match at all is a genuinely missed fill; it is recorded and
+alerted, never auto-corrected by fabricating a local Fill/SettlementEvent
+after the fact -- that would mean re-deriving lot allocation, PnL, and
+holding state outside the gateway's normal, tested flow.
 """
 
 from __future__ import annotations
@@ -193,6 +197,15 @@ async def _reconcile_positions(
     return positions_checked, view_drift_corrected, accounting_drift_detected
 
 
+def _find_exact_id_match(activity: AlpacaActivity, local_fills: list[Fill], already_matched: set[str]) -> Fill | None:
+    for fill in local_fills:
+        if fill.fill_id in already_matched:
+            continue
+        if fill.broker_fill_id is not None and fill.broker_fill_id == activity.activity_id:
+            return fill
+    return None
+
+
 def _find_heuristic_match(activity: AlpacaActivity, local_fills: list[Fill], already_matched: set[str]) -> Fill | None:
     if activity.qty is None or activity.price is None or activity.transaction_time is None:
         return None
@@ -224,12 +237,16 @@ async def _reconcile_fills(
 
     for activity in activities:
         fills_checked += 1
-        match = _find_heuristic_match(activity, local_fills, matched)
+        match = _find_exact_id_match(activity, local_fills, matched)
+        match_method = "exact_id"
+        if match is None:
+            match = _find_heuristic_match(activity, local_fills, matched)
+            match_method = "heuristic"
         if match is not None:
             matched.add(match.fill_id)
             await _record(
                 repositories, reconciliation_type="fill", subject_id=activity.activity_id, outcome=ReconciliationOutcome.MATCHED,
-                expected={"local_fill_id": match.fill_id}, actual={"activity_id": activity.activity_id, "match_method": "heuristic"},
+                expected={"local_fill_id": match.fill_id}, actual={"activity_id": activity.activity_id, "match_method": match_method},
                 occurred_at=now,
             )
             continue

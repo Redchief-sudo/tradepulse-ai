@@ -8,7 +8,7 @@ from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
 from tradepulse.config import risk_limits_for_profile
 from tradepulse.execution import ExecutionGateway, ExecutionRequest
-from tradepulse.models import AssetClass, AssetIdentity, ExecutionMode, SessionState, Side, TradingSession
+from tradepulse.models import AssetClass, AssetIdentity, ExecutionMode, SessionState, Side, TradeIntent, TradeIntentStatus, TradingSession
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.providers import AlpacaMarketDataProvider
 from tradepulse.risk import save_session
@@ -54,6 +54,31 @@ def _order_json(status: str, filled_qty: str, filled_avg_price: str | None) -> d
     }
 
 
+def _fill_activity(
+    activity_id: str, order_id: str = "order-1", *,
+    symbol: str = "AAPL", side: str = "buy", qty: str = "5", price: str = "199.60", transaction_time: str = QUOTE_TS,
+) -> dict:
+    return {
+        "id": activity_id, "activity_type": "FILL", "symbol": symbol, "side": side,
+        "qty": qty, "price": price, "transaction_time": transaction_time, "order_id": order_id,
+    }
+
+
+def _mock_fill_activities(*activities: dict) -> respx.Route:
+    return respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
+        return_value=httpx.Response(200, json=list(activities))
+    )
+
+
+def _intent(trade_intent_id: str = "intent-1", *, broker_order_id: str = "order-1") -> TradeIntent:
+    return TradeIntent(
+        trade_intent_id=trade_intent_id, idempotency_key=trade_intent_id, correlation_id=trade_intent_id,
+        asset=_aapl(), side=Side.BUY, execution_mode=ExecutionMode.PAPER, strategy="test", created_at=NOW,
+        requested_quantity=Decimal("5"), status=TradeIntentStatus.ACCEPTED,
+        broker_order_id=broker_order_id, client_order_id=trade_intent_id,
+    )
+
+
 @respx.mock
 async def test_buy_rejected_when_session_not_active(tmp_path) -> None:
     repositories, broker, gateway = await _setup(tmp_path)
@@ -72,6 +97,7 @@ async def test_full_buy_flow_fills_and_settles(tmp_path) -> None:
     _mock_quote()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities(_fill_activity("act-1"))
 
     request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
     result = await gateway.execute_intent(request)
@@ -88,6 +114,184 @@ async def test_full_buy_flow_fills_and_settles(tmp_path) -> None:
     holding = hydrate("holdings", holding_row["payload"])
     assert holding.quantity == Decimal("5")
 
+    fill_rows = await repositories.fills.list_all(limit=10)
+    assert len(fill_rows) == 1
+    fill = hydrate("fills", fill_rows[0]["payload"])
+    assert fill.fill_id == "act-1"  # the real Alpaca activity ID, not a synthesized order-id:fill:qty string
+    assert fill.broker_fill_id == "act-1"
+
+
+@respx.mock
+async def test_partial_fills_recorded_as_separate_activities_not_reconstructed_vwap(tmp_path) -> None:
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_quote()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.72")))
+    _mock_fill_activities(
+        _fill_activity("act-1", qty="2", price="199.50"),
+        _fill_activity("act-2", qty="3", price="199.87"),
+    )
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "filled"
+    assert result.filled_quantity == Decimal("5")
+
+    fill_rows = await repositories.fills.list_all(limit=10)
+    fills = {row["record_id"]: hydrate("fills", row["payload"]) for row in fill_rows}
+    assert set(fills) == {"act-1", "act-2"}
+    assert fills["act-1"].quantity == Decimal("2") and fills["act-1"].price == Decimal("199.50")
+    assert fills["act-2"].quantity == Decimal("3") and fills["act-2"].price == Decimal("199.87")
+
+
+@respx.mock
+async def test_activities_lag_behind_order_status_gateway_keeps_polling(tmp_path) -> None:
+    repositories, broker, gateway = await _setup(tmp_path)
+    gateway.FILL_TIMEOUT_SECONDS, gateway.POLL_INTERVAL_SECONDS = 5, 0.1
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_quote()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
+        side_effect=[httpx.Response(200, json=[]), httpx.Response(200, json=[_fill_activity("act-1")])]
+    )
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "filled"
+    assert result.filled_quantity == Decimal("5")
+    fill_rows = await repositories.fills.list_all(limit=10)
+    assert len(fill_rows) == 1
+    assert hydrate("fills", fill_rows[0]["payload"]).broker_fill_id == "act-1"
+
+
+@respx.mock
+async def test_foreign_order_activity_is_ignored(tmp_path) -> None:
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_quote()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities(
+        _fill_activity("act-1", order_id="order-1", qty="5"),
+        _fill_activity("act-foreign", order_id="order-999", qty="3"),
+    )
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "filled"
+    assert result.filled_quantity == Decimal("5")  # not 8 -- the foreign-order activity must never be attributed here
+    fill_rows = await repositories.fills.list_all(limit=10)
+    assert {row["record_id"] for row in fill_rows} == {"act-1"}
+
+
+@respx.mock
+async def test_attribute_order_fills_rejects_symbol_side_mismatch_and_alerts(tmp_path, caplog) -> None:
+    """Unit-level: order_id matching alone is not trusted -- an activity
+    linked to the right order but wrong symbol/side must be excluded and
+    alerted, never turned into a Fill. Exercised directly against
+    _attribute_order_fills rather than through the full 20s poll timeout,
+    since every activity here is deliberately invalid for the whole window."""
+    import logging
+
+    repositories, broker, gateway = await _setup(tmp_path)
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
+        return_value=httpx.Response(200, json=[_fill_activity("act-bad", order_id="order-1", symbol="TSLA", qty="5")])
+    )
+
+    with caplog.at_level(logging.WARNING):
+        attributed = await gateway._attribute_order_fills(_intent())
+    await broker.aclose()
+
+    assert attributed == Decimal("0")
+    fill_rows = await repositories.fills.list_all(limit=10)
+    assert fill_rows == []
+    skipped = [r for r in caplog.records if getattr(r, "event", None) == "telegram_alert_skipped_no_credentials"]
+    assert any("BROKER_FILL_INTEGRITY_MISMATCH" in r.alert_message for r in skipped)
+
+
+@respx.mock
+async def test_attribute_order_fills_idempotent_on_repeated_calls(tmp_path) -> None:
+    repositories, broker, gateway = await _setup(tmp_path)
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
+        return_value=httpx.Response(200, json=[_fill_activity("act-1", qty="5")])
+    )
+
+    intent = _intent()
+    first = await gateway._attribute_order_fills(intent)
+    second = await gateway._attribute_order_fills(intent)
+    await broker.aclose()
+
+    assert first == Decimal("5")
+    assert second == Decimal("5")
+    fill_rows = await repositories.fills.list_all(limit=10)
+    assert len(fill_rows) == 1  # no duplicate created on the second, identical attribution pass
+
+
+@respx.mock
+async def test_attributed_quantity_exceeding_order_quantity_fails_closed(tmp_path, caplog) -> None:
+    import logging
+
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_quote()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities(
+        _fill_activity("act-1", qty="5"),
+        _fill_activity("act-2", qty="3"),  # a broker-side anomaly: activities for this order sum to more than order.filled_qty
+    )
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    with caplog.at_level(logging.WARNING):
+        result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "pending"
+    assert result.reasons == ["BROKER_FILL_INTEGRITY_MISMATCH"]
+    intent_row = await repositories.trade_intents.get(result.trade_intent_id)
+    assert intent_row["status"] not in ("filled", "rejected")  # never finalized as terminal on untrusted quantity
+    skipped = [r for r in caplog.records if getattr(r, "event", None) == "telegram_alert_skipped_no_credentials"]
+    assert any("BROKER_FILL_INTEGRITY_MISMATCH" in r.alert_message for r in skipped)
+
+
+@respx.mock
+async def test_no_synthetic_fallback_when_no_activity_can_be_validated(tmp_path) -> None:
+    """When Alpaca's Activities API never surfaces a validatable fill for
+    the whole poll window, the gateway must leave the intent pending for
+    reconciliation rather than fabricating a fill ID -- proving the old
+    f"{order_id}:fill:{qty}" fallback path no longer exists."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    gateway.FILL_TIMEOUT_SECONDS, gateway.POLL_INTERVAL_SECONDS = 1, 0.2
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_quote()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities(_fill_activity("act-bad", symbol="TSLA", qty="5"))  # always invalid: wrong symbol
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "pending"
+    assert result.filled_quantity == Decimal("0")
+    fill_rows = await repositories.fills.list_all(limit=10)
+    assert fill_rows == []
+    intent_row = await repositories.trade_intents.get(result.trade_intent_id)
+    assert intent_row["status"] == "accepted"  # never advanced to filled on unattributed/unvalidated quantity
+
 
 @respx.mock
 async def test_terminal_intent_resumes_idempotently_without_resubmitting(tmp_path) -> None:
@@ -97,6 +301,7 @@ async def test_terminal_intent_resumes_idempotently_without_resubmitting(tmp_pat
     _mock_quote()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities(_fill_activity("act-1"))
 
     request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", decision_id="decision-1")
     first = await gateway.execute_intent(request)
@@ -169,6 +374,7 @@ async def test_buy_approved_when_daily_loss_under_limit(tmp_path) -> None:
     _mock_quote()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "1", "199.60")))
+    _mock_fill_activities(_fill_activity("act-1", qty="1"))
 
     request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("1"), strategy="test", confidence=Decimal("90"))
     result = await gateway.execute_intent(request)
@@ -207,6 +413,7 @@ async def test_ambiguous_submission_error_recovers_via_client_order_id_lookup(tm
         return_value=httpx.Response(200, json=_order_json("accepted", "0", None))
     )
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities(_fill_activity("act-1"))
 
     request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
     result = await gateway.execute_intent(request)
@@ -253,6 +460,7 @@ async def test_ambiguous_5xx_error_routes_through_recovery_not_straight_to_rejec
         return_value=httpx.Response(200, json=_order_json("accepted", "0", None))
     )
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities(_fill_activity("act-1"))
 
     request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
     result = await gateway.execute_intent(request)
