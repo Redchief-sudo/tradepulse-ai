@@ -5,6 +5,12 @@ import logging
 from datetime import UTC, datetime
 
 
+# Every attribute a plain LogRecord carries with no `extra=` at all -- computed
+# dynamically (not hand-listed) so it stays correct across Python versions.
+# Anything else on the record was added via `extra=` and must be surfaced.
+_RESERVED_RECORD_ATTRS = frozenset(logging.makeLogRecord({}).__dict__) | {"message"}
+
+
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
@@ -14,10 +20,10 @@ class JsonFormatter(logging.Formatter):
             "event": getattr(record, "event", record.getMessage()),
             "message": record.getMessage(),
         }
-        for field in ("correlation_id", "trade_intent_id", "order_id", "fill_id", "scan_generation"):
-            value = getattr(record, field, None)
-            if value is not None:
-                payload[field] = value
+        for key, value in record.__dict__.items():
+            if key in _RESERVED_RECORD_ATTRS or key == "event":
+                continue
+            payload[key] = value
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload, separators=(",", ":"), default=str)

@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from os import environ
 
 import httpx
@@ -8,15 +10,27 @@ from tradepulse.cli import (
     MONITOR_LOCK_KEY,
     RECONCILE_LOCK_KEY,
     SCAN_LOCK_KEY,
+    SETTLE_LOCK_KEY,
     _build_parser,
     _load_dotenv,
     _require_credentials,
     _run_monitor,
     _run_reconcile,
     _run_scan,
+    _run_settle,
 )
 from tradepulse.config import Settings, SettingsError
-from tradepulse.persistence import AsyncSQLiteDatabase, acquire_lock
+from tradepulse.models import (
+    AssetClass,
+    AssetIdentity,
+    ExecutionMode,
+    Fill,
+    SettlementEvent,
+    SettlementStatus,
+    Side,
+    TradeIntent,
+)
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate
 
 
 def test_scan_subcommand_parses() -> None:
@@ -32,6 +46,11 @@ def test_monitor_subcommand_parses() -> None:
 def test_reconcile_subcommand_parses() -> None:
     args = _build_parser().parse_args(["reconcile"])
     assert args.command == "reconcile"
+
+
+def test_settle_subcommand_parses() -> None:
+    args = _build_parser().parse_args(["settle"])
+    assert args.command == "settle"
 
 
 def test_missing_subcommand_is_required() -> None:
@@ -135,3 +154,48 @@ async def test_reconcile_exits_cleanly_when_lock_is_held(tmp_path) -> None:
 
     exit_code = await _run_reconcile(_settings(database_url))
     assert exit_code == 0
+
+
+async def test_settle_exits_cleanly_when_lock_is_held(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    assert await acquire_lock(database, SETTLE_LOCK_KEY, "other-owner", "settle", ttl_seconds=300) is True
+
+    exit_code = await _run_settle(_settings(database_url))
+    assert exit_code == 0
+
+
+async def test_settle_drains_a_previously_failed_settlement_without_a_new_trade(tmp_path) -> None:
+    """The exact gap this command closes: a RETRYABLE_FAILED event whose
+    next_retry_at has passed sits unresolved forever unless something OTHER
+    than a new trade drains it. No AlpacaClient/ExecutionGateway is even
+    constructed here -- proving `tradepulse settle` doesn't need one."""
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+
+    asset = AssetIdentity("AAPL", AssetClass.EQUITY, "alpaca:AAPL")
+    now = datetime.now(UTC)
+    intent = TradeIntent(
+        "ti-1", "idem-1", "corr-1", asset, Side.BUY, ExecutionMode.PAPER, "test", now - timedelta(minutes=10),
+        requested_quantity=Decimal("5"),
+    )
+    await repositories.trade_intents.create_once("ti-1", intent, status=intent.status.value, unique_value="idem-1")
+    fill = Fill("fill-1", "ti-1", "order-1", asset, Side.BUY, ExecutionMode.PAPER, Decimal("5"), Decimal("150"), Decimal("0"), Decimal("0"), now - timedelta(minutes=10))
+    await repositories.fills.create_once("fill-1", fill, unique_value=None)
+    stuck_event = SettlementEvent(
+        "se-1", "fill-1", "ti-1", asset, Side.BUY, ExecutionMode.PAPER, Decimal("5"), Decimal("150"), now - timedelta(minutes=10),
+        status=SettlementStatus.RETRYABLE_FAILED, attempt_count=1, next_retry_at=now - timedelta(minutes=5),
+    )
+    await repositories.settlements.create_once("se-1", stuck_event, status=stuck_event.status.value, unique_value="fill-1")
+
+    exit_code = await _run_settle(_settings(database_url))
+    assert exit_code == 0
+
+    event_row = await repositories.settlements.get("se-1")
+    assert event_row["status"] == "completed"
+    holding_row = await repositories.holdings.get("AAPL")
+    assert holding_row is not None
+    assert hydrate("holdings", holding_row["payload"]).quantity == Decimal("5")

@@ -18,7 +18,6 @@ from tradepulse.scanner import run_scan_cycle
 from tradepulse.settlement import SettlementProcessor
 from tradepulse.strategy import ExecutableUniverse
 
-
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)
 QUOTE_TS = NOW.isoformat().replace("+00:00", "Z")
 UNIVERSE = ExecutableUniverse(equities=frozenset({"AAPL"}), crypto=frozenset())
@@ -26,7 +25,7 @@ UNIVERSE = ExecutableUniverse(equities=frozenset({"AAPL"}), crypto=frozenset())
 
 def _tool_use_response(candidates: list[dict]) -> dict:
     return {
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-haiku-4-5",
         "content": [{"type": "tool_use", "name": SCAN_TOOL_NAME, "input": {"candidates": candidates}}],
     }
 
@@ -37,7 +36,7 @@ async def _setup(tmp_path):
     repositories = PersistenceRepositories.create(database)
     broker = AlpacaClient("key", "secret", "paper", 10)
     market_data = AlpacaMarketDataProvider(broker)
-    ai_provider = AnthropicAIProvider("key", "claude-haiku-4-5-20251001", 10)
+    ai_provider = AnthropicAIProvider("key", "claude-haiku-4-5", 10)
     alerts = TelegramAlerter(None, None)
     settlement = SettlementProcessor(repositories, alerts, clock=lambda: NOW)
     limits = risk_limits_for_profile("balanced")
@@ -145,6 +144,14 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
     holding_row = await repositories.holdings.get("AAPL")
     holding = hydrate("holdings", holding_row["payload"])
     assert holding.stop_loss == (Decimal("199.55") * Decimal("0.92")).quantize(Decimal("0.01"))
+
+    # A broker-truth equity snapshot must be persisted every cycle -- otherwise
+    # check_max_drawdown() has no history to compare against and can never trip.
+    snapshot_rows = await repositories.equity_snapshots.list_all()
+    assert len(snapshot_rows) == 1
+    snapshot = hydrate("equity_snapshots", snapshot_rows[0]["payload"])
+    assert snapshot.total_equity == Decimal("100000")
+    assert snapshot.source == "broker"
 
 
 @respx.mock

@@ -196,10 +196,12 @@ async def _reconcile_positions(
 def _find_heuristic_match(activity: AlpacaActivity, local_fills: list[Fill], already_matched: set[str]) -> Fill | None:
     if activity.qty is None or activity.price is None or activity.transaction_time is None:
         return None
+    if activity.side is None:
+        return None  # can't confidently match a side-ambiguous activity -- fail closed, let it surface as a missed fill
     for fill in local_fills:
         if fill.fill_id in already_matched:
             continue
-        if fill.asset.symbol != activity.symbol:
+        if fill.asset.symbol != activity.symbol or fill.side != activity.side:
             continue
         if fill.quantity != activity.qty or fill.price != activity.price:
             continue

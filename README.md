@@ -23,14 +23,16 @@ No command runs its own scheduling loop -- each does its work once and exits. Po
 ```bash
 .venv/bin/tradepulse scan       # AI-driven candidate discovery + position monitor, run CONCURRENTLY
 .venv/bin/tradepulse monitor    # position monitor alone, for a tighter cadence than scan's
+.venv/bin/tradepulse settle     # drains any due settlement retries independently of new trades
 .venv/bin/tradepulse reconcile  # after-the-fact audit against Alpaca's real positions/fills
 ```
 
-`scan` requires `ALPACA_API_KEY`, `ALPACA_API_SECRET`, and `ANTHROPIC_API_KEY`; `monitor`/`reconcile` need only the Alpaca credentials (see `.env.example`). Example crontab:
+`scan` requires `ALPACA_API_KEY`, `ALPACA_API_SECRET`, and `ANTHROPIC_API_KEY`; `monitor`/`settle`/`reconcile` need only the Alpaca credentials (see `.env.example`). Example crontab:
 
 ```
 */15 9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse scan      >> /var/log/tradepulse.log 2>&1
 */2  9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse monitor   >> /var/log/tradepulse.log 2>&1
+*    *    * * *    cd /path/to/repo && .venv/bin/tradepulse settle    >> /var/log/tradepulse.log 2>&1
 0    */6  * * *    cd /path/to/repo && .venv/bin/tradepulse reconcile >> /var/log/tradepulse.log 2>&1
 ```
 

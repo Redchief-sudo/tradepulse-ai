@@ -52,7 +52,7 @@ from tradepulse.providers import (
     ProviderHttpFailure,
     build_scan_request,
 )
-from tradepulse.risk import load_session
+from tradepulse.risk import build_portfolio_snapshot, load_session
 from tradepulse.strategy import (
     ExecutableUniverse,
     compute_real_factors,
@@ -185,6 +185,16 @@ async def run_scan_cycle(
     except Exception as exc:  # noqa: BLE001 - a broker outage must fail this scan cleanly, not crash the caller
         await _finish(ScanRunStatus.FAILED, candidates_discovered=len(candidates), error=f"BROKER_UNAVAILABLE: {exc}")
         return ScanCycleSummary(scan_run_id, ScanRunStatus.FAILED, len(candidates), 0, 0, [], error=f"BROKER_UNAVAILABLE: {exc}")
+
+    # Persist one broker-truth equity snapshot per cycle -- the sole source
+    # check_max_drawdown() has to search for a historical peak. Without this,
+    # equity_snapshots stays permanently empty and drawdown protection can
+    # never trip (drawdown against an empty history is always 0%).
+    equity_snapshot = await build_portfolio_snapshot(
+        repositories, cash_balance=account.cash, account_equity=account.equity,
+        broker_prev_close_equity=account.last_equity, now=now,
+    )
+    await repositories.equity_snapshots.create_once(equity_snapshot.snapshot_id, equity_snapshot)
 
     notional_budget = (risk_limits.max_position_pct / 100) * account.equity
 

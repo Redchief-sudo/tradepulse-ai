@@ -19,7 +19,6 @@ from tradepulse.models import (
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.reconciliation import run_reconciliation
 
-
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)
 
 
@@ -63,8 +62,8 @@ async def _seed_holding(repositories: PersistenceRepositories, *, quantity: str,
     await repositories.holdings.create_once("AAPL", holding)
 
 
-async def _seed_fill(repositories: PersistenceRepositories, *, fill_id: str, quantity: str, price: str, filled_at: datetime = NOW) -> None:
-    fill = Fill(fill_id, "ti-1", "order-1", _aapl(), Side.BUY, ExecutionMode.PAPER, Decimal(quantity), Decimal(price), Decimal("0"), Decimal("0"), filled_at)
+async def _seed_fill(repositories: PersistenceRepositories, *, fill_id: str, quantity: str, price: str, filled_at: datetime = NOW, side: Side = Side.BUY) -> None:
+    fill = Fill(fill_id, "ti-1", "order-1", _aapl(), side, ExecutionMode.PAPER, Decimal(quantity), Decimal(price), Decimal("0"), Decimal("0"), filled_at)
     await repositories.fills.create_once(fill_id, fill, unique_value=None)
 
 
@@ -75,9 +74,9 @@ def _position_json(qty: str, current_price: str = "150") -> dict:
     }
 
 
-def _activity_json(activity_id: str, qty: str, price: str, transaction_time: datetime = NOW) -> dict:
+def _activity_json(activity_id: str, qty: str, price: str, transaction_time: datetime = NOW, side: str = "buy") -> dict:
     return {
-        "id": activity_id, "activity_type": "FILL", "symbol": "AAPL", "side": "buy",
+        "id": activity_id, "activity_type": "FILL", "symbol": "AAPL", "side": side,
         "qty": qty, "price": price, "transaction_time": transaction_time.isoformat().replace("+00:00", "Z"),
     }
 
@@ -213,6 +212,30 @@ async def test_matched_fill_is_recorded_as_heuristic_match(tmp_path) -> None:
     assert len(fill_records) == 1
     assert fill_records[0].outcome == ReconciliationOutcome.MATCHED
     assert fill_records[0].actual["match_method"] == "heuristic"
+
+
+@respx.mock
+async def test_heuristic_matching_does_not_cross_match_opposite_sides(tmp_path) -> None:
+    """A same-symbol, same-quantity, same-price BUY and SELL in the same
+    window (a realistic scan-then-flip) must never be matched to the wrong
+    local Fill just because qty/price/time happen to coincide."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    await _seed_fill(repositories, fill_id="fill-buy", quantity="5", price="150", side=Side.BUY)
+    await _seed_fill(repositories, fill_id="fill-sell", quantity="5", price="150", side=Side.SELL)
+    _mock_positions([])
+    _mock_activities([_activity_json("activity-buy", "5", "150", side="buy")])
+
+    summary = await run_reconciliation(repositories, broker, _alerts(), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.missed_fills_detected == 0
+    records = await repositories.reconciliation_records.list_all()
+    payloads = [hydrate("reconciliation_records", r["payload"]) for r in records]
+    fill_records = [p for p in payloads if p.reconciliation_type == "fill"]
+    assert len(fill_records) == 1
+    assert fill_records[0].outcome == ReconciliationOutcome.MATCHED
+    assert fill_records[0].expected["local_fill_id"] == "fill-buy"  # never the sell fill
 
 
 @respx.mock

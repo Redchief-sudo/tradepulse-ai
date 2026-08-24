@@ -64,7 +64,7 @@ async def test_delete_is_rejected_on_append_only_tables(tmp_path) -> None:
 async def test_ai_response_persists_for_audit_trail(tmp_path) -> None:
     repositories = await _repositories(tmp_path)
     response = AIResponse(
-        request_id="req-1", provider="anthropic", model="claude-haiku-4-5-20251001", schema_version="1.0",
+        request_id="req-1", provider="anthropic", model="claude-haiku-4-5", schema_version="1.0",
         completed_at=NOW, result={"candidates": []}, latency_ms=250,
     )
     assert await repositories.ai_responses.create_once("req-1", response)

@@ -32,7 +32,7 @@ def test_invalid_timeout_fails_configuration() -> None:
 def test_defaults_use_balanced_risk_profile_and_anthropic_haiku() -> None:
     settings = Settings.from_env({})
     assert settings.risk_profile == "balanced"
-    assert settings.anthropic_model == "claude-haiku-4-5-20251001"
+    assert settings.anthropic_model == "claude-haiku-4-5"
     assert settings.anthropic_api_key is None
     assert settings.telegram_bot_token is None
 

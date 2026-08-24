@@ -158,7 +158,7 @@ def test_equity_snapshot_roundtrips() -> None:
 
 def test_ai_response_roundtrips() -> None:
     original = AIResponse(
-        request_id="req-1", provider="anthropic", model="claude-haiku-4-5-20251001", schema_version="1.0",
+        request_id="req-1", provider="anthropic", model="claude-haiku-4-5", schema_version="1.0",
         completed_at=NOW, result={"candidates": [{"symbol": "AAPL", "recommendation": "BUY", "confidence": 82.0, "summary": "ok"}]},
         latency_ms=420,
     )

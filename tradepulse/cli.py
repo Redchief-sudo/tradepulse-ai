@@ -7,13 +7,16 @@ CLI-driven, cron-external architecture decided for this system (see docs/).
 position monitor CONCURRENTLY (not sequentially) in one process, sharing a
 composition root but each independently lock-protected -- position
 protection latency is never tied to how long the AI discovery call takes.
-`tradepulse monitor` and `tradepulse reconcile` are also available standalone
-for operators who want a different cadence than the scan cycle's (position
-protection is typically wanted more often than discovery; reconciliation is
-an after-the-fact audit pass, typically wanted less often). Example crontab:
+`tradepulse monitor`, `tradepulse settle`, and `tradepulse reconcile` are also
+available standalone for operators who want a different cadence than the
+scan cycle's (position protection is typically wanted more often than
+discovery; settlement retries want a short, independent cadence so a quiet
+market doesn't leave one stranded; reconciliation is an after-the-fact audit
+pass, typically wanted less often). Example crontab:
 
     */15 9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse scan      >> /var/log/tradepulse.log 2>&1
     */2  9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse monitor   >> /var/log/tradepulse.log 2>&1
+    *    *    * * *    cd /path/to/repo && .venv/bin/tradepulse settle    >> /var/log/tradepulse.log 2>&1
     0    */6  * * *    cd /path/to/repo && .venv/bin/tradepulse reconcile >> /var/log/tradepulse.log 2>&1
 
 An overlapping invocation of the SAME command (cron re-firing before a slow
@@ -54,13 +57,15 @@ logger = logging.getLogger(__name__)
 
 SCAN_LOCK_KEY = "scan"
 MONITOR_LOCK_KEY = "monitor"
+SETTLE_LOCK_KEY = "settle"
 RECONCILE_LOCK_KEY = "reconcile"
 # Generous ceilings above any realistic single run -- long enough to never
 # steal a live run's lease, short enough that a crashed process doesn't
-# block that command indefinitely. Monitor's is shorter since it's meant to
-# be cron'd more frequently than scan/reconcile.
+# block that command indefinitely. Monitor's and settle's are shorter since
+# they're meant to be cron'd more frequently than scan/reconcile.
 SCAN_LOCK_TTL_SECONDS = 600
 MONITOR_LOCK_TTL_SECONDS = 300
+SETTLE_LOCK_TTL_SECONDS = 300
 RECONCILE_LOCK_TTL_SECONDS = 600
 
 
@@ -213,6 +218,38 @@ async def _run_monitor(settings: Settings) -> int:
     return 1 if _log_monitor_result(result) else 0
 
 
+async def _run_settle(settings: Settings) -> int:
+    """`tradepulse settle`: independently drains any due settlement retry --
+    the only production caller otherwise is the gateway's own post-fill hook,
+    which never fires if trading goes quiet while a retry is still pending."""
+    _require_credentials(settings, require_anthropic=False)
+
+    database = AsyncSQLiteDatabase(settings.database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+
+    alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
+    settlement = SettlementProcessor(repositories, alerts)
+    owner_token = str(uuid4())
+    if not await acquire_lock(database, SETTLE_LOCK_KEY, owner_token, "settle", SETTLE_LOCK_TTL_SECONDS):
+        logger.info("settle_skipped_lock_held", extra={"event": "settle_skipped_lock_held"})
+        return 0
+    try:
+        summary = await settlement.process_pending()
+    finally:
+        await release_lock(database, SETTLE_LOCK_KEY, owner_token)
+
+    logger.info(
+        "settle_finished",
+        extra={
+            "event": "settle_finished", "ok": summary.ok, "processed": summary.processed,
+            "completed": summary.completed, "retryable_failed": summary.retryable_failed,
+            "terminal_failed": summary.terminal_failed, "integrity_blocked": summary.integrity_blocked,
+        },
+    )
+    return 0 if summary.ok else 1
+
+
 async def _run_reconcile(settings: Settings) -> int:
     """`tradepulse reconcile`: after-the-fact audit against Alpaca's real state."""
     _require_credentials(settings, require_anthropic=False)
@@ -255,11 +292,14 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("scan", help="run one AI-driven scan cycle and the position monitor concurrently, then exit")
     subparsers.add_parser("monitor", help="run one stop/target position-protection pass and exit")
+    subparsers.add_parser("settle", help="drain any due settlement retries and exit")
     subparsers.add_parser("reconcile", help="run one reconciliation pass against Alpaca's real state and exit")
     return parser
 
 
-_COMMANDS: dict[str, Any] = {"scan": _run_scan, "monitor": _run_monitor, "reconcile": _run_reconcile}
+_COMMANDS: dict[str, Any] = {
+    "scan": _run_scan, "monitor": _run_monitor, "settle": _run_settle, "reconcile": _run_reconcile,
+}
 
 
 def _load_dotenv(path: Path = Path(".env")) -> None:

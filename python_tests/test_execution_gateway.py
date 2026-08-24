@@ -14,7 +14,6 @@ from tradepulse.providers import AlpacaMarketDataProvider
 from tradepulse.risk import save_session
 from tradepulse.settlement import SettlementProcessor
 
-
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)
 QUOTE_TS = NOW.isoformat().replace("+00:00", "Z")
 
@@ -36,9 +35,9 @@ async def _setup(tmp_path):
     return repositories, broker, gateway
 
 
-def _mock_account(cash: str = "50000", equity: str = "100000") -> None:
+def _mock_account(cash: str = "50000", equity: str = "100000", last_equity: str = "99500") -> None:
     respx.get("https://paper-api.alpaca.markets/v2/account").mock(
-        return_value=httpx.Response(200, json={"equity": equity, "last_equity": "99500", "cash": cash, "buying_power": equity, "portfolio_value": equity})
+        return_value=httpx.Response(200, json={"equity": equity, "last_equity": last_equity, "cash": cash, "buying_power": equity, "portfolio_value": equity})
     )
 
 
@@ -141,6 +140,42 @@ async def test_buy_rejected_when_broker_cash_insufficient(tmp_path) -> None:
     assert result.status == "rejected"
     assert any("INSUFFICIENT_CASH" in r for r in result.reasons)
     assert order_route.call_count == 0
+
+
+@respx.mock
+async def test_buy_rejected_when_daily_loss_exceeds_limit(tmp_path) -> None:
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    # balanced profile's max_daily_loss_pct is 1.0 -- a 1.5% decline must reject.
+    _mock_account(equity="98500", last_equity="100000")
+    _mock_quote()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("1"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "rejected"
+    assert any("MAX_DAILY_LOSS_EXCEEDED" in r for r in result.reasons)
+    assert order_route.call_count == 0
+
+
+@respx.mock
+async def test_buy_approved_when_daily_loss_under_limit(tmp_path) -> None:
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    # A 0.5% decline is under the balanced profile's 1.0% limit -- must NOT reject on this basis.
+    _mock_account(equity="99500", last_equity="100000")
+    _mock_quote()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "1", "199.60")))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("1"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "filled"
+    assert order_route.call_count == 1
 
 
 @respx.mock

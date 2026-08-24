@@ -24,7 +24,13 @@ from typing import Literal
 from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter
-from tradepulse.broker import AlpacaClient, AlpacaError, AlpacaOrderRequest, default_time_in_force, is_definitive_rejection
+from tradepulse.broker import (
+    AlpacaClient,
+    AlpacaError,
+    AlpacaOrderRequest,
+    default_time_in_force,
+    is_definitive_rejection,
+)
 from tradepulse.models import (
     AssetIdentity,
     ExecutionMode,
@@ -183,7 +189,8 @@ class ExecutionGateway:
             await self._repositories.trade_intents.update(trade_intent_id, intent, status=intent.status.value)
 
         snapshot = await build_portfolio_snapshot(
-            self._repositories, cash_balance=account.cash, account_equity=account.equity, now=now
+            self._repositories, cash_balance=account.cash, account_equity=account.equity,
+            broker_prev_close_equity=account.last_equity, now=now,
         )
 
         max_drawdown_breached = False

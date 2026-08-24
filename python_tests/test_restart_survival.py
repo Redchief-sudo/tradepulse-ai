@@ -92,7 +92,7 @@ def _order_json(status: str, filled_qty: str, filled_avg_price: str | None, orde
 
 def _tool_use_response(candidates: list[dict]) -> dict:
     return {
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-haiku-4-5",
         "content": [{"type": "tool_use", "name": SCAN_TOOL_NAME, "input": {"candidates": candidates}}],
     }
 
@@ -262,7 +262,7 @@ async def test_stale_scan_lock_is_reclaimed_after_a_crash(tmp_path) -> None:
         "ALPACA_API_KEY": "key", "ALPACA_API_SECRET": "secret", "ANTHROPIC_API_KEY": "key",
         "TRADEPULSE_DATABASE_URL": db_url,
     })
-    ai_provider = AnthropicAIProvider("key", "claude-haiku-4-5-20251001", 10)
+    ai_provider = AnthropicAIProvider("key", "claude-haiku-4-5", 10)
 
     # Process B: a fresh scan invocation must reclaim the stale lease, not honor it.
     result = await _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings)
@@ -296,7 +296,7 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
 
     # ---- Process A: scan discovers AAPL and opens a long position. ----
     _, repositories_a, broker_a, market_data_a, gateway_a, _, limits_a = await _fresh_gateway(db_url)
-    ai_provider_a = AnthropicAIProvider("key", "claude-haiku-4-5-20251001", 10)
+    ai_provider_a = AnthropicAIProvider("key", "claude-haiku-4-5", 10)
     await save_session(repositories_a, TradingSession("session", SessionState.ACTIVE, True, NOW))
     respx.post("https://api.anthropic.com/v1/messages").mock(
         return_value=httpx.Response(

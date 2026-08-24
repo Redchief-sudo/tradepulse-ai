@@ -1,13 +1,29 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
 from tradepulse.config import risk_limits_for_profile
-from tradepulse.models import AssetClass, Side
-from tradepulse.risk.engine import RiskCheckInput, RiskEvalOptions, evaluate_risk
-
+from tradepulse.models import AssetClass, PortfolioSnapshot, Side
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories
+from tradepulse.risk.engine import RiskCheckInput, RiskEvalOptions, check_max_drawdown, evaluate_risk
 
 NOW = datetime(2026, 8, 15, tzinfo=UTC)
 LIMITS = risk_limits_for_profile("balanced")
+
+
+async def _repositories(tmp_path) -> PersistenceRepositories:
+    database = AsyncSQLiteDatabase(f"sqlite:///{tmp_path}/test.db")
+    await database.initialize()
+    return PersistenceRepositories.create(database)
+
+
+async def _seed_equity_snapshot(repositories: PersistenceRepositories, equity: Decimal, snapshot_id: str) -> None:
+    snapshot = PortfolioSnapshot(
+        snapshot_id=snapshot_id, as_of=NOW, total_equity=equity, cash_balance=Decimal("0"),
+        holdings_value=Decimal("0"), sector_exposure={}, open_positions=0, outstanding_orders=0,
+        trades_today=0, daily_pnl_pct=Decimal("0"), source="broker",
+    )
+    await repositories.equity_snapshots.create_once(snapshot_id, snapshot)
 
 
 def _snapshot(**overrides):
@@ -107,3 +123,46 @@ def test_buy_rejected_without_quote_data_for_spread_check() -> None:
     decision = evaluate_risk(_buy(), _snapshot(), LIMITS, RiskEvalOptions(available_cash=Decimal("100000")))
     assert not decision.approved
     assert "NO_QUOTE_DATA_FOR_SPREAD_CHECK" in decision.reasons
+
+
+async def test_max_drawdown_breached_when_current_equity_far_below_historical_peak(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await _seed_equity_snapshot(repositories, Decimal("100000"), "snap-peak")
+    limits = replace(LIMITS, max_drawdown_pct=Decimal("15"))
+
+    check = await check_max_drawdown(repositories, Decimal("84000"), limits)
+
+    assert check.breached is True
+    assert check.peak_equity == Decimal("100000")
+    assert check.drawdown_pct == Decimal("16")
+
+
+async def test_max_drawdown_not_breached_within_limit(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await _seed_equity_snapshot(repositories, Decimal("100000"), "snap-peak")
+    limits = replace(LIMITS, max_drawdown_pct=Decimal("15"))
+
+    check = await check_max_drawdown(repositories, Decimal("90000"), limits)
+
+    assert check.breached is False
+
+
+async def test_max_drawdown_disabled_when_limit_is_zero(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await _seed_equity_snapshot(repositories, Decimal("100000"), "snap-peak")
+    limits = replace(LIMITS, max_drawdown_pct=Decimal("0"))
+
+    check = await check_max_drawdown(repositories, Decimal("10"), limits)
+
+    assert check.breached is False
+    assert check.peak_equity is None
+
+
+async def test_max_drawdown_uses_current_equity_as_peak_when_no_history(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    limits = replace(LIMITS, max_drawdown_pct=Decimal("15"))
+
+    check = await check_max_drawdown(repositories, Decimal("50000"), limits)
+
+    assert check.breached is False
+    assert check.peak_equity == Decimal("50000")

@@ -88,7 +88,7 @@ class Settings:
             coinmarketcap_api_key=values.get("COINMARKETCAP_API_KEY") or None,
             anthropic_api_key=values.get("ANTHROPIC_API_KEY") or None,
             anthropic_base_url=values.get("ANTHROPIC_BASE_URL") or None,
-            anthropic_model=values.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
+            anthropic_model=values.get("ANTHROPIC_MODEL", "claude-haiku-4-5"),
             api_signing_secret=values.get("TRADEPULSE_API_SIGNING_SECRET") or None,
             telegram_bot_token=values.get("TELEGRAM_BOT_TOKEN") or None,
             telegram_chat_id=values.get("TELEGRAM_CHAT_ID") or None,
