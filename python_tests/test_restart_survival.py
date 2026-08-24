@@ -12,6 +12,7 @@ matching this system's real invocation model (a fresh `tradepulse` process
 per cron firing, reading whatever the last process left in the database).
 """
 
+import json
 import math
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -299,24 +300,41 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
 
     _mock_account()
     _mock_quote()
-    orders_post_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(
-        side_effect=[
-            httpx.Response(200, json=_order_json("accepted", "0", None, order_id="order-1", side="buy")),
-            httpx.Response(200, json=_order_json("accepted", "0", None, order_id="order-2", side="sell")),
-        ]
-    )
-    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
-        return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60", order_id="order-1", side="buy"))
-    )
-    activities_route = respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
-        return_value=httpx.Response(
+
+    # The buy order's accept response never carries quantity, but the
+    # subsequent GET /orders/order-1 and activities polls must reflect
+    # whatever quantity the scanner's real notional/price sizing actually
+    # computed and submitted -- a fully filled order's filled_qty must
+    # exactly equal what it was submitted with (see fill_attribution.py's
+    # terminal_status_for_order), so a hardcoded guess here would silently
+    # drift from the real request.
+    placed: dict[str, str] = {}
+    post_call_count = {"n": 0}
+
+    def _accept_order(request: httpx.Request) -> httpx.Response:
+        post_call_count["n"] += 1
+        if post_call_count["n"] == 1:
+            placed["buy_qty"] = json.loads(request.content)["qty"]
+            return httpx.Response(200, json=_order_json("accepted", "0", None, order_id="order-1", side="buy"))
+        return httpx.Response(200, json=_order_json("accepted", "0", None, order_id="order-2", side="sell"))
+
+    orders_post_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=_accept_order)
+
+    def _order1_status(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_order_json("filled", placed["buy_qty"], "199.60", order_id="order-1", side="buy"))
+
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(side_effect=_order1_status)
+
+    def _activities_a(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
             200,
             json=[{
                 "id": "activity-buy-1", "activity_type": "FILL", "symbol": "AAPL", "side": "buy",
-                "qty": "5", "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-1",
+                "qty": placed["buy_qty"], "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-1",
             }],
         )
-    )
+
+    activities_route = respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(side_effect=_activities_a)
 
     # ---- Process A: scan discovers AAPL and opens a long position. ----
     _, repositories_a, broker_a, market_data_a, gateway_a, _, limits_a = await _fresh_gateway(db_url)

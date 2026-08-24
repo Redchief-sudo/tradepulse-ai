@@ -418,6 +418,27 @@ async def test_late_fill_recovery_attempted_but_activity_still_invalid_falls_thr
 
 
 @respx.mock
+async def test_late_fill_recovery_maps_done_for_day_partial_to_partially_filled(tmp_path) -> None:
+    """Recovery shares terminal_status_for_order with the live gateway path
+    -- a done_for_day order that only partially filled must land on
+    PARTIALLY_FILLED here too, never be folded into FILLED just because
+    it's a non-failure terminal order status."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    await _seed_intent(repositories, trade_intent_id="ti-4", broker_order_id="order-4", status=TradeIntentStatus.ACCEPTED)
+    _mock_positions([])
+    _mock_activities([_activity_json("activity-4", "3", "150", order_id="order-4")])  # requested 5, only 3 filled
+    _mock_order("order-4", "done_for_day", "3", "150")
+
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.late_fills_recovered == 1
+    intent_row = await repositories.trade_intents.get("ti-4")
+    assert intent_row["status"] == "partially_filled"
+
+
+@respx.mock
 async def test_broker_positions_outage_reports_degraded(tmp_path) -> None:
     repositories = await _repositories(tmp_path)
     broker = _broker()

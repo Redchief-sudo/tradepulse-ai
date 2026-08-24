@@ -53,10 +53,11 @@ from tradepulse.risk import (
 from tradepulse.settlement import SettlementProcessor
 
 from .fill_attribution import (
-    TERMINAL_FAILURE_ORDER_STATUSES,
     TERMINAL_ORDER_STATUSES,
     TERMINAL_STATUSES,
+    AttributedFills,
     attribute_order_fills,
+    terminal_status_for_order,
 )
 from .idempotency import IN_FLIGHT_STATUSES, derive_idempotency_key
 from .quotes import fetch_authoritative_quote
@@ -302,7 +303,7 @@ class ExecutionGateway:
             intent.filled_quantity, intent.filled_avg_price,
         )
 
-    async def _attribute_order_fills(self, current: TradeIntent) -> Decimal:
+    async def _attribute_order_fills(self, current: TradeIntent) -> AttributedFills:
         """Thin pass-through to the shared fill_attribution module -- kept so
         existing/direct callers of this method (including tests) don't need
         to reach into fill_attribution themselves. See that module's
@@ -325,11 +326,11 @@ class ExecutionGateway:
                 continue
 
             cumulative_filled = order.filled_qty
-            cumulative_avg_price = order.filled_avg_price or Decimal("0")
 
             attributed_qty = last_filled_qty
             if cumulative_filled > 0:
-                attributed_qty = await self._attribute_order_fills(current)
+                attributed = await self._attribute_order_fills(current)
+                attributed_qty = attributed.quantity
                 if attributed_qty > cumulative_filled:
                     # A broker-side data anomaly, not eventual-consistency
                     # lag -- activities scoped to this order should never sum
@@ -345,10 +346,14 @@ class ExecutionGateway:
                          "attributed_qty": str(attributed_qty), "order_filled_qty": str(cumulative_filled)},
                     )
                     return ExecutionResult(
-                        "pending", current.trade_intent_id, ["BROKER_FILL_INTEGRITY_MISMATCH"], attributed_qty, cumulative_avg_price or None
+                        "pending", current.trade_intent_id, ["BROKER_FILL_INTEGRITY_MISMATCH"], attributed_qty, attributed.avg_price
                     )
                 if attributed_qty != last_filled_qty:
-                    current = replace(current, filled_quantity=attributed_qty, filled_avg_price=cumulative_avg_price)
+                    # avg_price always derives from the SAME validated
+                    # activities as attributed_qty -- never Alpaca's
+                    # order-level VWAP, which can cover more (or different)
+                    # fills than have actually been attributed yet.
+                    current = replace(current, filled_quantity=attributed_qty, filled_avg_price=attributed.avg_price or current.filled_avg_price)
                     last_filled_qty = attributed_qty
 
             if order.status in TERMINAL_ORDER_STATUSES:
@@ -363,10 +368,29 @@ class ExecutionGateway:
                     # rather than fabricating anything.
                     await asyncio.sleep(self.POLL_INTERVAL_SECONDS)
                     continue
-                if order.status in TERMINAL_FAILURE_ORDER_STATUSES:
-                    terminal_status = TradeIntentStatus.PARTIALLY_FILLED if attributed_qty > 0 else TradeIntentStatus.REJECTED
-                else:
-                    terminal_status = TradeIntentStatus.FILLED
+                terminal_status = terminal_status_for_order(order.status, attributed_qty, current.requested_quantity)
+                if terminal_status is None:
+                    if order.status == "filled":
+                        # A broker-side contradiction (status=filled but
+                        # attributed quantity doesn't cover what was
+                        # requested) -- never finalize FILLED without full
+                        # evidence.
+                        await self._alerts.send(
+                            "critical",
+                            f"BROKER_ORDER_INTEGRITY_MISMATCH: order {current.broker_order_id} for {current.asset.symbol} "
+                            f"reports status=filled but attributed quantity ({attributed_qty}) is less than requested "
+                            f"({current.requested_quantity}).",
+                            {"trade_intent_id": current.trade_intent_id, "broker_order_id": current.broker_order_id,
+                             "attributed_qty": str(attributed_qty), "requested_quantity": str(current.requested_quantity)},
+                        )
+                        return ExecutionResult(
+                            "pending", current.trade_intent_id, ["BROKER_ORDER_INTEGRITY_MISMATCH"], attributed_qty, current.filled_avg_price
+                        )
+                    # done_for_day with zero fills today -- inconclusive, not
+                    # an error; Alpaca may still send updates the next
+                    # trading day. Exit the poll loop and fall through to the
+                    # timeout path below, which leaves the intent non-terminal.
+                    break
                 current = replace(current, status=terminal_status)
                 await self._repositories.trade_intents.update(current.trade_intent_id, current, status=current.status.value)
                 await self._settlement.process_pending()
@@ -375,7 +399,7 @@ class ExecutionGateway:
                     else "partially_filled" if terminal_status == TradeIntentStatus.PARTIALLY_FILLED
                     else "rejected"
                 )
-                return ExecutionResult(result_status, current.trade_intent_id, [], attributed_qty, cumulative_avg_price or None)
+                return ExecutionResult(result_status, current.trade_intent_id, [], attributed_qty, current.filled_avg_price)
 
             if order.status == "partially_filled" and current.status != TradeIntentStatus.PARTIALLY_FILLED:
                 current = replace(current, status=TradeIntentStatus.PARTIALLY_FILLED)

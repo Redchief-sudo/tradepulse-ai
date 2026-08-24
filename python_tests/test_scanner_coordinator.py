@@ -64,16 +64,37 @@ def _order_json(status: str, filled_qty: str, filled_avg_price: str | None) -> d
     }
 
 
-def _mock_fill_activities(activity_id: str, qty: str, price: str) -> None:
-    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
-        return_value=httpx.Response(
+def _mock_dynamic_full_fill(price: str = "199.60", activity_id: str = "act-1") -> respx.Route:
+    """Wires order placement -> status polling -> fill activity together so
+    the mocked fill always reflects whatever quantity the scanner's real
+    notional/price position sizing actually computed and submitted, instead
+    of a hardcoded guess that could silently drift from it (as it did once
+    the terminal-status mapping became quantity-aware -- a fully filled
+    order's filled_qty must exactly equal what it was submitted with)."""
+    import json as _json
+
+    state: dict[str, str] = {}
+
+    def _accept(request: httpx.Request) -> httpx.Response:
+        state["qty"] = _json.loads(request.content)["qty"]
+        return httpx.Response(200, json=_order_json("accepted", "0", None))
+
+    def _status(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_order_json("filled", state["qty"], price))
+
+    def _activities(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
             200,
             json=[{
                 "id": activity_id, "activity_type": "FILL", "symbol": "AAPL", "side": "buy",
-                "qty": qty, "price": price, "transaction_time": QUOTE_TS, "order_id": "order-1",
+                "qty": state["qty"], "price": price, "transaction_time": QUOTE_TS, "order_id": "order-1",
             }],
         )
-    )
+
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=_accept)
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(side_effect=_status)
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(side_effect=_activities)
+    return order_route
 
 
 def _synthetic_closes(n: int, trend: float, amplitude: float, period: float, phase: float) -> list[float]:
@@ -125,9 +146,7 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
     _mock_account()
     _mock_quote()
     _mock_bars(_BULLISH_CLOSES)
-    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
-    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
-    _mock_fill_activities("act-1", "5", "199.60")
+    order_route = _mock_dynamic_full_fill()
 
     summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW)
     await broker.aclose()
