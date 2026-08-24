@@ -15,9 +15,12 @@ from tradepulse.models import (
     PositionLot,
     ReconciliationOutcome,
     Side,
+    TradeIntent,
+    TradeIntentStatus,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.reconciliation import run_reconciliation
+from tradepulse.settlement import SettlementProcessor
 
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)
 
@@ -38,6 +41,10 @@ def _broker() -> AlpacaClient:
 
 def _alerts() -> TelegramAlerter:
     return TelegramAlerter(None, None)
+
+
+def _settlement(repositories: PersistenceRepositories) -> SettlementProcessor:
+    return SettlementProcessor(repositories, _alerts(), clock=lambda: NOW)
 
 
 def _mock_positions(positions: list[dict]) -> None:
@@ -73,6 +80,17 @@ async def _seed_fill(
     await repositories.fills.create_once(fill_id, fill, unique_value=None)
 
 
+async def _seed_intent(
+    repositories: PersistenceRepositories, *, trade_intent_id: str, broker_order_id: str,
+    status: TradeIntentStatus = TradeIntentStatus.ACCEPTED, side: Side = Side.BUY,
+) -> None:
+    intent = TradeIntent(
+        trade_intent_id, trade_intent_id, trade_intent_id, _aapl(), side, ExecutionMode.PAPER, "test", NOW,
+        requested_quantity=Decimal("5"), status=status, broker_order_id=broker_order_id, client_order_id=trade_intent_id,
+    )
+    await repositories.trade_intents.create_once(trade_intent_id, intent, status=intent.status.value, unique_value=trade_intent_id)
+
+
 def _position_json(qty: str, current_price: str = "150") -> dict:
     return {
         "symbol": "AAPL", "asset_class": "us_equity", "qty": qty, "avg_entry_price": "150",
@@ -80,11 +98,29 @@ def _position_json(qty: str, current_price: str = "150") -> dict:
     }
 
 
-def _activity_json(activity_id: str, qty: str, price: str, transaction_time: datetime = NOW, side: str = "buy") -> dict:
+def _order_json(status: str, filled_qty: str, filled_avg_price: str | None, order_id: str = "order-1", side: str = "buy") -> dict:
     return {
+        "id": order_id, "status": status, "symbol": "AAPL", "side": side,
+        "filled_qty": filled_qty, "filled_avg_price": filled_avg_price, "submitted_at": NOW.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _mock_order(order_id: str, status: str, filled_qty: str, filled_avg_price: str | None, side: str = "buy") -> None:
+    respx.get(f"https://paper-api.alpaca.markets/v2/orders/{order_id}").mock(
+        return_value=httpx.Response(200, json=_order_json(status, filled_qty, filled_avg_price, order_id=order_id, side=side))
+    )
+
+
+def _activity_json(
+    activity_id: str, qty: str, price: str, transaction_time: datetime = NOW, side: str = "buy", order_id: str | None = None,
+) -> dict:
+    activity = {
         "id": activity_id, "activity_type": "FILL", "symbol": "AAPL", "side": side,
         "qty": qty, "price": price, "transaction_time": transaction_time.isoformat().replace("+00:00", "Z"),
     }
+    if order_id is not None:
+        activity["order_id"] = order_id
+    return activity
 
 
 @respx.mock
@@ -96,7 +132,7 @@ async def test_all_three_agree_records_matched_only(tmp_path) -> None:
     _mock_positions([_position_json("10")])
     _mock_activities([])
 
-    summary = await run_reconciliation(repositories, broker, _alerts(), clock=lambda: NOW)
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.status == "ok"
@@ -118,7 +154,7 @@ async def test_stale_holding_view_is_rebuilt_when_lots_agree_with_broker(tmp_pat
     _mock_positions([_position_json("10")])
     _mock_activities([])
 
-    summary = await run_reconciliation(repositories, broker, _alerts(), clock=lambda: NOW)
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.view_drift_corrected == 1
@@ -144,7 +180,7 @@ async def test_lots_disagreeing_with_broker_is_accounting_drift_not_corrected(tm
     _mock_positions([_position_json("10")])  # broker says 10 -- a missed fill somewhere
     _mock_activities([])
 
-    summary = await run_reconciliation(repositories, broker, _alerts(), clock=lambda: NOW)
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.accounting_drift_detected == 1
@@ -171,7 +207,7 @@ async def test_local_holding_for_a_closed_position_is_deleted_when_lots_agree_it
     _mock_positions([])
     _mock_activities([])
 
-    summary = await run_reconciliation(repositories, broker, _alerts(), clock=lambda: NOW)
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.view_drift_corrected == 1
@@ -185,7 +221,7 @@ async def test_missed_fill_is_drift_detected_and_never_fabricated(tmp_path) -> N
     _mock_positions([])
     _mock_activities([_activity_json("activity-999", "5", "150")])  # no local fill matches this at all
 
-    summary = await run_reconciliation(repositories, broker, _alerts(), clock=lambda: NOW)
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.fills_checked == 1
@@ -208,7 +244,7 @@ async def test_matched_fill_is_recorded_as_heuristic_match(tmp_path) -> None:
     _mock_positions([])
     _mock_activities([_activity_json("activity-1", "5", "150")])
 
-    summary = await run_reconciliation(repositories, broker, _alerts(), clock=lambda: NOW)
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.missed_fills_detected == 0
@@ -234,7 +270,7 @@ async def test_exact_activity_id_match_wins_even_when_heuristic_would_not_match(
     # Heuristic-incompatible on purpose: different qty/price than the seeded Fill.
     _mock_activities([_activity_json("activity-1", "999", "1")])
 
-    summary = await run_reconciliation(repositories, broker, _alerts(), clock=lambda: NOW)
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.missed_fills_detected == 0
@@ -259,7 +295,7 @@ async def test_heuristic_matching_does_not_cross_match_opposite_sides(tmp_path) 
     _mock_positions([])
     _mock_activities([_activity_json("activity-buy", "5", "150", side="buy")])
 
-    summary = await run_reconciliation(repositories, broker, _alerts(), clock=lambda: NOW)
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.missed_fills_detected == 0
@@ -272,12 +308,122 @@ async def test_heuristic_matching_does_not_cross_match_opposite_sides(tmp_path) 
 
 
 @respx.mock
+async def test_late_fill_recovered_into_non_terminal_intent(tmp_path) -> None:
+    """The gateway's live poll window already expired on this order (it's
+    still ACCEPTED locally), but Alpaca shows it genuinely filled. Since the
+    activity's order_id ties it to a known local TradeIntent, reconciliation
+    should recover it through the same accounting path the gateway uses --
+    not fabricate anything, not leave it stranded."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    await _seed_intent(repositories, trade_intent_id="ti-1", broker_order_id="order-1", status=TradeIntentStatus.ACCEPTED)
+    _mock_positions([])
+    _mock_activities([_activity_json("activity-1", "5", "150", order_id="order-1")])
+    _mock_order("order-1", "filled", "5", "150")
+
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.missed_fills_detected == 0
+    assert summary.late_fills_recovered == 1
+
+    fill_row = await repositories.fills.get("activity-1")
+    assert fill_row is not None  # keyed by the real Alpaca activity ID, never a synthesized one
+
+    intent_row = await repositories.trade_intents.get("ti-1")
+    assert intent_row["status"] == "filled"  # finalized, not left stranded at ACCEPTED
+
+    holding_row = await repositories.holdings.get("AAPL")
+    assert holding_row is not None  # proves SettlementProcessor.process_pending() actually ran
+    assert hydrate("holdings", holding_row["payload"]).quantity == Decimal("5")
+
+    records = await repositories.reconciliation_records.list_all()
+    payloads = [hydrate("reconciliation_records", r["payload"]) for r in records]
+    fill_records = [p for p in payloads if p.reconciliation_type == "fill"]
+    assert len(fill_records) == 1
+    assert fill_records[0].outcome == ReconciliationOutcome.CORRECTED
+
+
+@respx.mock
+async def test_late_fill_recovered_into_already_terminal_intent(tmp_path) -> None:
+    """An intent that already reached FILLED can still be missing one of its
+    real fill activities (e.g. one attributed slice never made it into a
+    Fill before the poll window closed). Recovery must still create the
+    missing Fill/SettlementEvent -- and must never need to re-check the
+    order's broker status to do it, proven here by never mocking get_order
+    at all (an unmocked call would fail the test)."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    await _seed_intent(repositories, trade_intent_id="ti-2", broker_order_id="order-2", status=TradeIntentStatus.FILLED)
+    _mock_positions([])
+    _mock_activities([_activity_json("activity-2", "5", "150", order_id="order-2")])
+
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.late_fills_recovered == 1
+    fill_row = await repositories.fills.get("activity-2")
+    assert fill_row is not None
+
+    intent_row = await repositories.trade_intents.get("ti-2")
+    assert intent_row["status"] == "filled"  # untouched -- was already terminal
+
+
+@respx.mock
+async def test_orphaned_activity_with_no_matching_intent_still_never_fabricated(tmp_path) -> None:
+    """An activity whose order_id matches no local TradeIntent at all must
+    fall straight through to the unchanged missed-fill path -- recovery is
+    strictly additive and never loosens the no-fabrication guarantee."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    _mock_positions([])
+    _mock_activities([_activity_json("activity-orphan", "5", "150", order_id="order-does-not-exist-locally")])
+
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.missed_fills_detected == 1
+    assert summary.late_fills_recovered == 0
+    assert (await repositories.fills.list_all()) == []
+
+    records = await repositories.reconciliation_records.list_all()
+    payloads = [hydrate("reconciliation_records", r["payload"]) for r in records]
+    fill_records = [p for p in payloads if p.reconciliation_type == "fill"]
+    assert len(fill_records) == 1
+    assert fill_records[0].outcome == ReconciliationOutcome.DRIFT_DETECTED
+
+
+@respx.mock
+async def test_late_fill_recovery_attempted_but_activity_still_invalid_falls_through_to_missed(tmp_path) -> None:
+    """A known order matches by order_id, but the activity itself fails the
+    same validation attribute_order_fills always applies (here: wrong side)
+    -- a genuine anomaly, not a lag. Must still surface as a missed fill,
+    not a silent no-op."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    await _seed_intent(repositories, trade_intent_id="ti-3", broker_order_id="order-3", status=TradeIntentStatus.ACCEPTED, side=Side.BUY)
+    _mock_positions([])
+    _mock_activities([_activity_json("activity-3", "5", "150", side="sell", order_id="order-3")])  # wrong side vs the BUY intent
+    _mock_order("order-3", "accepted", "0", None)
+
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.missed_fills_detected == 1
+    assert summary.late_fills_recovered == 0
+    assert (await repositories.fills.list_all()) == []
+
+    intent_row = await repositories.trade_intents.get("ti-3")
+    assert intent_row["status"] == "accepted"  # untouched
+
+
+@respx.mock
 async def test_broker_positions_outage_reports_degraded(tmp_path) -> None:
     repositories = await _repositories(tmp_path)
     broker = _broker()
     respx.get("https://paper-api.alpaca.markets/v2/positions").mock(side_effect=httpx.ConnectError("connection refused"))
 
-    summary = await run_reconciliation(repositories, broker, _alerts(), clock=lambda: NOW)
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.status == "degraded"

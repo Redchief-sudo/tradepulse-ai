@@ -25,7 +25,6 @@ from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import (
-    AlpacaActivity,
     AlpacaClient,
     AlpacaError,
     AlpacaOrderRequest,
@@ -35,9 +34,7 @@ from tradepulse.broker import (
 from tradepulse.models import (
     AssetIdentity,
     ExecutionMode,
-    Fill,
     RiskLimits,
-    SettlementEvent,
     Side,
     TradeIntent,
     TradeIntentStatus,
@@ -55,14 +52,14 @@ from tradepulse.risk import (
 )
 from tradepulse.settlement import SettlementProcessor
 
+from .fill_attribution import (
+    TERMINAL_FAILURE_ORDER_STATUSES,
+    TERMINAL_ORDER_STATUSES,
+    TERMINAL_STATUSES,
+    attribute_order_fills,
+)
 from .idempotency import IN_FLIGHT_STATUSES, derive_idempotency_key
 from .quotes import fetch_authoritative_quote
-
-TERMINAL_STATUSES = frozenset(
-    {TradeIntentStatus.FILLED, TradeIntentStatus.REJECTED, TradeIntentStatus.CANCELED, TradeIntentStatus.EXPIRED, TradeIntentStatus.FAILED}
-)
-TERMINAL_FAILURE_ORDER_STATUSES = frozenset({"rejected", "canceled", "expired", "replaced"})
-TERMINAL_ORDER_STATUSES = frozenset({"filled", "done_for_day"} | TERMINAL_FAILURE_ORDER_STATUSES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,69 +302,14 @@ class ExecutionGateway:
             intent.filled_quantity, intent.filled_avg_price,
         )
 
-    @staticmethod
-    def _is_valid_fill_activity(activity: AlpacaActivity, current: TradeIntent) -> bool:
-        """A broker activity becoming a financial ledger record is an
-        accounting boundary -- validate every available field before
-        admitting it, rather than trusting order_id alone."""
-        if not activity.activity_id:
-            return False
-        if activity.symbol != current.asset.symbol:
-            return False
-        if activity.side != current.side:
-            return False
-        if activity.qty is None or activity.qty <= 0:
-            return False
-        if activity.price is None or activity.price <= 0:
-            return False
-        if activity.transaction_time is None:
-            return False
-        return True
-
     async def _attribute_order_fills(self, current: TradeIntent) -> Decimal:
-        """Fetch this order's real FILL activities from Alpaca and create a
-        local Fill/SettlementEvent for each validated one not already
-        recorded, keyed by Alpaca's own activity_id -- the real broker fill
-        identity, not a locally-synthesized string. Returns the total
-        quantity attributed from validated activities so far, so the caller
-        can tell whether the Activities API has fully caught up with what
-        /orders reports."""
-        activities = await self._broker.get_activities(activity_type="FILL", since=current.created_at)
-        order_activities = [a for a in activities if str(a.raw.get("order_id") or "") == current.broker_order_id]
-
-        validated: list[AlpacaActivity] = []
-        for activity in order_activities:
-            if not self._is_valid_fill_activity(activity, current):
-                await self._alerts.send(
-                    "critical",
-                    f"BROKER_FILL_INTEGRITY_MISMATCH: Alpaca FILL activity {activity.activity_id} is linked to "
-                    f"order {current.broker_order_id} but its symbol/side/qty/price/timestamp don't match the "
-                    f"expected trade -- excluded from attribution, not recorded as a Fill.",
-                    {"trade_intent_id": current.trade_intent_id, "broker_order_id": current.broker_order_id, "activity_id": activity.activity_id},
-                )
-                continue
-            validated.append(activity)
-        validated.sort(key=lambda a: (a.transaction_time, a.activity_id))
-
-        for activity in validated:
-            fill = Fill(
-                fill_id=activity.activity_id, trade_intent_id=current.trade_intent_id, order_id=current.broker_order_id,
-                asset=current.asset, side=current.side, execution_mode=current.execution_mode,
-                quantity=activity.qty, price=activity.price, fees=Decimal("0"), slippage=Decimal("0"),
-                filled_at=activity.transaction_time, broker_fill_id=activity.activity_id,
-            )
-            created = await self._repositories.fills.create_once(fill.fill_id, fill, unique_value=fill.fill_id)
-            if created:
-                event = SettlementEvent(
-                    settlement_event_id=fill.fill_id, fill_id=fill.fill_id, trade_intent_id=current.trade_intent_id,
-                    asset=current.asset, side=current.side, execution_mode=current.execution_mode,
-                    quantity=fill.quantity, price=fill.price, occurred_at=activity.transaction_time,
-                    broker_order_id=current.broker_order_id, broker_fill_id=activity.activity_id,
-                    client_order_id=current.client_order_id, sector=current.sector,
-                )
-                await self._repositories.settlements.create_once(fill.fill_id, event, status=event.status.value, unique_value=fill.fill_id)
-
-        return sum((a.qty for a in validated), Decimal("0"))
+        """Thin pass-through to the shared fill_attribution module -- kept so
+        existing/direct callers of this method (including tests) don't need
+        to reach into fill_attribution themselves. See that module's
+        docstring for why this logic is shared rather than gateway-private:
+        reconciliation's late-fill recovery needs the exact same accounting
+        path, not a second way to create a Fill/SettlementEvent."""
+        return await attribute_order_fills(self._repositories, self._broker, self._alerts, current, self._clock)
 
     async def _poll_and_settle(self, intent: TradeIntent) -> ExecutionResult:
         assert intent.broker_order_id is not None

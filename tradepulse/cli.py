@@ -274,7 +274,8 @@ async def _run_reconcile(settings: Settings) -> int:
             return 0
         try:
             alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
-            summary = await run_reconciliation(repositories, broker, alerts)
+            settlement = SettlementProcessor(repositories, alerts)
+            summary = await run_reconciliation(repositories, broker, settlement, alerts)
         finally:
             await release_lock(database, RECONCILE_LOCK_KEY, owner_token)
     finally:
@@ -286,7 +287,7 @@ async def _run_reconcile(settings: Settings) -> int:
             "event": "reconciliation_finished", "status": summary.status,
             "positions_checked": summary.positions_checked, "view_drift_corrected": summary.view_drift_corrected,
             "accounting_drift_detected": summary.accounting_drift_detected, "fills_checked": summary.fills_checked,
-            "missed_fills_detected": summary.missed_fills_detected,
+            "missed_fills_detected": summary.missed_fills_detected, "late_fills_recovered": summary.late_fills_recovered,
         },
     )
     if summary.status == "degraded":

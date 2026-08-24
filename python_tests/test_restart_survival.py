@@ -374,7 +374,7 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
     assert await repositories_b.holdings.get("AAPL") is None  # position fully closed
 
     # ---- Restart. Process C: reconciliation confirms clean state. ----
-    _, repositories_c, broker_c, _, _, _, _ = await _fresh_gateway(db_url)
+    _, repositories_c, broker_c, _, _, settlement_c, _ = await _fresh_gateway(db_url)
     alerts_c = TelegramAlerter(None, None)
 
     positions_route.mock(return_value=httpx.Response(200, json=[]))  # broker shows no position, matching the closed local state
@@ -385,7 +385,7 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
         ])
     )
 
-    reconcile_summary = await run_reconciliation(repositories_c, broker_c, alerts_c, clock=lambda: NOW)
+    reconcile_summary = await run_reconciliation(repositories_c, broker_c, settlement_c, alerts_c, clock=lambda: NOW)
     await broker_c.aclose()
 
     assert reconcile_summary.status == "ok"

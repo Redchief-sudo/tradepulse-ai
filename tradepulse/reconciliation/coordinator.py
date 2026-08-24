@@ -15,16 +15,23 @@ fill/lot history underneath it; a human is alerted instead.
 
 Fill reconciliation first tries an exact match on Alpaca's real per-fill
 activity ID (`Fill.broker_fill_id == activity.activity_id`) -- the
-execution gateway (execution/gateway.py::_attribute_order_fills) has
+execution gateway (execution/fill_attribution.py::attribute_order_fills) has
 carried that real ID since Fill records started being created from
 validated Alpaca FILL activities rather than a locally-synthesized ID. Only
 a local Fill with no activity-ID match at all (e.g. one predating that
 change) falls back to the older symbol/qty/price/time-window heuristic,
-which is never presented as an authoritative match. An Alpaca activity with
-no local match at all is a genuinely missed fill; it is recorded and
-alerted, never auto-corrected by fabricating a local Fill/SettlementEvent
-after the fact -- that would mean re-deriving lot allocation, PnL, and
-holding state outside the gateway's normal, tested flow.
+which is never presented as an authoritative match.
+
+An Alpaca activity with no local match at all is a candidate for late-fill
+recovery, never silent fabrication: if its `order_id` (Alpaca's own field)
+matches a known local TradeIntent, that's proof the fill genuinely belongs
+to a trade this system placed -- reconciliation runs it through the exact
+same accounting path the gateway uses (execution/fill_attribution.py::
+resolve_order_from_broker: attribute_order_fills, then
+SettlementProcessor.process_pending()), never a second, reconciliation-local
+way of deriving lot/holding state. Only when no known TradeIntent's
+broker_order_id matches at all is the activity a genuinely orphaned/missed
+fill; that case is recorded and alerted, never auto-corrected.
 """
 
 from __future__ import annotations
@@ -38,8 +45,11 @@ from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaActivity, AlpacaClient
-from tradepulse.models import AssetIdentity, Fill, Holding, ReconciliationOutcome, ReconciliationRecord
+from tradepulse.models import AssetIdentity, Fill, Holding, ReconciliationOutcome, ReconciliationRecord, TradeIntent
 from tradepulse.persistence import PersistenceRepositories, hydrate
+from tradepulse.settlement import SettlementProcessor
+
+from ..execution.fill_attribution import resolve_order_from_broker
 
 _OPEN_LOT_STATUSES = ("open", "partially_closed")
 _FILL_MATCH_WINDOW_SECONDS = 300
@@ -55,6 +65,7 @@ class ReconciliationSummary:
     accounting_drift_detected: int = 0
     fills_checked: int = 0
     missed_fills_detected: int = 0
+    late_fills_recovered: int = 0
     error: str | None = None
 
 
@@ -225,14 +236,23 @@ def _find_heuristic_match(activity: AlpacaActivity, local_fills: list[Fill], alr
 
 
 async def _reconcile_fills(
-    repositories: PersistenceRepositories, broker: AlpacaClient, alerts: TelegramAlerter, now: datetime, lookback: timedelta
-) -> tuple[int, int]:
+    repositories: PersistenceRepositories, broker: AlpacaClient, settlement: SettlementProcessor,
+    alerts: TelegramAlerter, now: datetime, lookback: timedelta,
+) -> tuple[int, int, int]:
     activities = await broker.get_activities(activity_type="FILL", since=now - lookback)
     fill_rows = await repositories.fills.list_all(limit=10000)
     local_fills = [hydrate("fills", row["payload"]) for row in fill_rows]
 
+    intent_rows = await repositories.trade_intents.list_all(limit=10000)
+    intents_by_order_id: dict[str, TradeIntent] = {}
+    for row in intent_rows:
+        intent = hydrate("trade_intents", row["payload"])
+        if intent.broker_order_id:
+            intents_by_order_id[intent.broker_order_id] = intent
+
     fills_checked = 0
     missed_fills = 0
+    late_fills_recovered = 0
     matched: set[str] = set()
 
     for activity in activities:
@@ -251,6 +271,33 @@ async def _reconcile_fills(
             )
             continue
 
+        order_id = str(activity.raw.get("order_id") or "")
+        candidate_intent = intents_by_order_id.get(order_id) if order_id else None
+        if candidate_intent is not None:
+            await resolve_order_from_broker(repositories, broker, settlement, alerts, candidate_intent, lambda: now)
+            recovered_row = await repositories.fills.get(activity.activity_id)
+            if recovered_row is not None:
+                late_fills_recovered += 1
+                await _record(
+                    repositories, reconciliation_type="fill", subject_id=activity.activity_id, outcome=ReconciliationOutcome.CORRECTED,
+                    expected={}, actual={
+                        "activity_id": activity.activity_id, "trade_intent_id": candidate_intent.trade_intent_id, "symbol": activity.symbol,
+                    },
+                    occurred_at=now,
+                    corrective_action="created local Fill/SettlementEvent from a late-recovered Alpaca activity via the order's known TradeIntent",
+                )
+                await alerts.send(
+                    "warning",
+                    f"Reconciliation: recovered a late fill for {activity.symbol} (activity {activity.activity_id}) into "
+                    f"trade intent {candidate_intent.trade_intent_id} -- the gateway's live poll window had already expired.",
+                    {"activity_id": activity.activity_id, "trade_intent_id": candidate_intent.trade_intent_id},
+                )
+                continue
+            # A known order matched, but the activity still failed the same
+            # validation attribute_order_fills always applies -- a genuine
+            # anomaly, not a lag. Fall through to the missed-fill path below
+            # rather than silently dropping it.
+
         missed_fills += 1
         await _record(
             repositories, reconciliation_type="fill", subject_id=activity.activity_id, outcome=ReconciliationOutcome.DRIFT_DETECTED,
@@ -266,12 +313,13 @@ async def _reconcile_fills(
             {"activity_id": activity.activity_id, "symbol": activity.symbol, "qty": str(activity.qty), "price": str(activity.price)},
         )
 
-    return fills_checked, missed_fills
+    return fills_checked, missed_fills, late_fills_recovered
 
 
 async def run_reconciliation(
     repositories: PersistenceRepositories,
     broker: AlpacaClient,
+    settlement: SettlementProcessor,
     alerts: TelegramAlerter,
     *,
     fill_lookback: timedelta = timedelta(days=1),
@@ -285,7 +333,7 @@ async def run_reconciliation(
         return ReconciliationSummary("degraded", error=f"BROKER_POSITIONS_UNAVAILABLE: {exc}")
 
     try:
-        fills_checked, missed_fills_detected = await _reconcile_fills(repositories, broker, alerts, now, fill_lookback)
+        fills_checked, missed_fills_detected, late_fills_recovered = await _reconcile_fills(repositories, broker, settlement, alerts, now, fill_lookback)
     except Exception as exc:  # noqa: BLE001 - same principle for the activities call
         await alerts.send("critical", f"Reconciliation degraded -- Alpaca activities unavailable: {exc}", {})
         return ReconciliationSummary(
@@ -294,5 +342,6 @@ async def run_reconciliation(
         )
 
     return ReconciliationSummary(
-        "ok", positions_checked, view_drift_corrected, accounting_drift_detected, fills_checked, missed_fills_detected
+        "ok", positions_checked, view_drift_corrected, accounting_drift_detected,
+        fills_checked, missed_fills_detected, late_fills_recovered,
     )
