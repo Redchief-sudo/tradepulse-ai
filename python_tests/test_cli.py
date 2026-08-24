@@ -11,6 +11,7 @@ from tradepulse.cli import (
     RECONCILE_LOCK_KEY,
     SCAN_LOCK_KEY,
     SETTLE_LOCK_KEY,
+    _build_ai_provider,
     _build_parser,
     _load_dotenv,
     _require_credentials,
@@ -31,6 +32,7 @@ from tradepulse.models import (
     TradeIntent,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate
+from tradepulse.providers import AnthropicAIProvider, OpenAIProvider
 
 
 def test_scan_subcommand_parses() -> None:
@@ -58,21 +60,49 @@ def test_missing_subcommand_is_required() -> None:
         _build_parser().parse_args([])
 
 
-def test_scan_requires_alpaca_and_anthropic_credentials() -> None:
+def test_scan_requires_alpaca_and_anthropic_credentials_by_default() -> None:
     with pytest.raises(SettingsError, match="ALPACA_API_KEY"):
-        _require_credentials(Settings.from_env({}), require_anthropic=True)
+        _require_credentials(Settings.from_env({}), require_ai=True)
     with pytest.raises(SettingsError, match="ANTHROPIC_API_KEY"):
-        _require_credentials(Settings.from_env({"ALPACA_API_KEY": "key", "ALPACA_API_SECRET": "secret"}), require_anthropic=True)
+        _require_credentials(Settings.from_env({"ALPACA_API_KEY": "key", "ALPACA_API_SECRET": "secret"}), require_ai=True)
     _require_credentials(
         Settings.from_env({"ALPACA_API_KEY": "key", "ALPACA_API_SECRET": "secret", "ANTHROPIC_API_KEY": "key"}),
-        require_anthropic=True,
+        require_ai=True,
     )
 
 
-def test_monitor_and_reconcile_do_not_require_anthropic_credentials() -> None:
-    _require_credentials(Settings.from_env({"ALPACA_API_KEY": "key", "ALPACA_API_SECRET": "secret"}), require_anthropic=False)
+def test_scan_requires_openai_credentials_when_that_provider_is_selected() -> None:
+    settings = Settings.from_env({"ALPACA_API_KEY": "key", "ALPACA_API_SECRET": "secret", "TRADEPULSE_AI_PROVIDER": "openai"})
+    with pytest.raises(SettingsError, match="OPENAI_API_KEY"):
+        _require_credentials(settings, require_ai=True)
+    settings = Settings.from_env({
+        "ALPACA_API_KEY": "key", "ALPACA_API_SECRET": "secret", "TRADEPULSE_AI_PROVIDER": "openai", "OPENAI_API_KEY": "key",
+    })
+    _require_credentials(settings, require_ai=True)  # must not also demand ANTHROPIC_API_KEY
+
+
+def test_monitor_and_reconcile_do_not_require_ai_credentials() -> None:
+    _require_credentials(Settings.from_env({"ALPACA_API_KEY": "key", "ALPACA_API_SECRET": "secret"}), require_ai=False)
     with pytest.raises(SettingsError, match="ALPACA_API_KEY"):
-        _require_credentials(Settings.from_env({}), require_anthropic=False)
+        _require_credentials(Settings.from_env({}), require_ai=False)
+
+
+async def test_build_ai_provider_selects_anthropic_by_default() -> None:
+    settings = Settings.from_env({"ANTHROPIC_API_KEY": "key"})
+    provider = _build_ai_provider(settings)
+    try:
+        assert isinstance(provider, AnthropicAIProvider)
+    finally:
+        await provider.aclose()
+
+
+async def test_build_ai_provider_selects_openai_when_configured() -> None:
+    settings = Settings.from_env({"TRADEPULSE_AI_PROVIDER": "openai", "OPENAI_API_KEY": "key"})
+    provider = _build_ai_provider(settings)
+    try:
+        assert isinstance(provider, OpenAIProvider)
+    finally:
+        await provider.aclose()
 
 
 def test_load_dotenv_populates_environ(tmp_path, monkeypatch) -> None:

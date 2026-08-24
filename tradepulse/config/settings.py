@@ -27,6 +27,7 @@ def _bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
 
 
 RISK_PROFILE_IDS = frozenset({"aggressive", "balanced", "conservative", "micro"})
+AI_PROVIDER_IDS = frozenset({"anthropic", "openai"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,9 +46,13 @@ class Settings:
     finnhub_api_key: str | None
     coingecko_api_key: str | None
     coinmarketcap_api_key: str | None
+    ai_provider: str
     anthropic_api_key: str | None
     anthropic_base_url: str | None
     anthropic_model: str
+    openai_api_key: str | None
+    openai_base_url: str | None
+    openai_model: str
     api_signing_secret: str | None
     telegram_bot_token: str | None
     telegram_chat_id: str | None
@@ -71,6 +76,9 @@ class Settings:
         risk_profile = values.get("TRADEPULSE_RISK_PROFILE", "balanced").strip().lower()
         if risk_profile not in RISK_PROFILE_IDS:
             raise SettingsError(f"TRADEPULSE_RISK_PROFILE must be one of {sorted(RISK_PROFILE_IDS)}")
+        ai_provider = values.get("TRADEPULSE_AI_PROVIDER", "anthropic").strip().lower()
+        if ai_provider not in AI_PROVIDER_IDS:
+            raise SettingsError(f"TRADEPULSE_AI_PROVIDER must be one of {sorted(AI_PROVIDER_IDS)}")
         return cls(
             database_url=values.get("TRADEPULSE_DATABASE_URL", "sqlite:///tradepulse.db"),
             log_level=values.get("TRADEPULSE_LOG_LEVEL", "INFO").upper(),
@@ -86,9 +94,13 @@ class Settings:
             finnhub_api_key=values.get("FINNHUB_API_KEY") or None,
             coingecko_api_key=values.get("COINGECKO_API_KEY") or None,
             coinmarketcap_api_key=values.get("COINMARKETCAP_API_KEY") or None,
+            ai_provider=ai_provider,
             anthropic_api_key=values.get("ANTHROPIC_API_KEY") or None,
             anthropic_base_url=values.get("ANTHROPIC_BASE_URL") or None,
             anthropic_model=values.get("ANTHROPIC_MODEL", "claude-haiku-4-5"),
+            openai_api_key=values.get("OPENAI_API_KEY") or None,
+            openai_base_url=values.get("OPENAI_BASE_URL") or None,
+            openai_model=values.get("OPENAI_MODEL", "gpt-4o-mini"),
             api_signing_secret=values.get("TRADEPULSE_API_SIGNING_SECRET") or None,
             telegram_bot_token=values.get("TELEGRAM_BOT_TOKEN") or None,
             telegram_chat_id=values.get("TELEGRAM_CHAT_ID") or None,

@@ -1,4 +1,7 @@
-"""Async Anthropic Messages API client -- the sole LLM provider for this MVP.
+"""Async Anthropic Messages API client -- one of the configurable AI
+discovery backends (see providers/ai_provider.py for the shared,
+provider-agnostic contract every backend satisfies; see providers/openai_ai.py
+for the other one).
 
 Mirrors tradepulse/broker/alpaca_client.py's shape (httpx.AsyncClient, typed
 errors, decimal-safe parsing). Per the base44 audit history (base44/shared
@@ -13,7 +16,7 @@ must fail closed (skip the candidate/pass), matching the fail-closed
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
@@ -21,6 +24,12 @@ import httpx
 
 from tradepulse.models import AIRequest, AIResponse
 
+from .ai_provider import (
+    SCAN_CANDIDATES_SCHEMA,
+    SCAN_TOOL_NAME,
+    OpportunityCandidate,
+    parse_scan_candidates,
+)
 from .errors import ProviderDataFailure, ProviderHttpFailure
 
 MESSAGES_PATH = "/v1/messages"
@@ -28,45 +37,10 @@ DEFAULT_BASE_URL = "https://api.anthropic.com"
 ANTHROPIC_VERSION = "2023-06-01"
 PROVIDER_NAME = "anthropic"
 
-
-@dataclass(frozen=True, slots=True)
-class OpportunityCandidate:
-    """One fail-closed-validated opportunity extracted from an AI scan response."""
-
-    symbol: str
-    recommendation: str
-    confidence: float
-    summary: str
-
-
-_ALLOWED_RECOMMENDATIONS = frozenset({"STRONG_BUY", "BUY", "HOLD", "SELL", "STRONG_SELL"})
-
-# The scan-pass tool schema. Fields are required; Anthropic's structured
-# tool-use output is validated against this shape in `_parse_scan_candidates`
-# rather than trusted as-is (models can and do omit required fields).
-SCAN_TOOL_NAME = "report_scan_candidates"
 _SCAN_TOOL_SCHEMA: Mapping[str, Any] = {
     "name": SCAN_TOOL_NAME,
     "description": "Report market-scan candidates with a recommendation and confidence for each.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "candidates": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "symbol": {"type": "string"},
-                        "recommendation": {"type": "string", "enum": sorted(_ALLOWED_RECOMMENDATIONS)},
-                        "confidence": {"type": "number"},
-                        "summary": {"type": "string"},
-                    },
-                    "required": ["symbol", "recommendation", "confidence", "summary"],
-                },
-            },
-        },
-        "required": ["candidates"],
-    },
+    "input_schema": SCAN_CANDIDATES_SCHEMA,
 }
 
 
@@ -145,11 +119,9 @@ def _error_message(response: httpx.Response) -> str:
 
 
 def _parse_scan_candidates(data: Mapping[str, Any]) -> list[OpportunityCandidate]:
-    """Extract and validate the tool_use block. Any missing/malformed field
-    on ANY candidate rejects the ENTIRE response (fail-closed) rather than
-    silently dropping just the bad candidate, since a partially-parseable
-    response indicates the model deviated from the requested schema and
-    the remaining candidates cannot be trusted either."""
+    """Extract the tool_use block -- the Anthropic-specific half of response
+    validation. Field-level validation of the extracted candidates is
+    shared with every other backend via ai_provider.parse_scan_candidates."""
     content = data.get("content")
     if not isinstance(content, list):
         raise ProviderDataFailure(PROVIDER_NAME, "scan", "scan_candidates", "AI_RESPONSE_MALFORMED", "response has no content blocks")
@@ -165,44 +137,7 @@ def _parse_scan_candidates(data: Mapping[str, Any]) -> list[OpportunityCandidate
     if not isinstance(tool_input, dict):
         raise ProviderDataFailure(PROVIDER_NAME, "scan", "scan_candidates", "AI_TOOL_INPUT_MALFORMED", "tool_use input is not an object")
 
-    raw_candidates = tool_input.get("candidates")
-    if not isinstance(raw_candidates, list):
-        raise ProviderDataFailure(PROVIDER_NAME, "scan", "scan_candidates", "AI_CANDIDATES_MISSING", "candidates field missing or not a list")
-
-    parsed: list[OpportunityCandidate] = []
-    for index, raw in enumerate(raw_candidates):
-        if not isinstance(raw, dict):
-            raise ProviderDataFailure(PROVIDER_NAME, "scan", "scan_candidates", "AI_CANDIDATE_MALFORMED", f"candidate[{index}] is not an object")
-        symbol = raw.get("symbol")
-        recommendation = raw.get("recommendation")
-        confidence = raw.get("confidence")
-        summary = raw.get("summary")
-        if not isinstance(symbol, str) or not symbol.strip():
-            raise ProviderDataFailure(PROVIDER_NAME, "scan", "scan_candidates", "AI_CANDIDATE_SYMBOL_INVALID", f"candidate[{index}] missing symbol")
-        if recommendation not in _ALLOWED_RECOMMENDATIONS:
-            raise ProviderDataFailure(
-                PROVIDER_NAME, "scan", "scan_candidates", "AI_CANDIDATE_RECOMMENDATION_INVALID",
-                f"candidate[{index}] recommendation {recommendation!r} not in {sorted(_ALLOWED_RECOMMENDATIONS)}",
-            )
-        if not isinstance(confidence, (int, float)) or not 0 <= confidence <= 100:
-            raise ProviderDataFailure(PROVIDER_NAME, "scan", "scan_candidates", "AI_CANDIDATE_CONFIDENCE_INVALID", f"candidate[{index}] confidence {confidence!r} out of [0,100]")
-        if not isinstance(summary, str) or not summary.strip():
-            raise ProviderDataFailure(PROVIDER_NAME, "scan", "scan_candidates", "AI_CANDIDATE_SUMMARY_INVALID", f"candidate[{index}] missing summary")
-        parsed.append(
-            OpportunityCandidate(symbol=symbol.strip().upper(), recommendation=recommendation, confidence=float(confidence), summary=summary.strip())
-        )
-    return parsed
+    return parse_scan_candidates(tool_input.get("candidates"), PROVIDER_NAME)
 
 
-def build_scan_request(request_id: str, correlation_id: str, prompt: str) -> AIRequest:
-    return AIRequest(
-        request_id=request_id,
-        correlation_id=correlation_id,
-        operation="scan_candidates",
-        schema_version="1.0",
-        created_at=datetime.now(UTC),
-        payload={"prompt": prompt},
-    )
-
-
-__all__ = ["AnthropicAIProvider", "OpportunityCandidate", "build_scan_request"]
+__all__ = ["AnthropicAIProvider"]

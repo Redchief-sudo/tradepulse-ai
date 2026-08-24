@@ -1,10 +1,11 @@
 """The scan cycle: AI-driven candidate discovery wired into Opportunity/
 TradeIntent construction and the execution gateway.
 
-Division of responsibility (matches the discovery-only contract documented
-on AnthropicAIProvider): the AI proposes SYMBOLS and a recommendation/
-confidence bucket only. It never supplies a price, a quantity, a stop-loss,
-or a target -- this module fetches its own reference quote per candidate
+Division of responsibility (matches the discovery-only contract shared by
+every AI backend -- see tradepulse/providers/ai_provider.py): the AI
+proposes SYMBOLS and a recommendation/confidence bucket only. It never
+supplies a price, a quantity, a stop-loss, or a target -- this module
+fetches its own reference quote per candidate
 (never the AI's word for it), and the execution gateway fetches its OWN
 fresh authoritative quote again before submitting, re-derives risk sizing
 from scratch, and re-checks the trading session immediately before the
@@ -20,6 +21,7 @@ deferred), not the scanner's.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -44,8 +46,8 @@ from tradepulse.models import (
 )
 from tradepulse.persistence import PersistenceRepositories, hydrate
 from tradepulse.providers import (
+    AIProvider,
     AlpacaMarketDataProvider,
-    AnthropicAIProvider,
     OpportunityCandidate,
     ProviderDataFailure,
     ProviderError,
@@ -61,6 +63,8 @@ from tradepulse.strategy import (
     weighted_composite,
 )
 
+logger = logging.getLogger(__name__)
+
 _ACTIONABLE_RECOMMENDATIONS = frozenset({"STRONG_BUY", "BUY"})
 _DETERMINISTIC_ACTIONABLE_SIGNALS = frozenset({"STRONG_BUY", "BUY"})
 
@@ -68,6 +72,14 @@ _DETERMINISTIC_ACTIONABLE_SIGNALS = frozenset({"STRONG_BUY", "BUY"})
 # real overlap; this only cleans up the audit trail after a crash left a
 # ScanRun stuck at RUNNING forever.
 STALE_SCAN_RUN_SECONDS = 900
+
+
+def _reject(symbol: str, reason: str, **context: Any) -> None:
+    """Every candidate-filtering `continue` in run_scan_cycle logs through
+    here first -- without this, a scan that approves zero candidates gives
+    no clue which gate(s) it lost to. Relies on JsonFormatter forwarding
+    every `extra=` field automatically (config/logging.py)."""
+    logger.info("candidate_rejected", extra={"event": "candidate_rejected", "symbol": symbol, "reason": reason, **context})
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +151,7 @@ async def _reclaim_stale_scan_runs(repositories: PersistenceRepositories, now: d
 
 async def run_scan_cycle(
     repositories: PersistenceRepositories,
-    ai_provider: AnthropicAIProvider,
+    ai_provider: AIProvider,
     market_data: AlpacaMarketDataProvider,
     broker: AlpacaClient,
     gateway: ExecutionGateway,
@@ -203,44 +215,57 @@ async def run_scan_cycle(
     submitted = 0
     for candidate in candidates:
         if candidate.recommendation not in _ACTIONABLE_RECOMMENDATIONS:
+            _reject(candidate.symbol, "NOT_ACTIONABLE_RECOMMENDATION", recommendation=candidate.recommendation)
             continue
         if candidate.confidence < risk_limits.min_confidence:
+            _reject(candidate.symbol, "CONFIDENCE_BELOW_MIN", confidence=candidate.confidence, min_confidence=str(risk_limits.min_confidence))
             continue
         asset = _asset_from_candidate(candidate)
         if not is_executable(asset, universe):
+            _reject(candidate.symbol, "OUTSIDE_EXECUTABLE_UNIVERSE")
             continue
 
         try:
             quote = await market_data.fetch_quote(asset)
-        except ProviderError:
+        except ProviderError as exc:
+            _reject(candidate.symbol, "QUOTE_FETCH_FAILED", error=str(exc))
             continue  # one bad quote must not abort the rest of the scan
 
         try:
             candles = await market_data.fetch_candles(asset)
-        except ProviderError:
+        except ProviderError as exc:
+            _reject(candidate.symbol, "CANDLE_FETCH_FAILED", error=str(exc))
             continue  # insufficient candle history or a data-fetch failure -- fail closed, same as every other provider boundary here
         scores = compute_real_factors(candles)
         if scores is None:
+            _reject(candidate.symbol, "INSUFFICIENT_FACTOR_DATA")
             continue
         composite = weighted_composite(scores, strategy_weights)
         deterministic_signal = signal_from_composite(composite)
         if deterministic_signal not in _DETERMINISTIC_ACTIONABLE_SIGNALS:
+            _reject(
+                candidate.symbol, "DETERMINISTIC_SIGNAL_DISAGREED", ai_recommendation=candidate.recommendation,
+                deterministic_signal=deterministic_signal, composite_score=str(composite),
+            )
             continue  # AI proposed it, but the deterministic technical/momentum/risk read disagrees
 
         if await has_in_flight_intent(repositories, asset.symbol):
+            _reject(candidate.symbol, "SYMBOL_HAS_IN_FLIGHT_INTENT")
             continue  # don't fight an order already in flight on this symbol (e.g. from the position monitor)
 
         if notional_budget <= 0 or quote.price <= 0:
+            _reject(candidate.symbol, "NO_NOTIONAL_BUDGET_OR_INVALID_PRICE", notional_budget=str(notional_budget), price=str(quote.price))
             continue
         quantity = _round_quantity(notional_budget / quote.price, asset.asset_class)
         if quantity <= 0:
+            _reject(candidate.symbol, "QUANTITY_ROUNDED_TO_ZERO", notional_budget=str(notional_budget), price=str(quote.price))
             continue
 
         stop_loss = _stop_loss_price(quote.price, risk_limits.stop_loss_pct, asset.asset_class) if risk_limits.stop_loss_pct > 0 else None
 
         opportunity = Opportunity(
             opportunity_id=str(uuid4()), scan_generation=scan_generation, asset=asset, quote=quote,
-            source="anthropic_ai", created_at=clock(), confidence=candidate.confidence,
+            source=ai_response.provider, created_at=clock(), confidence=candidate.confidence,
             metadata={
                 "ai_recommendation": candidate.recommendation, "ai_summary": candidate.summary,
                 "ai_request_id": ai_response.request_id,

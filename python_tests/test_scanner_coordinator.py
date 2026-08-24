@@ -1,3 +1,4 @@
+import logging
 import math
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -135,7 +136,9 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
 
     opp_rows = await repositories.opportunities.list_all()
     assert len(opp_rows) == 1
-    assert hydrate("opportunities", opp_rows[0]["payload"]).asset.symbol == "AAPL"
+    opportunity = hydrate("opportunities", opp_rows[0]["payload"])
+    assert opportunity.asset.symbol == "AAPL"
+    assert opportunity.source == "anthropic"  # reflects the actual AI backend used, not a hardcoded string
 
     # A protective stop must actually be set -- derived from the risk profile's
     # stop_loss_pct (balanced=8%) against the scanner's own quote (mid of the
@@ -155,7 +158,7 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
 
 
 @respx.mock
-async def test_deterministic_gate_rejects_ai_buy_when_composite_disagrees(tmp_path) -> None:
+async def test_deterministic_gate_rejects_ai_buy_when_composite_disagrees(tmp_path, caplog) -> None:
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     respx.post("https://api.anthropic.com/v1/messages").mock(
@@ -168,7 +171,8 @@ async def test_deterministic_gate_rejects_ai_buy_when_composite_disagrees(tmp_pa
     _mock_bars(_BEARISH_CLOSES)
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
-    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW)
+    with caplog.at_level(logging.INFO):
+        summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW)
     await broker.aclose()
     await ai_provider.aclose()
 
@@ -177,6 +181,11 @@ async def test_deterministic_gate_rejects_ai_buy_when_composite_disagrees(tmp_pa
     assert summary.candidates_approved == 0  # AI said BUY, but the deterministic composite disagreed
     assert order_route.call_count == 0
     assert (await repositories.opportunities.list_all()) == []
+
+    rejected = [r for r in caplog.records if getattr(r, "event", None) == "candidate_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0].reason == "DETERMINISTIC_SIGNAL_DISAGREED"
+    assert rejected[0].ai_recommendation == "BUY"
 
 
 @respx.mock
@@ -204,7 +213,7 @@ async def test_deterministic_gate_fails_closed_on_insufficient_candle_history(tm
 
 
 @respx.mock
-async def test_scan_cycle_skips_candidate_outside_executable_universe(tmp_path) -> None:
+async def test_scan_cycle_skips_candidate_outside_executable_universe(tmp_path, caplog) -> None:
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     respx.post("https://api.anthropic.com/v1/messages").mock(
@@ -215,7 +224,8 @@ async def test_scan_cycle_skips_candidate_outside_executable_universe(tmp_path) 
     _mock_account()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
-    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW)
+    with caplog.at_level(logging.INFO):
+        summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW)
     await broker.aclose()
     await ai_provider.aclose()
 
@@ -224,6 +234,11 @@ async def test_scan_cycle_skips_candidate_outside_executable_universe(tmp_path) 
     assert summary.candidates_approved == 0
     assert summary.orders_submitted == 0
     assert order_route.call_count == 0
+
+    rejected = [r for r in caplog.records if getattr(r, "event", None) == "candidate_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0].symbol == "ZZZZ"
+    assert rejected[0].reason == "OUTSIDE_EXECUTABLE_UNIVERSE"
 
 
 @respx.mock

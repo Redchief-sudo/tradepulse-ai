@@ -47,7 +47,7 @@ from tradepulse.execution import ExecutionGateway
 from tradepulse.models import ExecutionMode
 from tradepulse.monitor import MonitorCycleSummary, run_position_monitor
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, release_lock
-from tradepulse.providers import AlpacaMarketDataProvider, AnthropicAIProvider
+from tradepulse.providers import AIProvider, AlpacaMarketDataProvider, AnthropicAIProvider, OpenAIProvider
 from tradepulse.reconciliation import run_reconciliation
 from tradepulse.scanner import ScanCycleSummary, run_scan_cycle
 from tradepulse.settlement import SettlementProcessor
@@ -69,10 +69,13 @@ SETTLE_LOCK_TTL_SECONDS = 300
 RECONCILE_LOCK_TTL_SECONDS = 600
 
 
-def _require_credentials(settings: Settings, *, require_anthropic: bool) -> None:
+def _require_credentials(settings: Settings, *, require_ai: bool) -> None:
     checks = [("ALPACA_API_KEY", settings.alpaca_api_key), ("ALPACA_API_SECRET", settings.alpaca_api_secret)]
-    if require_anthropic:
-        checks.append(("ANTHROPIC_API_KEY", settings.anthropic_api_key))
+    if require_ai:
+        if settings.ai_provider == "openai":
+            checks.append(("OPENAI_API_KEY", settings.openai_api_key))
+        else:
+            checks.append(("ANTHROPIC_API_KEY", settings.anthropic_api_key))
     missing = [name for name, value in checks if not value]
     if missing:
         raise SettingsError(f"this command requires {', '.join(missing)} to be set")
@@ -81,6 +84,14 @@ def _require_credentials(settings: Settings, *, require_anthropic: bool) -> None
 def _build_broker(settings: Settings) -> AlpacaClient:
     assert settings.alpaca_api_key and settings.alpaca_api_secret
     return AlpacaClient(settings.alpaca_api_key, settings.alpaca_api_secret, settings.execution_mode, settings.broker_timeout_seconds)
+
+
+def _build_ai_provider(settings: Settings) -> AIProvider:
+    if settings.ai_provider == "openai":
+        assert settings.openai_api_key
+        return OpenAIProvider(settings.openai_api_key, settings.openai_model, settings.ai_timeout_seconds, settings.openai_base_url)
+    assert settings.anthropic_api_key
+    return AnthropicAIProvider(settings.anthropic_api_key, settings.anthropic_model, settings.ai_timeout_seconds, settings.anthropic_base_url)
 
 
 def _build_gateway(
@@ -93,7 +104,7 @@ def _build_gateway(
 
 
 async def _run_scan_leg(
-    database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, ai_provider: AnthropicAIProvider,
+    database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, ai_provider: AIProvider,
     market_data: AlpacaMarketDataProvider, broker: AlpacaClient, gateway: ExecutionGateway,
     settings: Settings,
 ) -> ScanCycleSummary | None:
@@ -168,17 +179,14 @@ def _log_monitor_result(result: MonitorCycleSummary | BaseException | None) -> b
 
 async def _run_scan(settings: Settings) -> int:
     """`tradepulse scan`: discovery and position protection, concurrently."""
-    _require_credentials(settings, require_anthropic=True)
+    _require_credentials(settings, require_ai=True)
 
     database = AsyncSQLiteDatabase(settings.database_url)
     await database.initialize()
     repositories = PersistenceRepositories.create(database)
 
     broker = _build_broker(settings)
-    assert settings.anthropic_api_key
-    ai_provider = AnthropicAIProvider(
-        settings.anthropic_api_key, settings.anthropic_model, settings.ai_timeout_seconds, settings.anthropic_base_url
-    )
+    ai_provider = _build_ai_provider(settings)
     try:
         market_data = AlpacaMarketDataProvider(broker)
         alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
@@ -200,7 +208,7 @@ async def _run_scan(settings: Settings) -> int:
 
 async def _run_monitor(settings: Settings) -> int:
     """`tradepulse monitor`: standalone, for a tighter cadence than scan's."""
-    _require_credentials(settings, require_anthropic=False)
+    _require_credentials(settings, require_ai=False)
 
     database = AsyncSQLiteDatabase(settings.database_url)
     await database.initialize()
@@ -222,7 +230,7 @@ async def _run_settle(settings: Settings) -> int:
     """`tradepulse settle`: independently drains any due settlement retry --
     the only production caller otherwise is the gateway's own post-fill hook,
     which never fires if trading goes quiet while a retry is still pending."""
-    _require_credentials(settings, require_anthropic=False)
+    _require_credentials(settings, require_ai=False)
 
     database = AsyncSQLiteDatabase(settings.database_url)
     await database.initialize()
@@ -252,7 +260,7 @@ async def _run_settle(settings: Settings) -> int:
 
 async def _run_reconcile(settings: Settings) -> int:
     """`tradepulse reconcile`: after-the-fact audit against Alpaca's real state."""
-    _require_credentials(settings, require_anthropic=False)
+    _require_credentials(settings, require_ai=False)
 
     database = AsyncSQLiteDatabase(settings.database_url)
     await database.initialize()

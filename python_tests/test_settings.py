@@ -32,9 +32,12 @@ def test_invalid_timeout_fails_configuration() -> None:
 def test_defaults_use_balanced_risk_profile_and_anthropic_haiku() -> None:
     settings = Settings.from_env({})
     assert settings.risk_profile == "balanced"
+    assert settings.ai_provider == "anthropic"
     assert settings.anthropic_model == "claude-haiku-4-5"
     assert settings.anthropic_api_key is None
     assert settings.telegram_bot_token is None
+    assert settings.openai_model == "gpt-4o-mini"
+    assert settings.openai_api_key is None
 
 
 def test_unknown_risk_profile_fails_configuration() -> None:
@@ -55,3 +58,21 @@ def test_risk_profile_and_anthropic_overrides_are_honored() -> None:
     assert settings.anthropic_model == "claude-sonnet-5"
     assert settings.telegram_bot_token == "bot-token"
     assert settings.telegram_chat_id == "12345"
+
+
+def test_unknown_ai_provider_fails_configuration() -> None:
+    with pytest.raises(SettingsError, match="TRADEPULSE_AI_PROVIDER"):
+        Settings.from_env({"TRADEPULSE_AI_PROVIDER": "grok"})
+
+
+def test_openai_provider_and_overrides_are_honored() -> None:
+    settings = Settings.from_env({
+        "TRADEPULSE_AI_PROVIDER": "openai",
+        "OPENAI_API_KEY": "sk-test",
+        "OPENAI_MODEL": "gpt-4.1-mini",
+        "OPENAI_BASE_URL": "https://example.test/v1",
+    })
+    assert settings.ai_provider == "openai"
+    assert settings.openai_api_key == "sk-test"
+    assert settings.openai_model == "gpt-4.1-mini"
+    assert settings.openai_base_url == "https://example.test/v1"

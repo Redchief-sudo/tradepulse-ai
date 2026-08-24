@@ -27,7 +27,11 @@ No command runs its own scheduling loop -- each does its work once and exits. Po
 .venv/bin/tradepulse reconcile  # after-the-fact audit against Alpaca's real positions/fills
 ```
 
-`scan` requires `ALPACA_API_KEY`, `ALPACA_API_SECRET`, and `ANTHROPIC_API_KEY`; `monitor`/`settle`/`reconcile` need only the Alpaca credentials (see `.env.example`). Example crontab:
+`scan` requires `ALPACA_API_KEY`, `ALPACA_API_SECRET`, and whichever AI provider's key is currently selected; `monitor`/`settle`/`reconcile` need only the Alpaca credentials (see `.env.example`).
+
+AI discovery backend is configurable via `TRADEPULSE_AI_PROVIDER` (`anthropic`, the default, or `openai`) -- set it plus the matching `ANTHROPIC_API_KEY`/`ANTHROPIC_MODEL` or `OPENAI_API_KEY`/`OPENAI_MODEL`. Both backends are validated against the identical fail-closed candidate schema (`tradepulse/providers/ai_provider.py`); the AI never controls price, quantity, stop-loss, or target regardless of which one is selected.
+
+Example crontab:
 
 ```
 */15 9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse scan      >> /var/log/tradepulse.log 2>&1
