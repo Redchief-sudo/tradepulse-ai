@@ -9,7 +9,7 @@ from .engine import (
     check_max_drawdown,
     evaluate_risk,
 )
-from .session import SESSION_RECORD_ID, SessionDecision, execution_session_decision, load_session, save_session
+from .session import SESSION_RECORD_ID, SessionDecision, execution_session_decision, load_session, save_session, transition_session
 
 __all__ = [
     "CashCheck",
@@ -26,4 +26,5 @@ __all__ = [
     "execution_session_decision",
     "load_session",
     "save_session",
+    "transition_session",
 ]

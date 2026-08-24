@@ -40,15 +40,16 @@ from typing import Any
 from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter
-from tradepulse.broker import AlpacaClient
+from tradepulse.broker import AlpacaClient, AlpacaError
 from tradepulse.config import Settings, SettingsError, default_strategy_weights, risk_limits_for_profile
 from tradepulse.config.logging import configure_logging
 from tradepulse.execution import ExecutionGateway
-from tradepulse.models import ExecutionMode
+from tradepulse.models import AuditEvent, ExecutionMode, SessionState, TradingSession
 from tradepulse.monitor import MonitorCycleSummary, run_position_monitor
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, release_lock
 from tradepulse.providers import AIProvider, AlpacaMarketDataProvider, AnthropicAIProvider, OpenAIProvider
 from tradepulse.reconciliation import run_reconciliation
+from tradepulse.risk import SESSION_RECORD_ID, load_session, transition_session
 from tradepulse.scanner import ScanCycleSummary, run_scan_cycle
 from tradepulse.settlement import SettlementProcessor
 from tradepulse.strategy import load_executable_universe
@@ -59,6 +60,18 @@ SCAN_LOCK_KEY = "scan"
 MONITOR_LOCK_KEY = "monitor"
 SETTLE_LOCK_KEY = "settle"
 RECONCILE_LOCK_KEY = "reconcile"
+# States `start` refuses unconditionally: RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED
+# need their own explicit reset-risk/reset-integrity command first;
+# SYSTEM_DEGRADED/MARKET_CLOSED are system-derived states this command has
+# no way to safely verify have actually cleared (see cli.py's session
+# commands section below).
+_START_HARD_BLOCKED_STATES = frozenset(
+    {SessionState.RISK_STOPPED, SessionState.FINANCIAL_INTEGRITY_BLOCKED, SessionState.SYSTEM_DEGRADED, SessionState.MARKET_CLOSED}
+)
+# `stop` must never downgrade an active safety block into a plain
+# MANUALLY_STOPPED -- that would erase the reason and the reset
+# requirement, letting a bare `start` through even though nothing was reset.
+_STOP_PRESERVED_STATES = frozenset({SessionState.RISK_STOPPED, SessionState.FINANCIAL_INTEGRITY_BLOCKED})
 # Generous ceilings above any realistic single run -- long enough to never
 # steal a live run's lease, short enough that a crashed process doesn't
 # block that command indefinitely. Monitor's and settle's are shorter since
@@ -296,6 +309,237 @@ async def _run_reconcile(settings: Settings) -> int:
     return 0
 
 
+async def _run_start(settings: Settings) -> int:
+    """`tradepulse start`: the sole operator path to ACTIVE. Refuses
+    unconditionally from RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED (run
+    reset-risk/reset-integrity first) and from SYSTEM_DEGRADED/MARKET_CLOSED
+    (system-derived states this command has no way to safely clear). From
+    any other state, proves the broker is actually reachable via a live
+    get_account() call before activating -- configured-but-broken
+    credentials must never produce ACTIVE."""
+    _require_credentials(settings, require_ai=False)
+
+    database = AsyncSQLiteDatabase(settings.database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+
+    current = await load_session(repositories)
+    if current.state in _START_HARD_BLOCKED_STATES:
+        logger.error(
+            "start_refused",
+            extra={
+                "event": "start_refused", "state": current.state.value,
+                "kill_switch_reason": current.kill_switch_reason, "financial_integrity_reason": current.financial_integrity_reason,
+            },
+        )
+        return 1
+    if current.state == SessionState.ACTIVE:
+        logger.info("start_noop_already_active", extra={"event": "start_noop_already_active"})
+        return 0
+
+    broker = _build_broker(settings)
+    try:
+        await broker.get_account()
+    except AlpacaError as exc:
+        logger.error("start_refused_broker_unreachable", extra={"event": "start_refused_broker_unreachable", "error": exc.message})
+        return 1
+    finally:
+        await broker.aclose()
+
+    now = datetime.now(UTC)
+
+    def decide(session: TradingSession) -> tuple[TradingSession, AuditEvent] | None:
+        if session.state in _START_HARD_BLOCKED_STATES or session.state == SessionState.ACTIVE:
+            return None
+        new_session = TradingSession(SESSION_RECORD_ID, SessionState.ACTIVE, True, now)
+        event = AuditEvent(
+            event_id=str(uuid4()), event_type="session_transition", severity="info",
+            message=f"{session.state.value} -> active via start", occurred_at=now,
+            entity_type="trading_session", entity_id=SESSION_RECORD_ID,
+            details={"action": "start", "previous_state": session.state.value, "new_state": "active"},
+        )
+        return new_session, event
+
+    result = await transition_session(repositories, decide)
+    if result is None:
+        logger.info("start_noop_state_changed_concurrently", extra={"event": "start_noop_state_changed_concurrently"})
+        return 0
+    logger.info("session_started", extra={"event": "session_started", "previous_state": current.state.value})
+    return 0
+
+
+async def _run_stop(settings: Settings) -> int:
+    """`tradepulse stop`: always invokable, even with broken or missing
+    credentials -- an operator must always be able to halt the runtime."""
+    database = AsyncSQLiteDatabase(settings.database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+
+    now = datetime.now(UTC)
+
+    def decide(session: TradingSession) -> tuple[TradingSession, AuditEvent] | None:
+        if session.state in _STOP_PRESERVED_STATES:
+            return None
+        if session.state in (SessionState.DISABLED, SessionState.MANUALLY_STOPPED) and not session.trading_active:
+            return None
+        new_session = TradingSession(SESSION_RECORD_ID, SessionState.MANUALLY_STOPPED, False, now)
+        event = AuditEvent(
+            event_id=str(uuid4()), event_type="session_transition", severity="info",
+            message=f"{session.state.value} -> manually_stopped via stop", occurred_at=now,
+            entity_type="trading_session", entity_id=SESSION_RECORD_ID,
+            details={"action": "stop", "previous_state": session.state.value, "new_state": "manually_stopped"},
+        )
+        return new_session, event
+
+    result = await transition_session(repositories, decide)
+    if result is None:
+        current = await load_session(repositories)
+        logger.info(
+            "stop_noop",
+            extra={
+                "event": "stop_noop", "state": current.state.value,
+                "kill_switch_reason": current.kill_switch_reason, "financial_integrity_reason": current.financial_integrity_reason,
+            },
+        )
+        return 0
+    logger.info("session_stopped", extra={"event": "session_stopped"})
+    return 0
+
+
+async def _run_status(settings: Settings) -> int:
+    """`tradepulse status`: read-only, always invokable regardless of
+    credentials -- reading local session state must never depend on broker
+    config being correct."""
+    database = AsyncSQLiteDatabase(settings.database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+
+    session = await load_session(repositories)
+    logger.info(
+        "session_status",
+        extra={
+            "event": "session_status", "state": session.state.value, "trading_active": session.trading_active,
+            "kill_switch_reason": session.kill_switch_reason, "kill_switch_reset_required": session.kill_switch_reset_required,
+            "financial_integrity_reason": session.financial_integrity_reason,
+            "financial_integrity_manual_reenable_required": session.financial_integrity_manual_reenable_required,
+            "updated_at": session.updated_at.isoformat(),
+        },
+    )
+    return 0
+
+
+async def _run_reset_risk(settings: Settings) -> int:
+    """`tradepulse reset-risk`: the only way to clear RISK_STOPPED --
+    acknowledges the kill-switch and lands on MANUALLY_STOPPED; a separate
+    `start` is still required to actually resume trading. Never requires
+    credentials -- clears a local flag only, never touches the broker."""
+    database = AsyncSQLiteDatabase(settings.database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+
+    now = datetime.now(UTC)
+
+    def decide(session: TradingSession) -> tuple[TradingSession, AuditEvent] | None:
+        if session.state != SessionState.RISK_STOPPED:
+            return None
+        new_session = TradingSession(SESSION_RECORD_ID, SessionState.MANUALLY_STOPPED, False, now)
+        event = AuditEvent(
+            event_id=str(uuid4()), event_type="session_transition", severity="info",
+            message="risk_stopped -> manually_stopped via reset-risk", occurred_at=now,
+            entity_type="trading_session", entity_id=SESSION_RECORD_ID,
+            details={
+                "action": "reset_risk", "previous_state": "risk_stopped", "new_state": "manually_stopped",
+                "reason": session.kill_switch_reason,
+            },
+        )
+        return new_session, event
+
+    result = await transition_session(repositories, decide)
+    if result is None:
+        logger.info("reset_risk_noop", extra={"event": "reset_risk_noop"})
+        return 0
+    logger.info("session_risk_reset", extra={"event": "session_risk_reset"})
+    return 0
+
+
+async def _run_reset_integrity(settings: Settings, *, force: bool) -> int:
+    """`tradepulse reset-integrity`: the only way to clear
+    FINANCIAL_INTEGRITY_BLOCKED. By default runs a real reconciliation pass
+    first and requires it to come back clean -- an operator's word alone is
+    not evidence that a financial-integrity condition has actually
+    resolved. `--force` skips that check for a genuine emergency override,
+    but is unmistakably logged as an unverified critical action."""
+    database = AsyncSQLiteDatabase(settings.database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+
+    current = await load_session(repositories)
+    if current.state != SessionState.FINANCIAL_INTEGRITY_BLOCKED:
+        logger.info("reset_integrity_noop", extra={"event": "reset_integrity_noop"})
+        return 0
+
+    now = datetime.now(UTC)
+    reconciliation_details: dict[str, Any] = {}
+
+    if not force:
+        _require_credentials(settings, require_ai=False)
+        broker = _build_broker(settings)
+        try:
+            alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
+            settlement = SettlementProcessor(repositories, alerts)
+            summary = await run_reconciliation(repositories, broker, settlement, alerts)
+        finally:
+            await broker.aclose()
+        if summary.status != "ok" or summary.accounting_drift_detected > 0:
+            logger.error(
+                "reset_integrity_refused_drift_detected",
+                extra={
+                    "event": "reset_integrity_refused_drift_detected", "reconciliation_status": summary.status,
+                    "accounting_drift_detected": summary.accounting_drift_detected,
+                },
+            )
+            return 1
+        reconciliation_details = {
+            "reconciliation_status": summary.status,
+            "positions_checked": str(summary.positions_checked),
+            "accounting_drift_detected": str(summary.accounting_drift_detected),
+        }
+
+    def decide(session: TradingSession) -> tuple[TradingSession, AuditEvent] | None:
+        if session.state != SessionState.FINANCIAL_INTEGRITY_BLOCKED:
+            return None
+        new_session = TradingSession(SESSION_RECORD_ID, SessionState.MANUALLY_STOPPED, False, now)
+        if force:
+            event = AuditEvent(
+                event_id=str(uuid4()), event_type="session_transition", severity="critical",
+                message="financial_integrity_blocked force-cleared WITHOUT a verifying reconciliation pass", occurred_at=now,
+                entity_type="trading_session", entity_id=SESSION_RECORD_ID,
+                details={
+                    "action": "reset_integrity_forced", "previous_state": "financial_integrity_blocked",
+                    "new_state": "manually_stopped", "reason": session.financial_integrity_reason,
+                },
+            )
+        else:
+            event = AuditEvent(
+                event_id=str(uuid4()), event_type="session_transition", severity="info",
+                message="financial_integrity_blocked cleared after a clean reconciliation pass", occurred_at=now,
+                entity_type="trading_session", entity_id=SESSION_RECORD_ID,
+                details={
+                    "action": "reset_integrity", "previous_state": "financial_integrity_blocked",
+                    "new_state": "manually_stopped", "reason": session.financial_integrity_reason,
+                    **reconciliation_details,
+                },
+            )
+        return new_session, event
+
+    result = await transition_session(repositories, decide)
+    if result is None:
+        logger.info("reset_integrity_noop_state_changed_concurrently", extra={"event": "reset_integrity_noop_state_changed_concurrently"})
+        return 0
+    logger.info("session_integrity_reset", extra={"event": "session_integrity_reset", "forced": force})
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tradepulse", description="TradePulse AI trading runtime")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -303,11 +547,22 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("monitor", help="run one stop/target position-protection pass and exit")
     subparsers.add_parser("settle", help="drain any due settlement retries and exit")
     subparsers.add_parser("reconcile", help="run one reconciliation pass against Alpaca's real state and exit")
+    subparsers.add_parser("start", help="activate the trading session (refuses from RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED/SYSTEM_DEGRADED/MARKET_CLOSED)")
+    subparsers.add_parser("stop", help="deactivate the trading session (never downgrades an active safety block)")
+    subparsers.add_parser("status", help="report the current trading session state and exit")
+    subparsers.add_parser("reset-risk", help="acknowledge and clear a RISK_STOPPED kill-switch (run start afterward to resume trading)")
+    reset_integrity_parser = subparsers.add_parser(
+        "reset-integrity", help="clear a FINANCIAL_INTEGRITY_BLOCKED session after a clean reconciliation pass (run start afterward to resume trading)"
+    )
+    reset_integrity_parser.add_argument(
+        "--force", action="store_true", help="skip the verifying reconciliation pass (emergency override, logged as a critical unverified action)"
+    )
     return parser
 
 
 _COMMANDS: dict[str, Any] = {
     "scan": _run_scan, "monitor": _run_monitor, "settle": _run_settle, "reconcile": _run_reconcile,
+    "start": _run_start, "stop": _run_stop, "status": _run_status, "reset-risk": _run_reset_risk,
 }
 
 
@@ -338,6 +593,8 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(settings.log_level)
 
     try:
+        if args.command == "reset-integrity":
+            return asyncio.run(_run_reset_integrity(settings, force=args.force))
         return asyncio.run(_COMMANDS[args.command](settings))
     except SettingsError as exc:
         print(f"tradepulse: {exc}", file=sys.stderr)

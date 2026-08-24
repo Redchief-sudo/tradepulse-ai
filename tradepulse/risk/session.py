@@ -12,11 +12,15 @@ to the plain "session not active" check.
 
 from __future__ import annotations
 
+import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from tradepulse.models import AssetClass, SessionState, Side, TradingSession
+from tradepulse.models import AssetClass, AuditEvent, SessionState, Side, TradingSession
 from tradepulse.persistence import PersistenceRepositories, hydrate
+from tradepulse.persistence.codec import decode_payload, encode_payload
+from tradepulse.persistence.repositories import utc_now
 
 # Single-operator system: exactly one TradingSession row exists, at this
 # fixed record_id.
@@ -36,6 +40,62 @@ async def save_session(repositories: PersistenceRepositories, session: TradingSe
         await repositories.trading_sessions.create_once(SESSION_RECORD_ID, session, status=session.state.value)
     else:
         await repositories.trading_sessions.update(SESSION_RECORD_ID, session, status=session.state.value)
+
+
+async def transition_session(
+    repositories: PersistenceRepositories,
+    decide: Callable[[TradingSession], tuple[TradingSession, AuditEvent] | None],
+) -> TradingSession | None:
+    """Atomically re-read the singleton TradingSession row, call
+    decide(current) for a final go/no-go against the FRESH state (not
+    whatever the caller read before this call), and if it returns a new
+    session + audit event, write BOTH in the same BEGIN IMMEDIATE
+    transaction -- so a session-state change and its audit record always
+    commit together or not at all, and a concurrent second command (e.g.
+    `start` racing `stop`) re-decides against whatever actually got
+    committed first rather than a stale pre-transaction read. Same
+    serialization guarantee persistence/lock.py::acquire_lock and
+    RecordRepository.claim_if_processable already rely on. Returns the new
+    session, or None if decide refused (state changed concurrently, or
+    nothing to do) -- in which case nothing is written, including no audit
+    event for a no-op.
+
+    Any async precondition (a live broker health check, a live
+    reconciliation pass) must happen BEFORE calling this -- the transaction
+    body below is synchronous, SQLite-only work, matching every other
+    database.run(write=True) caller in this codebase. `decide`'s closure
+    can capture such a precondition's result, but must still re-validate
+    `current.state` against what's actually committed here."""
+    database = repositories.trading_sessions.database
+
+    def op(connection: sqlite3.Connection) -> TradingSession | None:
+        row = connection.execute("SELECT * FROM trading_sessions WHERE record_id=?", (SESSION_RECORD_ID,)).fetchone()
+        current = (
+            hydrate("trading_sessions", decode_payload(row["payload"])) if row is not None
+            else TradingSession(SESSION_RECORD_ID, SessionState.DISABLED, False, datetime.now(UTC))
+        )
+        decision = decide(current)
+        if decision is None:
+            return None
+        new_session, event = decision
+        now = utc_now()
+        if row is None:
+            connection.execute(
+                "INSERT INTO trading_sessions (record_id, status, payload, created_at, updated_at) VALUES (?,?,?,?,?)",
+                (SESSION_RECORD_ID, new_session.state.value, encode_payload(new_session), now, now),
+            )
+        else:
+            connection.execute(
+                "UPDATE trading_sessions SET status=?, payload=?, updated_at=? WHERE record_id=?",
+                (new_session.state.value, encode_payload(new_session), now, SESSION_RECORD_ID),
+            )
+        connection.execute(
+            "INSERT INTO audit_events (record_id, payload, created_at) VALUES (?,?,?)",
+            (event.event_id, encode_payload(event), now),
+        )
+        return new_session
+
+    return await database.run(op, write=True)
 
 
 @dataclass(frozen=True, slots=True)
