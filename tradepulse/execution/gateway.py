@@ -42,7 +42,7 @@ from tradepulse.models import (
     TradeIntent,
     TradeIntentStatus,
 )
-from tradepulse.persistence import PersistenceRepositories, hydrate
+from tradepulse.persistence import PersistenceRepositories, hydrate, renew_lock
 from tradepulse.providers import AlpacaMarketDataProvider, ProviderError
 from tradepulse.risk import (
     RiskCheckInput,
@@ -63,7 +63,7 @@ from .fill_attribution import (
     attribute_order_fills,
     terminal_status_for_order,
 )
-from .idempotency import IN_FLIGHT_STATUSES, derive_idempotency_key
+from .idempotency import IN_FLIGHT_STATUSES, derive_idempotency_key, execution_lock_key, SYMBOL_LOCK_TTL_SECONDS
 from .quotes import fetch_authoritative_quote
 
 
@@ -81,6 +81,13 @@ class ExecutionRequest:
     sector: str | None = None
     order_type: Literal["market", "limit", "stop", "stop_limit"] = "market"
     idempotency_key: str | None = None
+    # If the caller (scanner/monitor) holds a per-asset execution
+    # reservation (see execution/idempotency.py), passing its owner_token
+    # here lets execute_intent re-verify -- right before the irreversible
+    # broker submission -- that the reservation is still valid. None (the
+    # default) means the caller isn't participating in the scheme; no new
+    # behavior for it.
+    symbol_lock_owner_token: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,6 +266,28 @@ class ExecutionGateway:
                 rejected = replace(approved, status=TradeIntentStatus.REJECTED, rejection_reason="EQUITY_MARKET_CLOSED")
                 await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
                 return ExecutionResult("rejected", trade_intent_id, ["EQUITY_MARKET_CLOSED"], Decimal("0"), None)
+
+        # Final ownership fence, right before the irreversible sequence
+        # begins: if the caller holds a per-asset execution reservation
+        # (see execution/idempotency.py), re-verify it's still valid.
+        # renew_lock both checks AND extends it in one call, so the lease is
+        # freshly renewed right as the genuinely long part (order placement
+        # + fill polling) begins. No ambiguity to recover from on rejection
+        # here -- place_order was never called.
+        if request.symbol_lock_owner_token is not None:
+            still_reserved = await renew_lock(
+                self._repositories.trade_intents.database, execution_lock_key(request.asset),
+                request.symbol_lock_owner_token, SYMBOL_LOCK_TTL_SECONDS,
+            )
+            if not still_reserved:
+                await self._alerts.send(
+                    "critical",
+                    f"Execution reservation lost for {request.asset.symbol} immediately before broker submission -- order NOT placed.",
+                    {"asset_class": request.asset.asset_class.value, "symbol": request.asset.symbol, "trade_intent_id": trade_intent_id},
+                )
+                rejected = replace(approved, status=TradeIntentStatus.REJECTED, rejection_reason="EXECUTION_RESERVATION_LOST")
+                await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
+                return ExecutionResult("rejected", trade_intent_id, ["EXECUTION_RESERVATION_LOST"], Decimal("0"), None)
 
         order_request = AlpacaOrderRequest(
             symbol=request.asset.symbol, qty=risk.approved_quantity, side=request.side,

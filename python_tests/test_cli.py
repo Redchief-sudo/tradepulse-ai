@@ -1,3 +1,5 @@
+import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from os import environ
@@ -6,6 +8,7 @@ import httpx
 import pytest
 import respx
 
+from tradepulse.alerts import TelegramAlerter
 from tradepulse.cli import (
     MONITOR_LOCK_KEY,
     RECONCILE_LOCK_KEY,
@@ -13,11 +16,13 @@ from tradepulse.cli import (
     SETTLE_LOCK_KEY,
     _build_ai_provider,
     _build_parser,
+    _lease_lost_signal,
     _load_dotenv,
     _require_credentials,
     _run_monitor,
     _run_reconcile,
     _run_scan,
+    _run_scan_leg,
     _run_settle,
 )
 from tradepulse.config import Settings, SettingsError
@@ -229,3 +234,74 @@ async def test_settle_drains_a_previously_failed_settlement_without_a_new_trade(
     holding_row = await repositories.holdings.get("AAPL")
     assert holding_row is not None
     assert hydrate("holdings", holding_row["payload"]).quantity == Decimal("5")
+
+
+async def test_lease_lost_signal_sets_event_and_sends_critical_alert(caplog) -> None:
+    """The shared (event, callback) pair every renewable command lease uses --
+    each of the four commands (_run_scan_leg/_run_monitor_leg/_run_settle/
+    _run_reconcile) wires this same helper as run_with_lock_renewal's
+    on_renewal_failed callback."""
+    alerts = TelegramAlerter(None, None)  # credential-less -- send() logs instead of hitting the network
+    lease_lost, on_lease_lost = _lease_lost_signal(alerts, SCAN_LOCK_KEY, "owner-1")
+    assert not lease_lost.is_set()
+
+    with caplog.at_level("WARNING"):
+        await on_lease_lost()
+
+    assert lease_lost.is_set()
+    skipped = [r for r in caplog.records if getattr(r, "event", None) == "telegram_alert_skipped_no_credentials"]
+    assert len(skipped) == 1
+    assert "Lock renewal failed for '" + SCAN_LOCK_KEY + "'" in skipped[0].alert_message
+
+
+async def _reassign_owner(database: AsyncSQLiteDatabase, lock_key: str, new_owner_token: str) -> None:
+    """Directly mutates the lock row's owner_token -- simulates a competing
+    acquire_lock() legitimately taking over after a real expiry, without
+    needing to orchestrate real wall-clock timing races in a test (matches
+    the convention already established in test_persistence_lock.py)."""
+
+    def op(connection: sqlite3.Connection) -> None:
+        connection.execute("UPDATE locks SET owner_token=? WHERE lock_key=?", (new_owner_token, lock_key))
+
+    await database.run(op, write=True)
+
+
+@respx.mock
+async def test_scan_leg_alerts_and_stops_new_work_when_its_lease_is_reclaimed(tmp_path, monkeypatch, caplog) -> None:
+    """End-to-end proof that _run_scan_leg's run_with_lock_renewal wiring is
+    real: a scan cycle that legitimately loses its lease mid-run (a) sends a
+    critical alert, (b) sets the lease_lost event threaded into
+    run_scan_cycle, and (c) still lets that in-flight run_scan_cycle call
+    complete and return its result -- no forced cancellation."""
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+
+    monkeypatch.setattr("tradepulse.cli.SCAN_LOCK_TTL_SECONDS", 1)  # interval = max(1/3, 1) = 1s
+
+    observed_lease_lost: dict[str, asyncio.Event] = {}
+
+    async def _stub_scan_cycle(*args, **kwargs):
+        lease_lost = kwargs["lease_lost"]
+        observed_lease_lost["event"] = lease_lost
+        await asyncio.sleep(0.3)
+        await _reassign_owner(database, SCAN_LOCK_KEY, "owner-other")  # a legitimate takeover after expiry
+        await asyncio.sleep(1.0)  # long enough for the next heartbeat tick to observe the theft
+        return "stub-result"
+
+    monkeypatch.setattr("tradepulse.cli.run_scan_cycle", _stub_scan_cycle)
+
+    broker = None
+    ai_provider = None
+    market_data = None
+    gateway = None
+    alerts = TelegramAlerter(None, None)
+
+    with caplog.at_level("WARNING"):
+        result = await _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, _settings(database_url), alerts)
+
+    assert result == "stub-result"  # never cancelled despite the lost lease
+    assert observed_lease_lost["event"].is_set()
+    skipped = [r for r in caplog.records if getattr(r, "event", None) == "telegram_alert_skipped_no_credentials"]
+    assert any("Lock renewal failed for '" + SCAN_LOCK_KEY + "'" in r.alert_message for r in skipped)

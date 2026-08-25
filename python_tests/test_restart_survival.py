@@ -287,9 +287,10 @@ async def test_stale_scan_lock_is_reclaimed_after_a_crash(tmp_path) -> None:
         "TRADEPULSE_DATABASE_URL": db_url,
     })
     ai_provider = AnthropicAIProvider("key", "claude-haiku-4-5", 10)
+    alerts = TelegramAlerter(None, None)
 
     # Process B: a fresh scan invocation must reclaim the stale lease, not honor it.
-    result = await _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings)
+    result = await _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings, alerts)
     await broker.aclose()
     await ai_provider.aclose()
 

@@ -14,10 +14,15 @@ settlement processing (see settlement/stages.py::is_settlement_processable).
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
+from typing import Any, TypeVar
 
 from .database import AsyncSQLiteDatabase
+
+T = TypeVar("T")
 
 
 async def acquire_lock(
@@ -54,3 +59,62 @@ async def release_lock(database: AsyncSQLiteDatabase, lock_key: str, owner_token
         connection.execute("DELETE FROM locks WHERE lock_key=? AND owner_token=?", (lock_key, owner_token))
 
     await database.run(op, write=True)
+
+
+async def renew_lock(database: AsyncSQLiteDatabase, lock_key: str, owner_token: str, ttl_seconds: int) -> bool:
+    """Extends expires_at ONLY if this caller still owns the lease AND that
+    lease is still unexpired -- same-owner alone isn't enough: a heartbeat
+    that fires late (after the lease already lapsed, before anyone
+    reclaimed it) must not resurrect an already-lost lease with ambiguous
+    ownership. Returns False if the lease was lost (expired, or reclaimed
+    by someone else, or never held) -- the caller must treat that as a
+    signal its exclusivity may be gone."""
+    now = datetime.now(UTC)
+    now_iso = now.isoformat()
+    expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat()
+
+    def op(connection: sqlite3.Connection) -> bool:
+        cursor = connection.execute(
+            "UPDATE locks SET expires_at=? WHERE lock_key=? AND owner_token=? AND expires_at > ?",
+            (expires_at, lock_key, owner_token, now_iso),
+        )
+        return cursor.rowcount == 1
+
+    return await database.run(op, write=True)
+
+
+async def run_with_lock_renewal(
+    database: AsyncSQLiteDatabase, lock_key: str, owner_token: str, ttl_seconds: int,
+    work: Coroutine[Any, Any, T], *, on_renewal_failed: Callable[[], Awaitable[None]] | None = None,
+) -> T:
+    """Runs `work` while a background task renews the lease every
+    ttl_seconds/3 -- so work that legitimately takes longer than the TTL
+    never gets its lease stolen by a concurrent invocation. If a renewal
+    ever fails (lease lost), calls on_renewal_failed once (if given) and
+    stops renewing -- but does NOT cancel `work` itself; aborting mid-flight
+    (a live broker order being polled, a settlement mid-write) could leave
+    things in a worse state than letting it finish. The caller's callback
+    is where "stop starting new work" gets signaled -- this function is
+    deliberately alert-agnostic (no TelegramAlerter dependency here), just
+    a generic hook."""
+    stop = asyncio.Event()
+
+    async def heartbeat() -> None:
+        interval = max(ttl_seconds / 3, 1)
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return  # stop was set -- work finished
+            except asyncio.TimeoutError:
+                pass
+            if not await renew_lock(database, lock_key, owner_token, ttl_seconds):
+                if on_renewal_failed is not None:
+                    await on_renewal_failed()
+                return
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    try:
+        return await work
+    finally:
+        stop.set()
+        await heartbeat_task

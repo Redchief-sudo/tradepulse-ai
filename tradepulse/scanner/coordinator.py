@@ -21,6 +21,7 @@ deferred), not the scanner's.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -31,7 +32,16 @@ from uuid import uuid4
 
 from tradepulse.broker import AlpacaClient
 from tradepulse.config import default_strategy_weights
-from tradepulse.execution import ExecutionGateway, ExecutionRequest, ExecutionResult, has_in_flight_intent
+from tradepulse.execution import (
+    SYMBOL_LOCK_TTL_SECONDS,
+    ExecutionGateway,
+    ExecutionRequest,
+    ExecutionResult,
+    execution_lock_key,
+    has_in_flight_intent,
+    release_symbol_reservation,
+    reserve_symbol_for_execution,
+)
 from tradepulse.models import (
     AssetClass,
     AssetIdentity,
@@ -44,7 +54,7 @@ from tradepulse.models import (
     Side,
     StrategyWeights,
 )
-from tradepulse.persistence import PersistenceRepositories, hydrate
+from tradepulse.persistence import PersistenceRepositories, hydrate, run_with_lock_renewal
 from tradepulse.providers import (
     AIProvider,
     AlpacaMarketDataProvider,
@@ -161,6 +171,7 @@ async def run_scan_cycle(
     trigger: ScanTrigger = ScanTrigger.SCHEDULED,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     strategy_weights: StrategyWeights | None = None,
+    lease_lost: asyncio.Event | None = None,
 ) -> ScanCycleSummary:
     now = clock()
     strategy_weights = strategy_weights or default_strategy_weights(now)
@@ -218,6 +229,9 @@ async def run_scan_cycle(
     approved = 0
     submitted = 0
     for candidate in candidates:
+        if lease_lost is not None and lease_lost.is_set():
+            _reject(candidate.symbol, "COMMAND_LEASE_LOST")
+            continue  # scan's own command lease may no longer be exclusive -- stop starting new work
         if candidate.recommendation not in _ACTIONABLE_RECOMMENDATIONS:
             _reject(candidate.symbol, "NOT_ACTIONABLE_RECOMMENDATION", recommendation=candidate.recommendation)
             continue
@@ -253,44 +267,54 @@ async def run_scan_cycle(
             )
             continue  # AI proposed it, but the deterministic technical/momentum/risk read disagrees
 
-        if await has_in_flight_intent(repositories, asset.symbol):
-            _reject(candidate.symbol, "SYMBOL_HAS_IN_FLIGHT_INTENT")
-            continue  # don't fight an order already in flight on this symbol (e.g. from the position monitor)
+        database = repositories.trade_intents.database
+        owner_token = str(uuid4())
+        if not await reserve_symbol_for_execution(database, asset, owner_token):
+            _reject(candidate.symbol, "SYMBOL_EXECUTION_LOCKED")
+            continue  # another coordinator is already processing this asset -- don't race it
+        try:
+            if await has_in_flight_intent(repositories, asset.symbol):
+                _reject(candidate.symbol, "SYMBOL_HAS_IN_FLIGHT_INTENT")
+                continue  # don't fight an order already in flight on this symbol (e.g. from the position monitor)
 
-        if notional_budget <= 0 or quote.price <= 0:
-            _reject(candidate.symbol, "NO_NOTIONAL_BUDGET_OR_INVALID_PRICE", notional_budget=str(notional_budget), price=str(quote.price))
-            continue
-        quantity = _round_quantity(notional_budget / quote.price, asset.asset_class)
-        if quantity <= 0:
-            _reject(candidate.symbol, "QUANTITY_ROUNDED_TO_ZERO", notional_budget=str(notional_budget), price=str(quote.price))
-            continue
+            if notional_budget <= 0 or quote.price <= 0:
+                _reject(candidate.symbol, "NO_NOTIONAL_BUDGET_OR_INVALID_PRICE", notional_budget=str(notional_budget), price=str(quote.price))
+                continue
+            quantity = _round_quantity(notional_budget / quote.price, asset.asset_class)
+            if quantity <= 0:
+                _reject(candidate.symbol, "QUANTITY_ROUNDED_TO_ZERO", notional_budget=str(notional_budget), price=str(quote.price))
+                continue
 
-        stop_loss = _stop_loss_price(quote.price, risk_limits.stop_loss_pct, asset.asset_class) if risk_limits.stop_loss_pct > 0 else None
+            stop_loss = _stop_loss_price(quote.price, risk_limits.stop_loss_pct, asset.asset_class) if risk_limits.stop_loss_pct > 0 else None
 
-        opportunity = Opportunity(
-            opportunity_id=str(uuid4()), scan_generation=scan_generation, asset=asset, quote=quote,
-            source=ai_response.provider, created_at=clock(), confidence=candidate.confidence,
-            metadata={
-                "ai_recommendation": candidate.recommendation, "ai_summary": candidate.summary,
-                "ai_request_id": ai_response.request_id,
-                "deterministic_signal": deterministic_signal, "composite_score": str(composite),
-                "technical_score": str(scores.technical_score), "momentum_score": str(scores.momentum_score),
-                "risk_score": str(scores.risk_score),
-                "stop_loss": str(stop_loss) if stop_loss is not None else None,
-            },
-        )
-        await repositories.opportunities.create_once(opportunity.opportunity_id, opportunity)
+            opportunity = Opportunity(
+                opportunity_id=str(uuid4()), scan_generation=scan_generation, asset=asset, quote=quote,
+                source=ai_response.provider, created_at=clock(), confidence=candidate.confidence,
+                metadata={
+                    "ai_recommendation": candidate.recommendation, "ai_summary": candidate.summary,
+                    "ai_request_id": ai_response.request_id,
+                    "deterministic_signal": deterministic_signal, "composite_score": str(composite),
+                    "technical_score": str(scores.technical_score), "momentum_score": str(scores.momentum_score),
+                    "risk_score": str(scores.risk_score),
+                    "stop_loss": str(stop_loss) if stop_loss is not None else None,
+                },
+            )
+            await repositories.opportunities.create_once(opportunity.opportunity_id, opportunity)
 
-        approved += 1
-        exec_request = ExecutionRequest(
-            asset=asset, side=Side.BUY, requested_quantity=quantity, strategy="ai_scan",
-            decision_id=opportunity.opportunity_id, confidence=Decimal(str(candidate.confidence)),
-            stop_loss=stop_loss,
-        )
-        result = await gateway.execute_intent(exec_request)
-        execution_results.append(result)
-        if result.status not in ("rejected", "skipped"):
-            submitted += 1
+            approved += 1
+            exec_request = ExecutionRequest(
+                asset=asset, side=Side.BUY, requested_quantity=quantity, strategy="ai_scan",
+                decision_id=opportunity.opportunity_id, confidence=Decimal(str(candidate.confidence)),
+                stop_loss=stop_loss, symbol_lock_owner_token=owner_token,
+            )
+            result = await run_with_lock_renewal(
+                database, execution_lock_key(asset), owner_token, SYMBOL_LOCK_TTL_SECONDS, gateway.execute_intent(exec_request),
+            )
+            execution_results.append(result)
+            if result.status not in ("rejected", "skipped"):
+                submitted += 1
+        finally:
+            await release_symbol_reservation(database, asset, owner_token)
 
     await _finish(
         ScanRunStatus.COMPLETED, candidates_discovered=len(candidates),

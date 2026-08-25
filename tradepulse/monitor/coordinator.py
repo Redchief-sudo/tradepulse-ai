@@ -14,16 +14,27 @@ the sole execution boundary.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
+from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient, AlpacaPosition
-from tradepulse.execution import ExecutionGateway, ExecutionRequest, ExecutionResult, has_in_flight_intent
+from tradepulse.execution import (
+    SYMBOL_LOCK_TTL_SECONDS,
+    ExecutionGateway,
+    ExecutionRequest,
+    ExecutionResult,
+    execution_lock_key,
+    has_in_flight_intent,
+    release_symbol_reservation,
+    reserve_symbol_for_execution,
+)
 from tradepulse.models import Holding, Side
-from tradepulse.persistence import PersistenceRepositories, hydrate
+from tradepulse.persistence import PersistenceRepositories, hydrate, run_with_lock_renewal
 
 MonitorStatus = Literal["ok", "degraded"]
 
@@ -54,6 +65,7 @@ async def run_position_monitor(
     alerts: TelegramAlerter,
     *,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    lease_lost: asyncio.Event | None = None,
 ) -> MonitorCycleSummary:
     try:
         positions = await broker.get_positions()
@@ -65,6 +77,8 @@ async def run_position_monitor(
     exits_triggered = 0
 
     for position in positions:
+        if lease_lost is not None and lease_lost.is_set():
+            continue  # monitor's own command lease may no longer be exclusive -- stop starting new work
         holding_row = await repositories.holdings.get(position.symbol.upper())
         if holding_row is None:
             continue  # nothing on file (e.g. opened outside this system) -- no threshold to check
@@ -73,18 +87,29 @@ async def run_position_monitor(
             continue
         if not _breached(position, holding):
             continue
-        if await has_in_flight_intent(repositories, position.symbol):
-            continue  # don't fight an order already in flight on this symbol (e.g. from the scanner)
 
-        is_long = position.qty > 0
-        exit_side = Side.SELL if is_long else Side.BUY
-        request = ExecutionRequest(
-            asset=holding.asset, side=exit_side, requested_quantity=abs(position.qty),
-            strategy="position_monitor", decision_id=f"monitor-{position.symbol}-{clock().isoformat()}",
-        )
-        result = await gateway.execute_intent(request)
-        execution_results.append(result)
-        if result.status not in ("rejected", "skipped"):
-            exits_triggered += 1
+        database = repositories.trade_intents.database
+        owner_token = str(uuid4())
+        if not await reserve_symbol_for_execution(database, holding.asset, owner_token):
+            continue  # another coordinator is already processing this asset -- don't race it
+        try:
+            if await has_in_flight_intent(repositories, position.symbol):
+                continue  # don't fight an order already in flight on this symbol (e.g. from the scanner)
+
+            is_long = position.qty > 0
+            exit_side = Side.SELL if is_long else Side.BUY
+            request = ExecutionRequest(
+                asset=holding.asset, side=exit_side, requested_quantity=abs(position.qty),
+                strategy="position_monitor", decision_id=f"monitor-{position.symbol}-{clock().isoformat()}",
+                symbol_lock_owner_token=owner_token,
+            )
+            result = await run_with_lock_renewal(
+                database, execution_lock_key(holding.asset), owner_token, SYMBOL_LOCK_TTL_SECONDS, gateway.execute_intent(request),
+            )
+            execution_results.append(result)
+            if result.status not in ("rejected", "skipped"):
+                exits_triggered += 1
+        finally:
+            await release_symbol_reservation(database, holding.asset, owner_token)
 
     return MonitorCycleSummary("ok", len(positions), exits_triggered, execution_results)

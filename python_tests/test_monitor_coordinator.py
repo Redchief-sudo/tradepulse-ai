@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -7,7 +8,7 @@ import respx
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
 from tradepulse.config import risk_limits_for_profile
-from tradepulse.execution import ExecutionGateway
+from tradepulse.execution import ExecutionGateway, reserve_symbol_for_execution
 from tradepulse.models import (
     AssetClass,
     AssetIdentity,
@@ -220,3 +221,42 @@ async def test_broker_outage_reports_degraded_status_and_alerts(tmp_path) -> Non
     assert summary.error is not None
     assert summary.positions_checked == 0
     assert summary.exits_triggered == 0
+
+
+@respx.mock
+async def test_breach_is_skipped_when_symbol_execution_lock_already_held(tmp_path) -> None:
+    """A concurrent scan already holds the per-symbol execution reservation
+    for AAPL -- the monitor must skip this breach cleanly rather than racing
+    to submit its own exit order."""
+    repositories, broker, gateway, alerts = await _setup(tmp_path)
+    await _seed_holding(repositories)
+    _mock_positions(qty="10", current_price="135")  # breaches stop_loss=140
+    _mock_account()
+    _mock_quote()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    database = repositories.trade_intents.database
+    assert await reserve_symbol_for_execution(database, _aapl(), "another-coordinator") is True
+
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.exits_triggered == 0
+    assert order_route.call_count == 0
+
+
+@respx.mock
+async def test_monitor_stops_starting_new_work_when_lease_already_lost(tmp_path) -> None:
+    repositories, broker, gateway, alerts = await _setup(tmp_path)
+    await _seed_holding(repositories)
+    _mock_positions(qty="10", current_price="135")  # would breach stop_loss=140
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    lease_lost = asyncio.Event()
+    lease_lost.set()
+
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, clock=lambda: NOW, lease_lost=lease_lost)
+    await broker.aclose()
+
+    assert summary.exits_triggered == 0
+    assert order_route.call_count == 0

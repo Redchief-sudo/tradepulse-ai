@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import math
 from datetime import UTC, datetime, timedelta
@@ -9,8 +10,8 @@ import respx
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
 from tradepulse.config import risk_limits_for_profile
-from tradepulse.execution import ExecutionGateway
-from tradepulse.models import ExecutionMode, ScanRun, ScanRunStatus, ScanTrigger, SessionState, TradingSession
+from tradepulse.execution import ExecutionGateway, execution_lock_key, reserve_symbol_for_execution
+from tradepulse.models import AssetClass, AssetIdentity, ExecutionMode, ScanRun, ScanRunStatus, ScanTrigger, SessionState, TradingSession
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.providers import AlpacaMarketDataProvider, AnthropicAIProvider
 from tradepulse.providers.anthropic_ai import SCAN_TOOL_NAME
@@ -398,3 +399,73 @@ async def test_scan_cycle_never_checks_market_clock_when_session_is_disabled(tmp
 
     assert ai_route.call_count == 1  # proceeds past the AI call -- never blocked at the SESSION_BLOCKED gate
     assert summary.error != "SESSION_BLOCKED"
+
+
+@respx.mock
+async def test_scan_cycle_rejects_candidate_when_symbol_execution_lock_already_held(tmp_path, caplog) -> None:
+    """A concurrent monitor (or a second scan) already holds the per-symbol
+    execution reservation for AAPL -- this scan cycle must skip it cleanly
+    rather than racing to submit, and never place an order."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])
+        )
+    )
+    _mock_account()
+    _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    database = repositories.trade_intents.database
+    asset = AssetIdentity("AAPL", AssetClass.EQUITY, "alpaca:AAPL")
+    assert await reserve_symbol_for_execution(database, asset, "another-coordinator") is True
+
+    with caplog.at_level(logging.INFO):
+        summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.candidates_approved == 0
+    assert order_route.call_count == 0
+    rejected = [r for r in caplog.records if getattr(r, "event", None) == "candidate_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0].reason == "SYMBOL_EXECUTION_LOCKED"
+
+
+@respx.mock
+async def test_scan_cycle_stops_starting_new_work_when_lease_already_lost(tmp_path, caplog) -> None:
+    """A command whose own lease may no longer be exclusive must stop
+    starting new work -- discovery still runs (AI is still called), but no
+    candidate reaches order placement."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    ai_route = respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])
+        )
+    )
+    _mock_account()
+    _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    lease_lost = asyncio.Event()
+    lease_lost.set()  # already lost before the loop even starts
+
+    with caplog.at_level(logging.INFO):
+        summary = await run_scan_cycle(
+            repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW, lease_lost=lease_lost,
+        )
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert ai_route.call_count == 1  # discovery still ran
+    assert summary.candidates_approved == 0
+    assert order_route.call_count == 0
+    rejected = [r for r in caplog.records if getattr(r, "event", None) == "candidate_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0].reason == "COMMAND_LEASE_LOST"

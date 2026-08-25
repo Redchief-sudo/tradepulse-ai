@@ -36,6 +36,7 @@ fill; that case is recorded and alerted, never auto-corrected.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -111,7 +112,8 @@ async def _rebuild_holding_from_lots(
 
 
 async def _reconcile_positions(
-    repositories: PersistenceRepositories, broker: AlpacaClient, alerts: TelegramAlerter, now: datetime
+    repositories: PersistenceRepositories, broker: AlpacaClient, alerts: TelegramAlerter, now: datetime,
+    lease_lost: asyncio.Event | None = None,
 ) -> tuple[int, int, int]:
     broker_positions = await broker.get_positions()
     broker_by_symbol = {p.symbol: p for p in broker_positions}
@@ -145,6 +147,8 @@ async def _reconcile_positions(
     accounting_drift_detected = 0
 
     for symbol in symbols:
+        if lease_lost is not None and lease_lost.is_set():
+            continue  # reconcile's own command lease may no longer be exclusive -- stop starting new work
         positions_checked += 1
         broker_qty = broker_by_symbol[symbol].qty if symbol in broker_by_symbol else Decimal("0")
         lots_qty = open_lots_by_symbol.get(symbol, Decimal("0"))
@@ -242,6 +246,7 @@ def _find_heuristic_match(activity: AlpacaActivity, local_fills: list[Fill], alr
 async def _reconcile_fills(
     repositories: PersistenceRepositories, broker: AlpacaClient, settlement: SettlementProcessor,
     alerts: TelegramAlerter, now: datetime, lookback: timedelta,
+    lease_lost: asyncio.Event | None = None,
 ) -> tuple[int, int, int]:
     activities = await broker.get_activities(activity_type="FILL", since=now - lookback)
     fill_rows = await repositories.fills.list_all(limit=10000)
@@ -260,6 +265,8 @@ async def _reconcile_fills(
     matched: set[str] = set()
 
     for activity in activities:
+        if lease_lost is not None and lease_lost.is_set():
+            continue  # reconcile's own command lease may no longer be exclusive -- stop starting new work
         fills_checked += 1
         match = _find_exact_id_match(activity, local_fills, matched)
         match_method = "exact_id"
@@ -340,16 +347,21 @@ async def run_reconciliation(
     *,
     fill_lookback: timedelta = timedelta(days=1),
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    lease_lost: asyncio.Event | None = None,
 ) -> ReconciliationSummary:
     now = clock()
     try:
-        positions_checked, view_drift_corrected, accounting_drift_detected = await _reconcile_positions(repositories, broker, alerts, now)
+        positions_checked, view_drift_corrected, accounting_drift_detected = await _reconcile_positions(
+            repositories, broker, alerts, now, lease_lost
+        )
     except Exception as exc:  # noqa: BLE001 - a broker outage here must fail this pass cleanly, not crash the caller
         await alerts.send("critical", f"Reconciliation degraded -- Alpaca positions unavailable: {exc}", {})
         return ReconciliationSummary("degraded", error=f"BROKER_POSITIONS_UNAVAILABLE: {exc}")
 
     try:
-        fills_checked, missed_fills_detected, late_fills_recovered = await _reconcile_fills(repositories, broker, settlement, alerts, now, fill_lookback)
+        fills_checked, missed_fills_detected, late_fills_recovered = await _reconcile_fills(
+            repositories, broker, settlement, alerts, now, fill_lookback, lease_lost
+        )
     except Exception as exc:  # noqa: BLE001 - same principle for the activities call
         await alerts.send("critical", f"Reconciliation degraded -- Alpaca activities unavailable: {exc}", {})
         return ReconciliationSummary(

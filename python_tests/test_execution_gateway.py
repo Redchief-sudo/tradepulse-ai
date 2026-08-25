@@ -7,9 +7,9 @@ import respx
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
 from tradepulse.config import risk_limits_for_profile
-from tradepulse.execution import ExecutionGateway, ExecutionRequest
+from tradepulse.execution import ExecutionGateway, ExecutionRequest, execution_lock_key
 from tradepulse.models import AssetClass, AssetIdentity, ExecutionMode, Holding, SessionState, Side, TradeIntent, TradeIntentStatus, TradingSession
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate
 from tradepulse.providers import AlpacaMarketDataProvider
 from tradepulse.risk import load_session, save_session
 from tradepulse.settlement import SettlementProcessor
@@ -126,6 +126,82 @@ async def test_full_buy_flow_fills_and_settles(tmp_path) -> None:
     fill = hydrate("fills", fill_rows[0]["payload"])
     assert fill.fill_id == "act-1"  # the real Alpaca activity ID, not a synthesized order-id:fill:qty string
     assert fill.broker_fill_id == "act-1"
+
+
+@respx.mock
+async def test_buy_with_valid_symbol_reservation_proceeds_normally(tmp_path) -> None:
+    """A caller participating in the reservation scheme, still holding its
+    own lease, sees no behavior change -- the gateway's fence is a no-op
+    when ownership genuinely still holds."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_quote()
+    _mock_market_open()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities(_fill_activity("act-1"))
+
+    database = repositories.trade_intents.database
+    owner_token = "owner-a"
+    assert await acquire_lock(database, execution_lock_key(_aapl()), owner_token, "execute_intent", 45) is True
+
+    request = ExecutionRequest(
+        asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"),
+        symbol_lock_owner_token=owner_token,
+    )
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "filled"
+
+
+@respx.mock
+async def test_buy_rejected_when_symbol_reservation_was_reclaimed_by_another_owner(tmp_path) -> None:
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_quote()
+    _mock_market_open()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    database = repositories.trade_intents.database
+    # A DIFFERENT owner holds the reservation -- as if it had been
+    # legitimately reclaimed after this caller's lease expired.
+    assert await acquire_lock(database, execution_lock_key(_aapl()), "owner-other", "execute_intent", 45) is True
+
+    request = ExecutionRequest(
+        asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"),
+        symbol_lock_owner_token="owner-mine",
+    )
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "rejected"
+    assert result.reasons == ["EXECUTION_RESERVATION_LOST"]
+    assert order_route.call_count == 0  # place_order never called -- no ambiguity to recover from
+
+
+@respx.mock
+async def test_buy_without_symbol_lock_owner_token_is_unaffected(tmp_path) -> None:
+    """The default (None) means the caller isn't participating in the
+    reservation scheme -- no new behavior, matching every pre-existing
+    direct execute_intent test in this file."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_quote()
+    _mock_market_open()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities(_fill_activity("act-1"))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    assert request.symbol_lock_owner_token is None
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "filled"
 
 
 @respx.mock

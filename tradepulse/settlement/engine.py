@@ -29,6 +29,7 @@ system's architecture:
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -269,7 +270,14 @@ class SettlementProcessor:
     async def _checkpoint(self, event: SettlementEvent) -> None:
         await self._repositories.settlements.update(event.settlement_event_id, event, status=event.status.value)
 
-    async def process_pending(self, limit: int = 100, stale_lease_seconds: int = 120, force_retry: bool = False) -> SettlementBatchSummary:
+    async def process_pending(
+        self,
+        limit: int = 100,
+        stale_lease_seconds: int = 120,
+        force_retry: bool = False,
+        *,
+        lease_lost: asyncio.Event | None = None,
+    ) -> SettlementBatchSummary:
         now = self._clock()
         rows = await self._repositories.settlements.list_all(limit=1000)
         events = [hydrate("settlements", row["payload"]) for row in rows]
@@ -282,6 +290,9 @@ class SettlementProcessor:
         outcome_counts = {status: 0 for status in ("retryable_failed", "integrity_blocked", "terminal_failed")}
 
         for event in due:
+            if lease_lost is not None and lease_lost.is_set():
+                continue  # settle's own command lease may no longer be exclusive -- stop starting new work
+
             def decide(current: SettlementEvent) -> SettlementEvent | None:
                 # Re-validated against the CURRENT row, inside the same
                 # atomic transaction as the claim -- the `due` list above is

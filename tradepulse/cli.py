@@ -33,6 +33,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from os import environ
 from pathlib import Path
@@ -48,7 +49,7 @@ from tradepulse.config.logging import configure_logging
 from tradepulse.execution import ExecutionGateway
 from tradepulse.models import AuditEvent, ExecutionMode, SessionState, TradingSession
 from tradepulse.monitor import MonitorCycleSummary, run_position_monitor
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, release_lock
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, release_lock, run_with_lock_renewal
 from tradepulse.providers import AIProvider, AlpacaMarketDataProvider, AnthropicAIProvider, OpenAIProvider
 from tradepulse.reconciliation import run_reconciliation
 from tradepulse.risk import SESSION_RECORD_ID, load_session, transition_session
@@ -118,10 +119,31 @@ def _build_gateway(
     return ExecutionGateway(repositories, broker, market_data, settlement, alerts, risk_limits, ExecutionMode(settings.execution_mode))
 
 
+def _lease_lost_signal(
+    alerts: TelegramAlerter, lock_key: str, owner_token: str,
+) -> tuple[asyncio.Event, Callable[[], Awaitable[None]]]:
+    """Builds the (event, callback) pair every renewable command lease uses:
+    the event lets the coordinator's own loop stop starting new work once
+    exclusivity may be gone, while in-flight work (a broker order being
+    polled, a settlement mid-write) still finishes -- aborting that is more
+    dangerous than letting it complete. The callback both flips the event
+    and alerts an operator."""
+    lease_lost = asyncio.Event()
+
+    async def on_lease_lost() -> None:
+        lease_lost.set()
+        await alerts.send(
+            "critical", f"Lock renewal failed for '{lock_key}' -- lease may have been reclaimed by a concurrent run.",
+            {"lock_key": lock_key, "owner_token": owner_token},
+        )
+
+    return lease_lost, on_lease_lost
+
+
 async def _run_scan_leg(
     database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, ai_provider: AIProvider,
     market_data: AlpacaMarketDataProvider, broker: AlpacaClient, gateway: ExecutionGateway,
-    settings: Settings,
+    settings: Settings, alerts: TelegramAlerter,
 ) -> ScanCycleSummary | None:
     owner_token = str(uuid4())
     if not await acquire_lock(database, SCAN_LOCK_KEY, owner_token, "scan", SCAN_LOCK_TTL_SECONDS):
@@ -131,8 +153,14 @@ async def _run_scan_leg(
         universe = load_executable_universe(settings)
         risk_limits = risk_limits_for_profile(settings.risk_profile)
         strategy_weights = default_strategy_weights(datetime.now(UTC))
-        return await run_scan_cycle(
-            repositories, ai_provider, market_data, broker, gateway, universe, risk_limits, strategy_weights=strategy_weights
+        lease_lost, on_lease_lost = _lease_lost_signal(alerts, SCAN_LOCK_KEY, owner_token)
+        return await run_with_lock_renewal(
+            database, SCAN_LOCK_KEY, owner_token, SCAN_LOCK_TTL_SECONDS,
+            run_scan_cycle(
+                repositories, ai_provider, market_data, broker, gateway, universe, risk_limits,
+                strategy_weights=strategy_weights, lease_lost=lease_lost,
+            ),
+            on_renewal_failed=on_lease_lost,
         )
     finally:
         await release_lock(database, SCAN_LOCK_KEY, owner_token)
@@ -147,7 +175,12 @@ async def _run_monitor_leg(
         logger.info("monitor_skipped_lock_held", extra={"event": "monitor_skipped_lock_held"})
         return None
     try:
-        return await run_position_monitor(repositories, broker, gateway, alerts)
+        lease_lost, on_lease_lost = _lease_lost_signal(alerts, MONITOR_LOCK_KEY, owner_token)
+        return await run_with_lock_renewal(
+            database, MONITOR_LOCK_KEY, owner_token, MONITOR_LOCK_TTL_SECONDS,
+            run_position_monitor(repositories, broker, gateway, alerts, lease_lost=lease_lost),
+            on_renewal_failed=on_lease_lost,
+        )
     finally:
         await release_lock(database, MONITOR_LOCK_KEY, owner_token)
 
@@ -208,7 +241,7 @@ async def _run_scan(settings: Settings) -> int:
         gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
 
         scan_result, monitor_result = await asyncio.gather(
-            _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings),
+            _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings, alerts),
             _run_monitor_leg(database, repositories, broker, gateway, alerts),
             return_exceptions=True,
         )
@@ -258,7 +291,12 @@ async def _run_settle(settings: Settings) -> int:
         logger.info("settle_skipped_lock_held", extra={"event": "settle_skipped_lock_held"})
         return 0
     try:
-        summary = await settlement.process_pending()
+        lease_lost, on_lease_lost = _lease_lost_signal(alerts, SETTLE_LOCK_KEY, owner_token)
+        summary = await run_with_lock_renewal(
+            database, SETTLE_LOCK_KEY, owner_token, SETTLE_LOCK_TTL_SECONDS,
+            settlement.process_pending(lease_lost=lease_lost),
+            on_renewal_failed=on_lease_lost,
+        )
     finally:
         await release_lock(database, SETTLE_LOCK_KEY, owner_token)
 
@@ -290,7 +328,12 @@ async def _run_reconcile(settings: Settings) -> int:
         try:
             alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
             settlement = SettlementProcessor(repositories, alerts)
-            summary = await run_reconciliation(repositories, broker, settlement, alerts)
+            lease_lost, on_lease_lost = _lease_lost_signal(alerts, RECONCILE_LOCK_KEY, owner_token)
+            summary = await run_with_lock_renewal(
+                database, RECONCILE_LOCK_KEY, owner_token, RECONCILE_LOCK_TTL_SECONDS,
+                run_reconciliation(repositories, broker, settlement, alerts, lease_lost=lease_lost),
+                on_renewal_failed=on_lease_lost,
+            )
         finally:
             await release_lock(database, RECONCILE_LOCK_KEY, owner_token)
     finally:
