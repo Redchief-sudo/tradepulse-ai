@@ -84,6 +84,12 @@ def _mock_quote(bid: str = "199.50", ask: str = "199.60") -> None:
     )
 
 
+def _mock_market_open(is_open: bool = True) -> None:
+    respx.get("https://paper-api.alpaca.markets/v2/clock").mock(
+        return_value=httpx.Response(200, json={"is_open": is_open, "next_open": QUOTE_TS, "next_close": QUOTE_TS, "timestamp": QUOTE_TS})
+    )
+
+
 def _order_json(status: str, filled_qty: str, filled_avg_price: str | None, order_id: str = "order-1", side: str = "buy") -> dict:
     return {
         "id": order_id, "status": status, "symbol": "AAPL", "side": side,
@@ -162,6 +168,7 @@ async def test_resume_after_crash_before_broker_submission(tmp_path) -> None:
 
     _mock_account()
     _mock_quote()
+    _mock_market_open()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
     _mock_fill_activities("act-1", "5", "199.60")
@@ -222,6 +229,7 @@ async def test_resume_after_crash_mid_settlement_stale_processing(tmp_path) -> N
     await save_session(repositories_a, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
     _mock_quote()
+    _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
     _mock_fill_activities("act-3", "5", "199.60")
@@ -300,6 +308,7 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
 
     _mock_account()
     _mock_quote()
+    _mock_market_open()
 
     # The buy order's accept response never carries quantity, but the
     # subsequent GET /orders/order-1 and activities polls must reflect

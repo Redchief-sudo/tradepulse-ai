@@ -6,6 +6,7 @@ import httpx
 import pytest
 import respx
 
+from tradepulse.broker import AlpacaClient
 from tradepulse.cli import (
     _run_reset_integrity,
     _run_reset_risk,
@@ -29,6 +30,7 @@ from tradepulse.risk import (
     latch_risk_stop,
     load_session,
     save_session,
+    sync_market_session,
     transition_session,
 )
 
@@ -85,6 +87,16 @@ def _market_closed(now: datetime = NOW) -> TradingSession:
 
 def _broker_unavailable(now: datetime = NOW) -> TradingSession:
     return TradingSession(SESSION_RECORD_ID, SessionState.BROKER_UNAVAILABLE, False, now)
+
+
+def _broker() -> AlpacaClient:
+    return AlpacaClient("key", "secret", "paper", 10)
+
+
+def _mock_clock(is_open: bool) -> None:
+    respx.get("https://paper-api.alpaca.markets/v2/clock").mock(
+        return_value=httpx.Response(200, json={"is_open": is_open, "next_open": None, "next_close": None, "timestamp": NOW.isoformat().replace("+00:00", "Z")})
+    )
 
 
 def _mock_account_ok() -> None:
@@ -581,3 +593,109 @@ async def test_start_refuses_cleanly_on_raw_transport_error(tmp_path) -> None:
     assert exit_code == 1  # no uncaught traceback
     session = await load_session(repositories)
     assert session.state == SessionState.MANUALLY_STOPPED
+
+
+# ---- sync_market_session ----------------------------------------------------
+
+async def test_sync_market_session_transitions_active_to_market_closed(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await save_session(repositories, _active())
+    broker = _broker()
+
+    with respx.mock:
+        _mock_clock(is_open=False)
+        result = await sync_market_session(repositories, broker, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert result is not None
+    assert result.state == SessionState.MARKET_CLOSED
+    assert result.trading_active is True  # preserved -- crypto keeps trading continuously
+    events = await _audit_events(repositories)
+    assert len(events) == 1
+    assert events[0].details["action"] == "sync_market_session"
+    assert events[0].severity == "info"  # routine, not a safety event
+
+
+async def test_sync_market_session_transitions_market_closed_to_active(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await save_session(repositories, _market_closed())
+    broker = _broker()
+
+    with respx.mock:
+        _mock_clock(is_open=True)
+        result = await sync_market_session(repositories, broker, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert result is not None
+    assert result.state == SessionState.ACTIVE
+
+
+@pytest.mark.parametrize(("seed", "is_open"), [(_active, True), (_market_closed, False)])
+async def test_sync_market_session_is_a_noop_when_already_correct(tmp_path, seed, is_open) -> None:
+    repositories = await _repositories(tmp_path)
+    seeded = seed()
+    await save_session(repositories, seeded)
+    broker = _broker()
+
+    with respx.mock:
+        _mock_clock(is_open=is_open)
+        result = await sync_market_session(repositories, broker, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert result is None
+    session = await load_session(repositories)
+    assert session.state == seeded.state
+    assert (await _audit_events(repositories)) == []
+
+
+@pytest.mark.parametrize(
+    "seed", [_manually_stopped, _risk_stopped, _integrity_blocked, _system_degraded, _broker_unavailable]
+)
+@pytest.mark.parametrize("is_open", [True, False])
+async def test_sync_market_session_never_touches_operator_or_safety_states(tmp_path, seed, is_open) -> None:
+    repositories = await _repositories(tmp_path)
+    seeded = seed()
+    await save_session(repositories, seeded)
+    broker = _broker()
+
+    with respx.mock:
+        _mock_clock(is_open=is_open)
+        result = await sync_market_session(repositories, broker, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert result is None
+    session = await load_session(repositories)
+    assert session.state == seeded.state
+    assert session.kill_switch_reason == seeded.kill_switch_reason
+    assert session.financial_integrity_reason == seeded.financial_integrity_reason
+    assert (await _audit_events(repositories)) == []
+
+
+async def test_sync_market_session_handles_alpaca_error_without_crashing(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await save_session(repositories, _active())
+    broker = _broker()
+
+    with respx.mock:
+        respx.get("https://paper-api.alpaca.markets/v2/clock").mock(return_value=httpx.Response(500, json={"message": "internal error"}))
+        result = await sync_market_session(repositories, broker, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert result is None
+    session = await load_session(repositories)
+    assert session.state == SessionState.ACTIVE  # unchanged, not guessed
+
+
+async def test_sync_market_session_handles_raw_transport_error_without_crashing(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await save_session(repositories, _active())
+    broker = _broker()
+
+    with respx.mock:
+        respx.get("https://paper-api.alpaca.markets/v2/clock").mock(side_effect=httpx.ConnectError("connection refused"))
+        result = await sync_market_session(repositories, broker, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert result is None
+    session = await load_session(repositories)
+    assert session.state == SessionState.ACTIVE

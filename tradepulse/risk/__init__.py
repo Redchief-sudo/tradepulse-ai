@@ -17,6 +17,7 @@ from .session import (
     latch_risk_stop,
     load_session,
     save_session,
+    sync_market_session,
     transition_session,
 )
 
@@ -37,5 +38,6 @@ __all__ = [
     "latch_risk_stop",
     "load_session",
     "save_session",
+    "sync_market_session",
     "transition_session",
 ]

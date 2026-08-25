@@ -25,6 +25,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import uuid4
 
+import httpx
+
+from tradepulse.broker import AlpacaClient, AlpacaError
 from tradepulse.models import AssetClass, AuditEvent, SessionState, Side, TradingSession
 from tradepulse.persistence import PersistenceRepositories, hydrate
 from tradepulse.persistence.codec import decode_payload, encode_payload
@@ -191,6 +194,54 @@ async def latch_financial_integrity_block(
             message=f"{session.state.value} -> financial_integrity_blocked: {reason}", occurred_at=now,
             entity_type="trading_session", entity_id=SESSION_RECORD_ID,
             details={"action": "latch_integrity_block", "previous_state": session.state.value, "new_state": "financial_integrity_blocked", "reason": reason},
+        )
+        return new_session, event
+
+    return await transition_session(repositories, decide)
+
+
+async def sync_market_session(
+    repositories: PersistenceRepositories, broker: AlpacaClient, clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> TradingSession | None:
+    """Keep the session's ACTIVE/MARKET_CLOSED distinction synchronized with
+    Alpaca's own authoritative market clock -- equities must never be gated
+    by cron-scheduling assumptions alone. Only ever transitions BETWEEN
+    ACTIVE and MARKET_CLOSED, symmetric with every other latch function's
+    rule that operator-authority and safety-block states are off-limits to
+    an automatic trigger: DISABLED, MANUALLY_STOPPED, RISK_STOPPED,
+    FINANCIAL_INTEGRITY_BLOCKED, SYSTEM_DEGRADED, and BROKER_UNAVAILABLE are
+    left untouched regardless of market hours -- callers should check
+    session.state is ACTIVE or MARKET_CLOSED before even calling this, to
+    skip a wasted get_clock() call otherwise. A broker clock failure
+    (AlpacaError, or a raw httpx transport error get_clock() doesn't wrap)
+    is inconclusive, not evidence either way -- leaves the session exactly
+    as it was, never guesses.
+
+    This keeps the session's DURABLE, operator-visible state accurate
+    (`tradepulse status` should say MARKET_CLOSED, not silently reject
+    candidates while still claiming ACTIVE) -- it is deliberately NOT the
+    only thing standing between a request and the broker; see
+    execution/gateway.py::execute_intent for the independent, always-fresh
+    check right before submission."""
+    try:
+        market_clock = await broker.get_clock()
+    except (AlpacaError, httpx.HTTPError):
+        return None
+    now = clock()
+
+    def decide(session: TradingSession) -> tuple[TradingSession, AuditEvent] | None:
+        if session.state == SessionState.ACTIVE and not market_clock.is_open:
+            target = SessionState.MARKET_CLOSED
+        elif session.state == SessionState.MARKET_CLOSED and market_clock.is_open:
+            target = SessionState.ACTIVE
+        else:
+            return None
+        new_session = TradingSession(SESSION_RECORD_ID, target, session.trading_active, now)
+        event = AuditEvent(
+            event_id=str(uuid4()), event_type="session_transition", severity="info",
+            message=f"{session.state.value} -> {target.value}: Alpaca market clock", occurred_at=now,
+            entity_type="trading_session", entity_id=SESSION_RECORD_ID,
+            details={"action": "sync_market_session", "previous_state": session.state.value, "new_state": target.value},
         )
         return new_session, event
 

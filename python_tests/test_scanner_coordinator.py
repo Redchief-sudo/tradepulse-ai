@@ -14,7 +14,7 @@ from tradepulse.models import ExecutionMode, ScanRun, ScanRunStatus, ScanTrigger
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.providers import AlpacaMarketDataProvider, AnthropicAIProvider
 from tradepulse.providers.anthropic_ai import SCAN_TOOL_NAME
-from tradepulse.risk import save_session
+from tradepulse.risk import load_session, save_session
 from tradepulse.scanner import run_scan_cycle
 from tradepulse.settlement import SettlementProcessor
 from tradepulse.strategy import ExecutableUniverse
@@ -54,6 +54,12 @@ def _mock_account(cash: str = "50000", equity: str = "100000") -> None:
 def _mock_quote(bid: str = "199.50", ask: str = "199.60") -> None:
     respx.get("https://data.alpaca.markets/v2/stocks/AAPL/quotes/latest").mock(
         return_value=httpx.Response(200, json={"symbol": "AAPL", "quote": {"bp": float(bid), "ap": float(ask), "t": QUOTE_TS}})
+    )
+
+
+def _mock_market_open(is_open: bool = True) -> None:
+    respx.get("https://paper-api.alpaca.markets/v2/clock").mock(
+        return_value=httpx.Response(200, json={"is_open": is_open, "next_open": QUOTE_TS, "next_close": QUOTE_TS, "timestamp": QUOTE_TS})
     )
 
 
@@ -138,6 +144,7 @@ def _mock_bars(closes: list[float]) -> None:
 async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
     ai_route = respx.post("https://api.anthropic.com/v1/messages").mock(
         return_value=httpx.Response(
             200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])
@@ -193,6 +200,7 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
 async def test_deterministic_gate_rejects_ai_buy_when_composite_disagrees(tmp_path, caplog) -> None:
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
     respx.post("https://api.anthropic.com/v1/messages").mock(
         return_value=httpx.Response(
             200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "AI likes it."}])
@@ -224,6 +232,7 @@ async def test_deterministic_gate_rejects_ai_buy_when_composite_disagrees(tmp_pa
 async def test_deterministic_gate_fails_closed_on_insufficient_candle_history(tmp_path) -> None:
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
     respx.post("https://api.anthropic.com/v1/messages").mock(
         return_value=httpx.Response(
             200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "AI likes it."}])
@@ -248,6 +257,7 @@ async def test_deterministic_gate_fails_closed_on_insufficient_candle_history(tm
 async def test_scan_cycle_skips_candidate_outside_executable_universe(tmp_path, caplog) -> None:
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
     respx.post("https://api.anthropic.com/v1/messages").mock(
         return_value=httpx.Response(
             200, json=_tool_use_response([{"symbol": "ZZZZ", "recommendation": "BUY", "confidence": 90, "summary": "not in universe"}])
@@ -295,6 +305,7 @@ async def test_scan_cycle_skips_entirely_when_session_is_kill_switched(tmp_path)
 async def test_scan_cycle_marks_failed_when_ai_provider_errors(tmp_path) -> None:
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
     respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(429, json={"error": {"message": "rate limited"}}))
 
     summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW)
@@ -352,3 +363,38 @@ async def test_recent_running_scan_run_is_left_alone(tmp_path) -> None:
 
     recent_row = await repositories.scan_runs.get("recent-1")
     assert recent_row["status"] == "running"
+
+
+@respx.mock
+async def test_scan_cycle_syncs_session_to_market_closed_before_evaluating_candidates(tmp_path) -> None:
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open(is_open=False)
+    ai_route = respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(200, json=_tool_use_response([])))
+
+    await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert ai_route.call_count == 1  # equity discovery still runs -- the sync doesn't hard-block the cycle, only new equity exposure
+    session = await load_session(repositories)
+    assert session.state == SessionState.MARKET_CLOSED
+
+
+@respx.mock
+async def test_scan_cycle_never_checks_market_clock_when_session_is_disabled(tmp_path) -> None:
+    """No session row at all -- defaults to DISABLED, which isn't ACTIVE or
+    MARKET_CLOSED, so sync_market_session is never even called (DISABLED
+    doesn't hard-block AI discovery itself -- only RISK_STOPPED/
+    FINANCIAL_INTEGRITY_BLOCKED do; actual execution authority is enforced
+    later at the gateway). Proven via respx: no /v2/clock mock is
+    registered, so an unexpected call fails the test."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    ai_route = respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(200, json=_tool_use_response([])))
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert ai_route.call_count == 1  # proceeds past the AI call -- never blocked at the SESSION_BLOCKED gate
+    assert summary.error != "SESSION_BLOCKED"

@@ -54,7 +54,7 @@ from tradepulse.providers import (
     ProviderHttpFailure,
     build_scan_request,
 )
-from tradepulse.risk import build_portfolio_snapshot, load_session
+from tradepulse.risk import build_portfolio_snapshot, load_session, sync_market_session
 from tradepulse.strategy import (
     ExecutableUniverse,
     compute_real_factors,
@@ -178,6 +178,10 @@ async def run_scan_cycle(
         await repositories.scan_runs.update(scan_run_id, finished, status=finished.status.value)
 
     session = await load_session(repositories)
+    if session.state in (SessionState.ACTIVE, SessionState.MARKET_CLOSED):
+        synced = await sync_market_session(repositories, broker, clock)
+        if synced is not None:
+            session = synced
     hard_blocked_states = (SessionState.FINANCIAL_INTEGRITY_BLOCKED, SessionState.RISK_STOPPED)
     if session.state in hard_blocked_states or session.kill_switch_reset_required or session.financial_integrity_manual_reenable_required:
         await _finish(ScanRunStatus.FAILED, error="SESSION_BLOCKED")

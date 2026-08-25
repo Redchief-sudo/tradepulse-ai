@@ -23,6 +23,8 @@ from decimal import Decimal
 from typing import Literal
 from uuid import uuid4
 
+import httpx
+
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import (
     AlpacaClient,
@@ -32,6 +34,7 @@ from tradepulse.broker import (
     is_definitive_rejection,
 )
 from tradepulse.models import (
+    AssetClass,
     AssetIdentity,
     ExecutionMode,
     RiskLimits,
@@ -237,6 +240,25 @@ class ExecutionGateway:
             rejected = replace(approved, status=TradeIntentStatus.REJECTED, rejection_reason=decision_at_submit.reason)
             await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
             return ExecutionResult("rejected", trade_intent_id, [decision_at_submit.reason], Decimal("0"), None)
+
+        # Independent of the session's own MARKET_CLOSED/ACTIVE label (which
+        # a scan cycle only resyncs periodically, see
+        # risk/session.py::sync_market_session) -- new equity exposure gets
+        # one more, always-fresh check right at the irreversible submission
+        # boundary. Crypto is exempt (continuous market); any protective
+        # exit is exempt regardless of asset class, matching the session
+        # gate's own exemption -- a stop-loss must still be able to fire.
+        if request.asset.asset_class == AssetClass.EQUITY and not protective_exit:
+            try:
+                market_clock = await self._broker.get_clock()
+            except (AlpacaError, httpx.HTTPError) as exc:
+                rejected = replace(approved, status=TradeIntentStatus.REJECTED, rejection_reason=f"MARKET_CLOCK_UNAVAILABLE: {exc}")
+                await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
+                return ExecutionResult("rejected", trade_intent_id, [rejected.rejection_reason], Decimal("0"), None)
+            if not market_clock.is_open:
+                rejected = replace(approved, status=TradeIntentStatus.REJECTED, rejection_reason="EQUITY_MARKET_CLOSED")
+                await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
+                return ExecutionResult("rejected", trade_intent_id, ["EQUITY_MARKET_CLOSED"], Decimal("0"), None)
 
         order_request = AlpacaOrderRequest(
             symbol=request.asset.symbol, qty=risk.approved_quantity, side=request.side,
