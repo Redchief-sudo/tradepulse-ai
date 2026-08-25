@@ -47,6 +47,7 @@ from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaActivity, AlpacaClient
 from tradepulse.models import AssetIdentity, Fill, Holding, ReconciliationOutcome, ReconciliationRecord, TradeIntent
 from tradepulse.persistence import PersistenceRepositories, hydrate
+from tradepulse.risk import latch_financial_integrity_block
 from tradepulse.settlement import SettlementProcessor
 
 from ..execution.fill_attribution import resolve_order_from_broker
@@ -204,6 +205,9 @@ async def _reconcile_positions(
                 f"position (broker={broker_qty}, lots={lots_qty}). NOT auto-corrected -- investigate missing/duplicate fills.",
                 {"symbol": symbol, "broker_qty": str(broker_qty), "lots_qty": str(lots_qty)},
             )
+            await latch_financial_integrity_block(
+                repositories, f"Accounting drift detected for {symbol}: broker={broker_qty}, lots={lots_qty}", clock=lambda: now
+            )
 
     return positions_checked, view_drift_corrected, accounting_drift_detected
 
@@ -311,6 +315,18 @@ async def _reconcile_fills(
             "critical",
             f"Reconciliation: MISSED FILL -- Alpaca activity {activity.activity_id} ({activity.symbol}) has no matching local Fill record.",
             {"activity_id": activity.activity_id, "symbol": activity.symbol, "qty": str(activity.qty), "price": str(activity.price)},
+        )
+        # Unrecoverable, not merely late: a successfully recovered fill
+        # (late_fills_recovered above) never reaches here at all. An
+        # activity that does is a broker execution TradePulse cannot prove
+        # or restore into its own ledger -- exactly the "local financial
+        # truth is uncertain" condition FINANCIAL_INTEGRITY_BLOCKED exists
+        # for, and exactly what reset-integrity's missed_fills_detected==0
+        # gate checks before allowing that block to be cleared.
+        await latch_financial_integrity_block(
+            repositories,
+            f"Unrecoverable broker fill: activity {activity.activity_id} ({activity.symbol}) has no matching or recoverable local Fill record.",
+            clock=lambda: now,
         )
 
     return fills_checked, missed_fills, late_fills_recovered

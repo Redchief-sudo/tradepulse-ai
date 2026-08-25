@@ -23,7 +23,14 @@ from tradepulse.models import (
     TradingSession,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
-from tradepulse.risk import SESSION_RECORD_ID, load_session, save_session, transition_session
+from tradepulse.risk import (
+    SESSION_RECORD_ID,
+    latch_financial_integrity_block,
+    latch_risk_stop,
+    load_session,
+    save_session,
+    transition_session,
+)
 
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)
 
@@ -113,6 +120,20 @@ def _mock_dirty_reconciliation() -> None:
         }])
     )
     respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(return_value=httpx.Response(200, json=[]))
+
+
+def _mock_missed_fill_reconciliation() -> None:
+    """Positions agree (no accounting drift), but there's an orphaned fill
+    activity with no matching local Fill and no known TradeIntent by
+    order_id -- accounting_drift_detected stays 0, missed_fills_detected
+    becomes 1."""
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[]))
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
+        return_value=httpx.Response(200, json=[{
+            "id": "activity-orphan", "activity_type": "FILL", "symbol": "AAPL", "side": "buy",
+            "qty": "5", "price": "150", "transaction_time": NOW.isoformat().replace("+00:00", "Z"), "order_id": "order-does-not-exist",
+        }])
+    )
 
 
 async def _audit_events(repositories: PersistenceRepositories) -> list[AuditEvent]:
@@ -465,3 +486,98 @@ async def test_transition_session_rolls_back_fully_on_decide_failure(tmp_path) -
     session = await load_session(repositories)
     assert session.state == SessionState.MANUALLY_STOPPED  # unchanged
     assert (await _audit_events(repositories)) == []  # no orphaned audit event
+
+
+# ---- latch_risk_stop / latch_financial_integrity_block ---------------------
+
+@pytest.mark.parametrize("seed", [_active, _manually_stopped])
+async def test_latch_risk_stop_transitions_into_risk_stopped(tmp_path, seed) -> None:
+    repositories = await _repositories(tmp_path)
+    await save_session(repositories, seed())
+
+    result = await latch_risk_stop(repositories, "daily loss exceeded", clock=lambda: NOW)
+    assert result is not None
+    assert result.state == SessionState.RISK_STOPPED
+    assert result.kill_switch_reason == "daily loss exceeded"
+    assert result.kill_switch_reset_required is True
+    events = await _audit_events(repositories)
+    assert len(events) == 1
+    assert events[0].details["action"] == "latch_risk_stop"
+    assert events[0].severity == "critical"
+
+
+async def test_latch_risk_stop_is_idempotent_and_preserves_original_reason(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await save_session(repositories, _risk_stopped(reason="first breach"))
+
+    result = await latch_risk_stop(repositories, "second breach", clock=lambda: NOW)
+    assert result is None
+    session = await load_session(repositories)
+    assert session.kill_switch_reason == "first breach"  # not overwritten
+    assert (await _audit_events(repositories)) == []
+
+
+async def test_latch_risk_stop_never_downgrades_financial_integrity_block(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    seeded = _integrity_blocked()
+    await save_session(repositories, seeded)
+
+    result = await latch_risk_stop(repositories, "daily loss exceeded", clock=lambda: NOW)
+    assert result is None
+    session = await load_session(repositories)
+    assert session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED
+    assert (await _audit_events(repositories)) == []
+
+
+async def test_latch_financial_integrity_block_escalates_from_risk_stopped(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await save_session(repositories, _risk_stopped(reason="daily loss exceeded"))
+
+    result = await latch_financial_integrity_block(repositories, "accounting drift", clock=lambda: NOW)
+    assert result is not None
+    assert result.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED
+    assert result.financial_integrity_reason == "accounting drift"
+    events = await _audit_events(repositories)
+    assert len(events) == 1
+    assert events[0].details["action"] == "latch_integrity_block"
+    assert events[0].severity == "critical"
+
+
+async def test_latch_financial_integrity_block_is_idempotent(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await save_session(repositories, _integrity_blocked(reason="first problem"))
+
+    result = await latch_financial_integrity_block(repositories, "second problem", clock=lambda: NOW)
+    assert result is None
+    session = await load_session(repositories)
+    assert session.financial_integrity_reason == "first problem"
+    assert (await _audit_events(repositories)) == []
+
+
+# ---- reset-integrity missed-fills gate -------------------------------------
+
+@respx.mock
+async def test_reset_integrity_refuses_while_missed_fill_persists_even_with_zero_drift(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await save_session(repositories, _integrity_blocked())
+    _mock_missed_fill_reconciliation()
+
+    exit_code = await _run_reset_integrity(_settings_with_creds(f"sqlite:///{tmp_path}/test.db"), force=False)
+    assert exit_code == 1
+    session = await load_session(repositories)
+    assert session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED
+
+
+# ---- start: broader broker-unreachable handling ----------------------------
+
+async def test_start_refuses_cleanly_on_raw_transport_error(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await save_session(repositories, _manually_stopped())
+
+    with respx.mock:
+        respx.get("https://paper-api.alpaca.markets/v2/account").mock(side_effect=httpx.ConnectError("connection refused"))
+        exit_code = await _run_start(_settings_with_creds(f"sqlite:///{tmp_path}/test.db"))
+
+    assert exit_code == 1  # no uncaught traceback
+    session = await load_session(repositories)
+    assert session.state == SessionState.MANUALLY_STOPPED

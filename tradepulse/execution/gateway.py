@@ -48,6 +48,7 @@ from tradepulse.risk import (
     check_max_drawdown,
     evaluate_risk,
     execution_session_decision,
+    latch_risk_stop,
     load_session,
 )
 from tradepulse.settlement import SettlementProcessor
@@ -210,6 +211,16 @@ class ExecutionGateway:
         )
         risk = evaluate_risk(risk_input, snapshot, self._risk_limits, risk_opts)
         if not risk.approved:
+            # A genuine account-level kill-switch condition -- not an
+            # ordinary per-trade sizing/eligibility rejection (insufficient
+            # cash, confidence too low, sector/position caps, etc.) -- must
+            # latch the durable session state reset-risk exists to clear,
+            # not just reject this one order.
+            kill_switch_reason = next(
+                (r for r in risk.reasons if r.startswith("MAX_DAILY_LOSS_EXCEEDED") or r == "MAX_DRAWDOWN_BREACHED"), None
+            )
+            if kill_switch_reason is not None:
+                await latch_risk_stop(self._repositories, kill_switch_reason, clock=self._clock)
             rejected = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason="; ".join(risk.reasons))
             await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
             return ExecutionResult("rejected", trade_intent_id, risk.reasons, Decimal("0"), None)

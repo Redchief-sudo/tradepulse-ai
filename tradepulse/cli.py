@@ -39,6 +39,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import httpx
+
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient, AlpacaError
 from tradepulse.config import Settings, SettingsError, default_strategy_weights, risk_limits_for_profile
@@ -340,8 +342,13 @@ async def _run_start(settings: Settings) -> int:
     broker = _build_broker(settings)
     try:
         await broker.get_account()
-    except AlpacaError as exc:
-        logger.error("start_refused_broker_unreachable", extra={"event": "start_refused_broker_unreachable", "error": exc.message})
+    except (AlpacaError, httpx.HTTPError) as exc:
+        # AlpacaError covers a definitive HTTP error response; httpx.HTTPError
+        # covers everything else (DNS failure, connection refused, timeout)
+        # that get_account() doesn't wrap -- broker health being unproven
+        # must refuse cleanly either way, never crash with an uncaught
+        # traceback or activate on ambiguous connectivity.
+        logger.error("start_refused_broker_unreachable", extra={"event": "start_refused_broker_unreachable", "error": str(exc)})
         return 1
     finally:
         await broker.aclose()
@@ -490,12 +497,13 @@ async def _run_reset_integrity(settings: Settings, *, force: bool) -> int:
             summary = await run_reconciliation(repositories, broker, settlement, alerts)
         finally:
             await broker.aclose()
-        if summary.status != "ok" or summary.accounting_drift_detected > 0:
+        if summary.status != "ok" or summary.accounting_drift_detected > 0 or summary.missed_fills_detected > 0:
             logger.error(
                 "reset_integrity_refused_drift_detected",
                 extra={
                     "event": "reset_integrity_refused_drift_detected", "reconciliation_status": summary.status,
                     "accounting_drift_detected": summary.accounting_drift_detected,
+                    "missed_fills_detected": summary.missed_fills_detected,
                 },
             )
             return 1
@@ -503,6 +511,7 @@ async def _run_reset_integrity(settings: Settings, *, force: bool) -> int:
             "reconciliation_status": summary.status,
             "positions_checked": str(summary.positions_checked),
             "accounting_drift_detected": str(summary.accounting_drift_detected),
+            "missed_fills_detected": str(summary.missed_fills_detected),
         }
 
     def decide(session: TradingSession) -> tuple[TradingSession, AuditEvent] | None:

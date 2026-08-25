@@ -5,9 +5,16 @@ defect fixed.
 Confirmed Base44 defect: `if (protectiveExit || side === 'sell') return
 {allowed: true, ...}` ran BEFORE the financial-integrity-blocked and
 kill-switch checks, so ANY sell order -- not just a genuine reduce-only exit
--- bypassed both safety gates entirely. Here the two hard gates are checked
-UNCONDITIONALLY FIRST; the protective-exit exemption only applies afterward,
-to the plain "session not active" check.
+-- bypassed both safety gates entirely. That bug was in how the exemption
+was COMPUTED (any `side === 'sell'`), not in checking it first. Here
+`protective_exit` is instead a narrowly-computed boolean the caller derives
+from actual position state (see execution/gateway.py: selling no more than
+the held quantity, or a buy that closes a short) -- so it's safe to check
+FIRST, before either hard gate: a kill-switch/integrity block must stop new
+risk-taking, but must not also freeze a position's own protective
+stop-loss/target exit while it's already blocked from opening anything new.
+A non-protective sell (protective_exit=False) still falls through to both
+hard gates exactly as before.
 """
 
 from __future__ import annotations
@@ -16,6 +23,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from uuid import uuid4
 
 from tradepulse.models import AssetClass, AuditEvent, SessionState, Side, TradingSession
 from tradepulse.persistence import PersistenceRepositories, hydrate
@@ -111,13 +119,13 @@ def execution_session_decision(
     state (selling <= held quantity, or a buy that closes a short) -- never
     inferred from `side` alone.
     """
+    if protective_exit:
+        return SessionDecision(True, "PROTECTIVE_EXIT_ALLOWED")
+
     if session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED or session.financial_integrity_manual_reenable_required:
         return SessionDecision(False, "FINANCIAL_INTEGRITY_BLOCKED")
     if session.state == SessionState.RISK_STOPPED or session.kill_switch_reset_required:
         return SessionDecision(False, "KILL_SWITCH_ACTIVE")
-
-    if protective_exit:
-        return SessionDecision(True, "PROTECTIVE_EXIT_ALLOWED")
 
     if session.trading_active and session.state == SessionState.MARKET_CLOSED and asset_class == AssetClass.CRYPTO:
         return SessionDecision(True, "CONTINUOUS_ASSET_SESSION")
@@ -126,3 +134,64 @@ def execution_session_decision(
         return SessionDecision(False, f"TRADING_SESSION_NOT_ACTIVE ({session.state.value})")
 
     return SessionDecision(True, "ACTIVE")
+
+
+async def latch_risk_stop(
+    repositories: PersistenceRepositories, reason: str, clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> TradingSession | None:
+    """Atomically transition into RISK_STOPPED from a genuine account-level
+    kill-switch condition (daily-loss / max-drawdown breach) -- not an
+    ordinary per-trade risk rejection. Idempotent (a no-op if already
+    RISK_STOPPED, preserving the original reason/timestamp rather than
+    overwriting it on a later breach) and never downgrades an existing
+    FINANCIAL_INTEGRITY_BLOCKED, which is the more severe condition."""
+    now = clock()
+
+    def decide(session: TradingSession) -> tuple[TradingSession, AuditEvent] | None:
+        if session.state in (SessionState.RISK_STOPPED, SessionState.FINANCIAL_INTEGRITY_BLOCKED):
+            return None
+        new_session = TradingSession(
+            SESSION_RECORD_ID, SessionState.RISK_STOPPED, False, now,
+            kill_switch_reason=reason, kill_switch_at=now, kill_switch_reset_required=True,
+        )
+        event = AuditEvent(
+            event_id=str(uuid4()), event_type="session_transition", severity="critical",
+            message=f"{session.state.value} -> risk_stopped: {reason}", occurred_at=now,
+            entity_type="trading_session", entity_id=SESSION_RECORD_ID,
+            details={"action": "latch_risk_stop", "previous_state": session.state.value, "new_state": "risk_stopped", "reason": reason},
+        )
+        return new_session, event
+
+    return await transition_session(repositories, decide)
+
+
+async def latch_financial_integrity_block(
+    repositories: PersistenceRepositories, reason: str, clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> TradingSession | None:
+    """Atomically transition into FINANCIAL_INTEGRITY_BLOCKED from a genuine
+    settlement/accounting-truth failure (SettlementStatus.INTEGRITY_BLOCKED,
+    reconciliation's ACCOUNTING_DRIFT, or an unrecoverable/orphan broker
+    fill). Idempotent for itself, but -- unlike latch_risk_stop -- DOES
+    escalate out of an existing RISK_STOPPED: an accounting-integrity
+    problem is more severe than an ordinary risk-limit breach and needs its
+    own, more rigorous reset path (reset-integrity's reconciliation gate);
+    it must never be silently absorbed into a plain risk stop that
+    reset-risk alone could clear."""
+    now = clock()
+
+    def decide(session: TradingSession) -> tuple[TradingSession, AuditEvent] | None:
+        if session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED:
+            return None
+        new_session = TradingSession(
+            SESSION_RECORD_ID, SessionState.FINANCIAL_INTEGRITY_BLOCKED, False, now,
+            financial_integrity_reason=reason, financial_integrity_manual_reenable_required=True,
+        )
+        event = AuditEvent(
+            event_id=str(uuid4()), event_type="session_transition", severity="critical",
+            message=f"{session.state.value} -> financial_integrity_blocked: {reason}", occurred_at=now,
+            entity_type="trading_session", entity_id=SESSION_RECORD_ID,
+            details={"action": "latch_integrity_block", "previous_state": session.state.value, "new_state": "financial_integrity_blocked", "reason": reason},
+        )
+        return new_session, event
+
+    return await transition_session(repositories, decide)

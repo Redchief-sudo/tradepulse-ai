@@ -10,12 +10,14 @@ from tradepulse.models import (
     ExecutionMode,
     Fill,
     PositionLot,
+    SessionState,
     SettlementEvent,
     SettlementStatus,
     Side,
     TradeIntent,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
+from tradepulse.risk import load_session
 from tradepulse.settlement import SettlementProcessor
 
 
@@ -158,6 +160,12 @@ async def test_manufactured_integrity_violation_blocks_permanently_and_alerts(tm
     # A second run must not retry an integrity_blocked event either.
     second_summary = await processor.process_pending()
     assert second_summary.processed == 0
+
+    session = await load_session(repositories)
+    assert session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED  # latched, not just alerted
+    assert session.financial_integrity_manual_reenable_required is True
+    events = await repositories.audit_events.list_all(limit=10)
+    assert len(events) == 1
 
 
 async def test_project_trade_realized_pnl_is_recomputed_not_accumulated_on_replay(tmp_path) -> None:

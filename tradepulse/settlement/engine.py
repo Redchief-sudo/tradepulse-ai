@@ -39,6 +39,7 @@ from uuid import uuid4
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.models import Holding, PositionLot, SettlementEvent, SettlementStatus
 from tradepulse.persistence import PersistenceRepositories, hydrate
+from tradepulse.risk import latch_financial_integrity_block
 
 from .lots import IntegrityViolationError, plan_signed_lot_fill
 from .stages import (
@@ -317,6 +318,7 @@ class SettlementProcessor:
                         f"Settlement integrity blocked: {event.asset.symbol} {event.side.value} {event.quantity}",
                         {"error": failure.error, "settlement_event_id": event.settlement_event_id},
                     )
+                    await latch_financial_integrity_block(self._repositories, f"Settlement integrity blocked: {failure.error}", clock=self._clock)
 
         refreshed_rows = await self._repositories.settlements.list_all(limit=1000)
         unresolved = [row for row in refreshed_rows if row.get("status") != SettlementStatus.COMPLETED.value]

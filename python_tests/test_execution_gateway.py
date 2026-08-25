@@ -8,10 +8,10 @@ from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
 from tradepulse.config import risk_limits_for_profile
 from tradepulse.execution import ExecutionGateway, ExecutionRequest
-from tradepulse.models import AssetClass, AssetIdentity, ExecutionMode, SessionState, Side, TradeIntent, TradeIntentStatus, TradingSession
+from tradepulse.models import AssetClass, AssetIdentity, ExecutionMode, Holding, SessionState, Side, TradeIntent, TradeIntentStatus, TradingSession
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.providers import AlpacaMarketDataProvider
-from tradepulse.risk import save_session
+from tradepulse.risk import load_session, save_session
 from tradepulse.settlement import SettlementProcessor
 
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)
@@ -484,6 +484,59 @@ async def test_buy_rejected_when_daily_loss_exceeds_limit(tmp_path) -> None:
 
     assert result.status == "rejected"
     assert any("MAX_DAILY_LOSS_EXCEEDED" in r for r in result.reasons)
+    assert order_route.call_count == 0
+
+    session = await load_session(repositories)
+    assert session.state == SessionState.RISK_STOPPED  # a genuine kill-switch condition latches the durable session, not just this one rejection
+    assert session.kill_switch_reset_required is True
+    events = await repositories.audit_events.list_all(limit=10)
+    assert len(events) == 1
+
+
+@respx.mock
+async def test_ordinary_rejection_does_not_latch_risk_stop(tmp_path) -> None:
+    """INSUFFICIENT_CASH is a per-trade sizing outcome, not an account-level
+    kill-switch condition -- it must reject this one order without touching
+    the durable session state."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account(cash="10")
+    _mock_quote()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "rejected"
+    session = await load_session(repositories)
+    assert session.state == SessionState.ACTIVE
+    assert (await repositories.audit_events.list_all(limit=10)) == []
+
+
+@respx.mock
+async def test_protective_exit_bypasses_only_the_session_gate_not_downstream_checks(tmp_path) -> None:
+    """RISK_STOPPED must still allow a genuine protective exit through the
+    session gate, but every downstream execution control keeps running --
+    the exemption must not become a general safety bypass. Proven here by
+    a broker account fetch failure (a check that happens AFTER the session
+    gate) still correctly producing a skipped result."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(
+        repositories,
+        TradingSession("session", SessionState.RISK_STOPPED, False, NOW, kill_switch_reason="daily loss", kill_switch_reset_required=True),
+    )
+    await repositories.holdings.create_once("AAPL", Holding(asset=_aapl(), quantity=Decimal("5"), average_price=Decimal("150"), updated_at=NOW))
+    _mock_quote()
+    respx.get("https://paper-api.alpaca.markets/v2/account").mock(return_value=httpx.Response(500, json={"message": "internal error"}))
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.SELL, requested_quantity=Decimal("5"), strategy="test")
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "skipped"
+    assert any("BROKER_UNAVAILABLE" in r for r in result.reasons)  # a downstream check, not the session gate, produced this rejection
     assert order_route.call_count == 0
 
 

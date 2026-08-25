@@ -14,12 +14,14 @@ from tradepulse.models import (
     Holding,
     PositionLot,
     ReconciliationOutcome,
+    SessionState,
     Side,
     TradeIntent,
     TradeIntentStatus,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.reconciliation import run_reconciliation
+from tradepulse.risk import load_session
 from tradepulse.settlement import SettlementProcessor
 
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)
@@ -198,6 +200,10 @@ async def test_lots_disagreeing_with_broker_is_accounting_drift_not_corrected(tm
     # no CORRECTED record was ever written for this symbol
     assert not any(p.outcome == ReconciliationOutcome.CORRECTED for p in payloads)
 
+    session = await load_session(repositories)
+    assert session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED  # a genuine accounting drift latches, not just alerts
+    assert "AAPL" in session.financial_integrity_reason
+
 
 @respx.mock
 async def test_local_holding_for_a_closed_position_is_deleted_when_lots_agree_its_gone(tmp_path) -> None:
@@ -234,6 +240,10 @@ async def test_missed_fill_is_drift_detected_and_never_fabricated(tmp_path) -> N
     assert len(fill_records) == 1
     assert fill_records[0].outcome == ReconciliationOutcome.DRIFT_DETECTED
     assert fill_records[0].actual["activity_id"] == "activity-999"
+
+    session = await load_session(repositories)
+    assert session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED  # unrecoverable, not merely late -- latches
+    assert "activity-999" in session.financial_integrity_reason
 
 
 @respx.mock
@@ -342,6 +352,9 @@ async def test_late_fill_recovered_into_non_terminal_intent(tmp_path) -> None:
     fill_records = [p for p in payloads if p.reconciliation_type == "fill"]
     assert len(fill_records) == 1
     assert fill_records[0].outcome == ReconciliationOutcome.CORRECTED
+
+    session = await load_session(repositories)
+    assert session.state == SessionState.DISABLED  # late but recovered -- never latches; unrecoverable and late are not the same thing
 
 
 @respx.mock
