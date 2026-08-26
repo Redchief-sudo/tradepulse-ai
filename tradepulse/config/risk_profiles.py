@@ -20,7 +20,7 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         max_open_positions=12, max_daily_loss_pct=Decimal("5"),
         spread_limit_pct=Decimal("2"), slippage_limit_pct=Decimal("1.5"),
         max_risk_per_trade_pct=Decimal("0.50"), max_total_exposure_pct=Decimal("60"),
-        max_simultaneous_orders=5,
+        max_simultaneous_orders=5, min_position_size_multiplier=Decimal("0.65"),
     ),
     "balanced": RiskLimits(
         profile_id="balanced",
@@ -29,7 +29,7 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         max_open_positions=5, max_daily_loss_pct=Decimal("1.0"),
         spread_limit_pct=Decimal("1.5"), slippage_limit_pct=Decimal("1"),
         max_risk_per_trade_pct=Decimal("0.30"), max_total_exposure_pct=Decimal("40"),
-        max_simultaneous_orders=2,
+        max_simultaneous_orders=2, min_position_size_multiplier=Decimal("0.5"),
     ),
     "conservative": RiskLimits(
         profile_id="conservative",
@@ -38,7 +38,7 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         max_open_positions=3, max_daily_loss_pct=Decimal("0.5"),
         spread_limit_pct=Decimal("1"), slippage_limit_pct=Decimal("0.5"),
         max_risk_per_trade_pct=Decimal("0.25"), max_total_exposure_pct=Decimal("30"),
-        max_simultaneous_orders=2,
+        max_simultaneous_orders=2, min_position_size_multiplier=Decimal("0.35"),
     ),
     "micro": RiskLimits(
         profile_id="micro",
@@ -47,7 +47,7 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         max_open_positions=3, max_daily_loss_pct=Decimal("2"),
         spread_limit_pct=Decimal("2"), slippage_limit_pct=Decimal("1"),
         max_risk_per_trade_pct=Decimal("1.0"), max_total_exposure_pct=Decimal("70"),
-        max_simultaneous_orders=2,
+        max_simultaneous_orders=2, min_position_size_multiplier=Decimal("0.5"),
     ),
 }
 

@@ -592,9 +592,11 @@ async def test_buy_rejected_when_confidence_below_minimum_and_never_reaches_brok
 
 @respx.mock
 async def test_buy_rejected_when_broker_cash_insufficient(tmp_path) -> None:
+    """Cash below min_lot_notional -- even the soft cash-sizing cap can't
+    produce anything executable, so this still rejects outright."""
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
-    _mock_account(cash="10")  # nowhere near enough for 5 shares at ~$200
+    _mock_account(cash="0.50")  # nowhere near enough for 5 shares at ~$200, or even the $1 minimum lot
     _mock_positions()
     _mock_quote()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
@@ -604,8 +606,49 @@ async def test_buy_rejected_when_broker_cash_insufficient(tmp_path) -> None:
     await broker.aclose()
 
     assert result.status == "rejected"
-    assert any("INSUFFICIENT_CASH" in r for r in result.reasons)
+    assert any("INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT" in r for r in result.reasons)
     assert order_route.call_count == 0
+
+
+@respx.mock
+async def test_buy_with_partial_cash_sizes_down_instead_of_rejecting(tmp_path) -> None:
+    """Enough cash for SOME shares, not the full request -- must size down,
+    never reject outright (small-account support). Fill mocks dynamically
+    echo whatever quantity the sizing math actually submits, rather than a
+    hand-computed guess that could silently drift from the real formula."""
+    import json as _json
+
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account(cash="500")  # affords ~2.4 shares at ~$200 ask, not the full 5 requested
+    _mock_positions()
+    _mock_quote()
+    _mock_market_open()
+
+    state: dict[str, str] = {}
+
+    def _accept(request: httpx.Request) -> httpx.Response:
+        state["qty"] = _json.loads(request.content)["qty"]
+        return httpx.Response(200, json=_order_json("accepted", "0", None))
+
+    def _status(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_order_json("filled", state["qty"], "199.60"))
+
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=_accept)
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(side_effect=_status)
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
+        side_effect=lambda request: httpx.Response(200, json=[{
+            "id": "act-1", "activity_type": "FILL", "symbol": "AAPL", "side": "buy",
+            "qty": state["qty"], "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-1",
+        }])
+    )
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status != "rejected"
+    assert Decimal("0") < result.filled_quantity < Decimal("5")
 
 
 @respx.mock
@@ -637,10 +680,11 @@ async def test_buy_rejected_when_daily_loss_exceeds_limit(tmp_path) -> None:
 async def test_ordinary_rejection_does_not_latch_risk_stop(tmp_path) -> None:
     """INSUFFICIENT_CASH is a per-trade sizing outcome, not an account-level
     kill-switch condition -- it must reject this one order without touching
-    the durable session state."""
+    the durable session state. Cash below min_lot_notional ($1 default) so
+    even the soft cash cap can't size this down to anything executable."""
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
-    _mock_account(cash="10")
+    _mock_account(cash="0.50")
     _mock_positions()
     _mock_quote()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))

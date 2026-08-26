@@ -67,12 +67,103 @@ def test_kill_switch_denies_zero_shares_never_partial() -> None:
 def test_buy_rejected_when_cash_insufficient() -> None:
     """Regression test for the confirmed Base44 gap: reserveCash() existed in
     cashLedger.ts but was never called from execution.ts, so a buy could be
-    approved with no pre-trade cash check. Here it is mandatory.
+    approved with no pre-trade cash check. Here it is mandatory. Cash is
+    below min_lot_notional ($1 default) so even the soft cash-sizing cap
+    can't produce anything executable -- still a genuine rejection.
     """
-    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("50"))
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("0.50"))
     decision = evaluate_risk(_buy(requested_quantity=Decimal("10"), price=Decimal("100")), _snapshot(), LIMITS, opts)
     assert not decision.approved
-    assert any("INSUFFICIENT_CASH" in reason for reason in decision.reasons)
+    assert any("INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT" in reason for reason in decision.reasons)
+
+
+def test_buy_with_partial_cash_sizes_down_instead_of_rejecting() -> None:
+    """Enough cash for some shares, not the full request -- sizes down,
+    never rejects outright (small-account support)."""
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("495"))
+    decision = evaluate_risk(_buy(requested_quantity=Decimal("10"), price=Decimal("100")), _snapshot(), LIMITS, opts)
+    assert decision.approved
+    assert Decimal("0") < decision.approved_quantity < Decimal("10")
+    assert any("BY_AVAILABLE_CASH" in reason for reason in decision.reasons)
+
+
+def test_protective_sell_ignores_available_cash() -> None:
+    sell = _buy(side=Side.SELL, requested_quantity=Decimal("5"))
+    opts = RiskEvalOptions(protective_exit=True, held_quantity=Decimal("5"), available_cash=Decimal("0.01"))
+    decision = evaluate_risk(sell, _snapshot(), LIMITS, opts)
+    assert decision.approved
+    assert decision.approved_quantity == Decimal("5")
+
+
+def test_plain_covered_sell_ignores_available_cash() -> None:
+    sell = _buy(side=Side.SELL, requested_quantity=Decimal("5"))
+    opts = RiskEvalOptions(held_quantity=Decimal("5"), available_cash=Decimal("0.01"))
+    decision = evaluate_risk(sell, _snapshot(), LIMITS, opts)
+    assert decision.approved
+    assert decision.approved_quantity == Decimal("5")
+
+
+def test_confidence_scales_risk_budget_not_just_quantity() -> None:
+    """Confidence modifies the ALLOWED RISK BUDGET (not requested quantity
+    directly) -- verify the budget-level invariant, not just the resulting
+    approved_quantity."""
+    stop_loss = Decimal("96")  # risk_per_share = 4 against price=100
+    total_equity = Decimal("100000")
+    base_risk_budget = (LIMITS.max_risk_per_trade_pct / 100) * total_equity
+    adjusted_risk_budget = base_risk_budget * LIMITS.min_position_size_multiplier
+
+    buy = _buy(confidence=LIMITS.min_confidence, stop_loss=stop_loss, requested_quantity=Decimal("300"))
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("10000000"))
+    decision = evaluate_risk(buy, _snapshot(total_equity=total_equity), LIMITS, opts)
+
+    risk_per_share = Decimal("100") - stop_loss
+    assert decision.approved
+    assert decision.approved_quantity * risk_per_share <= adjusted_risk_budget
+    assert adjusted_risk_budget <= base_risk_budget
+    assert any("RISK_BUDGET_SCALED_BY_CONFIDENCE" in r for r in decision.reasons)
+
+
+def test_confidence_at_100_uses_full_unscaled_risk_budget() -> None:
+    stop_loss = Decimal("96")
+    total_equity = Decimal("100000")
+    base_risk_budget = (LIMITS.max_risk_per_trade_pct / 100) * total_equity
+    buy = _buy(confidence=Decimal("100"), stop_loss=stop_loss, requested_quantity=Decimal("300"))
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("10000000"))
+    decision = evaluate_risk(buy, _snapshot(total_equity=total_equity), LIMITS, opts)
+
+    risk_per_share = Decimal("100") - stop_loss
+    assert decision.approved
+    assert decision.approved_quantity * risk_per_share <= base_risk_budget
+    assert not any("RISK_BUDGET_SCALED_BY_CONFIDENCE" in r for r in decision.reasons)
+
+
+def test_confidence_none_does_not_scale_risk_budget() -> None:
+    buy = _buy(confidence=None, stop_loss=Decimal("96"), requested_quantity=Decimal("300"))
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("10000000"))
+    decision = evaluate_risk(buy, _snapshot(), LIMITS, opts)
+    assert decision.approved
+    assert not any("RISK_BUDGET_SCALED_BY_CONFIDENCE" in r for r in decision.reasons)
+
+
+def test_min_lot_notional_rejects_tiny_notional_even_when_quantity_floor_passes() -> None:
+    """A low-priced asset where a few units clear the unit-quantity floor
+    (0.001) but not the dollar floor (min_lot_notional, $1 default)."""
+    buy = _buy(price=Decimal("0.01"), requested_quantity=Decimal("50"), confidence=None)  # 50 * $0.01 = $0.50 < $1
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("1000"))
+    decision = evaluate_risk(buy, _snapshot(), LIMITS, opts)
+    assert not decision.approved
+    assert any("INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT" in r for r in decision.reasons)
+
+
+def test_all_caps_combined_only_ever_shrink_never_enlarge() -> None:
+    """A high-confidence, low-risk request already at/under every cap comes
+    back completely unchanged -- proves the non-negotiable rule holds
+    through all sizing paths combined, not just individually."""
+    buy = _buy(confidence=Decimal("100"), requested_quantity=Decimal("1"), price=Decimal("100"))
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("1000000"))
+    decision = evaluate_risk(buy, _snapshot(), LIMITS, opts)
+    assert decision.approved
+    assert decision.approved_quantity == Decimal("1")
 
 
 def test_buy_approved_when_cash_sufficient() -> None:

@@ -11,14 +11,15 @@ from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
 from tradepulse.config import risk_limits_for_profile
 from tradepulse.execution import ExecutionGateway, reserve_symbol_for_execution
-from tradepulse.models import AssetClass, AssetIdentity, ExecutionMode, ScanRun, ScanRunStatus, ScanTrigger, SessionState, TradingSession, asset_identity_key
+from tradepulse.models import AssetClass, AssetIdentity, Candle, ExecutionMode, ScanRun, ScanRunStatus, ScanTrigger, SessionState, TradingSession, asset_identity_key
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.providers import AlpacaMarketDataProvider, AnthropicAIProvider
 from tradepulse.providers.anthropic_ai import SCAN_TOOL_NAME
 from tradepulse.risk import load_session, save_session
 from tradepulse.scanner import run_scan_cycle
+from tradepulse.scanner.coordinator import _atr_stop_loss_price, _stop_loss_price
 from tradepulse.settlement import SettlementProcessor
-from tradepulse.strategy import ExecutableUniverse
+from tradepulse.strategy import ExecutableUniverse, atr
 
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)
 QUOTE_TS = NOW.isoformat().replace("+00:00", "Z")
@@ -185,13 +186,22 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
     assert opportunity.asset.symbol == "AAPL"
     assert opportunity.source == "anthropic"  # reflects the actual AI backend used, not a hardcoded string
 
-    # A protective stop must actually be set -- derived from the risk profile's
-    # stop_loss_pct (balanced=8%) against the scanner's own quote (mid of the
-    # mocked 199.50/199.60 bid/ask), since the AI/composite never supply one;
-    # without this the position monitor has nothing to protect.
+    # A protective stop must actually be set -- ATR-based (the scanner's
+    # primary source; see scanner/coordinator.py::_atr_stop_loss_price)
+    # against the scanner's own quote (mid of the mocked 199.50/199.60
+    # bid/ask) and the same synthetic candle series used to discover this
+    # candidate, since the AI/composite never supply one; without this the
+    # position monitor has nothing to protect. Computed via the actual atr()
+    # function rather than hand-derived so this doesn't silently drift out
+    # of sync with the implementation.
     holding_row = await repositories.holdings.get(asset_identity_key(AssetIdentity("AAPL", AssetClass.EQUITY, "alpaca:AAPL")))
     holding = hydrate("holdings", holding_row["payload"])
-    assert holding.stop_loss == (Decimal("199.55") * Decimal("0.92")).quantize(Decimal("0.01"))
+    highs = [c * 1.006 for c in _BULLISH_CLOSES]
+    lows = [c * 0.994 for c in _BULLISH_CLOSES]
+    atr_value = atr(highs, lows, _BULLISH_CLOSES)
+    expected_distance = Decimal(str(atr_value)) * limits.atr_stop_multiplier
+    expected_stop = (Decimal("199.55") - expected_distance).quantize(Decimal("0.01"))
+    assert holding.stop_loss == expected_stop
 
     # A broker-truth equity snapshot must be persisted every cycle -- otherwise
     # check_max_drawdown() has no history to compare against and can never trip.
@@ -474,3 +484,61 @@ async def test_scan_cycle_stops_starting_new_work_when_lease_already_lost(tmp_pa
     rejected = [r for r in caplog.records if getattr(r, "event", None) == "candidate_rejected"]
     assert len(rejected) == 1
     assert rejected[0].reason == "COMMAND_LEASE_LOST"
+
+
+def _synthetic_candles(closes: list[float], band: float = 0.006) -> list[Candle]:
+    end = NOW
+    return [
+        Candle(
+            date=(end - timedelta(days=len(closes) - 1 - i)).date().isoformat(),
+            open=Decimal(str(close * (1 - band / 3))), high=Decimal(str(close * (1 + band))),
+            low=Decimal(str(close * (1 - band))), close=Decimal(str(close)), volume=Decimal("1000000"),
+        )
+        for i, close in enumerate(closes)
+    ]
+
+
+def test_atr_stop_loss_used_when_valid_and_within_sanity_band() -> None:
+    candles = _synthetic_candles(_BULLISH_CLOSES)
+    price = Decimal("199.55")
+    result = _atr_stop_loss_price(price, candles, Decimal("2"), AssetClass.EQUITY, Decimal("0.5"), Decimal("25"))
+    assert result is not None
+    assert result < price  # a real protective distance below the reference price
+
+    highs = [c * 1.006 for c in _BULLISH_CLOSES]
+    lows = [c * 0.994 for c in _BULLISH_CLOSES]
+    expected = (price - Decimal(str(atr(highs, lows, _BULLISH_CLOSES))) * Decimal("2")).quantize(Decimal("0.01"))
+    assert result == expected
+
+
+def test_atr_stop_loss_falls_back_to_fixed_pct_when_atr_unavailable() -> None:
+    """Too little candle history for atr()'s own minimum -- falls back to
+    the fixed-pct stop, never crashes or produces a nonsensical stop."""
+    too_few_candles = _synthetic_candles(_BULLISH_CLOSES[:5])
+    price = Decimal("199.55")
+    assert _atr_stop_loss_price(price, too_few_candles, Decimal("2"), AssetClass.EQUITY, Decimal("0.5"), Decimal("25")) is None
+
+    fallback = _stop_loss_price(price, Decimal("8"), AssetClass.EQUITY)
+    assert fallback == (price * Decimal("0.92")).quantize(Decimal("0.01"))
+
+
+def test_atr_stop_loss_falls_back_when_distance_is_pathologically_small() -> None:
+    """A near-flat candle series produces a near-zero ATR -- the resulting
+    distance would be pathologically close to price (a tiny risk_per_share
+    denominator feeding an absurdly large risk-based quantity). Must fall
+    back to the fixed-pct stop instead of accepting it."""
+    flat_closes = [100.0] * 40  # constant close, near-zero daily band -- ATR ~= 0.02% of price
+    candles = _synthetic_candles(flat_closes, band=0.0001)
+    price = Decimal("100")
+    result = _atr_stop_loss_price(price, candles, Decimal("2"), AssetClass.EQUITY, Decimal("0.5"), Decimal("25"))
+    assert result is None
+
+
+def test_atr_stop_loss_falls_back_when_distance_is_pathologically_large() -> None:
+    """An oversized ATR multiplier pushes the stop distance beyond the
+    configured max_stop_distance_pct -- not a meaningful protective level,
+    falls back rather than accepting it."""
+    candles = _synthetic_candles(_BULLISH_CLOSES)
+    price = Decimal("199.55")
+    result = _atr_stop_loss_price(price, candles, Decimal("2"), AssetClass.EQUITY, Decimal("0.5"), Decimal("0.1"))
+    assert result is None

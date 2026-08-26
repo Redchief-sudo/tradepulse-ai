@@ -35,6 +35,21 @@ def _minimum_quantity(asset_class: AssetClass) -> Decimal:
     return Decimal("0.00000001") if asset_class == AssetClass.CRYPTO else Decimal("0.001")
 
 
+def _confidence_multiplier(confidence: Decimal | None, min_confidence: Decimal, floor_multiplier: Decimal) -> Decimal:
+    """confidence is guaranteed >= min_confidence by the time this runs --
+    anything lower already rejected via CONFIDENCE_BELOW_MIN earlier in
+    evaluate_risk. None means the caller supplied no confidence signal at
+    all -- no scaling, matches how the min_confidence gate itself already
+    skips when confidence is None."""
+    if confidence is None:
+        return Decimal("1")
+    span = Decimal("100") - min_confidence
+    if span <= 0 or confidence >= 100:
+        return Decimal("1")
+    fraction = (confidence - min_confidence) / span
+    return floor_multiplier + (Decimal("1") - floor_multiplier) * fraction
+
+
 @dataclass(frozen=True, slots=True)
 class RiskCheckInput:
     symbol: str
@@ -72,6 +87,7 @@ class RiskDecision:
 class CashCheck:
     approved: bool
     reason: str | None
+    max_affordable_notional: Decimal
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,11 +104,15 @@ def check_cash_sufficiency(
     estimated_fees: Decimal,
     buffer_pct: Decimal = Decimal("1"),
 ) -> CashCheck:
-    required = requested_notional + estimated_fees
+    """max_affordable_notional lets callers use this as a downward SIZING cap
+    (see evaluate_risk's sizing block), not just a binary approve/reject --
+    a partially-affordable trade should size down, not get a blanket no."""
     buffered_cash = cash_balance * (Decimal("1") - buffer_pct / Decimal("100"))
+    max_affordable_notional = max(Decimal("0"), buffered_cash - estimated_fees)
+    required = requested_notional + estimated_fees
     if required > buffered_cash:
-        return CashCheck(False, f"INSUFFICIENT_CASH (required {required}, available {buffered_cash})")
-    return CashCheck(True, None)
+        return CashCheck(False, f"INSUFFICIENT_CASH (required {required}, available {buffered_cash})", max_affordable_notional)
+    return CashCheck(True, None, max_affordable_notional)
 
 
 def evaluate_risk(
@@ -167,23 +187,25 @@ def evaluate_risk(
             f"MAX_SIMULTANEOUS_ORDERS_REACHED ({snapshot.outstanding_orders}/{limits.max_simultaneous_orders})"
         )
 
-    # Pre-trade cash sufficiency -- mandatory for buys. This is the confirmed
-    # Base44 gap being closed: not optional, not a separate call site nobody
-    # reaches.
-    if opts.available_cash is not None:
-        cash_check = check_cash_sufficiency(opts.available_cash, qty * price, opts.estimated_fees)
-        if not cash_check.approved and cash_check.reason:
-            reasons.append(cash_check.reason)
-
     if reasons:
         return RiskDecision(False, Decimal("0"), reasons)
 
     approved_qty = qty
     if total_equity > 0 and price > 0:
         # Risk-based sizing: shares = risk_budget / risk_per_share, then cap
-        # by max_position_pct, max_sector_pct, and total exposure.
+        # by max_position_pct, max_sector_pct, total exposure, and cash.
         if intent.stop_loss is not None and intent.stop_loss > 0 and limits.max_risk_per_trade_pct:
             risk_budget = (limits.max_risk_per_trade_pct / 100) * total_equity
+            # Confidence scales the ALLOWED RISK BUDGET, not the resulting
+            # quantity directly -- ATR (via stop_loss) defines risk-per-unit,
+            # confidence determines how much of that budget gets deployed.
+            # intent.confidence is guaranteed >= min_confidence here (else
+            # already rejected above via CONFIDENCE_BELOW_MIN); None means no
+            # signal was supplied, so no scaling.
+            confidence_multiplier = _confidence_multiplier(intent.confidence, limits.min_confidence, limits.min_position_size_multiplier)
+            if confidence_multiplier < 1:
+                risk_budget *= confidence_multiplier
+                reasons.append(f"RISK_BUDGET_SCALED_BY_CONFIDENCE_TO_{(confidence_multiplier * 100).quantize(Decimal('0.1'))}PCT")
             risk_per_share = price - intent.stop_loss
             if risk_per_share > 0:
                 risk_based_qty = _round_qty(risk_budget / risk_per_share, intent.asset_class)
@@ -215,7 +237,20 @@ def evaluate_risk(
                     approved_qty = capped_by_exposure
                     reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_MAX_TOTAL_EXPOSURE")
 
-    if approved_qty < minimum_quantity:
+        # Cash is a downward SIZING cap here, not an earlier hard reject --
+        # a partially-affordable trade should size down (small-account
+        # support), not get a blanket no. Never reached for SELL/
+        # protective_exit (both return earlier in this function), so this
+        # can only ever shrink genuine new/increasing exposure.
+        if opts.available_cash is not None:
+            cash_check = check_cash_sufficiency(opts.available_cash, approved_qty * price, opts.estimated_fees)
+            if not cash_check.approved:
+                capped_by_cash = _round_qty(cash_check.max_affordable_notional / price, intent.asset_class) if price > 0 else Decimal("0")
+                if capped_by_cash < approved_qty:
+                    approved_qty = capped_by_cash
+                    reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_AVAILABLE_CASH")
+
+    if approved_qty < minimum_quantity or (price > 0 and approved_qty * price < limits.min_lot_notional):
         reasons.append("INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT")
         return RiskDecision(False, Decimal("0"), reasons)
 

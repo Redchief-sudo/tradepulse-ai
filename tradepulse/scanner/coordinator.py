@@ -45,6 +45,7 @@ from tradepulse.execution import (
 from tradepulse.models import (
     AssetClass,
     AssetIdentity,
+    Candle,
     Opportunity,
     RiskLimits,
     ScanRun,
@@ -67,6 +68,7 @@ from tradepulse.providers import (
 from tradepulse.risk import build_portfolio_snapshot, load_session, sync_market_session
 from tradepulse.strategy import (
     ExecutableUniverse,
+    atr,
     compute_real_factors,
     is_executable,
     signal_from_composite,
@@ -114,16 +116,45 @@ def _round_quantity(qty: Decimal, asset_class: AssetClass) -> Decimal:
     return floored / precision
 
 
-def _stop_loss_price(reference_price: Decimal, stop_loss_pct: Decimal, asset_class: AssetClass) -> Decimal:
-    """The scanner's only source of a protective stop -- there's no
-    signal-specific stop from the AI or the deterministic composite
-    (matching the discovery-only contract: they propose a symbol, never a
-    trade parameter), so this is derived from RiskLimits.stop_loss_pct, the
-    same per-profile value risk/engine.py's risk-per-share sizing already
-    expects a caller to supply."""
-    raw = reference_price * (Decimal("1") - stop_loss_pct / Decimal("100"))
+def _round_price(value: Decimal, asset_class: AssetClass) -> Decimal:
     precision = Decimal("0.00000001") if asset_class == AssetClass.CRYPTO else Decimal("0.01")
-    return raw.quantize(precision)
+    return value.quantize(precision)
+
+
+def _stop_loss_price(reference_price: Decimal, stop_loss_pct: Decimal, asset_class: AssetClass) -> Decimal:
+    """The scanner's fallback protective-stop source, used when an
+    ATR-based stop (see _atr_stop_loss_price) can't be computed -- derived
+    from RiskLimits.stop_loss_pct, the same per-profile value risk/engine.py's
+    risk-per-share sizing already expects a caller to supply."""
+    raw = reference_price * (Decimal("1") - stop_loss_pct / Decimal("100"))
+    return _round_price(raw, asset_class)
+
+
+def _atr_stop_loss_price(
+    reference_price: Decimal, candles: list[Candle], atr_multiplier: Decimal, asset_class: AssetClass,
+    min_stop_distance_pct: Decimal, max_stop_distance_pct: Decimal,
+) -> Decimal | None:
+    """Volatility-aware stop distance -- the scanner's PRIMARY source of a
+    protective stop, replacing the fixed stop_loss_pct entirely so
+    risk/engine.py's existing risk_per_share = price - stop_loss sizing
+    formula automatically becomes volatility-aware too, without a second/
+    independent sizing formula. Returns None (caller falls back to the
+    fixed-pct stop) when ATR can't be computed OR when the resulting
+    distance is outside the configured sanity band -- a near-zero distance
+    would otherwise feed a pathologically large risk-based quantity into
+    sizing; an oversized distance isn't a meaningful protective level at
+    all."""
+    atr_value = atr([float(c.high) for c in candles], [float(c.low) for c in candles], [float(c.close) for c in candles])
+    if atr_value is None or atr_value <= 0 or reference_price <= 0:
+        return None
+    distance = Decimal(str(atr_value)) * atr_multiplier
+    distance_pct = (distance / reference_price) * 100
+    if distance_pct < min_stop_distance_pct or distance_pct > max_stop_distance_pct:
+        return None
+    raw = reference_price - distance
+    if raw <= 0:
+        return None
+    return _round_price(raw, asset_class)
 
 
 def _build_scan_prompt(universe: ExecutableUniverse) -> str:
@@ -285,7 +316,16 @@ async def run_scan_cycle(
                 _reject(candidate.symbol, "QUANTITY_ROUNDED_TO_ZERO", notional_budget=str(notional_budget), price=str(quote.price))
                 continue
 
-            stop_loss = _stop_loss_price(quote.price, risk_limits.stop_loss_pct, asset.asset_class) if risk_limits.stop_loss_pct > 0 else None
+            stop_loss = (
+                (
+                    _atr_stop_loss_price(
+                        quote.price, candles, risk_limits.atr_stop_multiplier, asset.asset_class,
+                        risk_limits.min_stop_distance_pct, risk_limits.max_stop_distance_pct,
+                    )
+                    if risk_limits.atr_stop_multiplier > 0 else None
+                )
+                or (_stop_loss_price(quote.price, risk_limits.stop_loss_pct, asset.asset_class) if risk_limits.stop_loss_pct > 0 else None)
+            )
 
             opportunity = Opportunity(
                 opportunity_id=str(uuid4()), scan_generation=scan_generation, asset=asset, quote=quote,
