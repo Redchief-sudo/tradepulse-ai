@@ -887,8 +887,10 @@ async def test_buy_exposure_uses_broker_current_price_not_local_cost_basis(tmp_p
     local cost basis. A held MSFT position's cost basis ($200 total) is
     negligible exposure (0.2%), but its broker current_price puts it at
     exactly the balanced profile's 40% max_total_exposure_pct ceiling
-    ($40,000 of $100,000 equity) -- any further BUY must be rejected. Under
-    the old cost-basis behavior this BUY would sail through instead."""
+    ($40,000 of $100,000 equity) -- zero headroom remains, so any further
+    BUY must be rejected (sized down to zero by the exposure cap, then
+    caught by the minimum-lot floor). Under the old cost-basis behavior
+    this BUY would sail through instead."""
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     await repositories.holdings.create_once(
@@ -905,7 +907,7 @@ async def test_buy_exposure_uses_broker_current_price_not_local_cost_basis(tmp_p
     await broker.aclose()
 
     assert result.status == "rejected"
-    assert any("MAX_TOTAL_EXPOSURE_EXCEEDED" in r for r in result.reasons)
+    assert any("INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT" in r for r in result.reasons)
     assert order_route.call_count == 0
 
 

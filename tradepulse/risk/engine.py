@@ -174,13 +174,15 @@ def evaluate_risk(
         reasons.append(f"MAX_DAILY_LOSS_EXCEEDED ({snapshot.daily_pnl_pct:.2f}% <= -{limits.max_daily_loss_pct}%)")
 
     total_equity = snapshot.total_equity
-    if limits.max_total_exposure_pct and total_equity > 0:
-        current_exposure_pct = (snapshot.holdings_value / total_equity) * 100
-        new_exposure_pct = current_exposure_pct + (qty * price / total_equity) * 100
-        if new_exposure_pct > limits.max_total_exposure_pct:
-            reasons.append(
-                f"MAX_TOTAL_EXPOSURE_EXCEEDED ({new_exposure_pct:.1f}% > {limits.max_total_exposure_pct}%)"
-            )
+    # Total exposure is NOT an early hard reject -- it's a downward SIZING
+    # cap, applied below alongside max_position_pct/max_sector_pct/cash. A
+    # request that would blow the exposure ceiling should size down to
+    # whatever headroom remains, not get rejected outright while capacity
+    # still exists (same principle as every other capital-allocation cap in
+    # this function). See the max_total_exposure_pct cap inside the sizing
+    # block below -- it already computes remaining_exposure and shrinks
+    # approved_qty into it; zero remaining headroom naturally floors to a
+    # zero-ish quantity, caught by the final minimum-lot/notional check.
 
     if limits.max_simultaneous_orders and snapshot.outstanding_orders >= limits.max_simultaneous_orders:
         reasons.append(

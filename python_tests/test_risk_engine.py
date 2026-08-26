@@ -15,7 +15,7 @@ from tradepulse.models import (
     asset_identity_key,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories
-from tradepulse.risk.engine import RiskCheckInput, RiskEvalOptions, build_portfolio_snapshot, check_max_drawdown, evaluate_risk
+from tradepulse.risk.engine import RiskCheckInput, RiskEvalOptions, build_portfolio_snapshot, check_cash_sufficiency, check_max_drawdown, evaluate_risk
 
 NOW = datetime(2026, 8, 15, tzinfo=UTC)
 LIMITS = risk_limits_for_profile("balanced")
@@ -198,11 +198,30 @@ def test_buy_position_capped_to_max_position_pct() -> None:
     assert any("MAX_POSITION_PCT" in reason for reason in decision.reasons)
 
 
-def test_buy_rejected_outright_when_full_size_would_blow_total_exposure() -> None:
+def test_buy_sizes_down_when_requested_size_exceeds_remaining_total_exposure() -> None:
+    """Total-exposure headroom is the binding constraint -- must size DOWN
+    to whatever remains, never reject outright while capacity still exists.
+    Existing holdings already consume most of the balanced profile's 40% of
+    $100k = $40k exposure budget, leaving only $2k of headroom -- well under
+    what max_position_pct ($7k) alone would allow, so exposure is what
+    actually binds here."""
     opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("100000"))
-    decision = evaluate_risk(_buy(requested_quantity=Decimal("1000"), price=Decimal("100")), _snapshot(), LIMITS, opts)
+    snapshot = _snapshot(holdings_value=Decimal("38000"))
+    decision = evaluate_risk(_buy(requested_quantity=Decimal("50"), price=Decimal("100")), snapshot, LIMITS, opts)
+    assert decision.approved
+    assert decision.approved_quantity * Decimal("100") <= Decimal("2000")
+    assert any("BY_MAX_TOTAL_EXPOSURE" in reason for reason in decision.reasons)
+
+
+def test_buy_rejected_when_no_total_exposure_capacity_remains() -> None:
+    """Exposure already AT the cap -- capped quantity resolves to zero,
+    rejected via the generic minimum-lot floor, not a separate
+    exposure-specific early reject."""
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("100000"))
+    snapshot = _snapshot(holdings_value=Decimal("40000"))  # already at the 40% cap -- zero headroom
+    decision = evaluate_risk(_buy(requested_quantity=Decimal("50"), price=Decimal("100")), snapshot, LIMITS, opts)
     assert not decision.approved
-    assert any("MAX_TOTAL_EXPOSURE_EXCEEDED" in reason for reason in decision.reasons)
+    assert any("INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT" in reason for reason in decision.reasons)
 
 
 def test_buy_rejected_below_min_confidence() -> None:
@@ -376,3 +395,43 @@ async def test_build_portfolio_snapshot_does_not_count_risk_approved_as_outstand
     snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
 
     assert snapshot.outstanding_orders == 0
+
+
+def test_all_dynamic_controls_combine_and_still_approve_a_smaller_but_valid_quantity() -> None:
+    """Every dynamic control acting together -- confidence-adjusted risk
+    budget, position/sector/total-exposure caps, and cash -- still leaves an
+    executable quantity and approves it. The strongest proof of the
+    allocator as a WHOLE, not just each control verified in isolation."""
+    limits = replace(
+        LIMITS, max_risk_per_trade_pct=Decimal("1.0"), max_position_pct=Decimal("10"),
+        max_sector_pct=Decimal("8"), max_total_exposure_pct=Decimal("40"),
+    )
+    total_equity = Decimal("100000")
+    stop_loss = Decimal("90")  # price=100 -> risk_per_share=10 (stands in for an ATR-derived stop)
+    snapshot = _snapshot(total_equity=total_equity, holdings_value=Decimal("30000"), sector_exposure={"Tech": Decimal("3500")})
+    buy = _buy(confidence=limits.min_confidence, stop_loss=stop_loss, requested_quantity=Decimal("1000"), sector="Tech")
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("4000"))
+
+    decision = evaluate_risk(buy, snapshot, limits, opts)
+
+    risk_per_share = Decimal("100") - stop_loss
+    base_risk_budget = (limits.max_risk_per_trade_pct / 100) * total_equity
+    adjusted_risk_budget = base_risk_budget * limits.min_position_size_multiplier
+    max_position_notional = (limits.max_position_pct / 100) * total_equity
+    remaining_sector = (limits.max_sector_pct / 100) * total_equity - Decimal("3500")
+    remaining_exposure = (limits.max_total_exposure_pct / 100) * total_equity - Decimal("30000")
+    cash_check = check_cash_sufficiency(Decimal("4000"), Decimal("0"), Decimal("0"))
+
+    assert decision.approved
+    assert Decimal("0") < decision.approved_quantity < Decimal("1000")
+    final_notional = decision.approved_quantity * Decimal("100")
+
+    # risk at stop never exceeds the confidence-adjusted budget, which never
+    # exceeds the absolute max risk-per-trade budget
+    assert decision.approved_quantity * risk_per_share <= adjusted_risk_budget
+    assert adjusted_risk_budget <= base_risk_budget
+    # final notional respects every capacity cap simultaneously
+    assert final_notional <= max_position_notional
+    assert final_notional <= remaining_sector
+    assert final_notional <= remaining_exposure
+    assert final_notional <= cash_check.max_affordable_notional
