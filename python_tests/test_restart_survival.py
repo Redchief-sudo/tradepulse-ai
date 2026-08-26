@@ -25,7 +25,7 @@ from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
 from tradepulse.cli import SCAN_LOCK_KEY, _run_scan_leg
 from tradepulse.config import Settings, risk_limits_for_profile
-from tradepulse.execution import ExecutionGateway, ExecutionRequest
+from tradepulse.execution import ExecutionGateway, ExecutionRequest, derive_idempotency_key
 from tradepulse.models import (
     AssetClass,
     AssetIdentity,
@@ -37,6 +37,7 @@ from tradepulse.models import (
     TradeIntent,
     TradeIntentStatus,
     TradingSession,
+    asset_identity_key,
 )
 from tradepulse.monitor import run_position_monitor
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate
@@ -88,6 +89,10 @@ def _mock_market_open(is_open: bool = True) -> None:
     respx.get("https://paper-api.alpaca.markets/v2/clock").mock(
         return_value=httpx.Response(200, json={"is_open": is_open, "next_open": QUOTE_TS, "next_close": QUOTE_TS, "timestamp": QUOTE_TS})
     )
+
+
+def _mock_positions(*positions: dict) -> None:
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=list(positions)))
 
 
 def _order_json(status: str, filled_qty: str, filled_avg_price: str | None, order_id: str = "order-1", side: str = "buy") -> dict:
@@ -159,7 +164,7 @@ async def test_resume_after_crash_before_broker_submission(tmp_path) -> None:
     # row directly, matching what execute_intent would have written.
     _, repositories_a, _, _, _, _, _ = await _fresh_gateway(db_url)
     await save_session(repositories_a, TradingSession("session", SessionState.ACTIVE, True, NOW))
-    idempotency_key = "ik-test-decision-1-AAPL-buy"  # derive_idempotency_key(strategy, decision_id, None, symbol, side)
+    idempotency_key = derive_idempotency_key("test", "decision-1", None, _aapl(), Side.BUY)
     crashed_intent = TradeIntent(
         "ti-1", idempotency_key, "decision-1", _aapl(), Side.BUY, ExecutionMode.PAPER, "test", NOW,
         requested_quantity=Decimal("5"), reference_price=Decimal("199.55"), status=TradeIntentStatus.RISK_APPROVED,
@@ -167,6 +172,7 @@ async def test_resume_after_crash_before_broker_submission(tmp_path) -> None:
     await repositories_a.trade_intents.create_once("ti-1", crashed_intent, status=crashed_intent.status.value, unique_value=idempotency_key)
 
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -192,7 +198,7 @@ async def test_resume_after_crash_between_acceptance_and_fill_polling(tmp_path) 
     # recorded) but before _poll_and_settle ever ran.
     _, repositories_a, _, _, _, _, _ = await _fresh_gateway(db_url)
     await save_session(repositories_a, TradingSession("session", SessionState.ACTIVE, True, NOW))
-    idempotency_key = "ik-test-decision-2-AAPL-buy"
+    idempotency_key = derive_idempotency_key("test", "decision-2", None, _aapl(), Side.BUY)
     crashed_intent = TradeIntent(
         "ti-2", idempotency_key, "decision-2", _aapl(), Side.BUY, ExecutionMode.PAPER, "test", NOW,
         requested_quantity=Decimal("5"), reference_price=Decimal("199.55"), status=TradeIntentStatus.ACCEPTED,
@@ -214,7 +220,7 @@ async def test_resume_after_crash_between_acceptance_and_fill_polling(tmp_path) 
     assert result.trade_intent_id == "ti-2"
     assert result.status == "filled"
 
-    holding_row = await repositories_b.holdings.get("AAPL")
+    holding_row = await repositories_b.holdings.get(asset_identity_key(_aapl()))
     holding = hydrate("holdings", holding_row["payload"])
     assert holding.quantity == Decimal("5")
 
@@ -228,6 +234,7 @@ async def test_resume_after_crash_mid_settlement_stale_processing(tmp_path) -> N
     _, repositories_a, broker_a, _, gateway_a, _, _ = await _fresh_gateway(db_url)
     await save_session(repositories_a, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -252,7 +259,7 @@ async def test_resume_after_crash_mid_settlement_stale_processing(tmp_path) -> N
     summary = await settlement_b.process_pending(stale_lease_seconds=120)
     assert summary.completed == 1
 
-    holding_row = await repositories_b.holdings.get("AAPL")
+    holding_row = await repositories_b.holdings.get(asset_identity_key(_aapl()))
     holding = hydrate("holdings", holding_row["payload"])
     assert holding.quantity == Decimal("5")
     assert holding.average_price == Decimal("199.60")
@@ -308,6 +315,7 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
     universe = ExecutableUniverse(equities=frozenset({"AAPL"}), crypto=frozenset())
 
     _mock_account()
+    _mock_positions()  # no position yet -- Process A's buy is opening a fresh one
     _mock_quote()
     _mock_market_open()
 
@@ -362,7 +370,7 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
     await ai_provider_a.aclose()
 
     assert scan_summary.orders_submitted == 1
-    holding_row = await repositories_a.holdings.get("AAPL")
+    holding_row = await repositories_a.holdings.get(asset_identity_key(_aapl()))
     assert holding_row is not None
     holding = hydrate("holdings", holding_row["payload"])
     bought_qty = holding.quantity
@@ -399,7 +407,7 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
     assert monitor_summary.status == "ok"
     assert monitor_summary.exits_triggered == 1
     assert orders_post_route.call_count == 2  # one buy, one protective sell -- never more
-    assert await repositories_b.holdings.get("AAPL") is None  # position fully closed
+    assert await repositories_b.holdings.get(asset_identity_key(_aapl())) is None  # position fully closed
 
     # ---- Restart. Process C: reconciliation confirms clean state. ----
     _, repositories_c, broker_c, _, _, settlement_c, _ = await _fresh_gateway(db_url)

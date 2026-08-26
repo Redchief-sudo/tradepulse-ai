@@ -18,6 +18,7 @@ from tradepulse.models import (
     Side,
     TradeIntent,
     TradeIntentStatus,
+    asset_identity_key,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.reconciliation import run_reconciliation
@@ -68,7 +69,7 @@ async def _seed_lot(repositories: PersistenceRepositories, *, lot_id: str, fill_
 
 async def _seed_holding(repositories: PersistenceRepositories, *, quantity: str, average_price: str = "150") -> None:
     holding = Holding(asset=_aapl(), quantity=Decimal(quantity), average_price=Decimal(average_price), updated_at=NOW)
-    await repositories.holdings.create_once("AAPL", holding)
+    await repositories.holdings.create_once(asset_identity_key(_aapl()), holding)
 
 
 async def _seed_fill(
@@ -162,7 +163,7 @@ async def test_stale_holding_view_is_rebuilt_when_lots_agree_with_broker(tmp_pat
     assert summary.view_drift_corrected == 1
     assert summary.accounting_drift_detected == 0
 
-    holding_row = await repositories.holdings.get("AAPL")
+    holding_row = await repositories.holdings.get(asset_identity_key(_aapl()))
     holding = hydrate("holdings", holding_row["payload"])
     assert holding.quantity == Decimal("10")  # rebuilt to match lots/broker
 
@@ -188,7 +189,7 @@ async def test_lots_disagreeing_with_broker_is_accounting_drift_not_corrected(tm
     assert summary.accounting_drift_detected == 1
     assert summary.view_drift_corrected == 0
 
-    holding_row = await repositories.holdings.get("AAPL")
+    holding_row = await repositories.holdings.get(asset_identity_key(_aapl()))
     holding = hydrate("holdings", holding_row["payload"])
     assert holding.quantity == Decimal("5")  # untouched -- NOT silently corrected
 
@@ -217,7 +218,60 @@ async def test_local_holding_for_a_closed_position_is_deleted_when_lots_agree_it
     await broker.aclose()
 
     assert summary.view_drift_corrected == 1
-    assert await repositories.holdings.get("AAPL") is None
+    assert await repositories.holdings.get(asset_identity_key(_aapl())) is None
+
+
+def _aapl_crypto() -> AssetIdentity:
+    """Same ticker text as _aapl() -- proves the three-way broker/lots/
+    holdings comparison keeps them independent, not merged. native_asset_id
+    matches what asset_key_from_broker_symbol(CRYPTO, "AAPL") itself would
+    compute (normalize_alpaca_symbol leaves "AAPL" unchanged for crypto since
+    it matches no known quote-currency suffix), so this identity is the
+    SAME instrument the mocked broker crypto position below represents."""
+    return AssetIdentity("AAPL", AssetClass.CRYPTO, "alpaca:AAPL")
+
+
+@respx.mock
+async def test_two_positions_sharing_ticker_text_across_asset_classes_reconcile_independently(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    # Equity AAPL: everything agrees (matched). Crypto AAPL (same ticker
+    # text): local lots disagree with the broker -- accounting drift. Only
+    # the crypto one should ever be flagged; the equity one must stay clean.
+    await _seed_lot(repositories, lot_id="lot-equity", fill_id="fill-equity", quantity="10", price="150")
+    await _seed_holding(repositories, quantity="10")
+    crypto_lot = PositionLot(
+        lot_id="lot-crypto", originating_fill_id="fill-crypto", asset=_aapl_crypto(), position_side="long",
+        opened_quantity=Decimal("2"), remaining_quantity=Decimal("2"), acquisition_price=Decimal("60000"), opened_at=NOW,
+    )
+    await repositories.position_lots.create_once("lot-crypto", crypto_lot, unique_value="fill-crypto")
+    crypto_holding = Holding(asset=_aapl_crypto(), quantity=Decimal("2"), average_price=Decimal("60000"), updated_at=NOW)
+    await repositories.holdings.create_once(asset_identity_key(_aapl_crypto()), crypto_holding)
+
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(
+        200, json=[
+            _position_json("10"),
+            {"symbol": "AAPL", "asset_class": "crypto", "qty": "5", "avg_entry_price": "60000", "market_value": "0", "current_price": "60000", "unrealized_pl": "0"},
+        ],
+    ))
+    _mock_activities([])
+
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.positions_checked == 2
+    assert summary.accounting_drift_detected == 1  # crypto only
+    assert summary.view_drift_corrected == 0
+
+    records = await repositories.reconciliation_records.list_all()
+    payloads = [hydrate("reconciliation_records", r["payload"]) for r in records]
+    matched = [p for p in payloads if p.outcome == ReconciliationOutcome.MATCHED]
+    drifted = [p for p in payloads if p.outcome == ReconciliationOutcome.DRIFT_DETECTED]
+    assert len(matched) == 1  # the equity AAPL, untouched by the crypto AAPL's drift
+    assert len(drifted) == 1
+
+    equity_holding_row = await repositories.holdings.get(asset_identity_key(_aapl()))
+    assert hydrate("holdings", equity_holding_row["payload"]).quantity == Decimal("10")  # unaffected
 
 
 @respx.mock
@@ -343,7 +397,7 @@ async def test_late_fill_recovered_into_non_terminal_intent(tmp_path) -> None:
     intent_row = await repositories.trade_intents.get("ti-1")
     assert intent_row["status"] == "filled"  # finalized, not left stranded at ACCEPTED
 
-    holding_row = await repositories.holdings.get("AAPL")
+    holding_row = await repositories.holdings.get(asset_identity_key(_aapl()))
     assert holding_row is not None  # proves SettlementProcessor.process_pending() actually ran
     assert hydrate("holdings", holding_row["payload"]).quantity == Decimal("5")
 

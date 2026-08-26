@@ -126,7 +126,7 @@ class ExecutionGateway:
     async def execute_intent(self, request: ExecutionRequest) -> ExecutionResult:
         now = self._clock()
         idempotency_key = request.idempotency_key or derive_idempotency_key(
-            request.strategy, request.decision_id, request.signal_timestamp, request.asset.symbol, request.side
+            request.strategy, request.decision_id, request.signal_timestamp, request.asset, request.side
         )
 
         existing: TradeIntent | None = None
@@ -149,10 +149,28 @@ class ExecutionGateway:
                 # submission) or PROPOSED -- fall through and continue below,
                 # reusing this intent's id instead of creating a new one.
 
-        held_quantity = await self._held_quantity(request.asset.symbol)
+        # Broker positions are the quantity AUTHORITY for protective-exit
+        # classification -- the local Holding (see settlement/engine.py) can
+        # be wrong during exactly the accounting-drift scenario that trips
+        # FINANCIAL_INTEGRITY_BLOCKED, and a protective exit computed off a
+        # wrong local quantity could itself be blocked by the very state it
+        # exists to survive. A momentary fetch failure means "try again,"
+        # never "assume non-protective" or "assume flat" -- same fail-closed
+        # skip pattern as the quote/account fetches below.
+        try:
+            positions = await self._broker.get_positions()
+        except (AlpacaError, httpx.HTTPError) as exc:
+            return ExecutionResult("skipped", None, [f"BROKER_POSITIONS_UNAVAILABLE: {exc}"], Decimal("0"), None)
+
+        held_quantity = next(
+            (p.qty for p in positions if p.symbol.upper() == request.asset.symbol.upper()), Decimal("0")
+        )
         protective_exit = (
             request.side == Side.SELL and held_quantity > 0 and request.requested_quantity <= held_quantity
         ) or (request.side == Side.BUY and held_quantity < 0 and request.requested_quantity <= abs(held_quantity))
+        # Same broker truth feeds portfolio exposure -- current market value,
+        # not stale local cost basis (see risk/engine.py::build_portfolio_snapshot).
+        mark_prices = {p.symbol.upper(): p.current_price for p in positions}
 
         # Session check UNCONDITIONALLY before anything else -- see
         # risk/session.py for the audited defect this ordering fixes.
@@ -200,7 +218,7 @@ class ExecutionGateway:
 
         snapshot = await build_portfolio_snapshot(
             self._repositories, cash_balance=account.cash, account_equity=account.equity,
-            broker_prev_close_equity=account.last_equity, now=now,
+            broker_prev_close_equity=account.last_equity, mark_prices=mark_prices, now=now,
         )
 
         max_drawdown_breached = False
@@ -344,12 +362,6 @@ class ExecutionGateway:
             {"trade_intent_id": intent.trade_intent_id, "cause": str(cause)},
         )
         return ExecutionResult("pending", intent.trade_intent_id, [unknown.rejection_reason], Decimal("0"), None)
-
-    async def _held_quantity(self, symbol: str) -> Decimal:
-        row = await self._repositories.holdings.get(symbol.upper())
-        if row is None:
-            return Decimal("0")
-        return hydrate("holdings", row["payload"]).quantity
 
     def _result_from_intent(self, intent: TradeIntent) -> ExecutionResult:
         status_map: dict[TradeIntentStatus, str] = {

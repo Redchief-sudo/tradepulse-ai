@@ -6,8 +6,8 @@ symbol-level coordination that didn't exist in the audited source.
 
 from __future__ import annotations
 
-from tradepulse.models import AssetIdentity, Side, TradeIntentStatus
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, release_lock
+from tradepulse.models import AssetIdentity, Side, TradeIntentStatus, asset_identity_key
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate, release_lock
 
 # Defined here (not in gateway.py, which imports from this module) to avoid a
 # circular import -- gateway.py imports IN_FLIGHT_STATUSES from here instead.
@@ -22,7 +22,7 @@ SYMBOL_LOCK_TTL_SECONDS = 45
 
 
 def derive_idempotency_key(
-    strategy: str, decision_id: str | None, signal_timestamp: str | None, symbol: str, side: Side
+    strategy: str, decision_id: str | None, signal_timestamp: str | None, asset: AssetIdentity, side: Side
 ) -> str | None:
     """Retried calls (a cron re-fire, a resumed process) must resume the same
     intent rather than submit a second broker order. If we have enough
@@ -30,25 +30,30 @@ def derive_idempotency_key(
     key; otherwise return None -- a new intent will be created (this is only
     safe for genuinely one-off, caller-deduplicated calls)."""
     if decision_id or signal_timestamp:
-        return f"ik-{strategy}-{decision_id or signal_timestamp}-{symbol.upper()}-{side.value}"
+        return f"ik-{strategy}-{decision_id or signal_timestamp}-{asset_identity_key(asset)}-{side.value}"
     return None
 
 
-async def has_in_flight_intent(repositories: PersistenceRepositories, symbol: str) -> bool:
+async def has_in_flight_intent(repositories: PersistenceRepositories, asset: AssetIdentity) -> bool:
     """Catches an asset already busy from an earlier, unrelated attempt --
     complementary to, not a replacement for, reserve_symbol_for_execution
     below. The scanner (BUY-only) and the position monitor (protective-exit-
     only) run concurrently and operate on opposite sides of a symbol, but a
-    monitor-driven close and a scanner-driven reopen of the SAME symbol in
+    monitor-driven close and a scanner-driven reopen of the SAME asset in
     the same tick are not economically independent just because they're
     opposite sides. Callers must hold the asset's execution reservation
     while calling this -- checking it alone, without the reservation, would
     reopen the exact check-then-submit race the reservation exists to
-    close."""
+    close. Matches via asset_identity_key (asset class + venue + native ID),
+    not display symbol alone -- two economically distinct instruments must
+    never be treated as the same asset just because they share ticker text."""
     rows = await repositories.trade_intents.list_all(limit=1000)
     blocking = {status.value for status in IN_FLIGHT_STATUSES} | {TradeIntentStatus.SUBMISSION_UNKNOWN.value}
-    symbol_upper = symbol.upper()
-    return any(row["payload"]["asset"]["symbol"] == symbol_upper and row["status"] in blocking for row in rows)
+    target_key = asset_identity_key(asset)
+    return any(
+        row["status"] in blocking and asset_identity_key(hydrate("trade_intents", row["payload"]).asset) == target_key
+        for row in rows
+    )
 
 
 def execution_lock_key(asset: AssetIdentity) -> str:
@@ -56,7 +61,7 @@ def execution_lock_key(asset: AssetIdentity) -> str:
     string, so a ticker-shaped identifier can never collide across asset
     classes (crypto pairs already share ticker shapes with equities; more
     so once multi-asset scanning lands)."""
-    return f"execution:{asset.asset_class.value}:{asset.symbol.upper()}"
+    return f"execution:{asset_identity_key(asset)}"
 
 
 async def reserve_symbol_for_execution(database: AsyncSQLiteDatabase, asset: AssetIdentity, owner_token: str) -> bool:

@@ -141,7 +141,7 @@ def _build_scan_prompt(universe: ExecutableUniverse) -> str:
 
 def _asset_from_candidate(candidate: OpportunityCandidate) -> AssetIdentity:
     asset_class = AssetClass.CRYPTO if "/" in candidate.symbol else AssetClass.EQUITY
-    return AssetIdentity(symbol=candidate.symbol, asset_class=asset_class, native_asset_id=f"alpaca:{candidate.symbol}")
+    return AssetIdentity(symbol=candidate.symbol, asset_class=asset_class, native_asset_id=f"alpaca:{candidate.symbol.upper()}")
 
 
 async def _reclaim_stale_scan_runs(repositories: PersistenceRepositories, now: datetime) -> None:
@@ -273,7 +273,7 @@ async def run_scan_cycle(
             _reject(candidate.symbol, "SYMBOL_EXECUTION_LOCKED")
             continue  # another coordinator is already processing this asset -- don't race it
         try:
-            if await has_in_flight_intent(repositories, asset.symbol):
+            if await has_in_flight_intent(repositories, asset):
                 _reject(candidate.symbol, "SYMBOL_HAS_IN_FLIGHT_INTENT")
                 continue  # don't fight an order already in flight on this symbol (e.g. from the position monitor)
 

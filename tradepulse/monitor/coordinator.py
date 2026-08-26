@@ -33,7 +33,7 @@ from tradepulse.execution import (
     release_symbol_reservation,
     reserve_symbol_for_execution,
 )
-from tradepulse.models import Holding, Side
+from tradepulse.models import Holding, Side, asset_key_from_broker_symbol
 from tradepulse.persistence import PersistenceRepositories, hydrate, run_with_lock_renewal
 
 MonitorStatus = Literal["ok", "degraded"]
@@ -79,7 +79,7 @@ async def run_position_monitor(
     for position in positions:
         if lease_lost is not None and lease_lost.is_set():
             continue  # monitor's own command lease may no longer be exclusive -- stop starting new work
-        holding_row = await repositories.holdings.get(position.symbol.upper())
+        holding_row = await repositories.holdings.get(asset_key_from_broker_symbol(position.asset_class, position.symbol))
         if holding_row is None:
             continue  # nothing on file (e.g. opened outside this system) -- no threshold to check
         holding = hydrate("holdings", holding_row["payload"])
@@ -93,7 +93,7 @@ async def run_position_monitor(
         if not await reserve_symbol_for_execution(database, holding.asset, owner_token):
             continue  # another coordinator is already processing this asset -- don't race it
         try:
-            if await has_in_flight_intent(repositories, position.symbol):
+            if await has_in_flight_intent(repositories, holding.asset):
                 continue  # don't fight an order already in flight on this symbol (e.g. from the scanner)
 
             is_long = position.qty > 0

@@ -3,9 +3,9 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from tradepulse.config import risk_limits_for_profile
-from tradepulse.models import AssetClass, PortfolioSnapshot, Side
+from tradepulse.models import AssetClass, AssetIdentity, Holding, PortfolioSnapshot, Side
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories
-from tradepulse.risk.engine import RiskCheckInput, RiskEvalOptions, check_max_drawdown, evaluate_risk
+from tradepulse.risk.engine import RiskCheckInput, RiskEvalOptions, build_portfolio_snapshot, check_max_drawdown, evaluate_risk
 
 NOW = datetime(2026, 8, 15, tzinfo=UTC)
 LIMITS = risk_limits_for_profile("balanced")
@@ -166,3 +166,46 @@ async def test_max_drawdown_uses_current_equity_as_peak_when_no_history(tmp_path
 
     assert check.breached is False
     assert check.peak_equity == Decimal("50000")
+
+
+def _aapl() -> AssetIdentity:
+    return AssetIdentity("AAPL", AssetClass.EQUITY, "alpaca:AAPL")
+
+
+async def test_build_portfolio_snapshot_uses_mark_price_over_cost_basis_when_supplied(tmp_path) -> None:
+    """Finding 2's fix: holdings_value/sector_exposure must reflect current
+    market value (mark_prices), not the Holding's own cost-basis
+    average_price, whenever a mark is supplied for that symbol."""
+    repositories = await _repositories(tmp_path)
+    holding = Holding(asset=_aapl(), quantity=Decimal("10"), average_price=Decimal("100"), updated_at=NOW, sector="Tech")
+    await repositories.holdings.create_once("equity:default:alpaca:AAPL", holding)
+
+    snapshot = await build_portfolio_snapshot(
+        repositories, cash_balance=Decimal("0"), mark_prices={"AAPL": Decimal("250")}, now=NOW,
+    )
+
+    assert snapshot.holdings_value == Decimal("2500")  # 10 * 250 (current mark), not 10 * 100 (cost basis)
+    assert snapshot.sector_exposure["Tech"] == Decimal("2500")
+
+
+async def test_build_portfolio_snapshot_falls_back_to_cost_basis_when_symbol_has_no_mark(tmp_path) -> None:
+    """A symbol absent from mark_prices (e.g. the caller's positions fetch
+    didn't include it) must not silently zero out its exposure -- falls back
+    to the same average_price behavior as before this fix."""
+    repositories = await _repositories(tmp_path)
+    holding = Holding(asset=_aapl(), quantity=Decimal("10"), average_price=Decimal("100"), updated_at=NOW)
+    await repositories.holdings.create_once("equity:default:alpaca:AAPL", holding)
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), mark_prices={"MSFT": Decimal("400")}, now=NOW)
+
+    assert snapshot.holdings_value == Decimal("1000")  # 10 * 100 cost basis -- AAPL has no entry in mark_prices
+
+
+async def test_build_portfolio_snapshot_defaults_to_cost_basis_when_mark_prices_omitted(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    holding = Holding(asset=_aapl(), quantity=Decimal("10"), average_price=Decimal("100"), updated_at=NOW)
+    await repositories.holdings.create_once("equity:default:alpaca:AAPL", holding)
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
+
+    assert snapshot.holdings_value == Decimal("1000")

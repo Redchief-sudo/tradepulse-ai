@@ -25,6 +25,36 @@ class AssetIdentity:
         object.__setattr__(self, "metadata", immutable_metadata(self.metadata))
 
 
+def asset_identity_key(asset: AssetIdentity) -> str:
+    """The single definition of financial-instrument equality used
+    everywhere local state is keyed or matched -- Holding record IDs, lot
+    matching, in-flight-intent checks, idempotency keys, execution
+    reservations, reconciliation buckets. Derived from instrument identity
+    (asset class + venue + broker-native ID), never from display symbol
+    alone -- a ticker-shaped symbol can be shared by economically distinct
+    instruments (a crypto pair and an equity today; two option contracts or
+    two futures expirations once those asset classes exist). native_asset_id
+    is intentionally NOT case-normalized here -- a future venue's native ID
+    may be case-sensitive (an on-chain address, an already-cased OCC
+    contract ID); normalization instead happens once, at construction time,
+    wherever this system builds a broker-derived native_asset_id."""
+    venue = (asset.venue or "default").lower()
+    return f"{asset.asset_class.value}:{venue}:{asset.native_asset_id}"
+
+
+def asset_key_from_broker_symbol(asset_class: AssetClass, symbol: str) -> str:
+    """Alpaca is this system's only broker today -- every AssetIdentity built
+    from a broker-native fact alone (no local record yet) uses
+    native_asset_id=f"alpaca:{symbol}" and no venue (see
+    scanner/coordinator.py::_asset_from_candidate,
+    reconciliation/coordinator.py's broker-only fallback). Recomputing that
+    exact convention here, then reusing asset_identity_key, keeps this in the
+    one shared definition rather than a second copy of the format string. A
+    second broker/venue would need this parameterized -- out of scope while
+    there's only one."""
+    return asset_identity_key(AssetIdentity(symbol=symbol, asset_class=asset_class, native_asset_id=f"alpaca:{symbol.upper()}"))
+
+
 @dataclass(frozen=True, slots=True)
 class MarketQuote:
     asset: AssetIdentity

@@ -38,7 +38,7 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter
-from tradepulse.models import Holding, PositionLot, SettlementEvent, SettlementStatus
+from tradepulse.models import AssetIdentity, Holding, PositionLot, SettlementEvent, SettlementStatus, asset_identity_key
 from tradepulse.persistence import PersistenceRepositories, hydrate
 from tradepulse.risk import latch_financial_integrity_block
 
@@ -54,7 +54,7 @@ from .stages import (
 async def _project_lot(repositories: PersistenceRepositories, event: SettlementEvent) -> Mapping[str, Any]:
     lot_rows = await repositories.position_lots.list_all(limit=10000)
     lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
-    symbol_lots = [lot for lot in lots if lot.asset.symbol == event.asset.symbol]
+    symbol_lots = [lot for lot in lots if asset_identity_key(lot.asset) == asset_identity_key(event.asset)]
     plan = plan_signed_lot_fill(symbol_lots, event)
 
     for closure in plan.closures:
@@ -86,8 +86,8 @@ async def _project_lot(repositories: PersistenceRepositories, event: SettlementE
     return {"realized_pnl": plan.realized_pnl}
 
 
-def _holding_record_id(symbol: str) -> str:
-    return symbol.upper()
+def _holding_record_id(asset: AssetIdentity) -> str:
+    return asset_identity_key(asset)
 
 
 # Which fill's stop_loss/target_price govern an open position when it was
@@ -115,10 +115,11 @@ async def _project_holding(repositories: PersistenceRepositories, event: Settlem
     lot_rows = await repositories.position_lots.list_all(limit=10000)
     lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
     open_lots = [
-        lot for lot in lots if lot.asset.symbol == event.asset.symbol and lot.status in ("open", "partially_closed")
+        lot for lot in lots
+        if asset_identity_key(lot.asset) == asset_identity_key(event.asset) and lot.status in ("open", "partially_closed")
     ]
 
-    record_id = _holding_record_id(event.asset.symbol)
+    record_id = _holding_record_id(event.asset)
     existing_row = await repositories.holdings.get(record_id)
 
     if not open_lots:
@@ -191,11 +192,12 @@ async def _verify_integrity(repositories: PersistenceRepositories, event: Settle
     lot_rows = await repositories.position_lots.list_all(limit=10000)
     lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
     open_lots = [
-        lot for lot in lots if lot.asset.symbol == event.asset.symbol and lot.status in ("open", "partially_closed")
+        lot for lot in lots
+        if asset_identity_key(lot.asset) == asset_identity_key(event.asset) and lot.status in ("open", "partially_closed")
     ]
     lot_qty = sum((lot.signed_quantity for lot in open_lots), Decimal("0"))
 
-    holding_row = await repositories.holdings.get(_holding_record_id(event.asset.symbol))
+    holding_row = await repositories.holdings.get(_holding_record_id(event.asset))
     holding_qty = hydrate("holdings", holding_row["payload"]).quantity if holding_row is not None else Decimal("0")
 
     if lot_qty != holding_qty:

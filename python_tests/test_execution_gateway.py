@@ -8,7 +8,18 @@ from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
 from tradepulse.config import risk_limits_for_profile
 from tradepulse.execution import ExecutionGateway, ExecutionRequest, execution_lock_key
-from tradepulse.models import AssetClass, AssetIdentity, ExecutionMode, Holding, SessionState, Side, TradeIntent, TradeIntentStatus, TradingSession
+from tradepulse.models import (
+    AssetClass,
+    AssetIdentity,
+    ExecutionMode,
+    Holding,
+    SessionState,
+    Side,
+    TradeIntent,
+    TradeIntentStatus,
+    TradingSession,
+    asset_identity_key,
+)
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate
 from tradepulse.providers import AlpacaMarketDataProvider
 from tradepulse.risk import load_session, save_session
@@ -53,6 +64,22 @@ def _mock_market_open(is_open: bool = True) -> None:
     )
 
 
+def _position_json(symbol: str = "AAPL", qty: str = "5", current_price: str = "150", avg_entry_price: str = "150") -> dict:
+    return {
+        "symbol": symbol, "asset_class": "us_equity", "qty": qty, "avg_entry_price": avg_entry_price,
+        "market_value": "0", "current_price": current_price, "unrealized_pl": "0",
+    }
+
+
+def _mock_positions(*positions: dict) -> None:
+    """Broker positions are the quantity/mark-price authority execute_intent
+    now fetches on every call (see execution/gateway.py). Empty by default
+    -- most tests don't hold anything locally or on the broker."""
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(
+        return_value=httpx.Response(200, json=list(positions))
+    )
+
+
 def _order_json(status: str, filled_qty: str, filled_avg_price: str | None) -> dict:
     return {
         "id": "order-1", "status": status, "symbol": "AAPL", "side": "buy",
@@ -88,6 +115,7 @@ def _intent(trade_intent_id: str = "intent-1", *, broker_order_id: str = "order-
 @respx.mock
 async def test_buy_rejected_when_session_not_active(tmp_path) -> None:
     repositories, broker, gateway = await _setup(tmp_path)
+    _mock_positions()
     request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("1"), strategy="test")
     result = await gateway.execute_intent(request)
     await broker.aclose()
@@ -100,6 +128,7 @@ async def test_full_buy_flow_fills_and_settles(tmp_path) -> None:
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -116,7 +145,7 @@ async def test_full_buy_flow_fills_and_settles(tmp_path) -> None:
     intent_row = await repositories.trade_intents.get(result.trade_intent_id)
     assert intent_row["status"] == "filled"
 
-    holding_row = await repositories.holdings.get("AAPL")
+    holding_row = await repositories.holdings.get(asset_identity_key(_aapl()))
     assert holding_row is not None
     holding = hydrate("holdings", holding_row["payload"])
     assert holding.quantity == Decimal("5")
@@ -136,6 +165,7 @@ async def test_buy_with_valid_symbol_reservation_proceeds_normally(tmp_path) -> 
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -161,6 +191,7 @@ async def test_buy_rejected_when_symbol_reservation_was_reclaimed_by_another_own
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
@@ -190,6 +221,7 @@ async def test_buy_without_symbol_lock_owner_token_is_unaffected(tmp_path) -> No
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -209,6 +241,7 @@ async def test_partial_fills_recorded_as_separate_activities_not_reconstructed_v
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -238,6 +271,7 @@ async def test_activities_lag_behind_order_status_gateway_keeps_polling(tmp_path
     gateway.FILL_TIMEOUT_SECONDS, gateway.POLL_INTERVAL_SECONDS = 5, 0.1
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -262,6 +296,7 @@ async def test_foreign_order_activity_is_ignored(tmp_path) -> None:
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -332,6 +367,7 @@ async def test_attributed_quantity_exceeding_order_quantity_fails_closed(tmp_pat
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -364,6 +400,7 @@ async def test_no_synthetic_fallback_when_no_activity_can_be_validated(tmp_path)
     gateway.FILL_TIMEOUT_SECONDS, gateway.POLL_INTERVAL_SECONDS = 1, 0.2
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -390,6 +427,7 @@ async def test_done_for_day_with_partial_fill_finalizes_as_partially_filled(tmp_
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -414,6 +452,7 @@ async def test_done_for_day_with_zero_fill_stays_non_terminal(tmp_path) -> None:
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -438,6 +477,7 @@ async def test_filled_with_partial_attributed_quantity_is_integrity_mismatch(tmp
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -465,6 +505,7 @@ async def test_filled_avg_price_comes_from_attributed_activity_not_order_vwap(tm
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -493,6 +534,7 @@ async def test_filled_status_with_zero_quantity_is_rejected_as_integrity_mismatc
     gateway.FILL_TIMEOUT_SECONDS, gateway.POLL_INTERVAL_SECONDS = 1, 0.2
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -513,6 +555,7 @@ async def test_terminal_intent_resumes_idempotently_without_resubmitting(tmp_pat
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -534,6 +577,7 @@ async def test_buy_rejected_when_confidence_below_minimum_and_never_reaches_brok
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
@@ -551,6 +595,7 @@ async def test_buy_rejected_when_broker_cash_insufficient(tmp_path) -> None:
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account(cash="10")  # nowhere near enough for 5 shares at ~$200
+    _mock_positions()
     _mock_quote()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
@@ -569,6 +614,7 @@ async def test_buy_rejected_when_daily_loss_exceeds_limit(tmp_path) -> None:
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     # balanced profile's max_daily_loss_pct is 1.0 -- a 1.5% decline must reject.
     _mock_account(equity="98500", last_equity="100000")
+    _mock_positions()
     _mock_quote()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
@@ -595,6 +641,7 @@ async def test_ordinary_rejection_does_not_latch_risk_stop(tmp_path) -> None:
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account(cash="10")
+    _mock_positions()
     _mock_quote()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
@@ -620,7 +667,7 @@ async def test_protective_exit_bypasses_only_the_session_gate_not_downstream_che
         repositories,
         TradingSession("session", SessionState.RISK_STOPPED, False, NOW, kill_switch_reason="daily loss", kill_switch_reset_required=True),
     )
-    await repositories.holdings.create_once("AAPL", Holding(asset=_aapl(), quantity=Decimal("5"), average_price=Decimal("150"), updated_at=NOW))
+    _mock_positions(_position_json(qty="5"))
     _mock_quote()
     respx.get("https://paper-api.alpaca.markets/v2/account").mock(return_value=httpx.Response(500, json={"message": "internal error"}))
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
@@ -646,6 +693,7 @@ async def test_equity_buy_rejected_when_gateways_own_clock_check_says_closed(tmp
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open(is_open=False)
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
@@ -667,6 +715,7 @@ async def test_equity_buy_rejected_when_clock_check_fails_with_transport_error(t
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     respx.get("https://paper-api.alpaca.markets/v2/clock").mock(side_effect=httpx.ConnectError("connection refused"))
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
@@ -687,6 +736,7 @@ async def test_crypto_buy_exempt_from_market_clock_check(tmp_path) -> None:
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     respx.get("https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes").mock(
         return_value=httpx.Response(200, json={"quotes": {"BTC/USD": {"bp": 60000.0, "ap": 60010.0, "t": QUOTE_TS}}})
     )
@@ -717,8 +767,8 @@ async def test_protective_exit_exempt_from_market_clock_check(tmp_path) -> None:
     real closure surfaces as an ordinary broker-level outcome instead."""
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
-    await repositories.holdings.create_once("AAPL", Holding(asset=_aapl(), quantity=Decimal("5"), average_price=Decimal("150"), updated_at=NOW))
     _mock_account()
+    _mock_positions(_position_json(qty="5"))
     _mock_quote()
     _mock_market_open(is_open=False)
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -735,11 +785,93 @@ async def test_protective_exit_exempt_from_market_clock_check(tmp_path) -> None:
 
 
 @respx.mock
+async def test_protective_exit_uses_broker_quantity_not_understated_local_holding_even_when_integrity_blocked(tmp_path) -> None:
+    """The exact accounting-drift scenario finding 1 fixes: local Holding
+    understates the position (3) but Alpaca's real position is larger (10).
+    A protective SELL for the full broker quantity must still classify as a
+    protective exit -- and therefore must NOT be blocked by
+    FINANCIAL_INTEGRITY_BLOCKED, the very state this drift would trigger."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession(
+        "session", SessionState.FINANCIAL_INTEGRITY_BLOCKED, False, NOW,
+        financial_integrity_reason="accounting drift", financial_integrity_manual_reenable_required=True,
+    ))
+    await repositories.holdings.create_once(
+        asset_identity_key(_aapl()), Holding(asset=_aapl(), quantity=Decimal("3"), average_price=Decimal("150"), updated_at=NOW)
+    )
+    _mock_positions(_position_json(qty="10"))  # broker's real position is larger than the stale local Holding
+    _mock_account()
+    _mock_quote()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
+        return_value=httpx.Response(200, json={"id": "order-1", "status": "filled", "symbol": "AAPL", "side": "sell", "filled_qty": "10", "filled_avg_price": "199.60", "submitted_at": QUOTE_TS})
+    )
+    _mock_fill_activities(_fill_activity("act-1", side="sell", qty="10"))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.SELL, requested_quantity=Decimal("10"), strategy="test")
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "filled"
+
+
+@respx.mock
+async def test_sell_not_covered_by_broker_quantity_is_not_protective_and_stays_blocked(tmp_path) -> None:
+    """Inverse of the above -- a SELL that the broker's real position does
+    NOT cover must not be misclassified as protective, and so still hits
+    FINANCIAL_INTEGRITY_BLOCKED like any other new risk-taking action."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession(
+        "session", SessionState.FINANCIAL_INTEGRITY_BLOCKED, False, NOW,
+        financial_integrity_reason="accounting drift", financial_integrity_manual_reenable_required=True,
+    ))
+    _mock_positions(_position_json(qty="3"))  # broker position doesn't cover the requested exit
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.SELL, requested_quantity=Decimal("10"), strategy="test")
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "rejected"
+    assert result.reasons == ["FINANCIAL_INTEGRITY_BLOCKED"]
+    assert order_route.call_count == 0
+
+
+@respx.mock
+async def test_buy_exposure_uses_broker_current_price_not_local_cost_basis(tmp_path) -> None:
+    """Finding 2: exposure gating must use the broker's current_price, not
+    local cost basis. A held MSFT position's cost basis ($200 total) is
+    negligible exposure (0.2%), but its broker current_price puts it at
+    exactly the balanced profile's 40% max_total_exposure_pct ceiling
+    ($40,000 of $100,000 equity) -- any further BUY must be rejected. Under
+    the old cost-basis behavior this BUY would sail through instead."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    await repositories.holdings.create_once(
+        "equity:default:alpaca:MSFT",
+        Holding(asset=AssetIdentity("MSFT", AssetClass.EQUITY, "alpaca:MSFT"), quantity=Decimal("10"), average_price=Decimal("20"), updated_at=NOW),
+    )
+    _mock_positions(_position_json(symbol="MSFT", qty="10", current_price="4000"))  # $40,000 notional == 40% of equity
+    _mock_account(cash="50000", equity="100000")
+    _mock_quote()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("1"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "rejected"
+    assert any("MAX_TOTAL_EXPOSURE_EXCEEDED" in r for r in result.reasons)
+    assert order_route.call_count == 0
+
+
+@respx.mock
 async def test_buy_approved_when_daily_loss_under_limit(tmp_path) -> None:
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     # A 0.5% decline is under the balanced profile's 1.0% limit -- must NOT reject on this basis.
     _mock_account(equity="99500", last_equity="100000")
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -761,6 +893,7 @@ async def test_kill_switch_active_rejects_buy_even_with_everything_else_valid(tm
         repositories,
         TradingSession("session", SessionState.RISK_STOPPED, False, NOW, kill_switch_reason="daily loss", kill_switch_reset_required=True),
     )
+    _mock_positions()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
     request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("1"), strategy="test")
@@ -777,6 +910,7 @@ async def test_ambiguous_submission_error_recovers_via_client_order_id_lookup(tm
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=httpx.ConnectError("connection refused"))
@@ -801,6 +935,7 @@ async def test_definitive_rejection_ends_rejected_without_recovery_lookup(tmp_pa
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(
@@ -824,6 +959,7 @@ async def test_ambiguous_5xx_error_routes_through_recovery_not_straight_to_rejec
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(
@@ -849,6 +985,7 @@ async def test_recovery_lookup_404_ends_submission_unknown_and_never_resubmits(t
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=httpx.ConnectError("connection refused"))
@@ -874,6 +1011,7 @@ async def test_second_call_while_submission_unknown_retries_recovery_without_res
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_market_open()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=httpx.ConnectError("connection refused"))

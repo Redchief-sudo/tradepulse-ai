@@ -14,7 +14,7 @@ from .enums import (
     TradeIntentStatus,
 )
 from .fill import Fill
-from .market import AssetIdentity, Candle, MarketQuote
+from .market import AssetIdentity, Candle, MarketQuote, asset_identity_key, asset_key_from_broker_symbol
 from .opportunity import Opportunity
 from .order import Order
 from .portfolio import CashLedgerEntry, Holding, PnlRecord, PositionLot
@@ -34,4 +34,5 @@ __all__ = [
     "ReconciliationOutcome", "ReconciliationRecord", "RiskLimits", "ScanRun", "ScanRunStatus",
     "ScanTrigger", "SessionState", "SettlementEvent", "SettlementStatus", "Side",
     "StrategyWeights", "TradeIntent", "TradeIntentStatus", "TradingSession",
+    "asset_identity_key", "asset_key_from_broker_symbol",
 ]

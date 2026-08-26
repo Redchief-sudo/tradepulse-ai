@@ -10,8 +10,8 @@ import respx
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
 from tradepulse.config import risk_limits_for_profile
-from tradepulse.execution import ExecutionGateway, execution_lock_key, reserve_symbol_for_execution
-from tradepulse.models import AssetClass, AssetIdentity, ExecutionMode, ScanRun, ScanRunStatus, ScanTrigger, SessionState, TradingSession
+from tradepulse.execution import ExecutionGateway, reserve_symbol_for_execution
+from tradepulse.models import AssetClass, AssetIdentity, ExecutionMode, ScanRun, ScanRunStatus, ScanTrigger, SessionState, TradingSession, asset_identity_key
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.providers import AlpacaMarketDataProvider, AnthropicAIProvider
 from tradepulse.providers.anthropic_ai import SCAN_TOOL_NAME
@@ -56,6 +56,10 @@ def _mock_quote(bid: str = "199.50", ask: str = "199.60") -> None:
     respx.get("https://data.alpaca.markets/v2/stocks/AAPL/quotes/latest").mock(
         return_value=httpx.Response(200, json={"symbol": "AAPL", "quote": {"bp": float(bid), "ap": float(ask), "t": QUOTE_TS}})
     )
+
+
+def _mock_positions(*positions: dict) -> None:
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=list(positions)))
 
 
 def _mock_market_open(is_open: bool = True) -> None:
@@ -152,6 +156,7 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
         )
     )
     _mock_account()
+    _mock_positions()
     _mock_quote()
     _mock_bars(_BULLISH_CLOSES)
     order_route = _mock_dynamic_full_fill()
@@ -184,7 +189,7 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
     # stop_loss_pct (balanced=8%) against the scanner's own quote (mid of the
     # mocked 199.50/199.60 bid/ask), since the AI/composite never supply one;
     # without this the position monitor has nothing to protect.
-    holding_row = await repositories.holdings.get("AAPL")
+    holding_row = await repositories.holdings.get(asset_identity_key(AssetIdentity("AAPL", AssetClass.EQUITY, "alpaca:AAPL")))
     holding = hydrate("holdings", holding_row["payload"])
     assert holding.stop_loss == (Decimal("199.55") * Decimal("0.92")).quantize(Decimal("0.01"))
 

@@ -17,6 +17,7 @@ from tradepulse.models import (
     Side,
     TradeIntent,
     TradeIntentStatus,
+    asset_identity_key,
 )
 from tradepulse.monitor import run_position_monitor
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories
@@ -97,7 +98,7 @@ async def _seed_holding(repositories: PersistenceRepositories, *, quantity: str 
         stop_loss=Decimal(stop_loss) if stop_loss else None,
         target_price=Decimal(target_price) if target_price else None,
     )
-    await repositories.holdings.create_once("AAPL", holding)
+    await repositories.holdings.create_once(asset_identity_key(_aapl()), holding)
 
 
 @respx.mock

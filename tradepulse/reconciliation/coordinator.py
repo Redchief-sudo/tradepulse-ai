@@ -46,7 +46,16 @@ from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaActivity, AlpacaClient
-from tradepulse.models import AssetIdentity, Fill, Holding, ReconciliationOutcome, ReconciliationRecord, TradeIntent
+from tradepulse.models import (
+    AssetIdentity,
+    Fill,
+    Holding,
+    ReconciliationOutcome,
+    ReconciliationRecord,
+    TradeIntent,
+    asset_identity_key,
+    asset_key_from_broker_symbol,
+)
 from tradepulse.persistence import PersistenceRepositories, hydrate
 from tradepulse.risk import latch_financial_integrity_block
 from tradepulse.settlement import SettlementProcessor
@@ -77,7 +86,7 @@ async def _record(repositories: PersistenceRepositories, **kwargs) -> None:
 
 
 async def _rebuild_holding_from_lots(
-    repositories: PersistenceRepositories, symbol: str, asset: AssetIdentity, now: datetime
+    repositories: PersistenceRepositories, asset: AssetIdentity, now: datetime
 ) -> Holding | None:
     """Mirrors settlement/engine.py::_project_holding's own recompute (not
     imported directly -- that function is keyed off a SettlementEvent this
@@ -86,7 +95,8 @@ async def _rebuild_holding_from_lots(
     as execution/gateway.py's own `symbol.upper()` holding-key convention)."""
     lot_rows = await repositories.position_lots.list_all(limit=10000)
     lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
-    open_lots = [lot for lot in lots if lot.asset.symbol == symbol and lot.status in _OPEN_LOT_STATUSES]
+    target_key = asset_identity_key(asset)
+    open_lots = [lot for lot in lots if asset_identity_key(lot.asset) == target_key and lot.status in _OPEN_LOT_STATUSES]
     if not open_lots:
         return None
 
@@ -116,48 +126,59 @@ async def _reconcile_positions(
     lease_lost: asyncio.Event | None = None,
 ) -> tuple[int, int, int]:
     broker_positions = await broker.get_positions()
-    broker_by_symbol = {p.symbol: p for p in broker_positions}
+    broker_by_asset_key = {asset_key_from_broker_symbol(p.asset_class, p.symbol): p for p in broker_positions}
 
     lot_rows = await repositories.position_lots.list_all(limit=10000)
     all_lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
-    open_lots_by_symbol: dict[str, Decimal] = {}
-    asset_by_symbol: dict[str, AssetIdentity] = {}
+    open_lots_by_asset_key: dict[str, Decimal] = {}
+    asset_by_key: dict[str, AssetIdentity] = {}
     for lot in all_lots:
         if lot.status not in _OPEN_LOT_STATUSES:
             continue
-        open_lots_by_symbol[lot.asset.symbol] = open_lots_by_symbol.get(lot.asset.symbol, Decimal("0")) + lot.signed_quantity
-        asset_by_symbol.setdefault(lot.asset.symbol, lot.asset)
+        key = asset_identity_key(lot.asset)
+        open_lots_by_asset_key[key] = open_lots_by_asset_key.get(key, Decimal("0")) + lot.signed_quantity
+        asset_by_key.setdefault(key, lot.asset)
 
     holding_rows = await repositories.holdings.list_all(limit=10000)
-    holdings_by_symbol = {row["record_id"]: hydrate("holdings", row["payload"]) for row in holding_rows}
-    for symbol, holding in holdings_by_symbol.items():
-        asset_by_symbol.setdefault(symbol, holding.asset)
-    for symbol, position in broker_by_symbol.items():
-        # A symbol Alpaca reports with zero local record at all -- can only
+    holdings_by_asset_key = {row["record_id"]: hydrate("holdings", row["payload"]) for row in holding_rows}
+    for key, holding in holdings_by_asset_key.items():
+        asset_by_key.setdefault(key, holding.asset)
+    for key, position in broker_by_asset_key.items():
+        # A position Alpaca reports with zero local record at all -- can only
         # reach the VIEW_DRIFT (rebuild) branch below if lots_qty == broker_qty,
         # which is impossible here (lots_qty is 0, broker_qty isn't, or the
-        # symbol wouldn't be a broker position); this fallback exists for
+        # position wouldn't be a broker position); this fallback exists for
         # completeness, not because it's exercised on the happy path.
-        asset_by_symbol.setdefault(symbol, AssetIdentity(symbol=symbol, asset_class=position.asset_class, native_asset_id=f"alpaca:{symbol}"))
+        asset_by_key.setdefault(
+            key, AssetIdentity(symbol=position.symbol, asset_class=position.asset_class, native_asset_id=f"alpaca:{position.symbol.upper()}")
+        )
 
-    symbols = set(broker_by_symbol) | set(open_lots_by_symbol) | set(holdings_by_symbol)
+    def _display_symbol(key: str) -> str:
+        if key in broker_by_asset_key:
+            return broker_by_asset_key[key].symbol
+        if key in asset_by_key:
+            return asset_by_key[key].symbol
+        return holdings_by_asset_key[key].asset.symbol
+
+    asset_keys = set(broker_by_asset_key) | set(open_lots_by_asset_key) | set(holdings_by_asset_key)
 
     positions_checked = 0
     view_drift_corrected = 0
     accounting_drift_detected = 0
 
-    for symbol in symbols:
+    for key in asset_keys:
         if lease_lost is not None and lease_lost.is_set():
             continue  # reconcile's own command lease may no longer be exclusive -- stop starting new work
         positions_checked += 1
-        broker_qty = broker_by_symbol[symbol].qty if symbol in broker_by_symbol else Decimal("0")
-        lots_qty = open_lots_by_symbol.get(symbol, Decimal("0"))
-        holding = holdings_by_symbol.get(symbol)
+        display_symbol = _display_symbol(key)
+        broker_qty = broker_by_asset_key[key].qty if key in broker_by_asset_key else Decimal("0")
+        lots_qty = open_lots_by_asset_key.get(key, Decimal("0"))
+        holding = holdings_by_asset_key.get(key)
         holding_qty = holding.quantity if holding is not None else Decimal("0")
 
         if broker_qty == lots_qty == holding_qty:
             await _record(
-                repositories, reconciliation_type="position", subject_id=symbol, outcome=ReconciliationOutcome.MATCHED,
+                repositories, reconciliation_type="position", subject_id=display_symbol, outcome=ReconciliationOutcome.MATCHED,
                 expected={"broker_qty": str(broker_qty)}, actual={"lots_qty": str(lots_qty), "holding_qty": str(holding_qty)},
                 occurred_at=now,
             )
@@ -167,30 +188,30 @@ async def _reconcile_positions(
             # VIEW_DRIFT: the accounting (lots) already agrees with Alpaca --
             # only the materialized Holding is stale. Safe to rebuild it.
             await _record(
-                repositories, reconciliation_type="position_view", subject_id=symbol, outcome=ReconciliationOutcome.DRIFT_DETECTED,
+                repositories, reconciliation_type="position_view", subject_id=display_symbol, outcome=ReconciliationOutcome.DRIFT_DETECTED,
                 expected={"holding_qty": str(holding_qty)}, actual={"broker_qty": str(broker_qty), "lots_qty": str(lots_qty)},
                 occurred_at=now,
             )
             await alerts.send(
-                "warning", f"Reconciliation: local Holding view for {symbol} was stale, resyncing to lots/Alpaca",
-                {"symbol": symbol, "broker_qty": str(broker_qty), "was_holding_qty": str(holding_qty)},
+                "warning", f"Reconciliation: local Holding view for {display_symbol} was stale, resyncing to lots/Alpaca",
+                {"symbol": display_symbol, "broker_qty": str(broker_qty), "was_holding_qty": str(holding_qty)},
             )
 
             if lots_qty == 0:
                 if holding is not None:
-                    await repositories.holdings.delete(symbol)
+                    await repositories.holdings.delete(key)
             else:
-                asset = asset_by_symbol.get(symbol)
-                rebuilt = await _rebuild_holding_from_lots(repositories, symbol, asset, now) if asset is not None else None
+                asset = asset_by_key.get(key)
+                rebuilt = await _rebuild_holding_from_lots(repositories, asset, now) if asset is not None else None
                 if rebuilt is not None:
                     if holding is not None:
-                        await repositories.holdings.update(symbol, rebuilt)
+                        await repositories.holdings.update(key, rebuilt)
                     else:
-                        await repositories.holdings.create_once(symbol, rebuilt)
+                        await repositories.holdings.create_once(key, rebuilt)
 
             view_drift_corrected += 1
             await _record(
-                repositories, reconciliation_type="position_view", subject_id=symbol, outcome=ReconciliationOutcome.CORRECTED,
+                repositories, reconciliation_type="position_view", subject_id=display_symbol, outcome=ReconciliationOutcome.CORRECTED,
                 expected={"holding_qty": str(holding_qty)}, actual={"broker_qty": str(broker_qty)}, occurred_at=now,
                 corrective_action="rebuilt local Holding from position_lots to match Alpaca",
             )
@@ -199,18 +220,18 @@ async def _reconcile_positions(
             # Not auto-corrected -- the Holding is left untouched.
             accounting_drift_detected += 1
             await _record(
-                repositories, reconciliation_type="position_accounting", subject_id=symbol, outcome=ReconciliationOutcome.DRIFT_DETECTED,
+                repositories, reconciliation_type="position_accounting", subject_id=display_symbol, outcome=ReconciliationOutcome.DRIFT_DETECTED,
                 expected={"lots_qty": str(lots_qty)}, actual={"broker_qty": str(broker_qty), "holding_qty": str(holding_qty)},
                 occurred_at=now,
             )
             await alerts.send(
                 "critical",
-                f"Reconciliation: ACCOUNTING DRIFT for {symbol} -- local position_lots disagree with Alpaca's real "
+                f"Reconciliation: ACCOUNTING DRIFT for {display_symbol} -- local position_lots disagree with Alpaca's real "
                 f"position (broker={broker_qty}, lots={lots_qty}). NOT auto-corrected -- investigate missing/duplicate fills.",
-                {"symbol": symbol, "broker_qty": str(broker_qty), "lots_qty": str(lots_qty)},
+                {"symbol": display_symbol, "broker_qty": str(broker_qty), "lots_qty": str(lots_qty)},
             )
             await latch_financial_integrity_block(
-                repositories, f"Accounting drift detected for {symbol}: broker={broker_qty}, lots={lots_qty}", clock=lambda: now
+                repositories, f"Accounting drift detected for {display_symbol}: broker={broker_qty}, lots={lots_qty}", clock=lambda: now
             )
 
     return positions_checked, view_drift_corrected, accounting_drift_detected

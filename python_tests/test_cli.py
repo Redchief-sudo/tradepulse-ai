@@ -35,6 +35,7 @@ from tradepulse.models import (
     SettlementStatus,
     Side,
     TradeIntent,
+    asset_identity_key,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate
 from tradepulse.providers import AnthropicAIProvider, OpenAIProvider
@@ -231,7 +232,7 @@ async def test_settle_drains_a_previously_failed_settlement_without_a_new_trade(
 
     event_row = await repositories.settlements.get("se-1")
     assert event_row["status"] == "completed"
-    holding_row = await repositories.holdings.get("AAPL")
+    holding_row = await repositories.holdings.get(asset_identity_key(asset))
     assert holding_row is not None
     assert hydrate("holdings", holding_row["payload"]).quantity == Decimal("5")
 

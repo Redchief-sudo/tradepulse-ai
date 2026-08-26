@@ -15,6 +15,7 @@ from tradepulse.models import (
     SettlementStatus,
     Side,
     TradeIntent,
+    asset_identity_key,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.risk import load_session
@@ -69,7 +70,7 @@ async def test_buy_settlement_projects_lot_holding_and_intent_summary(tmp_path) 
     assert lot.position_side == "long"
     assert lot.remaining_quantity == Decimal("10")
 
-    holding_row = await repositories.holdings.get("AAPL")
+    holding_row = await repositories.holdings.get(asset_identity_key(asset()))
     assert holding_row is not None
     holding = hydrate("holdings", holding_row["payload"])
     assert holding.quantity == Decimal("10")
@@ -118,7 +119,7 @@ async def test_sell_closes_the_long_lot_and_realizes_pnl(tmp_path) -> None:
     summary = await processor.process_pending()
     assert summary.completed == 1
 
-    holding_row = await repositories.holdings.get("AAPL")
+    holding_row = await repositories.holdings.get(asset_identity_key(asset()))
     assert holding_row is None  # fully closed position -- the Holding row must be gone, not zero-quantity
 
     lot_rows = await repositories.position_lots.list_all()
@@ -333,7 +334,7 @@ async def test_holding_protective_thresholds_are_first_entry_wins_across_a_secon
     processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
     await processor.process_pending()
 
-    holding = hydrate("holdings", (await repositories.holdings.get("AAPL"))["payload"])
+    holding = hydrate("holdings", (await repositories.holdings.get(asset_identity_key(asset())))["payload"])
     assert holding.stop_loss == Decimal("140")
     assert holding.target_price == Decimal("170")
 
@@ -351,9 +352,56 @@ async def test_holding_protective_thresholds_are_first_entry_wins_across_a_secon
     processor2 = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: later)
     await processor2.process_pending()
 
-    holding = hydrate("holdings", (await repositories.holdings.get("AAPL"))["payload"])
+    holding = hydrate("holdings", (await repositories.holdings.get(asset_identity_key(asset())))["payload"])
     assert holding.quantity == Decimal("20")
     assert holding.average_price == Decimal("135")
     # first-entry-wins: the SECOND fill's thresholds must not overwrite the first's
     assert holding.stop_loss == Decimal("140")
     assert holding.target_price == Decimal("170")
+
+
+def _aapl_crypto() -> AssetIdentity:
+    """Same ticker text as asset() (AAPL equity) -- proves settlement keys
+    Holdings/lots by canonical instrument identity, not display symbol."""
+    return AssetIdentity("AAPL", AssetClass.CRYPTO, "alpaca:AAPLUSD")
+
+
+async def test_two_fills_sharing_ticker_text_across_asset_classes_settle_independently(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+
+    equity_intent = TradeIntent(
+        "ti-equity", "idem-equity", "corr-equity", asset(), Side.BUY, ExecutionMode.PAPER, "manual", NOW,
+        requested_quantity=Decimal("10"),
+    )
+    await repositories.trade_intents.create_once("ti-equity", equity_intent, status=equity_intent.status.value, unique_value="idem-equity")
+    equity_fill = Fill("fill-equity", "ti-equity", "order-equity", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-equity", equity_fill, unique_value=None)
+    equity_event = SettlementEvent("se-equity", "fill-equity", "ti-equity", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), NOW)
+    await repositories.settlements.create_once("se-equity", equity_event, status=equity_event.status.value, unique_value="fill-equity")
+
+    crypto_intent = TradeIntent(
+        "ti-crypto", "idem-crypto", "corr-crypto", _aapl_crypto(), Side.BUY, ExecutionMode.PAPER, "manual", NOW,
+        requested_quantity=Decimal("3"),
+    )
+    await repositories.trade_intents.create_once("ti-crypto", crypto_intent, status=crypto_intent.status.value, unique_value="idem-crypto")
+    crypto_fill = Fill("fill-crypto", "ti-crypto", "order-crypto", _aapl_crypto(), Side.BUY, ExecutionMode.PAPER, Decimal("3"), Decimal("60000"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-crypto", crypto_fill, unique_value=None)
+    crypto_event = SettlementEvent("se-crypto", "fill-crypto", "ti-crypto", _aapl_crypto(), Side.BUY, ExecutionMode.PAPER, Decimal("3"), Decimal("60000"), NOW)
+    await repositories.settlements.create_once("se-crypto", crypto_event, status=crypto_event.status.value, unique_value="fill-crypto")
+
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    summary = await processor.process_pending()
+
+    assert summary.completed == 2
+
+    lot_rows = await repositories.position_lots.list_all()
+    assert len(lot_rows) == 2  # not merged into one lot despite sharing ticker text
+
+    equity_holding_row = await repositories.holdings.get(asset_identity_key(asset()))
+    crypto_holding_row = await repositories.holdings.get(asset_identity_key(_aapl_crypto()))
+    assert equity_holding_row is not None and crypto_holding_row is not None
+
+    equity_holding = hydrate("holdings", equity_holding_row["payload"])
+    crypto_holding = hydrate("holdings", crypto_holding_row["payload"])
+    assert equity_holding.quantity == Decimal("10")
+    assert crypto_holding.quantity == Decimal("3")
