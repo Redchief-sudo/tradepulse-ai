@@ -30,6 +30,7 @@ from tradepulse.broker import (
     AlpacaClient,
     AlpacaError,
     AlpacaOrderRequest,
+    AlpacaPosition,
     default_time_in_force,
     is_definitive_rejection,
 )
@@ -41,6 +42,8 @@ from tradepulse.models import (
     Side,
     TradeIntent,
     TradeIntentStatus,
+    asset_identity_key,
+    asset_key_from_broker_symbol,
 )
 from tradepulse.persistence import PersistenceRepositories, hydrate, renew_lock
 from tradepulse.providers import AlpacaMarketDataProvider, ProviderError
@@ -162,15 +165,34 @@ class ExecutionGateway:
         except (AlpacaError, httpx.HTTPError) as exc:
             return ExecutionResult("skipped", None, [f"BROKER_POSITIONS_UNAVAILABLE: {exc}"], Decimal("0"), None)
 
-        held_quantity = next(
-            (p.qty for p in positions if p.symbol.upper() == request.asset.symbol.upper()), Decimal("0")
-        )
+        # Canonically-keyed, not bare-symbol -- must agree with the same
+        # identity scheme local financial state uses (Holdings, lots,
+        # in-flight checks; see models/market.py::asset_identity_key). Two
+        # broker positions should never legitimately collide on the same
+        # canonical key; if they do, that's a broker-data anomaly worth
+        # alerting on and refusing to guess through, not silently letting a
+        # dict comprehension pick whichever came last.
+        positions_by_key: dict[str, AlpacaPosition] = {}
+        for p in positions:
+            key = asset_key_from_broker_symbol(p.asset_class, p.symbol)
+            if key in positions_by_key:
+                await self._alerts.send(
+                    "critical",
+                    f"Duplicate broker position for canonical asset key {key} ({p.symbol}, {p.asset_class.value}) -- refusing to guess which is authoritative.",
+                    {"asset_key": key, "symbol": p.symbol, "asset_class": p.asset_class.value},
+                )
+                return ExecutionResult("skipped", None, [f"DUPLICATE_BROKER_POSITION_KEY: {key}"], Decimal("0"), None)
+            positions_by_key[key] = p
+
+        held_position = positions_by_key.get(asset_identity_key(request.asset))
+        held_quantity = held_position.qty if held_position is not None else Decimal("0")
         protective_exit = (
             request.side == Side.SELL and held_quantity > 0 and request.requested_quantity <= held_quantity
         ) or (request.side == Side.BUY and held_quantity < 0 and request.requested_quantity <= abs(held_quantity))
         # Same broker truth feeds portfolio exposure -- current market value,
         # not stale local cost basis (see risk/engine.py::build_portfolio_snapshot).
-        mark_prices = {p.symbol.upper(): p.current_price for p in positions}
+        # Keyed canonically to match how build_portfolio_snapshot looks it up.
+        mark_prices = {key: p.current_price for key, p in positions_by_key.items()}
 
         # Session check UNCONDITIONALLY before anything else -- see
         # risk/session.py for the audited defect this ordering fixes.

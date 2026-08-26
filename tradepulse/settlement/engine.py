@@ -325,13 +325,29 @@ class SettlementProcessor:
                 await self._checkpoint(failed_state)
                 failed += 1
                 outcome_counts[failure.status.value] += 1
-                if failure.status == SettlementStatus.INTEGRITY_BLOCKED:
+                # TERMINAL_FAILED also latches financial integrity, not just
+                # INTEGRITY_BLOCKED: a real broker fill (this event originates
+                # from one) whose accounting projection permanently fails --
+                # for ANY reason, not just a detected INTEGRITY_VIOLATION --
+                # leaves this system's local ledger permanently unresolved for
+                # that fill. The session must stop taking new risk exactly as
+                # it would for a detected integrity violation. This does NOT
+                # change the settlement event's own persisted status --
+                # failed_state.status above still records TERMINAL_FAILED,
+                # distinct from a genuine INTEGRITY_BLOCKED -- only a separate,
+                # global signal (TradingSession.state) is latched alongside it.
+                if failure.status in (SettlementStatus.INTEGRITY_BLOCKED, SettlementStatus.TERMINAL_FAILED):
+                    reason = (
+                        f"Settlement integrity blocked: {failure.error}"
+                        if failure.status == SettlementStatus.INTEGRITY_BLOCKED
+                        else f"Settlement permanently failed after {failure.attempt_count} attempts for a real broker fill: {failure.error}"
+                    )
                     await self._alerts.send(
                         "critical",
-                        f"Settlement integrity blocked: {event.asset.symbol} {event.side.value} {event.quantity}",
-                        {"error": failure.error, "settlement_event_id": event.settlement_event_id},
+                        f"Settlement {failure.status.value}: {event.asset.symbol} {event.side.value} {event.quantity}",
+                        {"error": failure.error, "settlement_event_id": event.settlement_event_id, "attempt_count": failure.attempt_count},
                     )
-                    await latch_financial_integrity_block(self._repositories, f"Settlement integrity blocked: {failure.error}", clock=self._clock)
+                    await latch_financial_integrity_block(self._repositories, reason, clock=self._clock)
 
         refreshed_rows = await self._repositories.settlements.list_all(limit=1000)
         unresolved = [row for row in refreshed_rows if row.get("status") != SettlementStatus.COMPLETED.value]

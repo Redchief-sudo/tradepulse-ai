@@ -64,9 +64,9 @@ def _mock_market_open(is_open: bool = True) -> None:
     )
 
 
-def _position_json(symbol: str = "AAPL", qty: str = "5", current_price: str = "150", avg_entry_price: str = "150") -> dict:
+def _position_json(symbol: str = "AAPL", qty: str = "5", current_price: str = "150", avg_entry_price: str = "150", asset_class: str = "us_equity") -> dict:
     return {
-        "symbol": symbol, "asset_class": "us_equity", "qty": qty, "avg_entry_price": avg_entry_price,
+        "symbol": symbol, "asset_class": asset_class, "qty": qty, "avg_entry_price": avg_entry_price,
         "market_value": "0", "current_price": current_price, "unrealized_pl": "0",
     }
 
@@ -862,6 +862,59 @@ async def test_buy_exposure_uses_broker_current_price_not_local_cost_basis(tmp_p
 
     assert result.status == "rejected"
     assert any("MAX_TOTAL_EXPOSURE_EXCEEDED" in r for r in result.reasons)
+    assert order_route.call_count == 0
+
+
+@respx.mock
+async def test_protective_exit_resolves_correct_position_when_broker_reports_same_symbol_across_asset_classes(tmp_path) -> None:
+    """Finding 1: two broker positions share display-symbol text ('AAPL')
+    but different asset classes -- held_quantity/mark_prices for an equity
+    AAPL request must resolve to the EQUITY position, not whichever entry a
+    bare-symbol match or dict-overwrite would have picked."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_positions(
+        _position_json(symbol="AAPL", qty="5", current_price="150", asset_class="us_equity"),
+        _position_json(symbol="AAPL", qty="2", current_price="60000", asset_class="crypto"),
+    )
+    _mock_account()
+    _mock_quote()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
+        return_value=httpx.Response(200, json={"id": "order-1", "status": "filled", "symbol": "AAPL", "side": "sell", "filled_qty": "5", "filled_avg_price": "150", "submitted_at": QUOTE_TS})
+    )
+    _mock_fill_activities(_fill_activity("act-1", side="sell", qty="5", price="150"))
+
+    # Selling the EQUITY quantity (5) -- if the gateway mismatched onto the
+    # crypto position's held_quantity (2), this would fail as
+    # INSUFFICIENT_POSITION_TO_SELL or reject as non-protective.
+    request = ExecutionRequest(asset=_aapl(), side=Side.SELL, requested_quantity=Decimal("5"), strategy="test")
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "filled"
+
+
+@respx.mock
+async def test_execute_intent_fails_closed_on_duplicate_canonical_broker_position_key(tmp_path) -> None:
+    """A malformed/duplicate broker response -- two positions both mapping
+    to the same canonical asset key -- must never be silently resolved by
+    picking whichever a dict comprehension kept last. Gateway refuses to
+    guess and never reaches order placement."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_positions(
+        _position_json(symbol="AAPL", qty="5", current_price="150"),
+        _position_json(symbol="AAPL", qty="9", current_price="999"),
+    )
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("1"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "skipped"
+    assert any("DUPLICATE_BROKER_POSITION_KEY" in r for r in result.reasons)
     assert order_route.call_count == 0
 
 

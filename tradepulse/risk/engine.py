@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from decimal import ROUND_FLOOR, Decimal
 from uuid import uuid4
 
-from tradepulse.models import AssetClass, PortfolioSnapshot, RiskLimits, Side, TradeIntentStatus
+from tradepulse.models import AssetClass, PortfolioSnapshot, RiskLimits, Side, TradeIntentStatus, asset_identity_key
 from tradepulse.persistence import PersistenceRepositories, hydrate
 
 
@@ -239,6 +239,11 @@ async def build_portfolio_snapshot(
     P&L uses the SAME definition the execution gateway uses, matching the
     audited Base44 fix for scan/execution using contradictory equity sources.
 
+    mark_prices is keyed by canonical asset identity
+    (models/market.py::asset_identity_key), NOT display symbol -- a
+    ticker-shaped symbol can be shared by economically distinct instruments,
+    so the caller (see execution/gateway.py) must build it the same way.
+
     Note: "today" is the caller's UTC calendar day, not an NY-session
     trading day -- a known simplification versus the audited system's
     nyDayStart() handling, acceptable for MVP scope.
@@ -252,7 +257,7 @@ async def build_portfolio_snapshot(
     holdings_value = Decimal("0")
     sector_exposure: dict[str, Decimal] = {}
     for holding in holdings:
-        mark = mark_prices.get(holding.asset.symbol, holding.average_price)
+        mark = mark_prices.get(asset_identity_key(holding.asset), holding.average_price)
         notional = abs(holding.quantity) * mark
         holdings_value += notional
         sector = holding.sector or "Other"
@@ -261,7 +266,16 @@ async def build_portfolio_snapshot(
     total_equity = account_equity if account_equity and account_equity > 0 else holdings_value
 
     intent_rows = await repositories.trade_intents.list_all(limit=1000)
-    outstanding_values = {TradeIntentStatus.SUBMITTED.value, TradeIntentStatus.ACCEPTED.value, TradeIntentStatus.PARTIALLY_FILLED.value}
+    # SUBMISSION_UNKNOWN counts too -- its broker outcome is genuinely
+    # unresolved (see execute_intent's _recover_unknown_submission: it may
+    # still be live at the broker, and must never be blind-resubmitted), so
+    # it represents the same kind of unresolved broker exposure as an
+    # ordinary in-flight order. RISK_APPROVED is deliberately excluded --
+    # it hasn't reached the broker yet.
+    outstanding_values = {
+        TradeIntentStatus.SUBMITTED.value, TradeIntentStatus.ACCEPTED.value,
+        TradeIntentStatus.PARTIALLY_FILLED.value, TradeIntentStatus.SUBMISSION_UNKNOWN.value,
+    }
     outstanding_orders = sum(1 for row in intent_rows if row["status"] in outstanding_values)
 
     fill_rows = await repositories.fills.list_all(limit=1000)

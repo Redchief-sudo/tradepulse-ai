@@ -3,7 +3,17 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from tradepulse.config import risk_limits_for_profile
-from tradepulse.models import AssetClass, AssetIdentity, Holding, PortfolioSnapshot, Side
+from tradepulse.models import (
+    AssetClass,
+    AssetIdentity,
+    ExecutionMode,
+    Holding,
+    PortfolioSnapshot,
+    Side,
+    TradeIntent,
+    TradeIntentStatus,
+    asset_identity_key,
+)
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories
 from tradepulse.risk.engine import RiskCheckInput, RiskEvalOptions, build_portfolio_snapshot, check_max_drawdown, evaluate_risk
 
@@ -172,31 +182,44 @@ def _aapl() -> AssetIdentity:
     return AssetIdentity("AAPL", AssetClass.EQUITY, "alpaca:AAPL")
 
 
+def _msft() -> AssetIdentity:
+    return AssetIdentity("MSFT", AssetClass.EQUITY, "alpaca:MSFT")
+
+
+def _aapl_crypto() -> AssetIdentity:
+    """Same ticker text as _aapl() -- proves mark_prices lookups are
+    identity-safe, not bare-symbol (a collision the Rev.65 gateway fix
+    itself was found to still have)."""
+    return AssetIdentity("AAPL", AssetClass.CRYPTO, "alpaca:AAPL")
+
+
 async def test_build_portfolio_snapshot_uses_mark_price_over_cost_basis_when_supplied(tmp_path) -> None:
     """Finding 2's fix: holdings_value/sector_exposure must reflect current
     market value (mark_prices), not the Holding's own cost-basis
-    average_price, whenever a mark is supplied for that symbol."""
+    average_price, whenever a mark is supplied for that asset."""
     repositories = await _repositories(tmp_path)
     holding = Holding(asset=_aapl(), quantity=Decimal("10"), average_price=Decimal("100"), updated_at=NOW, sector="Tech")
-    await repositories.holdings.create_once("equity:default:alpaca:AAPL", holding)
+    await repositories.holdings.create_once(asset_identity_key(_aapl()), holding)
 
     snapshot = await build_portfolio_snapshot(
-        repositories, cash_balance=Decimal("0"), mark_prices={"AAPL": Decimal("250")}, now=NOW,
+        repositories, cash_balance=Decimal("0"), mark_prices={asset_identity_key(_aapl()): Decimal("250")}, now=NOW,
     )
 
     assert snapshot.holdings_value == Decimal("2500")  # 10 * 250 (current mark), not 10 * 100 (cost basis)
     assert snapshot.sector_exposure["Tech"] == Decimal("2500")
 
 
-async def test_build_portfolio_snapshot_falls_back_to_cost_basis_when_symbol_has_no_mark(tmp_path) -> None:
-    """A symbol absent from mark_prices (e.g. the caller's positions fetch
+async def test_build_portfolio_snapshot_falls_back_to_cost_basis_when_asset_has_no_mark(tmp_path) -> None:
+    """An asset absent from mark_prices (e.g. the caller's positions fetch
     didn't include it) must not silently zero out its exposure -- falls back
     to the same average_price behavior as before this fix."""
     repositories = await _repositories(tmp_path)
     holding = Holding(asset=_aapl(), quantity=Decimal("10"), average_price=Decimal("100"), updated_at=NOW)
-    await repositories.holdings.create_once("equity:default:alpaca:AAPL", holding)
+    await repositories.holdings.create_once(asset_identity_key(_aapl()), holding)
 
-    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), mark_prices={"MSFT": Decimal("400")}, now=NOW)
+    snapshot = await build_portfolio_snapshot(
+        repositories, cash_balance=Decimal("0"), mark_prices={asset_identity_key(_msft()): Decimal("400")}, now=NOW
+    )
 
     assert snapshot.holdings_value == Decimal("1000")  # 10 * 100 cost basis -- AAPL has no entry in mark_prices
 
@@ -204,8 +227,61 @@ async def test_build_portfolio_snapshot_falls_back_to_cost_basis_when_symbol_has
 async def test_build_portfolio_snapshot_defaults_to_cost_basis_when_mark_prices_omitted(tmp_path) -> None:
     repositories = await _repositories(tmp_path)
     holding = Holding(asset=_aapl(), quantity=Decimal("10"), average_price=Decimal("100"), updated_at=NOW)
-    await repositories.holdings.create_once("equity:default:alpaca:AAPL", holding)
+    await repositories.holdings.create_once(asset_identity_key(_aapl()), holding)
 
     snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
 
     assert snapshot.holdings_value == Decimal("1000")
+
+
+async def test_build_portfolio_snapshot_mark_prices_do_not_collide_across_asset_classes(tmp_path) -> None:
+    """Two holdings sharing display-symbol text ('AAPL') but different asset
+    classes each get their OWN mark price from a canonically-keyed
+    mark_prices dict -- proves no bare-symbol collision."""
+    repositories = await _repositories(tmp_path)
+    equity_holding = Holding(asset=_aapl(), quantity=Decimal("10"), average_price=Decimal("100"), updated_at=NOW, sector="Tech")
+    crypto_holding = Holding(asset=_aapl_crypto(), quantity=Decimal("2"), average_price=Decimal("50000"), updated_at=NOW, sector="Crypto")
+    await repositories.holdings.create_once(asset_identity_key(_aapl()), equity_holding)
+    await repositories.holdings.create_once(asset_identity_key(_aapl_crypto()), crypto_holding)
+
+    snapshot = await build_portfolio_snapshot(
+        repositories, cash_balance=Decimal("0"),
+        mark_prices={asset_identity_key(_aapl()): Decimal("250"), asset_identity_key(_aapl_crypto()): Decimal("60000")},
+        now=NOW,
+    )
+
+    assert snapshot.holdings_value == Decimal("2500") + Decimal("120000")  # 10*250 + 2*60000, not cross-contaminated
+    assert snapshot.sector_exposure["Tech"] == Decimal("2500")
+    assert snapshot.sector_exposure["Crypto"] == Decimal("120000")
+
+
+async def _seed_intent(repositories: PersistenceRepositories, *, trade_intent_id: str, status: TradeIntentStatus) -> None:
+    intent = TradeIntent(
+        trade_intent_id, trade_intent_id, trade_intent_id, _aapl(), Side.BUY, ExecutionMode.PAPER, "test", NOW,
+        requested_quantity=Decimal("5"), status=status,
+    )
+    await repositories.trade_intents.create_once(trade_intent_id, intent, status=status.value, unique_value=trade_intent_id)
+
+
+async def test_build_portfolio_snapshot_counts_submission_unknown_as_outstanding(tmp_path) -> None:
+    """Finding 3: an intent whose broker outcome is genuinely unresolved
+    (never blind-resubmitted, per execute_intent's own recovery logic) must
+    count toward max_simultaneous_orders -- it may still be a live broker
+    order."""
+    repositories = await _repositories(tmp_path)
+    await _seed_intent(repositories, trade_intent_id="ti-unknown", status=TradeIntentStatus.SUBMISSION_UNKNOWN)
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
+
+    assert snapshot.outstanding_orders == 1
+
+
+async def test_build_portfolio_snapshot_does_not_count_risk_approved_as_outstanding(tmp_path) -> None:
+    """RISK_APPROVED hasn't reached the broker yet -- must not count as
+    outstanding broker exposure."""
+    repositories = await _repositories(tmp_path)
+    await _seed_intent(repositories, trade_intent_id="ti-approved", status=TradeIntentStatus.RISK_APPROVED)
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
+
+    assert snapshot.outstanding_orders == 0

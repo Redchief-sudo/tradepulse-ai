@@ -405,3 +405,54 @@ async def test_two_fills_sharing_ticker_text_across_asset_classes_settle_indepen
     crypto_holding = hydrate("holdings", crypto_holding_row["payload"])
     assert equity_holding.quantity == Decimal("10")
     assert crypto_holding.quantity == Decimal("3")
+
+
+async def test_settlement_exhausting_retries_latches_financial_integrity(tmp_path, monkeypatch) -> None:
+    """Finding 2: a settlement that permanently fails for a REASON OTHER
+    THAN a detected integrity violation must still latch financial
+    integrity once retries are exhausted -- a real broker fill (this event
+    originates from one) whose accounting can never be completed leaves the
+    local ledger unresolved, same severity as a detected violation."""
+    from tradepulse.settlement.stages import MAX_SETTLEMENT_ATTEMPTS
+
+    repositories = await _repositories(tmp_path)
+    await _seed_buy(repositories)
+
+    async def _boom(repositories: PersistenceRepositories, event: SettlementEvent) -> None:
+        raise RuntimeError("synthetic non-integrity settlement failure")
+
+    monkeypatch.setattr("tradepulse.settlement.engine._project_lot", _boom)
+
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    for _ in range(MAX_SETTLEMENT_ATTEMPTS):
+        await processor.process_pending(force_retry=True)
+
+    event_row = await repositories.settlements.get("se-1")
+    assert event_row["status"] == SettlementStatus.TERMINAL_FAILED.value
+    event = hydrate("settlements", event_row["payload"])
+    assert event.next_retry_at is None  # exhausted -- never retried again
+
+    session = await load_session(repositories)
+    assert session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED
+    assert "permanently failed" in session.financial_integrity_reason
+
+
+async def test_settlement_retryable_failure_does_not_latch_financial_integrity(tmp_path, monkeypatch) -> None:
+    """A single transient failure (attempts not yet exhausted) must NOT
+    latch the whole system -- only genuinely exhausted retries escalate."""
+    repositories = await _repositories(tmp_path)
+    await _seed_buy(repositories)
+
+    async def _boom(repositories: PersistenceRepositories, event: SettlementEvent) -> None:
+        raise RuntimeError("synthetic transient settlement failure")
+
+    monkeypatch.setattr("tradepulse.settlement.engine._project_lot", _boom)
+
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending(force_retry=True)  # attempt 1 of 8 -- not exhausted
+
+    event_row = await repositories.settlements.get("se-1")
+    assert event_row["status"] == SettlementStatus.RETRYABLE_FAILED.value
+
+    session = await load_session(repositories)
+    assert session.state != SessionState.FINANCIAL_INTEGRITY_BLOCKED
