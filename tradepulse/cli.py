@@ -3,10 +3,16 @@ schedule (cron, systemd timer, etc.). No command runs its own internal
 scheduling loop: each invocation does its work once and exits, matching the
 CLI-driven, cron-external architecture decided for this system (see docs/).
 
-`tradepulse scan` runs AI-driven candidate discovery and the stop/target
-position monitor CONCURRENTLY (not sequentially) in one process, sharing a
-composition root but each independently lock-protected -- position
-protection latency is never tied to how long the AI discovery call takes.
+`tradepulse scan --asset-class=<equity|crypto>` runs AI-driven candidate
+discovery for ONE lane plus the stop/target position monitor CONCURRENTLY
+(not sequentially) in one process, sharing a composition root but each
+independently lock-protected -- position protection latency is never tied to
+how long the AI discovery call takes. The two lanes are independently
+scheduled and independently lock-protected (separate lock keys, see
+scan_lock_key below) so a tighter crypto cadence never re-scans, or
+re-bills AI calls for, equities that are market-closed, and vice versa;
+both lanes share the SAME risk engine, execution gateway, and
+settlement/reconciliation pipeline -- lane separation is discovery-only.
 `tradepulse monitor`, `tradepulse settle`, and `tradepulse reconcile` are also
 available standalone for operators who want a different cadence than the
 scan cycle's (position protection is typically wanted more often than
@@ -14,7 +20,8 @@ discovery; settlement retries want a short, independent cadence so a quiet
 market doesn't leave one stranded; reconciliation is an after-the-fact audit
 pass, typically wanted less often). Example crontab:
 
-    */15 9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse scan      >> /var/log/tradepulse.log 2>&1
+    */15 9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse scan --asset-class=equity  >> /var/log/tradepulse.log 2>&1
+    */10 *    * * *    cd /path/to/repo && .venv/bin/tradepulse scan --asset-class=crypto  >> /var/log/tradepulse.log 2>&1
     */2  9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse monitor   >> /var/log/tradepulse.log 2>&1
     *    *    * * *    cd /path/to/repo && .venv/bin/tradepulse settle    >> /var/log/tradepulse.log 2>&1
     0    */6  * * *    cd /path/to/repo && .venv/bin/tradepulse reconcile >> /var/log/tradepulse.log 2>&1
@@ -47,7 +54,7 @@ from tradepulse.broker import AlpacaClient, AlpacaError
 from tradepulse.config import Settings, SettingsError, default_strategy_weights, risk_limits_for_profile
 from tradepulse.config.logging import configure_logging
 from tradepulse.execution import ExecutionGateway
-from tradepulse.models import AuditEvent, ExecutionMode, SessionState, TradingSession
+from tradepulse.models import AssetClass, AuditEvent, ExecutionMode, SessionState, TradingSession
 from tradepulse.monitor import MonitorCycleSummary, run_position_monitor
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, release_lock, run_with_lock_renewal
 from tradepulse.providers import AIProvider, AlpacaMarketDataProvider, AnthropicAIProvider, OpenAIProvider
@@ -83,6 +90,13 @@ SCAN_LOCK_TTL_SECONDS = 600
 MONITOR_LOCK_TTL_SECONDS = 300
 SETTLE_LOCK_TTL_SECONDS = 300
 RECONCILE_LOCK_TTL_SECONDS = 600
+
+
+def scan_lock_key(asset_class: AssetClass) -> str:
+    """Per-lane, not one global scan lock -- a slow AI/market-data call in
+    one asset-class lane must never block the other's cron-driven
+    invocation. See scanner/coordinator.py::run_scan_cycle."""
+    return f"{SCAN_LOCK_KEY}:{asset_class.value}"
 
 
 def _require_credentials(settings: Settings, *, require_ai: bool) -> None:
@@ -143,27 +157,28 @@ def _lease_lost_signal(
 async def _run_scan_leg(
     database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, ai_provider: AIProvider,
     market_data: AlpacaMarketDataProvider, broker: AlpacaClient, gateway: ExecutionGateway,
-    settings: Settings, alerts: TelegramAlerter,
+    settings: Settings, alerts: TelegramAlerter, asset_class: AssetClass,
 ) -> ScanCycleSummary | None:
+    lock_key = scan_lock_key(asset_class)
     owner_token = str(uuid4())
-    if not await acquire_lock(database, SCAN_LOCK_KEY, owner_token, "scan", SCAN_LOCK_TTL_SECONDS):
-        logger.info("scan_skipped_lock_held", extra={"event": "scan_skipped_lock_held"})
+    if not await acquire_lock(database, lock_key, owner_token, "scan", SCAN_LOCK_TTL_SECONDS):
+        logger.info("scan_skipped_lock_held", extra={"event": "scan_skipped_lock_held", "asset_class": asset_class.value})
         return None
     try:
         universe = load_executable_universe(settings)
         risk_limits = risk_limits_for_profile(settings.risk_profile)
         strategy_weights = default_strategy_weights(datetime.now(UTC))
-        lease_lost, on_lease_lost = _lease_lost_signal(alerts, SCAN_LOCK_KEY, owner_token)
+        lease_lost, on_lease_lost = _lease_lost_signal(alerts, lock_key, owner_token)
         return await run_with_lock_renewal(
-            database, SCAN_LOCK_KEY, owner_token, SCAN_LOCK_TTL_SECONDS,
+            database, lock_key, owner_token, SCAN_LOCK_TTL_SECONDS,
             run_scan_cycle(
-                repositories, ai_provider, market_data, broker, gateway, universe, risk_limits,
+                repositories, ai_provider, market_data, broker, gateway, universe, risk_limits, asset_class,
                 strategy_weights=strategy_weights, lease_lost=lease_lost,
             ),
             on_renewal_failed=on_lease_lost,
         )
     finally:
-        await release_lock(database, SCAN_LOCK_KEY, owner_token)
+        await release_lock(database, lock_key, owner_token)
 
 
 async def _run_monitor_leg(
@@ -185,23 +200,24 @@ async def _run_monitor_leg(
         await release_lock(database, MONITOR_LOCK_KEY, owner_token)
 
 
-def _log_scan_result(result: ScanCycleSummary | BaseException | None) -> bool:
+def _log_scan_result(result: ScanCycleSummary | BaseException | None, asset_class: AssetClass) -> bool:
     """Returns True if this leg should fail the process's exit code."""
     if result is None:
         return False
     if isinstance(result, BaseException):
-        logger.error("scan_cycle_crashed", extra={"event": "scan_cycle_crashed", "error": str(result)})
+        logger.error("scan_cycle_crashed", extra={"event": "scan_cycle_crashed", "error": str(result), "asset_class": asset_class.value})
         return True
     logger.info(
         "scan_cycle_finished",
         extra={
             "event": "scan_cycle_finished", "scan_generation": result.scan_run_id, "status": result.status.value,
+            "asset_class": asset_class.value,
             "candidates_discovered": result.candidates_discovered, "candidates_approved": result.candidates_approved,
             "orders_submitted": result.orders_submitted,
         },
     )
     if result.error:
-        logger.error("scan_cycle_failed", extra={"event": "scan_cycle_failed", "error": result.error})
+        logger.error("scan_cycle_failed", extra={"event": "scan_cycle_failed", "error": result.error, "asset_class": asset_class.value})
         return True
     return False
 
@@ -225,8 +241,12 @@ def _log_monitor_result(result: MonitorCycleSummary | BaseException | None) -> b
     return False
 
 
-async def _run_scan(settings: Settings) -> int:
-    """`tradepulse scan`: discovery and position protection, concurrently."""
+async def _run_scan(settings: Settings, asset_class: AssetClass) -> int:
+    """`tradepulse scan --asset-class=...`: single-lane discovery and
+    position protection, concurrently. Monitor is asset-class-agnostic
+    (protects every open position regardless of lane) and stays bundled in
+    exactly as before -- a second lane's concurrent monitor invocation
+    cleanly no-ops via MONITOR_LOCK_KEY's own lock-held skip."""
     _require_credentials(settings, require_ai=True)
 
     database = AsyncSQLiteDatabase(settings.database_url)
@@ -241,7 +261,7 @@ async def _run_scan(settings: Settings) -> int:
         gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
 
         scan_result, monitor_result = await asyncio.gather(
-            _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings, alerts),
+            _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings, alerts, asset_class),
             _run_monitor_leg(database, repositories, broker, gateway, alerts),
             return_exceptions=True,
         )
@@ -249,7 +269,7 @@ async def _run_scan(settings: Settings) -> int:
         await broker.aclose()
         await ai_provider.aclose()
 
-    scan_failed = _log_scan_result(scan_result)
+    scan_failed = _log_scan_result(scan_result, asset_class)
     monitor_failed = _log_monitor_result(monitor_result)
     return 1 if (scan_failed or monitor_failed) else 0
 
@@ -595,7 +615,12 @@ async def _run_reset_integrity(settings: Settings, *, force: bool) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tradepulse", description="TradePulse AI trading runtime")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("scan", help="run one AI-driven scan cycle and the position monitor concurrently, then exit")
+    scan_parser = subparsers.add_parser(
+        "scan", help="run one AI-driven scan cycle for a single asset-class lane, plus the position monitor, then exit"
+    )
+    scan_parser.add_argument(
+        "--asset-class", required=True, choices=["equity", "crypto"], help="which lane to scan this invocation"
+    )
     subparsers.add_parser("monitor", help="run one stop/target position-protection pass and exit")
     subparsers.add_parser("settle", help="drain any due settlement retries and exit")
     subparsers.add_parser("reconcile", help="run one reconciliation pass against Alpaca's real state and exit")
@@ -613,7 +638,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 _COMMANDS: dict[str, Any] = {
-    "scan": _run_scan, "monitor": _run_monitor, "settle": _run_settle, "reconcile": _run_reconcile,
+    "monitor": _run_monitor, "settle": _run_settle, "reconcile": _run_reconcile,
     "start": _run_start, "stop": _run_stop, "status": _run_status, "reset-risk": _run_reset_risk,
 }
 
@@ -647,6 +672,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "reset-integrity":
             return asyncio.run(_run_reset_integrity(settings, force=args.force))
+        if args.command == "scan":
+            return asyncio.run(_run_scan(settings, AssetClass(args.asset_class)))
         return asyncio.run(_COMMANDS[args.command](settings))
     except SettingsError as exc:
         print(f"tradepulse: {exc}", file=sys.stderr)

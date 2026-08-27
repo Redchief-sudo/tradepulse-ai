@@ -17,10 +17,11 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import AsyncIterator, Literal
 from uuid import uuid4
 
 import httpx
@@ -45,7 +46,7 @@ from tradepulse.models import (
     asset_identity_key,
     asset_key_from_broker_symbol,
 )
-from tradepulse.persistence import PersistenceRepositories, hydrate, renew_lock
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate, release_lock, renew_lock
 from tradepulse.providers import AlpacaMarketDataProvider, ProviderError
 from tradepulse.risk import (
     RiskCheckInput,
@@ -66,8 +67,41 @@ from .fill_attribution import (
     attribute_order_fills,
     terminal_status_for_order,
 )
-from .idempotency import IN_FLIGHT_STATUSES, derive_idempotency_key, execution_lock_key, SYMBOL_LOCK_TTL_SECONDS
+from .idempotency import (
+    IN_FLIGHT_STATUSES,
+    PORTFOLIO_RISK_LOCK_KEY,
+    PORTFOLIO_RISK_LOCK_TTL_SECONDS,
+    SYMBOL_LOCK_TTL_SECONDS,
+    derive_idempotency_key,
+    execution_lock_key,
+)
 from .quotes import fetch_authoritative_quote
+
+
+@asynccontextmanager
+async def _portfolio_risk_lock(database: AsyncSQLiteDatabase, needed: bool) -> AsyncIterator[bool]:
+    """Serializes the fetch-account/build-snapshot/evaluate_risk/persist-
+    RISK_APPROVED segment of execute_intent across DIFFERENT symbols -- two
+    concurrent calls for different symbols would otherwise both read the
+    same starting exposure and both approve capital against it, since
+    Alpaca's own buying-power check knows nothing about TradePulse's own
+    max_total_exposure_pct/max_sector_pct/max_simultaneous_orders. Held only
+    around that fast, local-only decision window -- never through broker
+    submission/fill polling, which can take up to FILL_TIMEOUT_SECONDS.
+    Non-blocking (fails fast if already held, same semantics as
+    reserve_symbol_for_execution): a losing concurrent call gets `False` and
+    must skip this candidate for now rather than wait, since there's no
+    forward-progress benefit to blocking on a decision window this short."""
+    if not needed:
+        yield True
+        return
+    owner_token = str(uuid4())
+    acquired = await acquire_lock(database, PORTFOLIO_RISK_LOCK_KEY, owner_token, "execute_intent", PORTFOLIO_RISK_LOCK_TTL_SECONDS)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            await release_lock(database, PORTFOLIO_RISK_LOCK_KEY, owner_token)
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,89 +228,103 @@ class ExecutionGateway:
         # Keyed canonically to match how build_portfolio_snapshot looks it up.
         mark_prices = {key: p.current_price for key, p in positions_by_key.items()}
 
-        # Session check UNCONDITIONALLY before anything else -- see
-        # risk/session.py for the audited defect this ordering fixes.
-        session = await load_session(self._repositories)
-        decision = execution_session_decision(session, request.side, request.asset.asset_class, protective_exit)
-        if not decision.allowed:
-            return ExecutionResult("rejected", existing.trade_intent_id if existing else None, [decision.reason], Decimal("0"), None)
+        # Everything through the RISK_APPROVED persist below is the
+        # capital-allocation DECISION -- serialized across different symbols
+        # by the portfolio-risk lock so a concurrent evaluation (a different
+        # asset-class lane, say) can't read the same stale exposure and
+        # independently approve capital that's already spoken for. Only
+        # needed when this can reach evaluate_risk's sizing block at all --
+        # protective exits and every SELL only ever reduce exposure, so they
+        # don't need cross-symbol serialization.
+        database = self._repositories.trade_intents.database
+        needs_portfolio_lock = request.side == Side.BUY and not protective_exit
+        async with _portfolio_risk_lock(database, needed=needs_portfolio_lock) as acquired:
+            if not acquired:
+                return ExecutionResult("skipped", None, ["PORTFOLIO_RISK_EVALUATION_LOCKED"], Decimal("0"), None)
 
-        try:
-            quote = await fetch_authoritative_quote(self._market_data, request.asset, request.side, now)
-        except ProviderError as exc:
-            return ExecutionResult("skipped", None, [f"NO_EXECUTABLE_QUOTE: {exc}"], Decimal("0"), None)
+            # Session check UNCONDITIONALLY before anything else -- see
+            # risk/session.py for the audited defect this ordering fixes.
+            session = await load_session(self._repositories)
+            decision = execution_session_decision(session, request.side, request.asset.asset_class, protective_exit)
+            if not decision.allowed:
+                return ExecutionResult("rejected", existing.trade_intent_id if existing else None, [decision.reason], Decimal("0"), None)
 
-        try:
-            account = await self._broker.get_account()
-        except AlpacaError as exc:
-            return ExecutionResult("skipped", None, [f"BROKER_UNAVAILABLE: {exc.message}"], Decimal("0"), None)
-        if account.equity <= 0:
-            return ExecutionResult("skipped", None, ["BROKER_ACCOUNT_INVALID"], Decimal("0"), None)
+            try:
+                quote = await fetch_authoritative_quote(self._market_data, request.asset, request.side, now)
+            except ProviderError as exc:
+                return ExecutionResult("skipped", None, [f"NO_EXECUTABLE_QUOTE: {exc}"], Decimal("0"), None)
 
-        trade_intent_id = existing.trade_intent_id if existing else str(uuid4())
-        intent = TradeIntent(
-            trade_intent_id=trade_intent_id,
-            idempotency_key=idempotency_key or str(uuid4()),
-            correlation_id=request.decision_id or trade_intent_id,
-            asset=request.asset,
-            side=request.side,
-            execution_mode=self._execution_mode,
-            strategy=request.strategy,
-            created_at=existing.created_at if existing else now,
-            requested_quantity=request.requested_quantity,
-            reference_price=quote.price,
-            confidence=float(request.confidence) if request.confidence is not None else None,
-            sector=request.sector,
-            stop_loss=request.stop_loss,
-            target_price=request.target_price,
-            status=TradeIntentStatus.PROPOSED,
-        )
-        if existing is None:
-            await self._repositories.trade_intents.create_once(
-                trade_intent_id, intent, status=intent.status.value, unique_value=intent.idempotency_key
+            try:
+                account = await self._broker.get_account()
+            except AlpacaError as exc:
+                return ExecutionResult("skipped", None, [f"BROKER_UNAVAILABLE: {exc.message}"], Decimal("0"), None)
+            if account.equity <= 0:
+                return ExecutionResult("skipped", None, ["BROKER_ACCOUNT_INVALID"], Decimal("0"), None)
+
+            trade_intent_id = existing.trade_intent_id if existing else str(uuid4())
+            intent = TradeIntent(
+                trade_intent_id=trade_intent_id,
+                idempotency_key=idempotency_key or str(uuid4()),
+                correlation_id=request.decision_id or trade_intent_id,
+                asset=request.asset,
+                side=request.side,
+                execution_mode=self._execution_mode,
+                strategy=request.strategy,
+                created_at=existing.created_at if existing else now,
+                requested_quantity=request.requested_quantity,
+                reference_price=quote.price,
+                confidence=float(request.confidence) if request.confidence is not None else None,
+                sector=request.sector,
+                stop_loss=request.stop_loss,
+                target_price=request.target_price,
+                status=TradeIntentStatus.PROPOSED,
             )
-        else:
-            await self._repositories.trade_intents.update(trade_intent_id, intent, status=intent.status.value)
+            if existing is None:
+                await self._repositories.trade_intents.create_once(
+                    trade_intent_id, intent, status=intent.status.value, unique_value=intent.idempotency_key
+                )
+            else:
+                await self._repositories.trade_intents.update(trade_intent_id, intent, status=intent.status.value)
 
-        snapshot = await build_portfolio_snapshot(
-            self._repositories, cash_balance=account.cash, account_equity=account.equity,
-            broker_prev_close_equity=account.last_equity, mark_prices=mark_prices, now=now,
-        )
-
-        max_drawdown_breached = False
-        if request.side == Side.BUY and not protective_exit and self._risk_limits.max_drawdown_pct > 0:
-            drawdown = await check_max_drawdown(self._repositories, snapshot.total_equity, self._risk_limits)
-            max_drawdown_breached = drawdown.breached
-
-        risk_input = RiskCheckInput(
-            symbol=request.asset.symbol, asset_class=request.asset.asset_class, side=request.side,
-            requested_quantity=request.requested_quantity, price=quote.price,
-            confidence=request.confidence, stop_loss=request.stop_loss, sector=request.sector or "Other",
-        )
-        risk_opts = RiskEvalOptions(
-            protective_exit=protective_exit, bid=quote.bid, ask=quote.ask,
-            estimated_slippage_pct=quote.estimated_slippage_pct,
-            held_quantity=abs(held_quantity), available_cash=account.cash,
-            max_drawdown_breached=max_drawdown_breached,
-        )
-        risk = evaluate_risk(risk_input, snapshot, self._risk_limits, risk_opts)
-        if not risk.approved:
-            # A genuine account-level kill-switch condition -- not an
-            # ordinary per-trade sizing/eligibility rejection (insufficient
-            # cash, confidence too low, sector/position caps, etc.) -- must
-            # latch the durable session state reset-risk exists to clear,
-            # not just reject this one order.
-            kill_switch_reason = next(
-                (r for r in risk.reasons if r.startswith("MAX_DAILY_LOSS_EXCEEDED") or r == "MAX_DRAWDOWN_BREACHED"), None
+            snapshot = await build_portfolio_snapshot(
+                self._repositories, cash_balance=account.cash, account_equity=account.equity,
+                broker_prev_close_equity=account.last_equity, mark_prices=mark_prices, now=now,
             )
-            if kill_switch_reason is not None:
-                await latch_risk_stop(self._repositories, kill_switch_reason, clock=self._clock)
-            rejected = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason="; ".join(risk.reasons))
-            await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
-            return ExecutionResult("rejected", trade_intent_id, risk.reasons, Decimal("0"), None)
 
-        approved = replace(intent, status=TradeIntentStatus.RISK_APPROVED, requested_quantity=risk.approved_quantity)
-        await self._repositories.trade_intents.update(trade_intent_id, approved, status=approved.status.value)
+            max_drawdown_breached = False
+            if request.side == Side.BUY and not protective_exit and self._risk_limits.max_drawdown_pct > 0:
+                drawdown = await check_max_drawdown(self._repositories, snapshot.total_equity, self._risk_limits)
+                max_drawdown_breached = drawdown.breached
+
+            risk_input = RiskCheckInput(
+                symbol=request.asset.symbol, asset_class=request.asset.asset_class, side=request.side,
+                requested_quantity=request.requested_quantity, price=quote.price,
+                confidence=request.confidence, stop_loss=request.stop_loss, sector=request.sector or "Other",
+            )
+            risk_opts = RiskEvalOptions(
+                protective_exit=protective_exit, bid=quote.bid, ask=quote.ask,
+                estimated_slippage_pct=quote.estimated_slippage_pct,
+                held_quantity=abs(held_quantity), available_cash=account.cash,
+                max_drawdown_breached=max_drawdown_breached,
+            )
+            risk = evaluate_risk(risk_input, snapshot, self._risk_limits, risk_opts)
+            if not risk.approved:
+                # A genuine account-level kill-switch condition -- not an
+                # ordinary per-trade sizing/eligibility rejection (insufficient
+                # cash, confidence too low, sector/position caps, etc.) -- must
+                # latch the durable session state reset-risk exists to clear,
+                # not just reject this one order.
+                kill_switch_reason = next(
+                    (r for r in risk.reasons if r.startswith("MAX_DAILY_LOSS_EXCEEDED") or r == "MAX_DRAWDOWN_BREACHED"), None
+                )
+                if kill_switch_reason is not None:
+                    await latch_risk_stop(self._repositories, kill_switch_reason, clock=self._clock)
+                rejected = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason="; ".join(risk.reasons))
+                await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
+                return ExecutionResult("rejected", trade_intent_id, risk.reasons, Decimal("0"), None)
+
+            approved = replace(intent, status=TradeIntentStatus.RISK_APPROVED, requested_quantity=risk.approved_quantity)
+            await self._repositories.trade_intents.update(trade_intent_id, approved, status=approved.status.value)
 
         # External quote/account/risk calls may take long enough for an
         # operator to have stopped trading. Revalidate immediately before

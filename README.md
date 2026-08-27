@@ -21,20 +21,22 @@ cp .env.example .env  # fill in ALPACA_API_KEY / ALPACA_API_SECRET, etc.
 No command runs its own scheduling loop -- each does its work once and exits. Point cron (or a systemd timer) at them:
 
 ```bash
-.venv/bin/tradepulse scan       # AI-driven candidate discovery + position monitor, run CONCURRENTLY
+.venv/bin/tradepulse scan --asset-class=equity  # AI-driven equity/ETF discovery + position monitor, run CONCURRENTLY
+.venv/bin/tradepulse scan --asset-class=crypto  # same, for the crypto lane -- independent schedule, independent lock
 .venv/bin/tradepulse monitor    # position monitor alone, for a tighter cadence than scan's
 .venv/bin/tradepulse settle     # drains any due settlement retries independently of new trades
 .venv/bin/tradepulse reconcile  # after-the-fact audit against Alpaca's real positions/fills
 ```
 
-`scan` requires `ALPACA_API_KEY`, `ALPACA_API_SECRET`, and whichever AI provider's key is currently selected; `monitor`/`settle`/`reconcile` need only the Alpaca credentials (see `.env.example`).
+`scan` requires `ALPACA_API_KEY`, `ALPACA_API_SECRET`, and whichever AI provider's key is currently selected; `monitor`/`settle`/`reconcile` need only the Alpaca credentials (see `.env.example`). The equity and crypto lanes are discovery-only lanes -- separate AI prompts and cron cadences, but one shared risk engine, execution gateway, and settlement/reconciliation pipeline underneath both.
 
 AI discovery backend is configurable via `TRADEPULSE_AI_PROVIDER` (`anthropic`, the default, or `openai`) -- set it plus the matching `ANTHROPIC_API_KEY`/`ANTHROPIC_MODEL` or `OPENAI_API_KEY`/`OPENAI_MODEL`. Both backends are validated against the identical fail-closed candidate schema (`tradepulse/providers/ai_provider.py`); the AI never controls price, quantity, stop-loss, or target regardless of which one is selected.
 
 Example crontab:
 
 ```
-*/15 9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse scan      >> /var/log/tradepulse.log 2>&1
+*/15 9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse scan --asset-class=equity  >> /var/log/tradepulse.log 2>&1
+*/10 *    * * *    cd /path/to/repo && .venv/bin/tradepulse scan --asset-class=crypto  >> /var/log/tradepulse.log 2>&1
 */2  9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse monitor   >> /var/log/tradepulse.log 2>&1
 *    *    * * *    cd /path/to/repo && .venv/bin/tradepulse settle    >> /var/log/tradepulse.log 2>&1
 0    */6  * * *    cd /path/to/repo && .venv/bin/tradepulse reconcile >> /var/log/tradepulse.log 2>&1

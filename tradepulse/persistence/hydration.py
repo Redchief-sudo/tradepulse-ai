@@ -307,6 +307,7 @@ def decode_scan_run(d: Mapping[str, Any]) -> ScanRun:
         scan_run_id=d["scan_run_id"],
         scan_generation=d["scan_generation"],
         trigger=ScanTrigger(d["trigger"]),
+        asset_class=AssetClass(d["asset_class"]),
         status=ScanRunStatus(d["status"]),
         started_at=_datetime(d["started_at"]),
         lock_owner_token=d["lock_owner_token"],

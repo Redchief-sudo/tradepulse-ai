@@ -24,6 +24,7 @@ from tradepulse.cli import (
     _run_scan,
     _run_scan_leg,
     _run_settle,
+    scan_lock_key,
 )
 from tradepulse.config import Settings, SettingsError
 from tradepulse.models import (
@@ -42,8 +43,14 @@ from tradepulse.providers import AnthropicAIProvider, OpenAIProvider
 
 
 def test_scan_subcommand_parses() -> None:
-    args = _build_parser().parse_args(["scan"])
+    args = _build_parser().parse_args(["scan", "--asset-class=equity"])
     assert args.command == "scan"
+    assert args.asset_class == "equity"
+
+
+def test_scan_subcommand_requires_asset_class() -> None:
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(["scan"])
 
 
 def test_monitor_subcommand_parses() -> None:
@@ -160,11 +167,11 @@ async def test_scan_leg_skipped_when_its_lock_is_held_but_monitor_leg_still_runs
     database_url = f"sqlite:///{tmp_path}/test.db"
     database = AsyncSQLiteDatabase(database_url)
     await database.initialize()
-    assert await acquire_lock(database, SCAN_LOCK_KEY, "other-owner", "scan", ttl_seconds=600) is True
+    assert await acquire_lock(database, scan_lock_key(AssetClass.EQUITY), "other-owner", "scan", ttl_seconds=600) is True
 
     positions_route = respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[]))
 
-    exit_code = await _run_scan(_settings(database_url))
+    exit_code = await _run_scan(_settings(database_url), AssetClass.EQUITY)
 
     assert exit_code == 0
     assert positions_route.call_count == 1  # monitor leg ran despite scan's lock being held
@@ -287,7 +294,7 @@ async def test_scan_leg_alerts_and_stops_new_work_when_its_lease_is_reclaimed(tm
         lease_lost = kwargs["lease_lost"]
         observed_lease_lost["event"] = lease_lost
         await asyncio.sleep(0.3)
-        await _reassign_owner(database, SCAN_LOCK_KEY, "owner-other")  # a legitimate takeover after expiry
+        await _reassign_owner(database, scan_lock_key(AssetClass.EQUITY), "owner-other")  # a legitimate takeover after expiry
         await asyncio.sleep(1.0)  # long enough for the next heartbeat tick to observe the theft
         return "stub-result"
 
@@ -300,9 +307,9 @@ async def test_scan_leg_alerts_and_stops_new_work_when_its_lease_is_reclaimed(tm
     alerts = TelegramAlerter(None, None)
 
     with caplog.at_level("WARNING"):
-        result = await _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, _settings(database_url), alerts)
+        result = await _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, _settings(database_url), alerts, AssetClass.EQUITY)
 
     assert result == "stub-result"  # never cancelled despite the lost lease
     assert observed_lease_lost["event"].is_set()
     skipped = [r for r in caplog.records if getattr(r, "event", None) == "telegram_alert_skipped_no_credentials"]
-    assert any("Lock renewal failed for '" + SCAN_LOCK_KEY + "'" in r.alert_message for r in skipped)
+    assert any("Lock renewal failed for '" + scan_lock_key(AssetClass.EQUITY) + "'" in r.alert_message for r in skipped)

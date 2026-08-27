@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .base import require_aware, require_text
-from .enums import ScanRunStatus, ScanTrigger
+from .enums import AssetClass, ScanRunStatus, ScanTrigger
 
 
 @dataclass(frozen=True, slots=True)
@@ -12,6 +12,7 @@ class ScanRun:
     scan_run_id: str
     scan_generation: str
     trigger: ScanTrigger
+    asset_class: AssetClass
     status: ScanRunStatus
     started_at: datetime
     lock_owner_token: str
@@ -24,6 +25,8 @@ class ScanRun:
     def __post_init__(self) -> None:
         if not isinstance(self.trigger, ScanTrigger):
             raise TypeError("trigger must be ScanTrigger")
+        if not isinstance(self.asset_class, AssetClass):
+            raise TypeError("asset_class must be AssetClass")
         if not isinstance(self.status, ScanRunStatus):
             raise TypeError("status must be ScanRunStatus")
         for name in ("scan_run_id", "scan_generation", "lock_owner_token"):

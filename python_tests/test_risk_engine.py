@@ -397,6 +397,50 @@ async def test_build_portfolio_snapshot_does_not_count_risk_approved_as_outstand
     assert snapshot.outstanding_orders == 0
 
 
+async def test_pending_risk_approved_intent_reserves_capacity_for_the_next_snapshot(tmp_path) -> None:
+    """The sequential-handoff case the portfolio-risk lock alone does NOT
+    cover: caller A evaluates risk, gets RISK_APPROVED, and releases the
+    lock -- all before its order ever reaches the broker, let alone fills.
+    A fresh build_portfolio_snapshot (as caller B's own risk evaluation would
+    call) must already see A's committed notional as exposure, so B is sized
+    down or rejected against the REMAINING capacity, not the full cap, even
+    though A's TradeIntent hasn't settled into a real Holding yet."""
+    repositories = await _repositories(tmp_path)
+    # max_sector_pct raised well above what this test's $38k Tech position
+    # would trip, so only max_total_exposure_pct (40% of $100k = $40k) binds
+    # -- isolates the assertion to the exposure reservation this test is
+    # actually about.
+    limits = replace(LIMITS, max_total_exposure_pct=Decimal("40"), max_sector_pct=Decimal("90"))
+    # Caller A: already RISK_APPROVED for $38,000 of AAPL, no fill yet -- no
+    # Holding row exists, so only the pending-notional reservation can
+    # possibly account for this.
+    approved_a = TradeIntent(
+        "ti-a", "ti-a", "ti-a", _aapl(), Side.BUY, ExecutionMode.PAPER, "test", NOW,
+        requested_quantity=Decimal("380"), reference_price=Decimal("100"), sector="Tech",
+        status=TradeIntentStatus.RISK_APPROVED,
+    )
+    await repositories.trade_intents.create_once("ti-a", approved_a, status=TradeIntentStatus.RISK_APPROVED.value, unique_value="ti-a")
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), account_equity=Decimal("100000"), now=NOW)
+
+    # Proves the reservation is visible on a completely fresh snapshot read
+    # -- not carried through in-memory state from caller A's own evaluation.
+    assert snapshot.holdings_value == Decimal("38000")
+    assert snapshot.sector_exposure["Tech"] == Decimal("38000")
+
+    # Caller B: a second, same-sector candidate that would easily fit within
+    # the FULL $40k cap (it only asks for $5k) but must still be evaluated
+    # against the $2k that's actually left once A's reservation is honored.
+    candidate_b = _buy(requested_quantity=Decimal("50"), price=Decimal("100"), sector="Tech")
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("100000"))
+
+    decision = evaluate_risk(candidate_b, snapshot, limits, opts)
+
+    assert decision.approved
+    assert decision.approved_quantity * Decimal("100") <= Decimal("2000")
+    assert any("BY_MAX_TOTAL_EXPOSURE" in reason for reason in decision.reasons)
+
+
 def test_all_dynamic_controls_combine_and_still_approve_a_smaller_but_valid_quantity() -> None:
     """Every dynamic control acting together -- confidence-adjusted risk
     budget, position/sector/total-exposure caps, and cash -- still leaves an

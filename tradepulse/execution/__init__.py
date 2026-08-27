@@ -1,6 +1,8 @@
 from .gateway import ExecutionGateway, ExecutionRequest, ExecutionResult
 from .idempotency import (
     IN_FLIGHT_STATUSES,
+    PORTFOLIO_RISK_LOCK_KEY,
+    PORTFOLIO_RISK_LOCK_TTL_SECONDS,
     SYMBOL_LOCK_TTL_SECONDS,
     derive_idempotency_key,
     execution_lock_key,
@@ -12,6 +14,8 @@ from .quotes import AuthoritativeQuote, fetch_authoritative_quote, max_quote_age
 
 __all__ = [
     "IN_FLIGHT_STATUSES",
+    "PORTFOLIO_RISK_LOCK_KEY",
+    "PORTFOLIO_RISK_LOCK_TTL_SECONDS",
     "SYMBOL_LOCK_TTL_SECONDS",
     "AuthoritativeQuote",
     "ExecutionGateway",

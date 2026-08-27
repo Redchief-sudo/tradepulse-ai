@@ -300,9 +300,39 @@ async def build_portfolio_snapshot(
         sector = holding.sector or "Other"
         sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + notional
 
+    intent_rows = await repositories.trade_intents.list_all(limit=1000)
+
+    # Pending-intent notional reservation: capital already committed by an
+    # approved-but-not-yet-settled TradeIntent must count as exposure too,
+    # not just settled holdings -- otherwise a second, concurrent risk
+    # evaluation (a different asset-class lane, say) reads the SAME stale
+    # holdings_value in the window between "decision persisted" and "fill
+    # settled into the holdings table" and independently approves capital
+    # that's already spoken for. The RISK_APPROVED row itself IS the
+    # durable reservation -- no separate ledger needed.
+    _pending_notional_statuses = {
+        TradeIntentStatus.RISK_APPROVED.value, TradeIntentStatus.SUBMITTED.value,
+        TradeIntentStatus.ACCEPTED.value, TradeIntentStatus.PARTIALLY_FILLED.value,
+        TradeIntentStatus.SUBMISSION_UNKNOWN.value,
+    }
+    for row in intent_rows:
+        if row["status"] not in _pending_notional_statuses:
+            continue
+        intent = hydrate("trade_intents", row["payload"])
+        # requested_quantity is overwritten with the RISK-APPROVED (possibly
+        # downsized) quantity once past PROPOSED -- see execution/gateway.py's
+        # replace(intent, status=RISK_APPROVED, requested_quantity=risk.approved_quantity)
+        # -- so this is already the real committed size, not the original ask.
+        remaining_qty = intent.requested_quantity - (intent.filled_quantity or Decimal("0"))
+        if remaining_qty <= 0 or intent.reference_price is None:
+            continue
+        pending_notional = remaining_qty * intent.reference_price
+        holdings_value += pending_notional
+        sector = intent.sector or "Other"
+        sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + pending_notional
+
     total_equity = account_equity if account_equity and account_equity > 0 else holdings_value
 
-    intent_rows = await repositories.trade_intents.list_all(limit=1000)
     # SUBMISSION_UNKNOWN counts too -- its broker outcome is genuinely
     # unresolved (see execute_intent's _recover_unknown_submission: it may
     # still be live at the broker, and must never be blind-resubmitted), so

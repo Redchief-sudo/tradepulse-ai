@@ -142,7 +142,7 @@ def test_audit_event_roundtrips() -> None:
 
 def test_scan_run_roundtrips() -> None:
     original = ScanRun(
-        "scan-1", "gen-1", ScanTrigger.SCHEDULED, ScanRunStatus.COMPLETED, NOW, "owner-1",
+        "scan-1", "gen-1", ScanTrigger.SCHEDULED, AssetClass.EQUITY, ScanRunStatus.COMPLETED, NOW, "owner-1",
         completed_at=NOW, candidates_discovered=5, candidates_approved=2, orders_submitted=1,
     )
     assert roundtrip("scan_runs", original) == original

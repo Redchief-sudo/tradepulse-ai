@@ -4,6 +4,7 @@ from decimal import Decimal
 import pytest
 
 from tradepulse.models import (
+    AssetClass,
     AuditEvent,
     PortfolioSnapshot,
     ReconciliationOutcome,
@@ -55,11 +56,11 @@ def test_audit_event_requires_known_severity() -> None:
 
 def test_failed_scan_run_requires_error_and_completed_at() -> None:
     with pytest.raises(ValueError, match="completed_at"):
-        ScanRun("scan-1", "gen-1", ScanTrigger.SCHEDULED, ScanRunStatus.FAILED, NOW, "owner-1")
+        ScanRun("scan-1", "gen-1", ScanTrigger.SCHEDULED, AssetClass.EQUITY, ScanRunStatus.FAILED, NOW, "owner-1")
     with pytest.raises(ValueError, match="error"):
-        ScanRun("scan-1", "gen-1", ScanTrigger.SCHEDULED, ScanRunStatus.FAILED, NOW, "owner-1", completed_at=NOW)
+        ScanRun("scan-1", "gen-1", ScanTrigger.SCHEDULED, AssetClass.EQUITY, ScanRunStatus.FAILED, NOW, "owner-1", completed_at=NOW)
     run = ScanRun(
-        "scan-1", "gen-1", ScanTrigger.SCHEDULED, ScanRunStatus.FAILED, NOW, "owner-1",
+        "scan-1", "gen-1", ScanTrigger.SCHEDULED, AssetClass.EQUITY, ScanRunStatus.FAILED, NOW, "owner-1",
         completed_at=NOW, error="broker unreachable",
     )
     assert run.error == "broker unreachable"

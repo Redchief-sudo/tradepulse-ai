@@ -20,6 +20,14 @@ IN_FLIGHT_STATUSES = frozenset(
 # heartbeat interval, not a hard cap on how long execute_intent may run.
 SYMBOL_LOCK_TTL_SECONDS = 45
 
+# Serializes the fetch-account/build-snapshot/evaluate_risk/persist-
+# RISK_APPROVED segment of execute_intent across DIFFERENT symbols -- see
+# execution/gateway.py's _portfolio_risk_lock. Held only around that fast,
+# local-only decision window, never through broker submission/fill polling,
+# so 30s is a safety ceiling, not an expected wait.
+PORTFOLIO_RISK_LOCK_KEY = "portfolio-risk-evaluation"
+PORTFOLIO_RISK_LOCK_TTL_SECONDS = 30
+
 
 def derive_idempotency_key(
     strategy: str, decision_id: str | None, signal_timestamp: str | None, asset: AssetIdentity, side: Side

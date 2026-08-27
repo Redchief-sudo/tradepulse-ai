@@ -12,6 +12,7 @@ matching this system's real invocation model (a fresh `tradepulse` process
 per cron firing, reading whatever the last process left in the database).
 """
 
+import asyncio
 import json
 import math
 from dataclasses import replace
@@ -23,7 +24,7 @@ import respx
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
-from tradepulse.cli import SCAN_LOCK_KEY, _run_scan_leg
+from tradepulse.cli import _run_scan_leg, scan_lock_key
 from tradepulse.config import Settings, risk_limits_for_profile
 from tradepulse.execution import ExecutionGateway, ExecutionRequest, derive_idempotency_key
 from tradepulse.models import (
@@ -31,6 +32,7 @@ from tradepulse.models import (
     AssetIdentity,
     ExecutionMode,
     ReconciliationOutcome,
+    ScanRunStatus,
     SessionState,
     SettlementStatus,
     Side,
@@ -281,7 +283,7 @@ async def test_stale_scan_lock_is_reclaimed_after_a_crash(tmp_path) -> None:
 
     # Process A acquired the scan lock and crashed without releasing it --
     # simulate by pre-acquiring with an already-expired TTL.
-    assert await acquire_lock(database, SCAN_LOCK_KEY, "dead-process", "scan", ttl_seconds=-1) is True
+    assert await acquire_lock(database, scan_lock_key(AssetClass.EQUITY), "dead-process", "scan", ttl_seconds=-1) is True
 
     # A blocked session keeps this fast and network-free -- this test is
     # about the lock, not the scan cycle's own logic.
@@ -297,7 +299,7 @@ async def test_stale_scan_lock_is_reclaimed_after_a_crash(tmp_path) -> None:
     alerts = TelegramAlerter(None, None)
 
     # Process B: a fresh scan invocation must reclaim the stale lease, not honor it.
-    result = await _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings, alerts)
+    result = await _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings, alerts, AssetClass.EQUITY)
     await broker.aclose()
     await ai_provider.aclose()
 
@@ -365,7 +367,7 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
     )
     _mock_bars(_BULLISH_CLOSES)
 
-    scan_summary = await run_scan_cycle(repositories_a, ai_provider_a, market_data_a, broker_a, gateway_a, universe, limits_a, clock=lambda: NOW)
+    scan_summary = await run_scan_cycle(repositories_a, ai_provider_a, market_data_a, broker_a, gateway_a, universe, limits_a, AssetClass.EQUITY, clock=lambda: NOW)
     await broker_a.aclose()
     await ai_provider_a.aclose()
 
@@ -436,3 +438,147 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
     assert len(payloads) == 2
     assert all(p.outcome == ReconciliationOutcome.MATCHED for p in payloads)
     assert all(p.reconciliation_type == "fill" for p in payloads)
+
+
+@respx.mock
+async def test_simultaneous_equity_and_crypto_scan_legs_coexist_against_same_database(tmp_path) -> None:
+    """The architecture actually being deployed: two independent cron
+    firings (`tradepulse scan --asset-class=equity` and `... --asset-class=
+    crypto`) landing at the same moment against the same database, each as
+    a genuinely separate process (independent AlpacaClient/gateway/AI
+    provider, same db_url). Proves: scan:equity/scan:crypto SCAN locks don't
+    block each other (both cycles complete, neither is skipped as
+    lock-held), both ScanRuns are independently attributable via
+    asset_class, and -- since both lanes simultaneously propose a genuinely
+    new BUY -- the shared portfolio-risk lock guards them exactly as
+    test_execution_gateway.py's single-gateway concurrency test proves,
+    whether or not the two independent lane processes' timing happens to
+    actually contend the lock on this particular run: never both silently
+    spending against the same stale exposure, and each execution that does
+    proceed lands in its own correctly-identified Holding row with no
+    canonical-identity collision between the lanes."""
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    settings = Settings.from_env({
+        "ALPACA_API_KEY": "key", "ALPACA_API_SECRET": "secret", "ANTHROPIC_API_KEY": "key",
+        "TRADEPULSE_DATABASE_URL": db_url,
+    })
+
+    database_shared, repositories_shared, _, _, _, _, _ = await _fresh_gateway(db_url)
+    await save_session(repositories_shared, TradingSession("session", SessionState.ACTIVE, True, NOW))
+
+    _mock_account(cash="150000", equity="150000")
+    _mock_positions()
+    _mock_quote()
+    _mock_market_open()
+    _mock_bars(_BULLISH_CLOSES)
+    respx.get("https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes").mock(
+        return_value=httpx.Response(200, json={"quotes": {"BTC/USD": {"bp": 60000.0, "ap": 60010.0, "t": QUOTE_TS}}})
+    )
+
+    def _bars_row(close: float, day) -> dict:
+        return {
+            "t": day.isoformat().replace("+00:00", "Z"), "o": close * 0.998, "h": close * 1.006,
+            "l": close * 0.994, "c": close, "v": 100.0,
+        }
+
+    def _crypto_bars_rows() -> list[dict]:
+        end = NOW
+        rows = [_bars_row(c, end - timedelta(days=len(_BULLISH_CLOSES) - 1 - i)) for i, c in enumerate(_BULLISH_CLOSES)]
+        return list(reversed(rows))
+
+    respx.get("https://data.alpaca.markets/v1beta3/crypto/us/bars").mock(
+        return_value=httpx.Response(200, json={"bars": {"BTC/USD": _crypto_bars_rows()}})
+    )
+
+    def _ai_response(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if "BTC/USD" in body:
+            return httpx.Response(200, json=_tool_use_response([{"symbol": "BTC/USD", "recommendation": "BUY", "confidence": 90, "summary": "Crypto momentum."}]))
+        return httpx.Response(200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}]))
+
+    respx.post("https://api.anthropic.com/v1/messages").mock(side_effect=_ai_response)
+
+    # The accept response never carries quantity -- the subsequent status
+    # poll and activities must reflect whatever the scanner's real
+    # confidence-adjusted sizing actually submitted (see the equivalent note
+    # in test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean
+    # above), not a hardcoded guess that would silently drift and produce a
+    # BROKER_ORDER_INTEGRITY_MISMATCH instead of a clean fill.
+    placed: dict[str, str] = {}
+
+    def _order_post_response(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "BTC" in body["symbol"]:
+            placed["btc_qty"] = body["qty"]
+            return httpx.Response(200, json={"id": "order-btc", "status": "accepted", "symbol": "BTC/USD", "side": "buy", "filled_qty": "0", "filled_avg_price": None, "submitted_at": QUOTE_TS})
+        placed["aapl_qty"] = body["qty"]
+        return httpx.Response(200, json={"id": "order-aapl", "status": "accepted", "symbol": "AAPL", "side": "buy", "filled_qty": "0", "filled_avg_price": None, "submitted_at": QUOTE_TS})
+
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=_order_post_response)
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-aapl").mock(
+        side_effect=lambda request: httpx.Response(200, json={"id": "order-aapl", "status": "filled", "symbol": "AAPL", "side": "buy", "filled_qty": placed["aapl_qty"], "filled_avg_price": "199.60", "submitted_at": QUOTE_TS})
+    )
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-btc").mock(
+        side_effect=lambda request: httpx.Response(200, json={"id": "order-btc", "status": "filled", "symbol": "BTC/USD", "side": "buy", "filled_qty": placed["btc_qty"], "filled_avg_price": "60010", "submitted_at": QUOTE_TS})
+    )
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
+        side_effect=lambda request: httpx.Response(200, json=[
+            *([{"id": "act-aapl-1", "activity_type": "FILL", "symbol": "AAPL", "side": "buy", "qty": placed["aapl_qty"], "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-aapl"}] if "aapl_qty" in placed else []),
+            *([{"id": "act-btc-1", "activity_type": "FILL", "symbol": "BTC/USD", "side": "buy", "qty": placed["btc_qty"], "price": "60010", "transaction_time": QUOTE_TS, "order_id": "order-btc"}] if "btc_qty" in placed else []),
+        ])
+    )
+
+    database_eq, repositories_eq, broker_eq, market_data_eq, gateway_eq, _, _ = await _fresh_gateway(db_url)
+    database_cr, repositories_cr, broker_cr, market_data_cr, gateway_cr, _, _ = await _fresh_gateway(db_url)
+    ai_provider_eq = AnthropicAIProvider("key", "claude-haiku-4-5", 10)
+    ai_provider_cr = AnthropicAIProvider("key", "claude-haiku-4-5", 10)
+    alerts_eq = TelegramAlerter(None, None)
+    alerts_cr = TelegramAlerter(None, None)
+
+    equity_result, crypto_result = await asyncio.gather(
+        _run_scan_leg(database_eq, repositories_eq, ai_provider_eq, market_data_eq, broker_eq, gateway_eq, settings, alerts_eq, AssetClass.EQUITY),
+        _run_scan_leg(database_cr, repositories_cr, ai_provider_cr, market_data_cr, broker_cr, gateway_cr, settings, alerts_cr, AssetClass.CRYPTO),
+    )
+    await broker_eq.aclose()
+    await broker_cr.aclose()
+    await ai_provider_eq.aclose()
+    await ai_provider_cr.aclose()
+
+    # Neither lane's SCAN lock blocked the other -- distinct lock keys, both
+    # cycles ran to completion rather than one being skipped as lock-held.
+    assert equity_result is not None
+    assert crypto_result is not None
+    assert equity_result.status == crypto_result.status == ScanRunStatus.COMPLETED
+
+    scan_run_rows = await repositories_shared.scan_runs.list_all()
+    scan_runs = [hydrate("scan_runs", r["payload"]) for r in scan_run_rows]
+    assert {run.asset_class for run in scan_runs} == {AssetClass.EQUITY, AssetClass.CRYPTO}
+
+    # The two lanes' genuinely new BUYs race for the SAME shared
+    # portfolio-risk lock, exactly like test_execution_gateway.py's
+    # single-process concurrency test -- but here the race is between two
+    # fully independent lane processes, each doing real (if fast, local)
+    # async work before reaching the lock, so whether their acquire_lock
+    # calls actually land in the same instant is scheduling-dependent, not
+    # deterministic. Assert on the invariant the lock exists to protect --
+    # never both silently spending against the same stale exposure -- across
+    # both possible outcomes: either the lock was contended and exactly one
+    # candidate lost cleanly with PORTFOLIO_RISK_EVALUATION_LOCKED, or it
+    # wasn't contended this time and both proceeded -- in which case each
+    # must still resolve into its OWN correctly-identified Holding, with no
+    # canonical-identity collision between the equity and crypto lanes.
+    equity_holding = await repositories_shared.holdings.get(asset_identity_key(_aapl()))
+    crypto_holding = await repositories_shared.holdings.get(asset_identity_key(AssetIdentity("BTC/USD", AssetClass.CRYPTO, "alpaca:BTC/USD")))
+    submitted_total = equity_result.orders_submitted + crypto_result.orders_submitted
+    assert submitted_total in (1, 2)
+    if submitted_total == 1:
+        locked_result = crypto_result if equity_result.orders_submitted == 1 else equity_result
+        assert locked_result.execution_results[0].reasons == ["PORTFOLIO_RISK_EVALUATION_LOCKED"]
+        winner_holding, loser_holding = (equity_holding, crypto_holding) if equity_result.orders_submitted == 1 else (crypto_holding, equity_holding)
+        assert winner_holding is not None and hydrate("holdings", winner_holding["payload"]).quantity > 0
+        assert loser_holding is None
+    else:
+        assert equity_holding is not None and hydrate("holdings", equity_holding["payload"]).quantity > 0
+        assert crypto_holding is not None and hydrate("holdings", crypto_holding["payload"]).quantity > 0
+        assert hydrate("holdings", equity_holding["payload"]).asset.asset_class == AssetClass.EQUITY
+        assert hydrate("holdings", crypto_holding["payload"]).asset.asset_class == AssetClass.CRYPTO

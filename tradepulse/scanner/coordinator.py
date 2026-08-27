@@ -86,14 +86,6 @@ _DETERMINISTIC_ACTIONABLE_SIGNALS = frozenset({"STRONG_BUY", "BUY"})
 STALE_SCAN_RUN_SECONDS = 900
 
 
-def _reject(symbol: str, reason: str, **context: Any) -> None:
-    """Every candidate-filtering `continue` in run_scan_cycle logs through
-    here first -- without this, a scan that approves zero candidates gives
-    no clue which gate(s) it lost to. Relies on JsonFormatter forwarding
-    every `extra=` field automatically (config/logging.py)."""
-    logger.info("candidate_rejected", extra={"event": "candidate_rejected", "symbol": symbol, "reason": reason, **context})
-
-
 @dataclass(frozen=True, slots=True)
 class ScanCycleSummary:
     scan_run_id: str
@@ -157,16 +149,33 @@ def _atr_stop_loss_price(
     return _round_price(raw, asset_class)
 
 
-def _build_scan_prompt(universe: ExecutableUniverse) -> str:
-    symbols = sorted(universe.equities | universe.crypto)
+def _build_scan_prompt(symbols: list[str], asset_class: AssetClass) -> str:
+    """One lane's symbols only -- the AI is never shown the other lane's
+    universe. The AI still only ever IDENTIFIES candidates; it never
+    decides position size (ATR, confidence-adjusted risk budget, and the
+    deterministic allocator in risk/engine.py do that) -- these prompts add
+    asset-aware market-interpretation context, not risk authority or
+    increasingly aggressive instructions."""
+    if asset_class == AssetClass.CRYPTO:
+        return (
+            "You are a crypto market-scanning analyst for an automated trading system. "
+            "Crypto markets trade continuously (24/7, no session close) and typically show "
+            "higher volatility and momentum persistence than equities. Review the following "
+            "tradeable pairs and report any worth considering for a new long position right now. "
+            "For each pair you report, give a recommendation (STRONG_BUY, BUY, HOLD, SELL, or "
+            "STRONG_SELL), a confidence score from 0-100, and a one-sentence summary of your "
+            "reasoning. Only report pairs from this exact list. It is fine to report zero "
+            "candidates if nothing stands out.\n\nPairs: " + ", ".join(symbols)
+        )
     return (
-        "You are a market-scanning analyst for an automated trading system. "
-        "Review the following tradeable symbols and report any that are worth "
-        "considering for a new long position today. For each symbol you report, give "
-        "a recommendation (STRONG_BUY, BUY, HOLD, SELL, or STRONG_SELL), a confidence "
-        "score from 0-100, and a one-sentence summary of your reasoning. Only report "
-        "symbols from this exact list. It is fine to report zero candidates if nothing "
-        "stands out.\n\nSymbols: " + ", ".join(symbols)
+        "You are an equity/ETF market-scanning analyst for an automated trading system. "
+        "Equity markets trade during regular exchange sessions and are more influenced by "
+        "fundamentals, sector rotation, and broader market regime than continuous crypto markets. "
+        "Review the following tradeable symbols and report any worth considering for a new long "
+        "position today. For each symbol you report, give a recommendation (STRONG_BUY, BUY, "
+        "HOLD, SELL, or STRONG_SELL), a confidence score from 0-100, and a one-sentence summary "
+        "of your reasoning. Only report symbols from this exact list. It is fine to report zero "
+        "candidates if nothing stands out.\n\nSymbols: " + ", ".join(symbols)
     )
 
 
@@ -198,6 +207,7 @@ async def run_scan_cycle(
     gateway: ExecutionGateway,
     universe: ExecutableUniverse,
     risk_limits: RiskLimits,
+    asset_class: AssetClass,
     *,
     trigger: ScanTrigger = ScanTrigger.SCHEDULED,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -210,10 +220,22 @@ async def run_scan_cycle(
     scan_run_id = str(uuid4())
     scan_generation = now.strftime("%Y%m%dT%H%M%SZ")
     scan_run = ScanRun(
-        scan_run_id=scan_run_id, scan_generation=scan_generation, trigger=trigger,
+        scan_run_id=scan_run_id, scan_generation=scan_generation, trigger=trigger, asset_class=asset_class,
         status=ScanRunStatus.RUNNING, started_at=now, lock_owner_token=str(uuid4()),
     )
     await repositories.scan_runs.create_once(scan_run_id, scan_run, status=scan_run.status.value)
+
+    def _reject(symbol: str, reason: str, **context: Any) -> None:
+        """Every candidate-filtering `continue` below logs through here
+        first -- without this, a scan that approves zero candidates gives
+        no clue which gate(s) it lost to. Relies on JsonFormatter forwarding
+        every `extra=` field automatically (config/logging.py). A closure
+        (not the former module-level function) so every rejection carries
+        this cycle's lane without threading it through every call site."""
+        logger.info(
+            "candidate_rejected",
+            extra={"event": "candidate_rejected", "symbol": symbol, "reason": reason, "asset_class": asset_class.value, **context},
+        )
 
     async def _finish(status: ScanRunStatus, **fields: Any) -> None:
         finished = replace(scan_run, status=status, completed_at=clock(), **fields)
@@ -229,7 +251,8 @@ async def run_scan_cycle(
         await _finish(ScanRunStatus.FAILED, error="SESSION_BLOCKED")
         return ScanCycleSummary(scan_run_id, ScanRunStatus.FAILED, 0, 0, 0, [], error="SESSION_BLOCKED")
 
-    request = build_scan_request(str(uuid4()), scan_run_id, _build_scan_prompt(universe))
+    lane_symbols = sorted(universe.crypto if asset_class == AssetClass.CRYPTO else universe.equities)
+    request = build_scan_request(str(uuid4()), scan_run_id, _build_scan_prompt(lane_symbols, asset_class))
     try:
         ai_response, candidates = await ai_provider.scan_candidates(request)
     except (ProviderHttpFailure, ProviderDataFailure) as exc:
@@ -272,6 +295,13 @@ async def run_scan_cycle(
         asset = _asset_from_candidate(candidate)
         if not is_executable(asset, universe):
             _reject(candidate.symbol, "OUTSIDE_EXECUTABLE_UNIVERSE")
+            continue
+        if asset.asset_class != asset_class:
+            # Defense in depth -- the prompt only ever offers this lane's
+            # symbols, but AI output is an untrusted hint (same principle as
+            # OUTSIDE_EXECUTABLE_UNIVERSE above), so nothing actually forces
+            # it to honor that.
+            _reject(candidate.symbol, "OUTSIDE_SCAN_LANE")
             continue
 
         try:

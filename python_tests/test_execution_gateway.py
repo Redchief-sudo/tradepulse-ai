@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -7,7 +8,13 @@ import respx
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
 from tradepulse.config import risk_limits_for_profile
-from tradepulse.execution import ExecutionGateway, ExecutionRequest, execution_lock_key
+from tradepulse.execution import (
+    PORTFOLIO_RISK_LOCK_KEY,
+    PORTFOLIO_RISK_LOCK_TTL_SECONDS,
+    ExecutionGateway,
+    ExecutionRequest,
+    execution_lock_key,
+)
 from tradepulse.models import (
     AssetClass,
     AssetIdentity,
@@ -20,7 +27,7 @@ from tradepulse.models import (
     TradingSession,
     asset_identity_key,
 )
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate, release_lock
 from tradepulse.providers import AlpacaMarketDataProvider
 from tradepulse.risk import load_session, save_session
 from tradepulse.settlement import SettlementProcessor
@@ -1132,3 +1139,139 @@ async def test_second_call_while_submission_unknown_retries_recovery_without_res
 
     intent_row = await repositories.trade_intents.get(first.trade_intent_id)
     assert intent_row["status"] == "submission_unknown"
+
+
+@respx.mock
+async def test_buy_skipped_when_portfolio_risk_lock_already_held(tmp_path) -> None:
+    """A non-protective BUY that can't acquire the portfolio-risk lock
+    (another concurrent execute_intent call is mid-decision) must skip
+    cleanly rather than proceed against a stale snapshot -- see
+    execution/gateway.py's _portfolio_risk_lock."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_positions()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    database = repositories.trade_intents.database
+    assert await acquire_lock(database, PORTFOLIO_RISK_LOCK_KEY, "owner-other", "execute_intent", PORTFOLIO_RISK_LOCK_TTL_SECONDS) is True
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "skipped"
+    assert result.reasons == ["PORTFOLIO_RISK_EVALUATION_LOCKED"]
+    assert order_route.call_count == 0
+
+
+@respx.mock
+async def test_protective_sell_executes_despite_portfolio_risk_lock_held(tmp_path) -> None:
+    """A stop-loss must never wait on the portfolio-risk lock -- only new
+    BUY exposure needs cross-symbol serialization; a protective exit only
+    ever reduces exposure."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(
+        repositories,
+        TradingSession("session", SessionState.RISK_STOPPED, False, NOW, kill_switch_reason="daily loss", kill_switch_reset_required=True),
+    )
+    _mock_account()
+    _mock_positions(_position_json(qty="5"))
+    _mock_quote()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
+        return_value=httpx.Response(200, json={"id": "order-1", "status": "filled", "symbol": "AAPL", "side": "sell", "filled_qty": "5", "filled_avg_price": "199.60", "submitted_at": QUOTE_TS})
+    )
+    _mock_fill_activities(_fill_activity("act-1", side="sell", qty="5"))
+
+    database = repositories.trade_intents.database
+    assert await acquire_lock(database, PORTFOLIO_RISK_LOCK_KEY, "owner-other", "execute_intent", PORTFOLIO_RISK_LOCK_TTL_SECONDS) is True
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.SELL, requested_quantity=Decimal("5"), strategy="test")
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "filled"
+
+
+@respx.mock
+async def test_covered_sell_executes_despite_portfolio_risk_lock_held(tmp_path) -> None:
+    """A plain (non-protective) covered SELL is also exempt -- it reduces
+    exposure just like a protective exit, so it never needs the lock."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_positions(_position_json(qty="5"))
+    _mock_quote()
+    _mock_market_open()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
+        return_value=httpx.Response(200, json={"id": "order-1", "status": "filled", "symbol": "AAPL", "side": "sell", "filled_qty": "5", "filled_avg_price": "199.60", "submitted_at": QUOTE_TS})
+    )
+    _mock_fill_activities(_fill_activity("act-1", side="sell", qty="5"))
+
+    database = repositories.trade_intents.database
+    assert await acquire_lock(database, PORTFOLIO_RISK_LOCK_KEY, "owner-other", "execute_intent", PORTFOLIO_RISK_LOCK_TTL_SECONDS) is True
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.SELL, requested_quantity=Decimal("5"), strategy="test")
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "filled"
+
+
+@respx.mock
+async def test_concurrent_buys_for_different_symbols_serialize_through_portfolio_risk_lock(tmp_path) -> None:
+    """The concurrency regression the review specifically asked for: two
+    execute_intent calls for DIFFERENT symbols (equity + crypto), each of
+    which would individually be approved, but which TOGETHER would blow
+    max_total_exposure_pct if both read the same stale snapshot. Without
+    the portfolio-risk lock, both could read $0 committed and both approve
+    a large BUY; with it, exactly one proceeds to order placement and the
+    other is skipped."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    # balanced profile's max_total_exposure_pct is well under 100% -- a
+    # $100k-equity account with two simultaneous ~$60k BUYs (AAPL @ ~$199.60,
+    # ~300 shares; BTC @ ~$60010, ~1 unit) would together blow it if both
+    # were approved against the same starting snapshot.
+    _mock_account(cash="150000", equity="100000", last_equity="100000")
+    _mock_positions()
+    _mock_quote()
+    _mock_market_open()
+    respx.get("https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes").mock(
+        return_value=httpx.Response(200, json={"quotes": {"BTC/USD": {"bp": 60000.0, "ap": 60010.0, "t": QUOTE_TS}}})
+    )
+
+    def _aapl_order(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "order-aapl", "status": "filled", "symbol": "AAPL", "side": "buy",
+            "filled_qty": "300", "filled_avg_price": "199.60", "submitted_at": QUOTE_TS,
+        })
+
+    def _btc_order(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "order-btc", "status": "filled", "symbol": "BTC/USD", "side": "buy",
+            "filled_qty": "1", "filled_avg_price": "60010", "submitted_at": QUOTE_TS,
+        })
+
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=lambda request: (
+        _aapl_order(request) if b'"AAPL"' in request.content else _btc_order(request)
+    ))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-aapl").mock(side_effect=_aapl_order)
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-btc").mock(side_effect=_btc_order)
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(return_value=httpx.Response(200, json=[
+        {"id": "act-aapl-1", "activity_type": "FILL", "symbol": "AAPL", "side": "buy", "qty": "300", "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-aapl"},
+        {"id": "act-btc-1", "activity_type": "FILL", "symbol": "BTC/USD", "side": "buy", "qty": "1", "price": "60010", "transaction_time": QUOTE_TS, "order_id": "order-btc"},
+    ]))
+
+    aapl_request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("300"), strategy="test", confidence=Decimal("90"))
+    btc_request = ExecutionRequest(asset=_btc(), side=Side.BUY, requested_quantity=Decimal("1"), strategy="test", confidence=Decimal("90"))
+
+    results = await asyncio.gather(gateway.execute_intent(aapl_request), gateway.execute_intent(btc_request))
+    await broker.aclose()
+
+    statuses = [r.status for r in results]
+    assert statuses.count("skipped") == 1
+    assert any(status in ("filled", "pending", "rejected") for status in statuses)  # the winner reached a real decision, not silently dropped
+    skipped = [r for r in results if r.status == "skipped"]
+    assert skipped[0].reasons == ["PORTFOLIO_RISK_EVALUATION_LOCKED"]
