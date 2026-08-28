@@ -28,6 +28,7 @@ def _bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
 
 RISK_PROFILE_IDS = frozenset({"aggressive", "balanced", "conservative", "micro"})
 AI_PROVIDER_IDS = frozenset({"anthropic", "openai"})
+ALPACA_MARKET_DATA_TIER_IDS = frozenset({"auto", "basic", "algo_trader_plus"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +61,7 @@ class Settings:
     equity_universe_path: str | None
     crypto_universe_path: str | None
     options_universe_path: str | None
+    alpaca_market_data_tier: str
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -80,6 +82,9 @@ class Settings:
         ai_provider = values.get("TRADEPULSE_AI_PROVIDER", "anthropic").strip().lower()
         if ai_provider not in AI_PROVIDER_IDS:
             raise SettingsError(f"TRADEPULSE_AI_PROVIDER must be one of {sorted(AI_PROVIDER_IDS)}")
+        alpaca_market_data_tier = values.get("ALPACA_MARKET_DATA_TIER", "auto").strip().lower()
+        if alpaca_market_data_tier not in ALPACA_MARKET_DATA_TIER_IDS:
+            raise SettingsError(f"ALPACA_MARKET_DATA_TIER must be one of {sorted(ALPACA_MARKET_DATA_TIER_IDS)}")
         return cls(
             database_url=values.get("TRADEPULSE_DATABASE_URL", "sqlite:///tradepulse.db"),
             log_level=values.get("TRADEPULSE_LOG_LEVEL", "INFO").upper(),
@@ -109,4 +114,5 @@ class Settings:
             equity_universe_path=values.get("TRADEPULSE_EQUITY_UNIVERSE_PATH") or None,
             crypto_universe_path=values.get("TRADEPULSE_CRYPTO_UNIVERSE_PATH") or None,
             options_universe_path=values.get("TRADEPULSE_OPTIONS_UNIVERSE_PATH") or None,
+            alpaca_market_data_tier=alpaca_market_data_tier,
         )

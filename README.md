@@ -34,6 +34,8 @@ No command runs its own scheduling loop -- each does its work once and exits. Po
 
 AI discovery backend is configurable via `TRADEPULSE_AI_PROVIDER` (`anthropic`, the default, or `openai`) -- set it plus the matching `ANTHROPIC_API_KEY`/`ANTHROPIC_MODEL` or `OPENAI_API_KEY`/`OPENAI_MODEL`. Both backends are validated against the identical fail-closed candidate schema (`tradepulse/providers/ai_provider.py`); the AI never controls price, quantity, stop-loss, or target regardless of which one is selected.
 
+Alpaca market-data feed is resolved via `ALPACA_MARKET_DATA_TIER` (default `auto`): probes SIP (equities) and OPRA (options) entitlement independently at the start of every `scan`/`monitor` invocation and uses whichever your account is actually authorized for, falling back per-feed to IEX/indicative where it isn't -- a free "Basic" Alpaca account works out of the box, no data subscription required. Set `basic` to force IEX/indicative without probing, or `algo_trader_plus` to require SIP+OPRA and fail startup cleanly if either isn't authorized (never a silent downgrade). The resolved feed is fixed for that whole invocation and recorded on every `Opportunity` (`market_data_feed`/`market_data_authority` in its metadata) so paper-trading results can be separated into consolidated (SIP/OPRA) vs. non-consolidated (IEX/indicative) evidence -- see `providers/market_data_capability.py`.
+
 Example crontab:
 
 ```

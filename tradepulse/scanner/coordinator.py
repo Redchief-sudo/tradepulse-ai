@@ -82,6 +82,20 @@ logger = logging.getLogger(__name__)
 _ACTIONABLE_RECOMMENDATIONS = frozenset({"STRONG_BUY", "BUY"})
 _DETERMINISTIC_ACTIONABLE_SIGNALS = frozenset({"STRONG_BUY", "BUY"})
 
+# Provenance for every Opportunity -- which Alpaca feed actually produced
+# the quote a trade decision was based on, so paper-trading results can
+# later be separated into consolidated (SIP/OPRA) vs. non-consolidated
+# (IEX/indicative) evidence. Keys match RawQuote.source (see
+# broker/alpaca_client.py). IEX is a real exchange feed, not "indicative" --
+# these are kept as two distinct authority levels, never collapsed into one.
+_MARKET_DATA_AUTHORITY = {
+    "alpaca_sip": "consolidated",
+    "alpaca_opra": "consolidated",
+    "alpaca_iex": "exchange_limited",
+    "alpaca_indicative": "indicative",
+    "alpaca_crypto": "crypto",
+}
+
 # Generous vs cli.py's SCAN_LOCK_TTL_SECONDS=600 -- the lock already prevents
 # real overlap; this only cleans up the audit trail after a crash left a
 # ScanRun stuck at RUNNING forever.
@@ -455,6 +469,9 @@ async def run_scan_cycle(
                     "technical_score": str(scores.technical_score), "momentum_score": str(scores.momentum_score),
                     "risk_score": str(scores.risk_score),
                     "stop_loss": str(stop_loss) if stop_loss is not None else None,
+                    "market_data_provider": "alpaca",
+                    "market_data_feed": trade_quote.provider.removeprefix("alpaca_"),
+                    "market_data_authority": _MARKET_DATA_AUTHORITY.get(trade_quote.provider, "unknown"),
                 },
             )
             await repositories.opportunities.create_once(opportunity.opportunity_id, opportunity)

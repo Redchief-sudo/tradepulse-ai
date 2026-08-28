@@ -54,11 +54,25 @@ def _decimal_or_none(value: object) -> Decimal | None:
 
 
 class AlpacaClient:
-    def __init__(self, api_key: str, api_secret: str, mode: Literal["paper", "live"], timeout_seconds: int) -> None:
+    def __init__(
+        self, api_key: str, api_secret: str, mode: Literal["paper", "live"], timeout_seconds: int,
+        equity_feed: Literal["iex", "sip"] = "iex", option_feed: Literal["indicative", "opra"] = "indicative",
+    ) -> None:
         self._api_key = api_key
         self._api_secret = api_secret
         self._mode = mode
         self._client = httpx.AsyncClient(timeout=timeout_seconds)
+        # Defaults are the always-working Basic tier -- a safe fail-safe
+        # for any caller that never resolves capabilities (see
+        # providers/market_data_capability.py). set_market_data_feeds is
+        # meant to be called ONCE, right after construction, before any
+        # market-data work starts -- never mid-session.
+        self._equity_feed = equity_feed
+        self._option_feed = option_feed
+
+    def set_market_data_feeds(self, *, equity_feed: Literal["iex", "sip"], option_feed: Literal["indicative", "opra"]) -> None:
+        self._equity_feed = equity_feed
+        self._option_feed = option_feed
 
     @property
     def _trading_base(self) -> str:
@@ -142,7 +156,13 @@ class AlpacaClient:
             )
         return positions
 
-    async def get_latest_quote(self, symbol: str, asset_class: AssetClass) -> RawQuote:
+    async def get_latest_quote(self, symbol: str, asset_class: AssetClass, feed_override: str | None = None) -> RawQuote:
+        """feed_override forces a specific feed for this ONE call without
+        mutating client state -- used only by
+        providers/market_data_capability.py's entitlement probes. Every
+        ordinary caller (scanner, gateway, settlement) omits it and gets
+        whatever set_market_data_feeds last resolved (Basic's iex/
+        indicative by default, until a capability resolution runs)."""
         normalized = str(symbol).upper().replace("-", "/")
         is_crypto = asset_class == AssetClass.CRYPTO
         is_option = asset_class == AssetClass.OPTION
@@ -152,27 +172,32 @@ class AlpacaClient:
         elif is_option:
             # Verified live against Alpaca's docs 2026-08-26: same
             # {"quotes": {symbol: {bp, ap, t}}} envelope shape as crypto's
-            # quotes endpoint, keyed by the OCC symbol. feed is explicit
-            # (opra), not left to Alpaca's own default -- that default is
-            # "opra if subscribed, else indicative" (a free, delayed/
-            # modified feed), which would let sizing/stop/spread math
-            # silently run against non-authoritative data with no signal
-            # that it happened. An unauthorized-for-opra account gets a
-            # clean, visible 403 here, which the caller (fetch_quote) already
-            # turns into a fail-closed QUOTE_FETCH_FAILED rejection -- same
-            # as every other market-data failure path in this codebase,
-            # never a silent downgrade to a cheaper feed.
+            # quotes endpoint, keyed by the OCC symbol. feed is always
+            # explicit (never Alpaca's own silent per-request default) --
+            # resolved once at startup (see providers/
+            # market_data_capability.py) and held for the whole session, so
+            # a Basic account cleanly uses "indicative" throughout and a
+            # Plus account cleanly uses "opra" throughout, each correctly
+            # tagged in Opportunity provenance -- never a silent per-request
+            # fallback with no signal which feed actually served the quote.
+            option_feed = feed_override or self._option_feed
             url = f"{DATA_BASE}/v1beta1/options/quotes/latest"
-            response = await self._client.get(url, headers=self._headers, params={"symbols": normalized, "feed": "opra"})
+            response = await self._client.get(url, headers=self._headers, params={"symbols": normalized, "feed": option_feed})
         else:
+            equity_feed = feed_override or self._equity_feed
             url = f"{DATA_BASE}/v2/stocks/{normalized}/quotes/latest"
-            response = await self._client.get(url, headers=self._headers, params={"feed": "iex"})
+            response = await self._client.get(url, headers=self._headers, params={"feed": equity_feed})
         if not response.is_success:
             raise_alpaca_error(response, "getLatestQuote")
         data = response.json()
         quote = (data.get("quotes") or {}).get(normalized) if (is_crypto or is_option) else data.get("quote")
         quote = quote or {}
-        source = "alpaca_crypto" if is_crypto else "alpaca_options" if is_option else "alpaca_iex"
+        if is_crypto:
+            source = "alpaca_crypto"
+        elif is_option:
+            source = f"alpaca_{feed_override or self._option_feed}"
+        else:
+            source = f"alpaca_{feed_override or self._equity_feed}"
         return RawQuote(
             symbol=normalized,
             bid=_decimal_or_none(quote.get("bp")),
@@ -250,7 +275,7 @@ class AlpacaClient:
             response = await self._client.get(url, headers=self._headers, params={**params, "symbols": normalized})
         else:
             url = f"{DATA_BASE}/v2/stocks/{normalized}/bars"
-            response = await self._client.get(url, headers=self._headers, params={**params, "feed": "iex"})
+            response = await self._client.get(url, headers=self._headers, params={**params, "feed": self._equity_feed})
         if not response.is_success:
             raise_alpaca_error(response, "getBars")
         data = response.json()

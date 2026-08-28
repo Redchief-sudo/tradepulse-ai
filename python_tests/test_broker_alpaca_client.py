@@ -143,7 +143,10 @@ async def test_get_positions_infers_options_asset_class_from_us_option() -> None
 
 
 @respx.mock
-async def test_get_latest_quote_parses_options_envelope() -> None:
+async def test_get_latest_quote_parses_options_envelope_using_default_indicative_feed() -> None:
+    """A fresh client (no capability resolution run) defaults to the
+    always-working Basic tier -- indicative options, iex equities -- a
+    safe fail-safe for any caller that never calls set_market_data_feeds."""
     route = respx.get("https://data.alpaca.markets/v1beta1/options/quotes/latest").mock(
         return_value=httpx.Response(
             200, json={"quotes": {"AAPL251219C00150000": {"bp": 2.0, "ap": 2.1, "t": "2026-08-26T15:00:00Z"}}}
@@ -156,11 +159,79 @@ async def test_get_latest_quote_parses_options_envelope() -> None:
         await client.aclose()
     assert quote.bid == Decimal("2.0")
     assert quote.ask == Decimal("2.1")
-    assert quote.source == "alpaca_options"
-    # feed is explicit (opra), never left to Alpaca's own "opra if
-    # subscribed, else indicative" default -- a silent downgrade to a
-    # delayed/modified feed must never happen unnoticed.
+    assert quote.source == "alpaca_indicative"
+    assert route.calls[0].request.url.params["feed"] == "indicative"
+
+
+@respx.mock
+async def test_get_latest_quote_uses_opra_after_set_market_data_feeds() -> None:
+    route = respx.get("https://data.alpaca.markets/v1beta1/options/quotes/latest").mock(
+        return_value=httpx.Response(
+            200, json={"quotes": {"AAPL251219C00150000": {"bp": 2.0, "ap": 2.1, "t": "2026-08-26T15:00:00Z"}}}
+        )
+    )
+    client = AlpacaClient("key", "secret", "paper", 10)
+    client.set_market_data_feeds(equity_feed="sip", option_feed="opra")
+    try:
+        quote = await client.get_latest_quote("AAPL251219C00150000", AssetClass.OPTION)
+    finally:
+        await client.aclose()
+    assert quote.source == "alpaca_opra"
     assert route.calls[0].request.url.params["feed"] == "opra"
+
+
+@respx.mock
+async def test_get_latest_quote_feed_override_forces_one_call_without_mutating_state() -> None:
+    """feed_override is used only by the capability probe -- it must never
+    persist onto the client, so an ordinary subsequent call still uses
+    whatever set_market_data_feeds (or the default) already resolved."""
+    route = respx.get("https://data.alpaca.markets/v1beta1/options/quotes/latest").mock(
+        return_value=httpx.Response(
+            200, json={"quotes": {"AAPL251219C00150000": {"bp": 2.0, "ap": 2.1, "t": "2026-08-26T15:00:00Z"}}}
+        )
+    )
+    client = AlpacaClient("key", "secret", "paper", 10)
+    try:
+        probed = await client.get_latest_quote("AAPL251219C00150000", AssetClass.OPTION, feed_override="opra")
+        ordinary = await client.get_latest_quote("AAPL251219C00150000", AssetClass.OPTION)
+    finally:
+        await client.aclose()
+    assert probed.source == "alpaca_opra"
+    assert ordinary.source == "alpaca_indicative"  # unaffected by the override -- still the untouched default
+    assert route.calls[0].request.url.params["feed"] == "opra"
+    assert route.calls[1].request.url.params["feed"] == "indicative"
+
+
+@respx.mock
+async def test_get_latest_quote_equity_uses_default_iex_then_sip_after_set() -> None:
+    route = respx.get("https://data.alpaca.markets/v2/stocks/AAPL/quotes/latest").mock(
+        return_value=httpx.Response(200, json={"symbol": "AAPL", "quote": {"bp": 199.50, "ap": 199.60, "t": "2026-08-26T15:00:00Z"}})
+    )
+    client = AlpacaClient("key", "secret", "paper", 10)
+    try:
+        default_quote = await client.get_latest_quote("AAPL", AssetClass.EQUITY)
+        client.set_market_data_feeds(equity_feed="sip", option_feed="opra")
+        sip_quote = await client.get_latest_quote("AAPL", AssetClass.EQUITY)
+    finally:
+        await client.aclose()
+    assert default_quote.source == "alpaca_iex"
+    assert route.calls[0].request.url.params["feed"] == "iex"
+    assert sip_quote.source == "alpaca_sip"
+    assert route.calls[1].request.url.params["feed"] == "sip"
+
+
+@respx.mock
+async def test_get_bars_equity_uses_resolved_feed() -> None:
+    route = respx.get("https://data.alpaca.markets/v2/stocks/AAPL/bars").mock(
+        return_value=httpx.Response(200, json={"bars": []})
+    )
+    client = AlpacaClient("key", "secret", "paper", 10)
+    client.set_market_data_feeds(equity_feed="sip", option_feed="opra")
+    try:
+        await client.get_bars("AAPL", AssetClass.EQUITY, datetime(2026, 8, 1, tzinfo=UTC), datetime(2026, 8, 26, tzinfo=UTC))
+    finally:
+        await client.aclose()
+    assert route.calls[0].request.url.params["feed"] == "sip"
 
 
 @respx.mock
@@ -171,6 +242,7 @@ async def test_get_latest_quote_fails_closed_when_opra_not_authorized() -> None:
         return_value=httpx.Response(403, json={"message": "not subscribed to OPRA", "code": 40410000})
     )
     client = AlpacaClient("key", "secret", "paper", 10)
+    client.set_market_data_feeds(equity_feed="sip", option_feed="opra")
     try:
         with pytest.raises(AlpacaError) as exc_info:
             await client.get_latest_quote("AAPL251219C00150000", AssetClass.OPTION)

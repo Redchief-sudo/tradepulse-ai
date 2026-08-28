@@ -39,7 +39,7 @@ from tradepulse.models import (
     asset_identity_key,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate
-from tradepulse.providers import AnthropicAIProvider, OpenAIProvider
+from tradepulse.providers import AnthropicAIProvider, MarketDataCapabilities, OpenAIProvider
 
 
 def test_scan_subcommand_parses() -> None:
@@ -156,9 +156,14 @@ def test_load_dotenv_missing_file_is_a_no_op(tmp_path) -> None:
 
 
 def _settings(database_url: str, **extra: str) -> Settings:
+    # ALPACA_MARKET_DATA_TIER defaults to "basic" here (a genuine no-probe
+    # override, see market_data_capability.py) so existing tests that don't
+    # care about capability resolution don't need extra respx mocks for the
+    # SIP/OPRA probes -- override explicitly for tests that DO exercise
+    # resolution (see test_market_data_capabilities_resolved_once_before_lane_fanout).
     return Settings.from_env({
         "ALPACA_API_KEY": "key", "ALPACA_API_SECRET": "secret", "ANTHROPIC_API_KEY": "key",
-        "TRADEPULSE_DATABASE_URL": database_url, **extra,
+        "TRADEPULSE_DATABASE_URL": database_url, "ALPACA_MARKET_DATA_TIER": "basic", **extra,
     })
 
 
@@ -214,6 +219,33 @@ async def test_three_lane_concurrent_scan_locks_independently_and_survives_one_c
     # Every lane's lock was released, not left stuck held by the crash.
     for asset_class in (AssetClass.EQUITY, AssetClass.CRYPTO, AssetClass.OPTION):
         assert await acquire_lock(database, scan_lock_key(asset_class), "post-check", "scan", ttl_seconds=60) is True
+
+
+@respx.mock
+async def test_market_data_capabilities_resolved_once_before_lane_fanout(tmp_path, monkeypatch) -> None:
+    """Capability resolution is a single broker-level fact, not a per-lane
+    one -- it must happen exactly once, before the scan legs fan out, never
+    duplicated inside each _run_scan_leg."""
+    database_url = f"sqlite:///{tmp_path}/test.db"
+
+    call_count = {"n": 0}
+
+    async def _stub_resolve(broker, requested_tier):
+        call_count["n"] += 1
+        return MarketDataCapabilities("sip", "opra")
+
+    async def _stub_scan_cycle(repositories, ai_provider, market_data, broker, gateway, universe, risk_limits, asset_class, **kwargs):
+        return None
+
+    monkeypatch.setattr("tradepulse.cli.resolve_market_data_capabilities", _stub_resolve)
+    monkeypatch.setattr("tradepulse.cli.run_scan_cycle", _stub_scan_cycle)
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[]))
+
+    settings = _settings(database_url, ALPACA_MARKET_DATA_TIER="auto")
+    exit_code = await _run_scan(settings, [AssetClass.EQUITY, AssetClass.CRYPTO, AssetClass.OPTION])
+
+    assert exit_code == 0
+    assert call_count["n"] == 1  # not 3 -- resolved once, shared across every lane
 
 
 @respx.mock

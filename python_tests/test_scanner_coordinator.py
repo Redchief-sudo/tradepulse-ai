@@ -656,6 +656,87 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
 
 
 @respx.mock
+async def test_opportunity_metadata_carries_resolved_market_data_provenance(tmp_path) -> None:
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    broker.set_market_data_feeds(equity_feed="sip", option_feed="opra")
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])
+        )
+    )
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
+    _mock_dynamic_full_fill()
+
+    await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    opp_rows = await repositories.opportunities.list_all()
+    opportunity = hydrate("opportunities", opp_rows[0]["payload"])
+    assert opportunity.metadata["market_data_provider"] == "alpaca"
+    assert opportunity.metadata["market_data_feed"] == "sip"
+    assert opportunity.metadata["market_data_authority"] == "consolidated"
+
+
+@respx.mock
+async def test_mixed_capability_provenance_is_independently_correct_per_lane(tmp_path) -> None:
+    """SIP rejected, OPRA entitled is a real, expected resolved state now
+    that the two feeds are probed independently (see
+    market_data_capability.py). Equity and options Opportunities against
+    the SAME broker must each carry THEIR OWN feed's provenance, not a
+    single account-wide label."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    broker.set_market_data_feeds(equity_feed="iex", option_feed="opra")
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    _mock_account()
+    _mock_positions()
+
+    # ---- Equity lane ----
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])
+        )
+    )
+    _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
+    _mock_dynamic_full_fill()
+    await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+
+    # ---- Options lane ----
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])
+        )
+    )
+    occ_symbol = "AAPL" + (NOW + timedelta(days=30)).date().strftime("%y%m%d") + "C00205000"
+    _mock_options_chain(occ_symbol)
+    _mock_options_quote(occ_symbol)
+    _mock_options_dynamic_full_fill(occ_symbol)
+    await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, OPTIONS_UNIVERSE, limits, AssetClass.OPTION, clock=lambda: NOW)
+
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    opp_rows = await repositories.opportunities.list_all()
+    assert len(opp_rows) == 2
+    opportunities = {o.asset.asset_class: o for o in (hydrate("opportunities", r["payload"]) for r in opp_rows)}
+
+    equity_opp = opportunities[AssetClass.EQUITY]
+    assert equity_opp.metadata["market_data_feed"] == "iex"
+    assert equity_opp.metadata["market_data_authority"] == "exchange_limited"
+
+    option_opp = opportunities[AssetClass.OPTION]
+    assert option_opp.metadata["market_data_feed"] == "opra"
+    assert option_opp.metadata["market_data_authority"] == "consolidated"
+
+
+@respx.mock
 async def test_deterministic_gate_rejects_ai_buy_when_composite_disagrees(tmp_path, caplog) -> None:
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))

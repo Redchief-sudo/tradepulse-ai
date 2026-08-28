@@ -65,7 +65,14 @@ from tradepulse.execution import ExecutionGateway
 from tradepulse.models import AssetClass, AuditEvent, ExecutionMode, SessionState, TradingSession
 from tradepulse.monitor import MonitorCycleSummary, run_position_monitor
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, release_lock, run_with_lock_renewal
-from tradepulse.providers import AIProvider, AlpacaMarketDataProvider, AnthropicAIProvider, OpenAIProvider
+from tradepulse.providers import (
+    AIProvider,
+    AlpacaMarketDataProvider,
+    AnthropicAIProvider,
+    MarketDataCapabilityError,
+    OpenAIProvider,
+    resolve_market_data_capabilities,
+)
 from tradepulse.reconciliation import run_reconciliation
 from tradepulse.risk import SESSION_RECORD_ID, load_session, transition_session
 from tradepulse.scanner import ScanCycleSummary, run_scan_cycle
@@ -139,6 +146,34 @@ def _build_gateway(
     settlement = SettlementProcessor(repositories, alerts)
     risk_limits = risk_limits_for_profile(settings.risk_profile)
     return ExecutionGateway(repositories, broker, market_data, settlement, alerts, risk_limits, ExecutionMode(settings.execution_mode))
+
+
+async def _resolve_and_apply_market_data_feeds(broker: AlpacaClient, settings: Settings) -> None:
+    """Resolves which Alpaca feeds this account is entitled to (see
+    providers/market_data_capability.py) and applies them to `broker`
+    ONCE, before any market-data work starts -- called from both
+    `_run_scan` and `_run_monitor` (the only two commands that fetch
+    quotes, directly or via the gateway's authoritative quote fetch for
+    protective exits), never per-lane. Any resolution failure -- an
+    explicit algo_trader_plus requirement not met, or an indeterminate
+    probe outcome (auth/rate-limit/transport/malformed-response) -- is
+    normalized to MarketDataCapabilityError so main() has exactly one
+    clean, expected exception type to report for this whole class of
+    startup problem."""
+    try:
+        capabilities = await resolve_market_data_capabilities(broker, settings.alpaca_market_data_tier)
+    except MarketDataCapabilityError:
+        raise
+    except (AlpacaError, httpx.HTTPError) as exc:
+        raise MarketDataCapabilityError(f"failed to resolve Alpaca market-data capabilities: {exc}") from exc
+    broker.set_market_data_feeds(equity_feed=capabilities.equity_feed, option_feed=capabilities.option_feed)
+    logger.info(
+        "market_data_capabilities_resolved",
+        extra={
+            "event": "market_data_capabilities_resolved", "tier": capabilities.tier_label,
+            "equity_feed": capabilities.equity_feed, "option_feed": capabilities.option_feed,
+        },
+    )
 
 
 def _lease_lost_signal(
@@ -275,6 +310,8 @@ async def _run_scan(settings: Settings, asset_classes: list[AssetClass]) -> int:
     broker = _build_broker(settings)
     ai_provider = _build_ai_provider(settings)
     try:
+        await _resolve_and_apply_market_data_feeds(broker, settings)
+
         market_data = AlpacaMarketDataProvider(broker)
         alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
         gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
@@ -309,6 +346,8 @@ async def _run_monitor(settings: Settings) -> int:
 
     broker = _build_broker(settings)
     try:
+        await _resolve_and_apply_market_data_feeds(broker, settings)
+
         market_data = AlpacaMarketDataProvider(broker)
         alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
         gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
@@ -702,7 +741,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "scan":
             return asyncio.run(_run_scan(settings, [AssetClass(v) for v in args.asset_class]))
         return asyncio.run(_COMMANDS[args.command](settings))
-    except SettingsError as exc:
+    except (SettingsError, MarketDataCapabilityError) as exc:
         print(f"tradepulse: {exc}", file=sys.stderr)
         return 1
 
