@@ -732,6 +732,31 @@ async def test_protective_exit_bypasses_only_the_session_gate_not_downstream_che
     assert order_route.call_count == 0
 
 
+@respx.mock
+async def test_buy_skipped_when_broker_returns_unrecognized_position_asset_class(tmp_path) -> None:
+    """A broker position with an asset_class this system doesn't recognize
+    must never be silently coerced into EQUITY -- it fails the whole
+    positions fetch (AlpacaDataIntegrityError), which this gateway's
+    existing BROKER_POSITIONS_UNAVAILABLE fail-closed skip already covers,
+    same as any other positions-fetch failure."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[{
+        "symbol": "WEIRD", "asset_class": "some_future_asset_class", "qty": "1", "avg_entry_price": "1",
+        "market_value": "0", "current_price": "1", "unrealized_pl": "0",
+    }]))
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "skipped"
+    assert any("BROKER_POSITIONS_UNAVAILABLE" in r for r in result.reasons)
+    assert any("BROKER_ASSET_CLASS_UNKNOWN" in r for r in result.reasons)
+    assert order_route.call_count == 0
+
+
 def _btc() -> AssetIdentity:
     return AssetIdentity("BTC/USD", AssetClass.CRYPTO, "alpaca:BTC/USD")
 

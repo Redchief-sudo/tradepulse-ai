@@ -290,6 +290,68 @@ async def test_broker_outage_reports_degraded_status_and_alerts(tmp_path) -> Non
 
 
 @respx.mock
+async def test_unrecognized_broker_position_asset_class_reports_degraded_status(tmp_path) -> None:
+    """A position with an asset_class this system doesn't recognize must
+    fail the whole positions fetch (AlpacaDataIntegrityError) rather than
+    being silently coerced into EQUITY -- this monitor's existing generic
+    except-and-degrade path already covers it, same as any other
+    positions-fetch failure."""
+    repositories, broker, gateway, alerts = await _setup(tmp_path)
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[{
+        "symbol": "WEIRD", "asset_class": "some_future_asset_class", "qty": "1", "avg_entry_price": "1",
+        "market_value": "0", "current_price": "1", "unrealized_pl": "0",
+    }]))
+
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.status == "degraded"
+    assert "BROKER_ASSET_CLASS_UNKNOWN" in summary.error
+
+
+@respx.mock
+async def test_option_with_invalid_expiry_metadata_alerts_but_keeps_stop_target_protection(tmp_path, caplog) -> None:
+    """Missing/malformed expiry on an OPTION holding must never be silently
+    treated as 'not near expiry' -- it's surfaced as a critical alert, but
+    the position's ordinary stop/target protection (independent of expiry)
+    keeps working."""
+    repositories, broker, gateway, alerts = await _setup(tmp_path)
+    contract = AssetIdentity(
+        "AAPL251219C00150000", AssetClass.OPTION, "alpaca:AAPL251219C00150000",
+        metadata={"underlying_symbol": "AAPL", "contract_multiplier": "100"},  # no "expiry" key at all
+    )
+    holding = Holding(asset=contract, quantity=Decimal("1"), average_price=Decimal("2.00"), updated_at=NOW, stop_loss=Decimal("1.00"))
+    await repositories.holdings.create_once(asset_identity_key(contract), holding)
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[{
+        "symbol": "AAPL251219C00150000", "asset_class": "us_option", "qty": "1", "avg_entry_price": "2.00",
+        "market_value": "0", "current_price": "0.90", "unrealized_pl": "0",  # below stop_loss=1.00
+    }]))
+    _mock_account()
+    respx.get("https://data.alpaca.markets/v1beta1/options/quotes/latest").mock(
+        return_value=httpx.Response(200, json={"quotes": {"AAPL251219C00150000": {"bp": 0.89, "ap": 0.90, "t": QUOTE_TS}}})
+    )
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(
+        return_value=httpx.Response(200, json={"id": "order-1", "status": "accepted", "symbol": "AAPL251219C00150000", "side": "sell", "filled_qty": "0", "filled_avg_price": None, "submitted_at": QUOTE_TS})
+    )
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
+        return_value=httpx.Response(200, json={"id": "order-1", "status": "filled", "symbol": "AAPL251219C00150000", "side": "sell", "filled_qty": "1", "filled_avg_price": "0.90", "submitted_at": QUOTE_TS})
+    )
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(return_value=httpx.Response(200, json=[{
+        "id": "act-1", "activity_type": "FILL", "symbol": "AAPL251219C00150000", "side": "sell",
+        "qty": "1", "price": "0.90", "transaction_time": QUOTE_TS, "order_id": "order-1",
+    }]))
+
+    with caplog.at_level("WARNING"):
+        summary = await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.exits_triggered == 1  # stop breach still protected the position
+    assert order_route.call_count == 1
+    skipped = [r for r in caplog.records if getattr(r, "event", None) == "telegram_alert_skipped_no_credentials"]
+    assert any("OPTION_EXPIRY_METADATA_INVALID" in r.alert_message for r in skipped)
+
+
+@respx.mock
 async def test_breach_is_skipped_when_symbol_execution_lock_already_held(tmp_path) -> None:
     """A concurrent scan already holds the per-symbol execution reservation
     for AAPL -- the monitor must skip this breach cleanly rather than racing

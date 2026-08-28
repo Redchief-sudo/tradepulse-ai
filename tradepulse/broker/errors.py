@@ -52,6 +52,20 @@ class AlpacaError(RuntimeError):
         }
 
 
+class AlpacaDataIntegrityError(RuntimeError):
+    """Raised when Alpaca returns a well-formed, successful HTTP response
+    whose CONTENT can't be trusted to build correct local state -- distinct
+    from AlpacaError (a definitive HTTP-level outcome): this is "the request
+    succeeded, but what it told us shouldn't be silently coerced into a
+    known shape." First use: get_positions() encountering an asset_class
+    value this system doesn't recognize (see alpaca_client.py) -- silently
+    defaulting an unrecognized broker position to AssetClass.EQUITY would
+    let a real instrument (say, a future asset class) build a WRONG
+    canonical identity and corrupt Holding lookups, protective-exit
+    classification, and reconciliation, all without any signal that it
+    happened. Fail loudly instead."""
+
+
 def is_definitive_rejection(exc: Exception) -> bool:
     """True only for a confirmed Alpaca business-logic rejection (a clear
     4xx response other than 429 rate-limit) -- safe to mark an order

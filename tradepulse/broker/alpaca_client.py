@@ -16,7 +16,7 @@ import httpx
 
 from tradepulse.models import AssetClass, Side
 
-from .errors import extract_request_id, raise_alpaca_error
+from .errors import AlpacaDataIntegrityError, extract_request_id, raise_alpaca_error
 from .symbols import infer_alpaca_asset_class, normalize_alpaca_symbol
 from .types import (
     AlpacaAccount,
@@ -113,10 +113,22 @@ class AlpacaClient:
             raw_class = row.get("asset_class")
             # Verified live against Alpaca's docs 2026-08-26: "crypto",
             # "us_option", "us_equity" are the three values this field
-            # actually takes.
-            asset_class = (
-                AssetClass.CRYPTO if raw_class == "crypto" else AssetClass.OPTION if raw_class == "us_option" else AssetClass.EQUITY
-            )
+            # actually takes. Anything else fails loudly rather than being
+            # silently coerced into EQUITY -- an unrecognized asset_class
+            # here would otherwise build a WRONG canonical identity for a
+            # real broker position, corrupting Holding lookups, protective-
+            # exit classification, and reconciliation with no signal it
+            # happened.
+            if raw_class == "crypto":
+                asset_class = AssetClass.CRYPTO
+            elif raw_class == "us_option":
+                asset_class = AssetClass.OPTION
+            elif raw_class == "us_equity":
+                asset_class = AssetClass.EQUITY
+            else:
+                raise AlpacaDataIntegrityError(
+                    f"BROKER_ASSET_CLASS_UNKNOWN: position {row.get('symbol')!r} has unrecognized asset_class {raw_class!r}"
+                )
             positions.append(
                 AlpacaPosition(
                     symbol=normalize_alpaca_symbol(str(row.get("symbol", "")), asset_class),
@@ -140,9 +152,18 @@ class AlpacaClient:
         elif is_option:
             # Verified live against Alpaca's docs 2026-08-26: same
             # {"quotes": {symbol: {bp, ap, t}}} envelope shape as crypto's
-            # quotes endpoint, keyed by the OCC symbol.
+            # quotes endpoint, keyed by the OCC symbol. feed is explicit
+            # (opra), not left to Alpaca's own default -- that default is
+            # "opra if subscribed, else indicative" (a free, delayed/
+            # modified feed), which would let sizing/stop/spread math
+            # silently run against non-authoritative data with no signal
+            # that it happened. An unauthorized-for-opra account gets a
+            # clean, visible 403 here, which the caller (fetch_quote) already
+            # turns into a fail-closed QUOTE_FETCH_FAILED rejection -- same
+            # as every other market-data failure path in this codebase,
+            # never a silent downgrade to a cheaper feed.
             url = f"{DATA_BASE}/v1beta1/options/quotes/latest"
-            response = await self._client.get(url, headers=self._headers, params={"symbols": normalized})
+            response = await self._client.get(url, headers=self._headers, params={"symbols": normalized, "feed": "opra"})
         else:
             url = f"{DATA_BASE}/v2/stocks/{normalized}/quotes/latest"
             response = await self._client.get(url, headers=self._headers, params={"feed": "iex"})

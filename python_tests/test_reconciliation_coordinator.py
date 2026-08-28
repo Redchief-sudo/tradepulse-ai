@@ -559,3 +559,24 @@ async def test_broker_positions_outage_reports_degraded(tmp_path) -> None:
 
     assert summary.status == "degraded"
     assert summary.error is not None
+
+
+@respx.mock
+async def test_unrecognized_broker_position_asset_class_reports_degraded(tmp_path) -> None:
+    """Same fail-closed principle as the positions-outage case above --
+    an unrecognized asset_class must fail the whole positions fetch
+    (AlpacaDataIntegrityError) rather than being silently coerced into
+    EQUITY, and this reconciliation pass's existing generic except already
+    covers it cleanly."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[{
+        "symbol": "WEIRD", "asset_class": "some_future_asset_class", "qty": "1", "avg_entry_price": "1",
+        "market_value": "0", "current_price": "1", "unrealized_pl": "0",
+    }]))
+
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.status == "degraded"
+    assert "BROKER_ASSET_CLASS_UNKNOWN" in summary.error

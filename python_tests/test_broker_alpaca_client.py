@@ -6,7 +6,7 @@ import httpx
 import pytest
 import respx
 
-from tradepulse.broker import AlpacaClient, AlpacaError, default_time_in_force, is_definitive_rejection
+from tradepulse.broker import AlpacaClient, AlpacaDataIntegrityError, AlpacaError, default_time_in_force, is_definitive_rejection
 from tradepulse.models import AssetClass
 
 
@@ -97,6 +97,30 @@ async def test_get_positions_normalizes_crypto_symbols() -> None:
 
 
 @respx.mock
+async def test_get_positions_fails_closed_on_unrecognized_asset_class() -> None:
+    """A position with an asset_class this system doesn't recognize must
+    never be silently coerced into EQUITY -- that would build a WRONG
+    canonical identity for a real broker position and corrupt every local
+    lookup keyed by it (Holding, protective-exit classification,
+    reconciliation)."""
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(
+        return_value=httpx.Response(
+            200,
+            json=[{
+                "symbol": "WEIRD", "asset_class": "some_future_asset_class", "qty": "1", "avg_entry_price": "1",
+                "market_value": "0", "current_price": "1", "unrealized_pl": "0",
+            }],
+        )
+    )
+    client = AlpacaClient("key", "secret", "paper", 10)
+    try:
+        with pytest.raises(AlpacaDataIntegrityError, match="BROKER_ASSET_CLASS_UNKNOWN"):
+            await client.get_positions()
+    finally:
+        await client.aclose()
+
+
+@respx.mock
 async def test_get_positions_infers_options_asset_class_from_us_option() -> None:
     respx.get("https://paper-api.alpaca.markets/v2/positions").mock(
         return_value=httpx.Response(
@@ -120,7 +144,7 @@ async def test_get_positions_infers_options_asset_class_from_us_option() -> None
 
 @respx.mock
 async def test_get_latest_quote_parses_options_envelope() -> None:
-    respx.get("https://data.alpaca.markets/v1beta1/options/quotes/latest").mock(
+    route = respx.get("https://data.alpaca.markets/v1beta1/options/quotes/latest").mock(
         return_value=httpx.Response(
             200, json={"quotes": {"AAPL251219C00150000": {"bp": 2.0, "ap": 2.1, "t": "2026-08-26T15:00:00Z"}}}
         )
@@ -133,6 +157,27 @@ async def test_get_latest_quote_parses_options_envelope() -> None:
     assert quote.bid == Decimal("2.0")
     assert quote.ask == Decimal("2.1")
     assert quote.source == "alpaca_options"
+    # feed is explicit (opra), never left to Alpaca's own "opra if
+    # subscribed, else indicative" default -- a silent downgrade to a
+    # delayed/modified feed must never happen unnoticed.
+    assert route.calls[0].request.url.params["feed"] == "opra"
+
+
+@respx.mock
+async def test_get_latest_quote_fails_closed_when_opra_not_authorized() -> None:
+    """An account without OPRA access gets a definitive 403 -- this must
+    propagate as a real error, never a silent fallback to a cheaper feed."""
+    respx.get("https://data.alpaca.markets/v1beta1/options/quotes/latest").mock(
+        return_value=httpx.Response(403, json={"message": "not subscribed to OPRA", "code": 40410000})
+    )
+    client = AlpacaClient("key", "secret", "paper", 10)
+    try:
+        with pytest.raises(AlpacaError) as exc_info:
+            await client.get_latest_quote("AAPL251219C00150000", AssetClass.OPTION)
+    finally:
+        await client.aclose()
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.is_auth_error()
 
 
 @respx.mock

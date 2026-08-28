@@ -29,6 +29,7 @@ import httpx
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import (
     AlpacaClient,
+    AlpacaDataIntegrityError,
     AlpacaError,
     AlpacaOrderRequest,
     AlpacaPosition,
@@ -198,7 +199,7 @@ class ExecutionGateway:
         # skip pattern as the quote/account fetches below.
         try:
             positions = await self._broker.get_positions()
-        except (AlpacaError, httpx.HTTPError) as exc:
+        except (AlpacaError, AlpacaDataIntegrityError, httpx.HTTPError) as exc:
             return ExecutionResult("skipped", None, [f"BROKER_POSITIONS_UNAVAILABLE: {exc}"], Decimal("0"), None)
 
         # Canonically-keyed, not bare-symbol -- must agree with the same

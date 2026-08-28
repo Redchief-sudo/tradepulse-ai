@@ -58,6 +58,29 @@ def _breached(position: AlpacaPosition, holding: Holding) -> bool:
     )
 
 
+def _option_expiry_metadata_invalid(holding: Holding) -> bool:
+    """True when an OPTION holding's expiry metadata is missing or
+    malformed -- the near-expiry safety net (_near_expiry below) genuinely
+    cannot be evaluated for it. This must be surfaced loudly (see
+    run_position_monitor's critical alert), never silently folded into
+    "not near expiry" -- "confirmed safe" and "unknown" are different
+    things for a safety trigger, and conflating them would let the exact
+    protection this trigger exists for go dark with no signal it happened.
+    This should essentially never fire in practice (the scanner always sets
+    valid expiry metadata) -- it's a defense against corrupted/foreign
+    Holding state, not an expected runtime path."""
+    if holding.asset.asset_class != AssetClass.OPTION:
+        return False
+    expiry_raw = holding.asset.metadata.get("expiry")
+    if not expiry_raw:
+        return True
+    try:
+        date.fromisoformat(str(expiry_raw))
+    except ValueError:
+        return True
+    return False
+
+
 def _near_expiry(holding: Holding, today: date, min_days_to_expiry: int) -> bool:
     """An independent exit trigger alongside _breached, specific to
     options: letting a long option ride to expiration risks total loss
@@ -66,12 +89,16 @@ def _near_expiry(holding: Holding, today: date, min_days_to_expiry: int) -> bool
     Only local state (holding.asset.metadata) knows the expiry -- Alpaca's
     position response doesn't conveniently carry it -- matching this
     module's existing division of responsibility (stop_loss/target_price
-    are likewise only ever known locally, never from the broker)."""
+    are likewise only ever known locally, never from the broker). Returns
+    False (not "near expiry") whenever _option_expiry_metadata_invalid
+    would also be True -- callers must check that separately and alert;
+    this function alone cannot distinguish "confirmed not near expiry"
+    from "unknown," which is exactly why that separate check exists."""
     if holding.asset.asset_class != AssetClass.OPTION:
         return False
     expiry_raw = holding.asset.metadata.get("expiry")
     if not expiry_raw:
-        return False  # an OPTION holding with no recorded expiry is itself an anomaly, not something to force-close on
+        return False
     try:
         expiry = date.fromisoformat(str(expiry_raw))
     except ValueError:
@@ -105,6 +132,13 @@ async def run_position_monitor(
         if holding_row is None:
             continue  # nothing on file (e.g. opened outside this system) -- no threshold to check
         holding = hydrate("holdings", holding_row["payload"])
+        if _option_expiry_metadata_invalid(holding):
+            await alerts.send(
+                "critical",
+                f"OPTION_EXPIRY_METADATA_INVALID for {position.symbol} -- the near-expiry forced-close safety check "
+                "cannot run for this position; its stop/target protection (if any) is unaffected.",
+                {"symbol": position.symbol, "asset_class": holding.asset.asset_class.value},
+            )
         expiring = _near_expiry(holding, clock().date(), risk_limits.options_forced_close_days_before_expiry)
         if holding.stop_loss is None and holding.target_price is None and not expiring:
             continue
