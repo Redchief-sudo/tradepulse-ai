@@ -35,11 +35,22 @@ DEFAULT_EQUITY_UNIVERSE = (
 # all; this MVP always enforces one, defaulting to the most liquid pairs.
 DEFAULT_CRYPTO_UNIVERSE = ("BTC/USD", "ETH/USD", "SOL/USD", "LTC/USD", "BCH/USD")
 
+# Options underlyings -- a curated, deliberately narrower subset of
+# DEFAULT_EQUITY_UNIVERSE (mega-cap tech + broad index ETFs only). Several
+# names above (bond ETFs, several blue chips) have materially thinner
+# options chains/liquidity than these -- a deterministic-but-illiquid
+# contract selection (strategy/options_selection.py) is a bad first cut.
+DEFAULT_OPTIONS_UNDERLYING_UNIVERSE = (
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
+    "SPY", "QQQ", "IWM",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ExecutableUniverse:
     equities: frozenset[str]
     crypto: frozenset[str]
+    options_underlyings: frozenset[str] = frozenset()
 
 
 def _load_symbols(path: str | None, default: tuple[str, ...]) -> frozenset[str]:
@@ -56,14 +67,20 @@ def load_executable_universe(settings: Settings) -> ExecutableUniverse:
     return ExecutableUniverse(
         equities=_load_symbols(settings.equity_universe_path, DEFAULT_EQUITY_UNIVERSE),
         crypto=_load_symbols(settings.crypto_universe_path, DEFAULT_CRYPTO_UNIVERSE),
+        options_underlyings=_load_symbols(settings.options_universe_path, DEFAULT_OPTIONS_UNDERLYING_UNIVERSE),
     )
 
 
 def is_executable(asset: AssetIdentity, universe: ExecutableUniverse) -> bool:
-    symbol = asset.symbol.upper()
     if asset.asset_class == AssetClass.CRYPTO:
-        return symbol in universe.crypto
-    return symbol in universe.equities
+        return asset.symbol.upper() in universe.crypto
+    if asset.asset_class == AssetClass.OPTION:
+        # By the time this runs, asset is the resolved CONTRACT (an OCC
+        # symbol), not the underlying the AI actually proposed -- check the
+        # underlying recorded in metadata at contract-resolution time, not
+        # asset.symbol.
+        return str(asset.metadata.get("underlying_symbol", "")).upper() in universe.options_underlyings
+    return asset.symbol.upper() in universe.equities
 
 
 def filter_executable(candidates: Iterable[Opportunity], universe: ExecutableUniverse) -> list[Opportunity]:

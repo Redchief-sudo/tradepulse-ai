@@ -128,6 +128,72 @@ async def test_sell_closes_the_long_lot_and_realizes_pnl(tmp_path) -> None:
     assert lot.realized_pnl == Decimal("150")  # (165-150)*10
 
 
+def _aapl_call() -> AssetIdentity:
+    return AssetIdentity(
+        "AAPL251219C00150000", AssetClass.OPTION, "alpaca:AAPL251219C00150000",
+        metadata={"underlying_symbol": "AAPL", "contract_multiplier": "100"},
+    )
+
+
+async def test_option_realized_pnl_applies_the_contract_multiplier_end_to_end(tmp_path) -> None:
+    """The exact accounting invariant from plan review: BUY 1 contract at
+    $2.00 premium (multiplier 100, entry notional $200), SELL at $2.50 --
+    realized gross P&L must equal EXACTLY $50 ((2.50-2.00)*1*100) all the
+    way through Fill -> SettlementEvent -> lot consumption -> realized P&L,
+    never $0.50 (multiplier forgotten), $5,000 (applied twice), or $200
+    (premium mistaken for P&L). The single cheapest test against the most
+    dangerous silent accounting failure options introduce."""
+    repositories = await _repositories(tmp_path)
+    contract = _aapl_call()
+
+    buy_intent = TradeIntent(
+        "ti-1", "idem-1", "corr-1", contract, Side.BUY, ExecutionMode.PAPER, "manual", NOW,
+        requested_quantity=Decimal("1"),
+    )
+    await repositories.trade_intents.create_once("ti-1", buy_intent, status=buy_intent.status.value, unique_value=buy_intent.idempotency_key)
+    buy_fill = Fill("fill-1", "ti-1", "order-1", contract, Side.BUY, ExecutionMode.PAPER, Decimal("1"), Decimal("2.00"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-1", buy_fill, unique_value=None)
+    buy_event = SettlementEvent("se-1", "fill-1", "ti-1", contract, Side.BUY, ExecutionMode.PAPER, Decimal("1"), Decimal("2.00"), NOW)
+    await repositories.settlements.create_once("se-1", buy_event, status=buy_event.status.value, unique_value="fill-1")
+
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending()
+
+    holding_row = await repositories.holdings.get(asset_identity_key(contract))
+    assert holding_row is not None
+    holding = hydrate("holdings", holding_row["payload"])
+    assert holding.average_price == Decimal("2.00")  # a per-unit PRICE, never multiplied -- the multiplier only ever applies at the notional/P&L boundary
+
+    sell_intent = TradeIntent(
+        "ti-2", "idem-2", "corr-2", contract, Side.SELL, ExecutionMode.PAPER, "manual", NOW,
+        requested_quantity=Decimal("1"),
+    )
+    await repositories.trade_intents.create_once("ti-2", sell_intent, status=sell_intent.status.value, unique_value=sell_intent.idempotency_key)
+    sell_fill = Fill("fill-2", "ti-2", "order-2", contract, Side.SELL, ExecutionMode.PAPER, Decimal("1"), Decimal("2.50"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-2", sell_fill, unique_value=None)
+    sell_event = SettlementEvent("se-2", "fill-2", "ti-2", contract, Side.SELL, ExecutionMode.PAPER, Decimal("1"), Decimal("2.50"), NOW)
+    await repositories.settlements.create_once("se-2", sell_event, status=sell_event.status.value, unique_value="fill-2")
+
+    summary = await processor.process_pending()
+    assert summary.completed == 1
+
+    holding_row = await repositories.holdings.get(asset_identity_key(contract))
+    assert holding_row is None  # fully closed
+
+    lot_rows = await repositories.position_lots.list_all()
+    lot = hydrate("position_lots", lot_rows[0]["payload"])
+    assert lot.status == "closed"
+    assert lot.realized_pnl == Decimal("50")  # (2.50 - 2.00) * 1 * 100 -- NOT 0.50, 5000, or 200
+
+    settlement_event_row = await repositories.settlements.get("se-2")
+    settlement_event = hydrate("settlements", settlement_event_row["payload"])
+    assert settlement_event.realized_pnl == Decimal("50")
+
+    intent_row = await repositories.trade_intents.get("ti-2")
+    intent = hydrate("trade_intents", intent_row["payload"])
+    assert intent.realized_pnl == Decimal("50")
+
+
 async def test_manufactured_integrity_violation_blocks_permanently_and_alerts(tmp_path) -> None:
     repositories = await _repositories(tmp_path)
     # A lot that already claims to have closed more than the incoming event's

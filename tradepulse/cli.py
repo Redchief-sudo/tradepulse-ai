@@ -3,25 +3,33 @@ schedule (cron, systemd timer, etc.). No command runs its own internal
 scheduling loop: each invocation does its work once and exits, matching the
 CLI-driven, cron-external architecture decided for this system (see docs/).
 
-`tradepulse scan --asset-class=<equity|crypto>` runs AI-driven candidate
-discovery for ONE lane plus the stop/target position monitor CONCURRENTLY
-(not sequentially) in one process, sharing a composition root but each
-independently lock-protected -- position protection latency is never tied to
-how long the AI discovery call takes. The two lanes are independently
-scheduled and independently lock-protected (separate lock keys, see
-scan_lock_key below) so a tighter crypto cadence never re-scans, or
-re-bills AI calls for, equities that are market-closed, and vice versa;
-both lanes share the SAME risk engine, execution gateway, and
-settlement/reconciliation pipeline -- lane separation is discovery-only.
-`tradepulse monitor`, `tradepulse settle`, and `tradepulse reconcile` are also
-available standalone for operators who want a different cadence than the
-scan cycle's (position protection is typically wanted more often than
+`tradepulse scan --asset-class=<equity|crypto|option> [more...]` runs
+AI-driven candidate discovery for one OR MORE lanes plus the stop/target
+position monitor, all CONCURRENTLY (not sequentially) in one process,
+sharing a composition root but each independently lock-protected --
+position protection latency is never tied to how long any lane's AI
+discovery call takes, and a slow or crashing lane never blocks its siblings
+(asyncio.gather(..., return_exceptions=True), never TaskGroup -- see
+_run_scan). Each lane is independently scheduled and independently
+lock-protected (separate lock keys, see scan_lock_key below) so a tighter
+crypto cadence never re-scans, or re-bills AI calls for, equities that are
+market-closed, and vice versa; every lane shares the SAME risk engine,
+execution gateway, and settlement/reconciliation pipeline -- lane
+separation is discovery-only. This is the "parallel multi-asset
+supervisor": several specialized market-discovery lanes running
+concurrently, one centralized capital/risk authority underneath all of
+them, never N independent trading bots. `tradepulse monitor`,
+`tradepulse settle`, and `tradepulse reconcile` are also available
+standalone for operators who want a different cadence than the scan
+cycle's (position protection is typically wanted more often than
 discovery; settlement retries want a short, independent cadence so a quiet
 market doesn't leave one stranded; reconciliation is an after-the-fact audit
-pass, typically wanted less often). Example crontab:
+pass, typically wanted less often). Example crontab (one lane per line, or
+combine any subset into a single `--asset-class` invocation):
 
     */15 9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse scan --asset-class=equity  >> /var/log/tradepulse.log 2>&1
     */10 *    * * *    cd /path/to/repo && .venv/bin/tradepulse scan --asset-class=crypto  >> /var/log/tradepulse.log 2>&1
+    */20 9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse scan --asset-class=option   >> /var/log/tradepulse.log 2>&1
     */2  9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse monitor   >> /var/log/tradepulse.log 2>&1
     *    *    * * *    cd /path/to/repo && .venv/bin/tradepulse settle    >> /var/log/tradepulse.log 2>&1
     0    */6  * * *    cd /path/to/repo && .venv/bin/tradepulse reconcile >> /var/log/tradepulse.log 2>&1
@@ -183,7 +191,7 @@ async def _run_scan_leg(
 
 async def _run_monitor_leg(
     database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, broker: AlpacaClient,
-    gateway: ExecutionGateway, alerts: TelegramAlerter,
+    gateway: ExecutionGateway, alerts: TelegramAlerter, settings: Settings,
 ) -> MonitorCycleSummary | None:
     owner_token = str(uuid4())
     if not await acquire_lock(database, MONITOR_LOCK_KEY, owner_token, "monitor", MONITOR_LOCK_TTL_SECONDS):
@@ -191,9 +199,10 @@ async def _run_monitor_leg(
         return None
     try:
         lease_lost, on_lease_lost = _lease_lost_signal(alerts, MONITOR_LOCK_KEY, owner_token)
+        risk_limits = risk_limits_for_profile(settings.risk_profile)
         return await run_with_lock_renewal(
             database, MONITOR_LOCK_KEY, owner_token, MONITOR_LOCK_TTL_SECONDS,
-            run_position_monitor(repositories, broker, gateway, alerts, lease_lost=lease_lost),
+            run_position_monitor(repositories, broker, gateway, alerts, risk_limits, lease_lost=lease_lost),
             on_renewal_failed=on_lease_lost,
         )
     finally:
@@ -241,12 +250,22 @@ def _log_monitor_result(result: MonitorCycleSummary | BaseException | None) -> b
     return False
 
 
-async def _run_scan(settings: Settings, asset_class: AssetClass) -> int:
-    """`tradepulse scan --asset-class=...`: single-lane discovery and
-    position protection, concurrently. Monitor is asset-class-agnostic
-    (protects every open position regardless of lane) and stays bundled in
-    exactly as before -- a second lane's concurrent monitor invocation
-    cleanly no-ops via MONITOR_LOCK_KEY's own lock-held skip."""
+async def _run_scan(settings: Settings, asset_classes: list[AssetClass]) -> int:
+    """`tradepulse scan --asset-class=... [asset-class ...]`: one or more
+    lanes' discovery plus the stop/target position monitor, all CONCURRENTLY
+    (not sequentially) in one process. Each lane is independently
+    lock-protected (see scan_lock_key) and independently attributed (see
+    ScanRun.asset_class), so a slow/crashing lane never blocks or takes down
+    its siblings -- return_exceptions=True on the single gather call below
+    covers every leg, scan or monitor alike (deliberately NOT
+    asyncio.TaskGroup, which cancels every sibling task on one's first
+    exception -- exactly wrong here). A single `--asset-class` value behaves
+    identically to before this generalization -- this is purely a wider
+    fan-out over the same per-lane unit (_run_scan_leg), not a rewrite of
+    it. Monitor is asset-class-agnostic (protects every open position
+    regardless of lane) and stays bundled in exactly as before -- a second
+    lane's concurrent monitor invocation cleanly no-ops via
+    MONITOR_LOCK_KEY's own lock-held skip."""
     _require_credentials(settings, require_ai=True)
 
     database = AsyncSQLiteDatabase(settings.database_url)
@@ -260,16 +279,22 @@ async def _run_scan(settings: Settings, asset_class: AssetClass) -> int:
         alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
         gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
 
-        scan_result, monitor_result = await asyncio.gather(
-            _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings, alerts, asset_class),
-            _run_monitor_leg(database, repositories, broker, gateway, alerts),
+        scan_legs = [
+            _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings, alerts, asset_class)
+            for asset_class in asset_classes
+        ]
+        *scan_results, monitor_result = await asyncio.gather(
+            *scan_legs,
+            _run_monitor_leg(database, repositories, broker, gateway, alerts, settings),
             return_exceptions=True,
         )
     finally:
         await broker.aclose()
         await ai_provider.aclose()
 
-    scan_failed = _log_scan_result(scan_result, asset_class)
+    scan_failed = any(
+        _log_scan_result(result, asset_class) for result, asset_class in zip(scan_results, asset_classes, strict=True)
+    )
     monitor_failed = _log_monitor_result(monitor_result)
     return 1 if (scan_failed or monitor_failed) else 0
 
@@ -287,7 +312,7 @@ async def _run_monitor(settings: Settings) -> int:
         market_data = AlpacaMarketDataProvider(broker)
         alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
         gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
-        result = await _run_monitor_leg(database, repositories, broker, gateway, alerts)
+        result = await _run_monitor_leg(database, repositories, broker, gateway, alerts, settings)
     finally:
         await broker.aclose()
 
@@ -616,10 +641,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tradepulse", description="TradePulse AI trading runtime")
     subparsers = parser.add_subparsers(dest="command", required=True)
     scan_parser = subparsers.add_parser(
-        "scan", help="run one AI-driven scan cycle for a single asset-class lane, plus the position monitor, then exit"
+        "scan", help="run one AI-driven scan cycle for one or more asset-class lanes (concurrently), plus the position monitor, then exit"
     )
     scan_parser.add_argument(
-        "--asset-class", required=True, choices=["equity", "crypto"], help="which lane to scan this invocation"
+        "--asset-class", required=True, nargs="+", choices=["equity", "crypto", "option"],
+        help="which lane(s) to scan this invocation -- one value runs a single lane (e.g. a lane-specific cron cadence); "
+        "multiple values fan out concurrently from this one process",
     )
     subparsers.add_parser("monitor", help="run one stop/target position-protection pass and exit")
     subparsers.add_parser("settle", help="drain any due settlement retries and exit")
@@ -673,7 +700,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "reset-integrity":
             return asyncio.run(_run_reset_integrity(settings, force=args.force))
         if args.command == "scan":
-            return asyncio.run(_run_scan(settings, AssetClass(args.asset_class)))
+            return asyncio.run(_run_scan(settings, [AssetClass(v) for v in args.asset_class]))
         return asyncio.run(_COMMANDS[args.command](settings))
     except SettingsError as exc:
         print(f"tradepulse: {exc}", file=sys.stderr)

@@ -42,6 +42,29 @@ def asset_identity_key(asset: AssetIdentity) -> str:
     return f"{asset.asset_class.value}:{venue}:{asset.native_asset_id}"
 
 
+def is_continuous_market(asset_class: AssetClass) -> bool:
+    """True only for asset classes that trade 24/7 with no session close
+    (crypto today). Drives BOTH risk/session.py::execution_session_decision's
+    MARKET_CLOSED exemption AND execution/gateway.py::execute_intent's
+    fresh pre-submission clock-check requirement -- one shared property
+    instead of two independently-maintained asset-class lists that could
+    drift apart as a third/fourth asset class is added later."""
+    return asset_class == AssetClass.CRYPTO
+
+
+def contract_multiplier_of(asset: AssetIdentity) -> Decimal:
+    """The sole authority for converting a raw quantity*price into real
+    dollar notional -- an options contract represents `multiplier` units of
+    the underlying (typically 100), so every notional/exposure/P&L
+    computation anywhere in this system (risk engine, settlement lot
+    consumption, anywhere else money is derived from quantity*price) MUST
+    call this rather than reading asset.metadata["contract_multiplier"]
+    directly -- a second, independent read site is how defaults/conversions
+    quietly drift apart. Defaults to 1 for every asset class that doesn't
+    set it (equity, crypto today)."""
+    return Decimal(str(asset.metadata.get("contract_multiplier", "1")))
+
+
 def asset_key_from_broker_symbol(asset_class: AssetClass, symbol: str) -> str:
     """Alpaca is this system's only broker today -- every AssetIdentity built
     from a broker-native fact alone (no local record yet) uses

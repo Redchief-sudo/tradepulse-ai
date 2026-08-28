@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Literal
 from uuid import uuid4
 
@@ -33,7 +33,7 @@ from tradepulse.execution import (
     release_symbol_reservation,
     reserve_symbol_for_execution,
 )
-from tradepulse.models import Holding, Side, asset_key_from_broker_symbol
+from tradepulse.models import AssetClass, Holding, RiskLimits, Side, asset_key_from_broker_symbol
 from tradepulse.persistence import PersistenceRepositories, hydrate, run_with_lock_renewal
 
 MonitorStatus = Literal["ok", "degraded"]
@@ -58,11 +58,33 @@ def _breached(position: AlpacaPosition, holding: Holding) -> bool:
     )
 
 
+def _near_expiry(holding: Holding, today: date, min_days_to_expiry: int) -> bool:
+    """An independent exit trigger alongside _breached, specific to
+    options: letting a long option ride to expiration risks total loss
+    (or assignment, for a short leg -- moot here, this system never holds
+    one) in a way no other asset class this system trades is exposed to.
+    Only local state (holding.asset.metadata) knows the expiry -- Alpaca's
+    position response doesn't conveniently carry it -- matching this
+    module's existing division of responsibility (stop_loss/target_price
+    are likewise only ever known locally, never from the broker)."""
+    if holding.asset.asset_class != AssetClass.OPTION:
+        return False
+    expiry_raw = holding.asset.metadata.get("expiry")
+    if not expiry_raw:
+        return False  # an OPTION holding with no recorded expiry is itself an anomaly, not something to force-close on
+    try:
+        expiry = date.fromisoformat(str(expiry_raw))
+    except ValueError:
+        return False
+    return (expiry - today).days <= min_days_to_expiry
+
+
 async def run_position_monitor(
     repositories: PersistenceRepositories,
     broker: AlpacaClient,
     gateway: ExecutionGateway,
     alerts: TelegramAlerter,
+    risk_limits: RiskLimits,
     *,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     lease_lost: asyncio.Event | None = None,
@@ -83,9 +105,10 @@ async def run_position_monitor(
         if holding_row is None:
             continue  # nothing on file (e.g. opened outside this system) -- no threshold to check
         holding = hydrate("holdings", holding_row["payload"])
-        if holding.stop_loss is None and holding.target_price is None:
+        expiring = _near_expiry(holding, clock().date(), risk_limits.options_forced_close_days_before_expiry)
+        if holding.stop_loss is None and holding.target_price is None and not expiring:
             continue
-        if not _breached(position, holding):
+        if not _breached(position, holding) and not expiring:
             continue
 
         database = repositories.trade_intents.database

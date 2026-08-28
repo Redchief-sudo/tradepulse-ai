@@ -59,6 +59,7 @@ class Settings:
     risk_profile: str
     equity_universe_path: str | None
     crypto_universe_path: str | None
+    options_universe_path: str | None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -107,4 +108,5 @@ class Settings:
             risk_profile=risk_profile,
             equity_universe_path=values.get("TRADEPULSE_EQUITY_UNIVERSE_PATH") or None,
             crypto_universe_path=values.get("TRADEPULSE_CRYPTO_UNIVERSE_PATH") or None,
+            options_universe_path=values.get("TRADEPULSE_OPTIONS_UNIVERSE_PATH") or None,
         )

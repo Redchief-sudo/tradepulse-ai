@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal
 
-from tradepulse.models import PositionLot, SettlementEvent, Side
+from tradepulse.models import PositionLot, SettlementEvent, Side, contract_multiplier_of
 
 
 class IntegrityViolationError(RuntimeError):
@@ -38,6 +38,13 @@ class SignedLotPlan:
 def plan_signed_lot_fill(lots: list[PositionLot], event: SettlementEvent) -> SignedLotPlan:
     opening_direction: Literal["long", "short"] = "long" if event.side == Side.BUY else "short"
     closing_direction: Literal["long", "short"] = "short" if opening_direction == "long" else "long"
+    # Every lot here is the SAME instrument as the fill event (this function
+    # is called per-asset), so one multiplier applies throughout -- 1 for
+    # equity/crypto, ~100 for a standard options contract. Without this, a
+    # closed option position's realized P&L would be understated by exactly
+    # that factor (see models/market.py::contract_multiplier_of, the sole
+    # authority -- never read asset.metadata directly here).
+    multiplier = contract_multiplier_of(event.asset)
 
     # Replay protection: if this event's fill_id already closed against some
     # lots (a resumed/retried settlement run), don't double-close them --
@@ -50,9 +57,9 @@ def plan_signed_lot_fill(lots: list[PositionLot], event: SettlementEvent) -> Sig
             continue
         already_closed += qty
         if lot.position_side == "long":
-            realized_pnl += (event.price - lot.acquisition_price) * qty
+            realized_pnl += (event.price - lot.acquisition_price) * qty * multiplier
         else:
-            realized_pnl += (lot.acquisition_price - event.price) * qty
+            realized_pnl += (lot.acquisition_price - event.price) * qty * multiplier
 
     already_opened = sum(
         (lot.opened_quantity for lot in lots if lot.originating_fill_id == event.fill_id and lot.position_side == opening_direction),
@@ -79,9 +86,9 @@ def plan_signed_lot_fill(lots: list[PositionLot], event: SettlementEvent) -> Sig
         if quantity <= 0:
             continue
         pnl = (
-            (event.price - lot.acquisition_price) * quantity
+            (event.price - lot.acquisition_price) * quantity * multiplier
             if closing_direction == "long"
-            else (lot.acquisition_price - event.price) * quantity
+            else (lot.acquisition_price - event.price) * quantity * multiplier
         )
         closures.append(LotClosure(lot=lot, quantity=quantity, pnl=pnl))
         realized_pnl += pnl

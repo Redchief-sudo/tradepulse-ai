@@ -23,12 +23,14 @@ No command runs its own scheduling loop -- each does its work once and exits. Po
 ```bash
 .venv/bin/tradepulse scan --asset-class=equity  # AI-driven equity/ETF discovery + position monitor, run CONCURRENTLY
 .venv/bin/tradepulse scan --asset-class=crypto  # same, for the crypto lane -- independent schedule, independent lock
+.venv/bin/tradepulse scan --asset-class=option  # same, for the options lane (long calls only -- see below)
+.venv/bin/tradepulse scan --asset-class equity crypto option  # or fan all three lanes out from ONE invocation, concurrently
 .venv/bin/tradepulse monitor    # position monitor alone, for a tighter cadence than scan's
 .venv/bin/tradepulse settle     # drains any due settlement retries independently of new trades
 .venv/bin/tradepulse reconcile  # after-the-fact audit against Alpaca's real positions/fills
 ```
 
-`scan` requires `ALPACA_API_KEY`, `ALPACA_API_SECRET`, and whichever AI provider's key is currently selected; `monitor`/`settle`/`reconcile` need only the Alpaca credentials (see `.env.example`). The equity and crypto lanes are discovery-only lanes -- separate AI prompts and cron cadences, but one shared risk engine, execution gateway, and settlement/reconciliation pipeline underneath both.
+`scan` requires `ALPACA_API_KEY`, `ALPACA_API_SECRET`, and whichever AI provider's key is currently selected; `monitor`/`settle`/`reconcile` need only the Alpaca credentials (see `.env.example`). Equity, crypto, and options are discovery-only lanes -- separate AI prompts and cron cadences (or run together from one `scan` invocation, see above), but one shared risk engine, execution gateway, and settlement/reconciliation pipeline underneath all three. The AI never picks a specific option contract either: it gives a directional view on an underlying, and a deterministic (non-AI) rule resolves the actual strike/expiry -- see `strategy/options_selection.py`. Options support is intentionally minimal for now: long calls only (no puts, no spreads, no short options), a flat pct-of-premium stop instead of Greeks, and a forced close within a configurable number of days before expiry.
 
 AI discovery backend is configurable via `TRADEPULSE_AI_PROVIDER` (`anthropic`, the default, or `openai`) -- set it plus the matching `ANTHROPIC_API_KEY`/`ANTHROPIC_MODEL` or `OPENAI_API_KEY`/`OPENAI_MODEL`. Both backends are validated against the identical fail-closed candidate schema (`tradepulse/providers/ai_provider.py`); the AI never controls price, quantity, stop-loss, or target regardless of which one is selected.
 
@@ -37,6 +39,7 @@ Example crontab:
 ```
 */15 9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse scan --asset-class=equity  >> /var/log/tradepulse.log 2>&1
 */10 *    * * *    cd /path/to/repo && .venv/bin/tradepulse scan --asset-class=crypto  >> /var/log/tradepulse.log 2>&1
+*/20 9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse scan --asset-class=option   >> /var/log/tradepulse.log 2>&1
 */2  9-16 * * 1-5  cd /path/to/repo && .venv/bin/tradepulse monitor   >> /var/log/tradepulse.log 2>&1
 *    *    * * *    cd /path/to/repo && .venv/bin/tradepulse settle    >> /var/log/tradepulse.log 2>&1
 0    */6  * * *    cd /path/to/repo && .venv/bin/tradepulse reconcile >> /var/log/tradepulse.log 2>&1

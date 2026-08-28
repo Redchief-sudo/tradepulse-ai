@@ -148,6 +148,49 @@ async def test_all_three_agree_records_matched_only(tmp_path) -> None:
     assert outcomes == [ReconciliationOutcome.MATCHED]
 
 
+def _aapl_call() -> AssetIdentity:
+    return AssetIdentity(
+        "AAPL251219C00150000", AssetClass.OPTION, "alpaca:AAPL251219C00150000",
+        metadata={"underlying_symbol": "AAPL", "contract_multiplier": "100"},
+    )
+
+
+@respx.mock
+async def test_options_position_reconciles_cleanly_when_all_three_agree(tmp_path) -> None:
+    """Confirms reconciliation's broker-position -> AssetIdentity
+    construction (asset_key_from_broker_symbol/AssetIdentity built from
+    position.asset_class/symbol) is genuinely asset-class-agnostic -- an
+    options position needs zero special-casing here since the fix already
+    lives entirely in get_positions' asset_class inference (now correctly
+    returning AssetClass.OPTION for a "us_option" row)."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    lot = PositionLot(
+        lot_id="lot-opt-1", originating_fill_id="fill-opt-1", asset=_aapl_call(), position_side="long",
+        opened_quantity=Decimal("1"), remaining_quantity=Decimal("1"), acquisition_price=Decimal("2.00"),
+        opened_at=NOW,
+    )
+    await repositories.position_lots.create_once("lot-opt-1", lot, unique_value="fill-opt-1")
+    holding = Holding(asset=_aapl_call(), quantity=Decimal("1"), average_price=Decimal("2.00"), updated_at=NOW)
+    await repositories.holdings.create_once(asset_identity_key(_aapl_call()), holding)
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[{
+        "symbol": "AAPL251219C00150000", "asset_class": "us_option", "qty": "1", "avg_entry_price": "2.00",
+        "market_value": "0", "current_price": "2.50", "unrealized_pl": "0",
+    }]))
+    _mock_activities([])
+
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.status == "ok"
+    assert summary.positions_checked == 1
+    assert summary.accounting_drift_detected == 0
+
+    records = await repositories.reconciliation_records.list_all()
+    outcomes = [hydrate("reconciliation_records", r["payload"]).outcome for r in records]
+    assert outcomes == [ReconciliationOutcome.MATCHED]
+
+
 @respx.mock
 async def test_stale_holding_view_is_rebuilt_when_lots_agree_with_broker(tmp_path) -> None:
     repositories = await _repositories(tmp_path)

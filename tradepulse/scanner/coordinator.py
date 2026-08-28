@@ -54,6 +54,7 @@ from tradepulse.models import (
     SessionState,
     Side,
     StrategyWeights,
+    contract_multiplier_of,
 )
 from tradepulse.persistence import PersistenceRepositories, hydrate, run_with_lock_renewal
 from tradepulse.providers import (
@@ -71,6 +72,7 @@ from tradepulse.strategy import (
     atr,
     compute_real_factors,
     is_executable,
+    select_contract,
     signal_from_composite,
     weighted_composite,
 )
@@ -103,7 +105,7 @@ def _round_quantity(qty: Decimal, asset_class: AssetClass) -> Decimal:
     and can only shrink further, so a mismatch here can't create risk, but
     keeping it aligned avoids proposing quantities the risk engine would
     immediately re-floor for cosmetic reasons."""
-    precision = Decimal("100000000") if asset_class == AssetClass.CRYPTO else Decimal("1000")
+    precision = Decimal("100000000") if asset_class == AssetClass.CRYPTO else Decimal("1") if asset_class == AssetClass.OPTION else Decimal("1000")
     floored = (max(qty, Decimal("0")) * precision).to_integral_value(rounding=ROUND_FLOOR)
     return floored / precision
 
@@ -166,6 +168,18 @@ def _build_scan_prompt(symbols: list[str], asset_class: AssetClass) -> str:
             "STRONG_SELL), a confidence score from 0-100, and a one-sentence summary of your "
             "reasoning. Only report pairs from this exact list. It is fine to report zero "
             "candidates if nothing stands out.\n\nPairs: " + ", ".join(symbols)
+        )
+    if asset_class == AssetClass.OPTION:
+        return (
+            "You are an options market-scanning analyst for an automated trading system. "
+            "You are evaluating the UNDERLYING stocks/ETFs below for a bullish directional view "
+            "only -- you never choose a specific option contract, strike, or expiration; a "
+            "separate deterministic process selects the actual contract once you identify a "
+            "promising underlying. Review the following underlying symbols and report any worth "
+            "a bullish view right now. For each symbol you report, give a recommendation "
+            "(STRONG_BUY, BUY, HOLD, SELL, or STRONG_SELL), a confidence score from 0-100, and a "
+            "one-sentence summary of your reasoning. Only report symbols from this exact list. It "
+            "is fine to report zero candidates if nothing stands out.\n\nUnderlying symbols: " + ", ".join(symbols)
         )
     return (
         "You are an equity/ETF market-scanning analyst for an automated trading system. "
@@ -251,7 +265,12 @@ async def run_scan_cycle(
         await _finish(ScanRunStatus.FAILED, error="SESSION_BLOCKED")
         return ScanCycleSummary(scan_run_id, ScanRunStatus.FAILED, 0, 0, 0, [], error="SESSION_BLOCKED")
 
-    lane_symbols = sorted(universe.crypto if asset_class == AssetClass.CRYPTO else universe.equities)
+    if asset_class == AssetClass.CRYPTO:
+        lane_symbols = sorted(universe.crypto)
+    elif asset_class == AssetClass.OPTION:
+        lane_symbols = sorted(universe.options_underlyings)
+    else:
+        lane_symbols = sorted(universe.equities)
     request = build_scan_request(str(uuid4()), scan_run_id, _build_scan_prompt(lane_symbols, asset_class))
     try:
         ai_response, candidates = await ai_provider.scan_candidates(request)
@@ -292,17 +311,34 @@ async def run_scan_cycle(
         if candidate.confidence < risk_limits.min_confidence:
             _reject(candidate.symbol, "CONFIDENCE_BELOW_MIN", confidence=candidate.confidence, min_confidence=str(risk_limits.min_confidence))
             continue
+        # For the OPTIONS lane, `asset` is only ever the UNDERLYING's plain
+        # equity identity -- the AI proposes a directional view on the
+        # underlying, never a specific contract (see _build_scan_prompt's
+        # options branch). The universe/lane checks below run against this
+        # underlying; the resolved CONTRACT (built further down, after the
+        # deterministic gate passes) is never re-checked against the
+        # universe since it's produced by our own deterministic code from
+        # the already-validated underlying's real chain data, not untrusted
+        # AI output -- the underlying is the only untrusted-input boundary.
         asset = _asset_from_candidate(candidate)
-        if not is_executable(asset, universe):
-            _reject(candidate.symbol, "OUTSIDE_EXECUTABLE_UNIVERSE")
-            continue
-        if asset.asset_class != asset_class:
-            # Defense in depth -- the prompt only ever offers this lane's
-            # symbols, but AI output is an untrusted hint (same principle as
-            # OUTSIDE_EXECUTABLE_UNIVERSE above), so nothing actually forces
-            # it to honor that.
-            _reject(candidate.symbol, "OUTSIDE_SCAN_LANE")
-            continue
+        if asset_class == AssetClass.OPTION:
+            if asset.asset_class != AssetClass.EQUITY:
+                _reject(candidate.symbol, "OUTSIDE_SCAN_LANE")
+                continue
+            if asset.symbol not in universe.options_underlyings:
+                _reject(candidate.symbol, "OUTSIDE_EXECUTABLE_UNIVERSE")
+                continue
+        else:
+            if not is_executable(asset, universe):
+                _reject(candidate.symbol, "OUTSIDE_EXECUTABLE_UNIVERSE")
+                continue
+            if asset.asset_class != asset_class:
+                # Defense in depth -- the prompt only ever offers this
+                # lane's symbols, but AI output is an untrusted hint (same
+                # principle as OUTSIDE_EXECUTABLE_UNIVERSE above), so
+                # nothing actually forces it to honor that.
+                _reject(candidate.symbol, "OUTSIDE_SCAN_LANE")
+                continue
 
         try:
             quote = await market_data.fetch_quote(asset)
@@ -326,39 +362,91 @@ async def run_scan_cycle(
                 candidate.symbol, "DETERMINISTIC_SIGNAL_DISAGREED", ai_recommendation=candidate.recommendation,
                 deterministic_signal=deterministic_signal, composite_score=str(composite),
             )
-            continue  # AI proposed it, but the deterministic technical/momentum/risk read disagrees
+            continue  # AI proposed it, but the deterministic technical/momentum/risk read disagrees, on the UNDERLYING's own technicals
+
+        # trade_asset/trade_quote are what actually gets sized, stopped, and
+        # executed -- equal to the underlying's own asset/quote for every
+        # lane except OPTIONS, where a deterministic (never AI-chosen)
+        # contract-selection step turns the underlying's bullish signal into
+        # a specific, tradeable OCC contract.
+        if asset_class == AssetClass.OPTION:
+            try:
+                chain = await market_data.fetch_option_chain(
+                    asset.symbol, risk_limits.options_expiry_min_days, risk_limits.options_expiry_max_days, now.date(),
+                )
+            except ProviderError as exc:
+                _reject(candidate.symbol, "OPTION_CHAIN_FETCH_FAILED", error=str(exc))
+                continue
+            contract = select_contract(
+                "call", quote.price, chain, min_dte=risk_limits.options_expiry_min_days,
+                max_dte=risk_limits.options_expiry_max_days, target_otm_pct=risk_limits.options_target_otm_pct, now=now.date(),
+            )
+            if contract is None:
+                _reject(candidate.symbol, "NO_ELIGIBLE_OPTION_CONTRACT")
+                continue
+            trade_asset = AssetIdentity(
+                symbol=contract.occ_symbol, asset_class=AssetClass.OPTION, native_asset_id=f"alpaca:{contract.occ_symbol}",
+                metadata={
+                    "underlying_symbol": contract.underlying_symbol, "expiry": contract.expiry.isoformat(),
+                    "strike": str(contract.strike), "option_type": contract.option_type,
+                    "contract_multiplier": str(contract.contract_multiplier),
+                },
+            )
+            try:
+                trade_quote = await market_data.fetch_quote(trade_asset)
+            except ProviderError as exc:
+                _reject(candidate.symbol, "OPTION_QUOTE_FETCH_FAILED", error=str(exc))
+                continue
+        else:
+            trade_asset = asset
+            trade_quote = quote
 
         database = repositories.trade_intents.database
         owner_token = str(uuid4())
-        if not await reserve_symbol_for_execution(database, asset, owner_token):
+        if not await reserve_symbol_for_execution(database, trade_asset, owner_token):
             _reject(candidate.symbol, "SYMBOL_EXECUTION_LOCKED")
             continue  # another coordinator is already processing this asset -- don't race it
         try:
-            if await has_in_flight_intent(repositories, asset):
+            if await has_in_flight_intent(repositories, trade_asset):
                 _reject(candidate.symbol, "SYMBOL_HAS_IN_FLIGHT_INTENT")
                 continue  # don't fight an order already in flight on this symbol (e.g. from the position monitor)
 
-            if notional_budget <= 0 or quote.price <= 0:
-                _reject(candidate.symbol, "NO_NOTIONAL_BUDGET_OR_INVALID_PRICE", notional_budget=str(notional_budget), price=str(quote.price))
+            multiplier = contract_multiplier_of(trade_asset)  # 1 for equity/crypto, ~100 for an options contract
+            if notional_budget <= 0 or trade_quote.price <= 0:
+                _reject(candidate.symbol, "NO_NOTIONAL_BUDGET_OR_INVALID_PRICE", notional_budget=str(notional_budget), price=str(trade_quote.price))
                 continue
-            quantity = _round_quantity(notional_budget / quote.price, asset.asset_class)
+            quantity = _round_quantity(notional_budget / (trade_quote.price * multiplier), trade_asset.asset_class)
             if quantity <= 0:
-                _reject(candidate.symbol, "QUANTITY_ROUNDED_TO_ZERO", notional_budget=str(notional_budget), price=str(quote.price))
+                _reject(candidate.symbol, "QUANTITY_ROUNDED_TO_ZERO", notional_budget=str(notional_budget), price=str(trade_quote.price))
                 continue
 
-            stop_loss = (
-                (
-                    _atr_stop_loss_price(
-                        quote.price, candles, risk_limits.atr_stop_multiplier, asset.asset_class,
-                        risk_limits.min_stop_distance_pct, risk_limits.max_stop_distance_pct,
-                    )
-                    if risk_limits.atr_stop_multiplier > 0 else None
+            if asset_class == AssetClass.OPTION:
+                # A flat pct-of-entry-premium stop, never ATR -- ATR would
+                # need the CONTRACT's own candle history, which this design
+                # deliberately doesn't fetch (too short-lived/decay-driven
+                # to be a meaningful momentum signal; see the deterministic
+                # gate above, which correctly runs on the underlying
+                # instead). Reuses the same helper the equity/crypto
+                # fallback path already uses, just against the option's own
+                # premium.
+                stop_loss = (
+                    _stop_loss_price(trade_quote.price, risk_limits.options_premium_stop_pct, AssetClass.OPTION)
+                    if risk_limits.options_premium_stop_pct > 0 else None
                 )
-                or (_stop_loss_price(quote.price, risk_limits.stop_loss_pct, asset.asset_class) if risk_limits.stop_loss_pct > 0 else None)
-            )
+            else:
+                stop_loss = (
+                    (
+                        _atr_stop_loss_price(
+                            trade_quote.price, candles, risk_limits.atr_stop_multiplier, trade_asset.asset_class,
+                            risk_limits.min_stop_distance_pct, risk_limits.max_stop_distance_pct,
+                        )
+                        if risk_limits.atr_stop_multiplier > 0 else None
+                    )
+                    or (_stop_loss_price(trade_quote.price, risk_limits.stop_loss_pct, trade_asset.asset_class) if risk_limits.stop_loss_pct > 0 else None)
+                )
 
             opportunity = Opportunity(
-                opportunity_id=str(uuid4()), scan_generation=scan_generation, asset=asset, quote=quote,
+                opportunity_id=str(uuid4()), scan_generation=scan_generation, asset=trade_asset, quote=trade_quote,
                 source=ai_response.provider, created_at=clock(), confidence=candidate.confidence,
                 metadata={
                     "ai_recommendation": candidate.recommendation, "ai_summary": candidate.summary,
@@ -373,18 +461,18 @@ async def run_scan_cycle(
 
             approved += 1
             exec_request = ExecutionRequest(
-                asset=asset, side=Side.BUY, requested_quantity=quantity, strategy="ai_scan",
+                asset=trade_asset, side=Side.BUY, requested_quantity=quantity, strategy="ai_scan",
                 decision_id=opportunity.opportunity_id, confidence=Decimal(str(candidate.confidence)),
                 stop_loss=stop_loss, symbol_lock_owner_token=owner_token,
             )
             result = await run_with_lock_renewal(
-                database, execution_lock_key(asset), owner_token, SYMBOL_LOCK_TTL_SECONDS, gateway.execute_intent(exec_request),
+                database, execution_lock_key(trade_asset), owner_token, SYMBOL_LOCK_TTL_SECONDS, gateway.execute_intent(exec_request),
             )
             execution_results.append(result)
             if result.status not in ("rejected", "skipped"):
                 submitted += 1
         finally:
-            await release_symbol_reservation(database, asset, owner_token)
+            await release_symbol_reservation(database, trade_asset, owner_token)
 
     await _finish(
         ScanRunStatus.COMPLETED, candidates_discovered=len(candidates),

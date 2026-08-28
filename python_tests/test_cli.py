@@ -45,7 +45,12 @@ from tradepulse.providers import AnthropicAIProvider, OpenAIProvider
 def test_scan_subcommand_parses() -> None:
     args = _build_parser().parse_args(["scan", "--asset-class=equity"])
     assert args.command == "scan"
-    assert args.asset_class == "equity"
+    assert args.asset_class == ["equity"]  # a single value still parses to a one-element list, not a bare string
+
+
+def test_scan_subcommand_parses_multiple_asset_classes() -> None:
+    args = _build_parser().parse_args(["scan", "--asset-class", "equity", "crypto", "option"])
+    assert args.asset_class == ["equity", "crypto", "option"]
 
 
 def test_scan_subcommand_requires_asset_class() -> None:
@@ -171,10 +176,44 @@ async def test_scan_leg_skipped_when_its_lock_is_held_but_monitor_leg_still_runs
 
     positions_route = respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[]))
 
-    exit_code = await _run_scan(_settings(database_url), AssetClass.EQUITY)
+    exit_code = await _run_scan(_settings(database_url), [AssetClass.EQUITY])
 
     assert exit_code == 0
     assert positions_route.call_count == 1  # monitor leg ran despite scan's lock being held
+
+
+@respx.mock
+async def test_three_lane_concurrent_scan_locks_independently_and_survives_one_crash(tmp_path, monkeypatch) -> None:
+    """The parallel multi-asset supervisor: three lanes fan out from ONE
+    `_run_scan` call, each independently lock-protected (proven by each
+    stub invocation observing its own distinct asset_class), and one lane
+    raising must never cancel its siblings or the monitor leg --
+    return_exceptions=True on the shared gather call, not asyncio.TaskGroup.
+    """
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+
+    observed_lanes: list[AssetClass] = []
+
+    async def _stub_scan_cycle(repositories, ai_provider, market_data, broker, gateway, universe, risk_limits, asset_class, **kwargs):
+        observed_lanes.append(asset_class)
+        if asset_class == AssetClass.CRYPTO:
+            raise RuntimeError("simulated crypto-lane crash")
+        return None  # None -> _log_scan_result treats it as a clean no-op, same as a lock-skip
+
+    monkeypatch.setattr("tradepulse.cli.run_scan_cycle", _stub_scan_cycle)
+    positions_route = respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[]))
+
+    exit_code = await _run_scan(_settings(database_url), [AssetClass.EQUITY, AssetClass.CRYPTO, AssetClass.OPTION])
+
+    assert set(observed_lanes) == {AssetClass.EQUITY, AssetClass.CRYPTO, AssetClass.OPTION}  # all three ran, none skipped by another's lock
+    assert positions_route.call_count == 1  # monitor leg ran despite the crypto lane's crash
+    assert exit_code == 1  # the crashed lane still fails the process's own exit code
+
+    # Every lane's lock was released, not left stuck held by the crash.
+    for asset_class in (AssetClass.EQUITY, AssetClass.CRYPTO, AssetClass.OPTION):
+        assert await acquire_lock(database, scan_lock_key(asset_class), "post-check", "scan", ttl_seconds=60) is True
 
 
 @respx.mock

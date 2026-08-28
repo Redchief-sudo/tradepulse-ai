@@ -780,6 +780,36 @@ async def test_equity_buy_rejected_when_clock_check_fails_with_transport_error(t
     assert order_route.call_count == 0
 
 
+def _aapl_call() -> AssetIdentity:
+    return AssetIdentity(
+        "AAPL251219C00150000", AssetClass.OPTION, "alpaca:AAPL251219C00150000",
+        metadata={"underlying_symbol": "AAPL", "contract_multiplier": "100"},
+    )
+
+
+@respx.mock
+async def test_option_buy_rejected_when_gateways_own_clock_check_says_closed(tmp_path) -> None:
+    """Options trade the regular exchange session just like equities --
+    NOT exempt from the fresh pre-submission clock check the way crypto is."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_positions()
+    respx.get("https://data.alpaca.markets/v1beta1/options/quotes/latest").mock(
+        return_value=httpx.Response(200, json={"quotes": {"AAPL251219C00150000": {"bp": 2.00, "ap": 2.01, "t": QUOTE_TS}}})
+    )
+    _mock_market_open(is_open=False)
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    request = ExecutionRequest(asset=_aapl_call(), side=Side.BUY, requested_quantity=Decimal("1"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "rejected"
+    assert result.reasons == ["OPTION_MARKET_CLOSED"]
+    assert order_route.call_count == 0
+
+
 @respx.mock
 async def test_crypto_buy_exempt_from_market_clock_check(tmp_path) -> None:
     """Crypto trades continuously -- no /v2/clock mock is registered at

@@ -4,6 +4,7 @@ from enum import StrEnum
 class AssetClass(StrEnum):
     EQUITY = "equity"
     CRYPTO = "crypto"
+    OPTION = "option"
     FOREX = "forex"
     COMMODITY = "commodity"
     FIXED_INCOME = "fixed_income"

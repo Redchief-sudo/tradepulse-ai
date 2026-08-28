@@ -87,6 +87,22 @@ class AlpacaOrderResponse:
 
 
 @dataclass(frozen=True, slots=True)
+class AlpacaOptionContract:
+    """Raw row from GET /v2/options/contracts (trading API host, NOT the
+    data API -- contract metadata/eligibility, not price data). Verified
+    live against Alpaca's docs 2026-08-26."""
+
+    occ_symbol: str
+    underlying_symbol: str
+    option_type: str  # "call" | "put"
+    strike_price: Decimal
+    expiration_date: str  # "YYYY-MM-DD"
+    multiplier: Decimal
+    status: str
+    tradable: bool
+
+
+@dataclass(frozen=True, slots=True)
 class AlpacaActivity:
     activity_id: str
     activity_type: str

@@ -18,21 +18,33 @@ from datetime import UTC, datetime
 from decimal import ROUND_FLOOR, Decimal
 from uuid import uuid4
 
-from tradepulse.models import AssetClass, PortfolioSnapshot, RiskLimits, Side, TradeIntentStatus, asset_identity_key
+from tradepulse.models import (
+    AssetClass,
+    PortfolioSnapshot,
+    RiskLimits,
+    Side,
+    TradeIntentStatus,
+    asset_identity_key,
+    contract_multiplier_of,
+)
 from tradepulse.persistence import PersistenceRepositories, hydrate
 
 
 def _round_qty(qty: Decimal, asset_class: AssetClass) -> Decimal:
     """Floor at asset-appropriate precision so a cap never increases the
     requested notional. Equities use thousandths; crypto uses eight decimal
-    places."""
-    precision = Decimal("100000000") if asset_class == AssetClass.CRYPTO else Decimal("1000")
+    places; options trade in whole contracts only."""
+    precision = Decimal("100000000") if asset_class == AssetClass.CRYPTO else Decimal("1") if asset_class == AssetClass.OPTION else Decimal("1000")
     floored = (max(qty, Decimal("0")) * precision).to_integral_value(rounding=ROUND_FLOOR)
     return floored / precision
 
 
 def _minimum_quantity(asset_class: AssetClass) -> Decimal:
-    return Decimal("0.00000001") if asset_class == AssetClass.CRYPTO else Decimal("0.001")
+    if asset_class == AssetClass.CRYPTO:
+        return Decimal("0.00000001")
+    if asset_class == AssetClass.OPTION:
+        return Decimal("1")
+    return Decimal("0.001")
 
 
 def _confidence_multiplier(confidence: Decimal | None, min_confidence: Decimal, floor_multiplier: Decimal) -> Decimal:
@@ -60,6 +72,11 @@ class RiskCheckInput:
     confidence: Decimal | None = None
     stop_loss: Decimal | None = None
     sector: str = "Other"
+    # Dollar notional = quantity * price * contract_multiplier -- 1 for
+    # equity/crypto, ~100 for a standard options contract. Callers derive
+    # this once via models/market.py::contract_multiplier_of(asset), the
+    # sole authority; evaluate_risk never reads asset metadata itself.
+    contract_multiplier: Decimal = Decimal("1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,9 +210,18 @@ def evaluate_risk(
         return RiskDecision(False, Decimal("0"), reasons)
 
     approved_qty = qty
+    # Dollar notional for one unit of this instrument -- 1 unit = 1 share
+    # for equity/crypto (multiplier 1), but 1 options contract represents
+    # `contract_multiplier` (typically 100) units of underlying exposure.
+    # Every notional/exposure computation below multiplies by this, INCLUDING
+    # risk-based sizing's unit_risk (before the division that derives
+    # quantity, not applied only to the notional caps afterward) -- applying
+    # it only downstream could transiently size a position ~100x too large
+    # before any cap catches it.
+    notional_per_unit = price * intent.contract_multiplier
     if total_equity > 0 and price > 0:
-        # Risk-based sizing: shares = risk_budget / risk_per_share, then cap
-        # by max_position_pct, max_sector_pct, total exposure, and cash.
+        # Risk-based sizing: shares = risk_budget / unit_risk, then cap by
+        # max_position_pct, max_sector_pct, total exposure, and cash.
         if intent.stop_loss is not None and intent.stop_loss > 0 and limits.max_risk_per_trade_pct:
             risk_budget = (limits.max_risk_per_trade_pct / 100) * total_equity
             # Confidence scales the ALLOWED RISK BUDGET, not the resulting
@@ -208,32 +234,32 @@ def evaluate_risk(
             if confidence_multiplier < 1:
                 risk_budget *= confidence_multiplier
                 reasons.append(f"RISK_BUDGET_SCALED_BY_CONFIDENCE_TO_{(confidence_multiplier * 100).quantize(Decimal('0.1'))}PCT")
-            risk_per_share = price - intent.stop_loss
-            if risk_per_share > 0:
-                risk_based_qty = _round_qty(risk_budget / risk_per_share, intent.asset_class)
+            unit_risk = abs(price - intent.stop_loss) * intent.contract_multiplier
+            if unit_risk > 0:
+                risk_based_qty = _round_qty(risk_budget / unit_risk, intent.asset_class)
                 if risk_based_qty < approved_qty:
                     approved_qty = risk_based_qty
                     reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_RISK_BASED_SIZING")
 
         max_position_notional = (limits.max_position_pct / 100) * total_equity
-        if approved_qty * price > max_position_notional:
-            approved_qty = _round_qty(max_position_notional / price, intent.asset_class)
+        if approved_qty * notional_per_unit > max_position_notional:
+            approved_qty = _round_qty(max_position_notional / notional_per_unit, intent.asset_class)
             reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_MAX_POSITION_PCT")
 
         current_sector = snapshot.sector_exposure.get(intent.sector, Decimal("0"))
         max_sector_notional = (limits.max_sector_pct / 100) * total_equity
         remaining_sector = max_sector_notional - current_sector
-        if approved_qty * price > remaining_sector:
-            capped_by_sector = _round_qty(remaining_sector / price, intent.asset_class) if price > 0 else Decimal("0")
+        if approved_qty * notional_per_unit > remaining_sector:
+            capped_by_sector = _round_qty(remaining_sector / notional_per_unit, intent.asset_class) if notional_per_unit > 0 else Decimal("0")
             if capped_by_sector < approved_qty:
                 approved_qty = capped_by_sector
                 reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_MAX_SECTOR_PCT")
 
         if limits.max_total_exposure_pct:
             remaining_exposure = ((limits.max_total_exposure_pct / 100) * total_equity) - snapshot.holdings_value
-            if approved_qty * price > remaining_exposure:
+            if approved_qty * notional_per_unit > remaining_exposure:
                 capped_by_exposure = (
-                    _round_qty(remaining_exposure / price, intent.asset_class) if price > 0 else Decimal("0")
+                    _round_qty(remaining_exposure / notional_per_unit, intent.asset_class) if notional_per_unit > 0 else Decimal("0")
                 )
                 if capped_by_exposure < approved_qty:
                     approved_qty = capped_by_exposure
@@ -245,14 +271,14 @@ def evaluate_risk(
         # protective_exit (both return earlier in this function), so this
         # can only ever shrink genuine new/increasing exposure.
         if opts.available_cash is not None:
-            cash_check = check_cash_sufficiency(opts.available_cash, approved_qty * price, opts.estimated_fees)
+            cash_check = check_cash_sufficiency(opts.available_cash, approved_qty * notional_per_unit, opts.estimated_fees)
             if not cash_check.approved:
-                capped_by_cash = _round_qty(cash_check.max_affordable_notional / price, intent.asset_class) if price > 0 else Decimal("0")
+                capped_by_cash = _round_qty(cash_check.max_affordable_notional / notional_per_unit, intent.asset_class) if notional_per_unit > 0 else Decimal("0")
                 if capped_by_cash < approved_qty:
                     approved_qty = capped_by_cash
                     reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_AVAILABLE_CASH")
 
-    if approved_qty < minimum_quantity or (price > 0 and approved_qty * price < limits.min_lot_notional):
+    if approved_qty < minimum_quantity or (notional_per_unit > 0 and approved_qty * notional_per_unit < limits.min_lot_notional):
         reasons.append("INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT")
         return RiskDecision(False, Decimal("0"), reasons)
 
@@ -295,7 +321,7 @@ async def build_portfolio_snapshot(
     sector_exposure: dict[str, Decimal] = {}
     for holding in holdings:
         mark = mark_prices.get(asset_identity_key(holding.asset), holding.average_price)
-        notional = abs(holding.quantity) * mark
+        notional = abs(holding.quantity) * mark * contract_multiplier_of(holding.asset)
         holdings_value += notional
         sector = holding.sector or "Other"
         sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + notional
@@ -326,7 +352,7 @@ async def build_portfolio_snapshot(
         remaining_qty = intent.requested_quantity - (intent.filled_quantity or Decimal("0"))
         if remaining_qty <= 0 or intent.reference_price is None:
             continue
-        pending_notional = remaining_qty * intent.reference_price
+        pending_notional = remaining_qty * intent.reference_price * contract_multiplier_of(intent.asset)
         holdings_value += pending_notional
         sector = intent.sector or "Other"
         sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + pending_notional

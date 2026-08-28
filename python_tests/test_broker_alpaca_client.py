@@ -1,11 +1,12 @@
 import os
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import httpx
 import pytest
 import respx
 
-from tradepulse.broker import AlpacaClient, AlpacaError, is_definitive_rejection
+from tradepulse.broker import AlpacaClient, AlpacaError, default_time_in_force, is_definitive_rejection
 from tradepulse.models import AssetClass
 
 
@@ -93,6 +94,109 @@ async def test_get_positions_normalizes_crypto_symbols() -> None:
     assert by_symbol["BTC/USD"].asset_class == AssetClass.CRYPTO
     assert "AAPL" in by_symbol
     assert by_symbol["AAPL"].asset_class == AssetClass.EQUITY
+
+
+@respx.mock
+async def test_get_positions_infers_options_asset_class_from_us_option() -> None:
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "symbol": "AAPL251219C00150000", "asset_class": "us_option", "qty": "1", "avg_entry_price": "2.00",
+                    "market_value": "250", "current_price": "2.50", "unrealized_pl": "50",
+                },
+            ],
+        )
+    )
+    client = AlpacaClient("key", "secret", "paper", 10)
+    try:
+        positions = await client.get_positions()
+    finally:
+        await client.aclose()
+    assert positions[0].symbol == "AAPL251219C00150000"
+    assert positions[0].asset_class == AssetClass.OPTION
+
+
+@respx.mock
+async def test_get_latest_quote_parses_options_envelope() -> None:
+    respx.get("https://data.alpaca.markets/v1beta1/options/quotes/latest").mock(
+        return_value=httpx.Response(
+            200, json={"quotes": {"AAPL251219C00150000": {"bp": 2.0, "ap": 2.1, "t": "2026-08-26T15:00:00Z"}}}
+        )
+    )
+    client = AlpacaClient("key", "secret", "paper", 10)
+    try:
+        quote = await client.get_latest_quote("AAPL251219C00150000", AssetClass.OPTION)
+    finally:
+        await client.aclose()
+    assert quote.bid == Decimal("2.0")
+    assert quote.ask == Decimal("2.1")
+    assert quote.source == "alpaca_options"
+
+
+@respx.mock
+async def test_get_options_chain_parses_contracts_and_skips_non_tradable() -> None:
+    respx.get("https://paper-api.alpaca.markets/v2/options/contracts").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "option_contracts": [
+                    {
+                        "symbol": "aapl251219c00150000", "underlying_symbol": "aapl", "type": "call",
+                        "strike_price": "150.00", "expiration_date": "2025-12-19", "multiplier": "100",
+                        "status": "active", "tradable": True,
+                    },
+                    {
+                        "symbol": "AAPL251219C00160000", "underlying_symbol": "AAPL", "type": "call",
+                        "strike_price": "160.00", "expiration_date": "2025-12-19", "multiplier": "100",
+                        "status": "active", "tradable": False,
+                    },
+                ],
+                "next_page_token": None,
+            },
+        )
+    )
+    client = AlpacaClient("key", "secret", "paper", 10)
+    try:
+        contracts = await client.get_options_chain("AAPL", "2025-12-01", "2025-12-31")
+    finally:
+        await client.aclose()
+    assert len(contracts) == 1  # the non-tradable contract is skipped
+    assert contracts[0].occ_symbol == "AAPL251219C00150000"  # uppercased
+    assert contracts[0].underlying_symbol == "AAPL"
+    assert contracts[0].strike_price == Decimal("150.00")
+    assert contracts[0].multiplier == Decimal("100")
+
+
+@respx.mock
+async def test_get_options_chain_follows_pagination() -> None:
+    page1 = httpx.Response(200, json={
+        "option_contracts": [
+            {"symbol": "AAPL251219C00150000", "underlying_symbol": "AAPL", "type": "call", "strike_price": "150",
+             "expiration_date": "2025-12-19", "multiplier": "100", "status": "active", "tradable": True},
+        ],
+        "next_page_token": "page-2",
+    })
+    page2 = httpx.Response(200, json={
+        "option_contracts": [
+            {"symbol": "AAPL251219C00155000", "underlying_symbol": "AAPL", "type": "call", "strike_price": "155",
+             "expiration_date": "2025-12-19", "multiplier": "100", "status": "active", "tradable": True},
+        ],
+        "next_page_token": None,
+    })
+    route = respx.get("https://paper-api.alpaca.markets/v2/options/contracts").mock(side_effect=[page1, page2])
+    client = AlpacaClient("key", "secret", "paper", 10)
+    try:
+        contracts = await client.get_options_chain("AAPL", "2025-12-01", "2025-12-31")
+    finally:
+        await client.aclose()
+    assert route.call_count == 2
+    assert {c.occ_symbol for c in contracts} == {"AAPL251219C00150000", "AAPL251219C00155000"}
+
+
+def test_default_time_in_force_is_day_for_options() -> None:
+    assert default_time_in_force(AssetClass.OPTION) == "day"
 
 
 @respx.mock

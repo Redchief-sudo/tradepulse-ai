@@ -28,7 +28,7 @@ from uuid import uuid4
 import httpx
 
 from tradepulse.broker import AlpacaClient, AlpacaError
-from tradepulse.models import AssetClass, AuditEvent, SessionState, Side, TradingSession
+from tradepulse.models import AssetClass, AuditEvent, SessionState, Side, TradingSession, is_continuous_market
 from tradepulse.persistence import PersistenceRepositories, hydrate
 from tradepulse.persistence.codec import decode_payload, encode_payload
 from tradepulse.persistence.repositories import utc_now
@@ -130,7 +130,7 @@ def execution_session_decision(
     if session.state == SessionState.RISK_STOPPED or session.kill_switch_reset_required:
         return SessionDecision(False, "KILL_SWITCH_ACTIVE")
 
-    if session.trading_active and session.state == SessionState.MARKET_CLOSED and asset_class == AssetClass.CRYPTO:
+    if session.trading_active and session.state == SessionState.MARKET_CLOSED and is_continuous_market(asset_class):
         return SessionDecision(True, "CONTINUOUS_ASSET_SESSION")
 
     if session.state != SessionState.ACTIVE or not session.trading_active:

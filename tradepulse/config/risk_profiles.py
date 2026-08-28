@@ -21,6 +21,8 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         spread_limit_pct=Decimal("2"), slippage_limit_pct=Decimal("1.5"),
         max_risk_per_trade_pct=Decimal("0.50"), max_total_exposure_pct=Decimal("60"),
         max_simultaneous_orders=5, min_position_size_multiplier=Decimal("0.65"),
+        options_premium_stop_pct=Decimal("45"), options_expiry_min_days=14, options_expiry_max_days=30,
+        options_target_otm_pct=Decimal("5"), options_forced_close_days_before_expiry=2,
     ),
     "balanced": RiskLimits(
         profile_id="balanced",
@@ -30,6 +32,8 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         spread_limit_pct=Decimal("1.5"), slippage_limit_pct=Decimal("1"),
         max_risk_per_trade_pct=Decimal("0.30"), max_total_exposure_pct=Decimal("40"),
         max_simultaneous_orders=2, min_position_size_multiplier=Decimal("0.5"),
+        options_premium_stop_pct=Decimal("35"), options_expiry_min_days=21, options_expiry_max_days=45,
+        options_target_otm_pct=Decimal("3"), options_forced_close_days_before_expiry=2,
     ),
     "conservative": RiskLimits(
         profile_id="conservative",
@@ -39,6 +43,8 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         spread_limit_pct=Decimal("1"), slippage_limit_pct=Decimal("0.5"),
         max_risk_per_trade_pct=Decimal("0.25"), max_total_exposure_pct=Decimal("30"),
         max_simultaneous_orders=2, min_position_size_multiplier=Decimal("0.35"),
+        options_premium_stop_pct=Decimal("25"), options_expiry_min_days=30, options_expiry_max_days=60,
+        options_target_otm_pct=Decimal("1.5"), options_forced_close_days_before_expiry=3,
     ),
     "micro": RiskLimits(
         profile_id="micro",
@@ -48,6 +54,8 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         spread_limit_pct=Decimal("2"), slippage_limit_pct=Decimal("1"),
         max_risk_per_trade_pct=Decimal("1.0"), max_total_exposure_pct=Decimal("70"),
         max_simultaneous_orders=2, min_position_size_multiplier=Decimal("0.5"),
+        options_premium_stop_pct=Decimal("40"), options_expiry_min_days=14, options_expiry_max_days=35,
+        options_target_otm_pct=Decimal("4"), options_forced_close_days_before_expiry=2,
     ),
 }
 

@@ -45,6 +45,8 @@ from tradepulse.models import (
     TradeIntentStatus,
     asset_identity_key,
     asset_key_from_broker_symbol,
+    contract_multiplier_of,
+    is_continuous_market,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate, release_lock, renew_lock
 from tradepulse.providers import AlpacaMarketDataProvider, ProviderError
@@ -300,6 +302,7 @@ class ExecutionGateway:
                 symbol=request.asset.symbol, asset_class=request.asset.asset_class, side=request.side,
                 requested_quantity=request.requested_quantity, price=quote.price,
                 confidence=request.confidence, stop_loss=request.stop_loss, sector=request.sector or "Other",
+                contract_multiplier=contract_multiplier_of(request.asset),
             )
             risk_opts = RiskEvalOptions(
                 protective_exit=protective_exit, bid=quote.bid, ask=quote.ask,
@@ -338,12 +341,15 @@ class ExecutionGateway:
 
         # Independent of the session's own MARKET_CLOSED/ACTIVE label (which
         # a scan cycle only resyncs periodically, see
-        # risk/session.py::sync_market_session) -- new equity exposure gets
-        # one more, always-fresh check right at the irreversible submission
-        # boundary. Crypto is exempt (continuous market); any protective
-        # exit is exempt regardless of asset class, matching the session
-        # gate's own exemption -- a stop-loss must still be able to fire.
-        if request.asset.asset_class == AssetClass.EQUITY and not protective_exit:
+        # risk/session.py::sync_market_session) -- new exposure in any
+        # non-continuous-market asset class (equity, options -- both trade
+        # only during the regular exchange session) gets one more,
+        # always-fresh check right at the irreversible submission boundary.
+        # Crypto is exempt (continuous market, see is_continuous_market);
+        # any protective exit is exempt regardless of asset class, matching
+        # the session gate's own exemption -- a stop-loss must still be able
+        # to fire.
+        if not is_continuous_market(request.asset.asset_class) and not protective_exit:
             try:
                 market_clock = await self._broker.get_clock()
             except (AlpacaError, httpx.HTTPError) as exc:
@@ -351,9 +357,13 @@ class ExecutionGateway:
                 await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
                 return ExecutionResult("rejected", trade_intent_id, [rejected.rejection_reason], Decimal("0"), None)
             if not market_clock.is_open:
-                rejected = replace(approved, status=TradeIntentStatus.REJECTED, rejection_reason="EQUITY_MARKET_CLOSED")
+                # Preserves the existing "EQUITY_MARKET_CLOSED" label exactly
+                # for equity (established, tested string) while giving
+                # options its own distinct, non-misleading reason.
+                reason = "EQUITY_MARKET_CLOSED" if request.asset.asset_class == AssetClass.EQUITY else "OPTION_MARKET_CLOSED"
+                rejected = replace(approved, status=TradeIntentStatus.REJECTED, rejection_reason=reason)
                 await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
-                return ExecutionResult("rejected", trade_intent_id, ["EQUITY_MARKET_CLOSED"], Decimal("0"), None)
+                return ExecutionResult("rejected", trade_intent_id, [reason], Decimal("0"), None)
 
         # Final ownership fence, right before the irreversible sequence
         # begins: if the caller holds a per-asset execution reservation

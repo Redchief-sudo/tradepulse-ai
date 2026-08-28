@@ -6,10 +6,11 @@ ProviderError; none returns fabricated, zero-filled, or interpolated data.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from tradepulse.broker import AlpacaClient, AlpacaError
 from tradepulse.models import AssetIdentity, Candle, MarketQuote
+from tradepulse.strategy.options_selection import OptionContractSummary
 
 from .errors import ProviderDataFailure, ProviderHttpFailure
 
@@ -70,3 +71,36 @@ class AlpacaMarketDataProvider:
             Candle(date=bar.date, open=bar.open, high=bar.high, low=bar.low, close=bar.close, volume=bar.volume)
             for bar in raw_bars
         ]
+
+    async def fetch_option_chain(
+        self, underlying_symbol: str, min_dte: int, max_dte: int, now: date
+    ) -> list[OptionContractSummary]:
+        """Translates the raw broker chain response into the domain shape
+        strategy/options_selection.py::select_contract operates over.
+        expiration_gte/lte are computed here from the DTE window so the
+        broker only ever returns contracts that could possibly be
+        eligible -- select_contract still re-applies the exact window
+        itself (this is a server-side prefilter, not a substitute)."""
+        gte = date.fromordinal(now.toordinal() + min_dte).isoformat()
+        lte = date.fromordinal(now.toordinal() + max_dte).isoformat()
+        try:
+            raw_contracts = await self._client.get_options_chain(underlying_symbol, gte, lte)
+        except AlpacaError as exc:
+            raise ProviderHttpFailure("alpaca", underlying_symbol, "fetch_option_chain", exc.status_code, exc.message) from exc
+
+        summaries: list[OptionContractSummary] = []
+        for contract in raw_contracts:
+            if contract.option_type not in ("call", "put"):
+                continue
+            try:
+                expiry = date.fromisoformat(contract.expiration_date)
+            except ValueError:
+                continue
+            summaries.append(
+                OptionContractSummary(
+                    occ_symbol=contract.occ_symbol, underlying_symbol=contract.underlying_symbol,
+                    option_type=contract.option_type, strike=contract.strike_price, expiry=expiry,
+                    contract_multiplier=contract.multiplier,
+                )
+            )
+        return summaries

@@ -343,6 +343,252 @@ async def test_full_crypto_scan_cycle_executes_ai_recommended_buy(tmp_path) -> N
     assert holding.stop_loss < Decimal("60005")  # mid of the mocked 60000/60010 bid/ask -- a real ATR-based protective distance
 
 
+def _mock_options_quote(occ_symbol: str, bid: str = "2.00", ask: str = "2.02") -> None:
+    respx.get("https://data.alpaca.markets/v1beta1/options/quotes/latest").mock(
+        return_value=httpx.Response(200, json={"quotes": {occ_symbol: {"bp": float(bid), "ap": float(ask), "t": QUOTE_TS}}})
+    )
+
+
+def _mock_options_chain(occ_symbol: str, underlying: str = "AAPL", strike: str = "205", days_out: int = 30) -> None:
+    """One eligible call contract, comfortably inside the balanced
+    profile's [21, 45]-day window, near the 3%-OTM target off a ~199.55
+    mid quote (spot*1.03 ~= 205.5, so strike 205 wins)."""
+    expiry = (NOW + timedelta(days=days_out)).date().isoformat()
+    respx.get("https://paper-api.alpaca.markets/v2/options/contracts").mock(
+        return_value=httpx.Response(200, json={
+            "option_contracts": [{
+                "symbol": occ_symbol, "underlying_symbol": underlying, "type": "call",
+                "strike_price": strike, "expiration_date": expiry, "multiplier": "100",
+                "status": "active", "tradable": True,
+            }],
+            "next_page_token": None,
+        })
+    )
+
+
+def _mock_options_dynamic_full_fill(occ_symbol: str, price: str = "2.02") -> respx.Route:
+    """Options counterpart of _mock_dynamic_full_fill -- whole-contract qty,
+    OCC symbol, but otherwise the same accept -> status -> activity wiring
+    so the mocked fill reflects whatever quantity the scanner's real sizing
+    actually computed."""
+    import json as _json
+
+    state: dict[str, str] = {}
+
+    def _accept(request: httpx.Request) -> httpx.Response:
+        state["qty"] = _json.loads(request.content)["qty"]
+        return httpx.Response(200, json={
+            "id": "order-1", "status": "accepted", "symbol": occ_symbol, "side": "buy",
+            "filled_qty": "0", "filled_avg_price": None, "submitted_at": QUOTE_TS,
+        })
+
+    def _status(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "order-1", "status": "filled", "symbol": occ_symbol, "side": "buy",
+            "filled_qty": state["qty"], "filled_avg_price": price, "submitted_at": QUOTE_TS,
+        })
+
+    def _activities(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{
+            "id": "act-opt-1", "activity_type": "FILL", "symbol": occ_symbol, "side": "buy",
+            "qty": state["qty"], "price": price, "transaction_time": QUOTE_TS, "order_id": "order-1",
+        }])
+
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=_accept)
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(side_effect=_status)
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(side_effect=_activities)
+    return order_route
+
+
+OPTIONS_UNIVERSE = ExecutableUniverse(equities=frozenset(), crypto=frozenset(), options_underlyings=frozenset({"AAPL"}))
+
+
+@respx.mock
+async def test_options_lane_prompt_never_names_a_specific_contract(tmp_path) -> None:
+    """The AI is only ever shown underlying tickers -- it never sees or
+    reasons about specific contracts, matching the module's own division of
+    responsibility (see _build_scan_prompt's options branch docstring)."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    captured: dict[str, bytes] = {}
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.content
+        return httpx.Response(200, json=_tool_use_response([]))
+
+    respx.post("https://api.anthropic.com/v1/messages").mock(side_effect=_capture)
+
+    await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, OPTIONS_UNIVERSE, limits, AssetClass.OPTION, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    prompt = captured["body"].decode()
+    assert "AAPL" in prompt
+    assert "never choose a specific" in prompt.lower()  # explicit division-of-responsibility language, not just absence of the word "contract"
+
+
+@respx.mock
+async def test_option_candidate_outside_requested_lane_is_rejected(tmp_path, caplog) -> None:
+    """The options lane's AI hallucinates a crypto pair -- rejected
+    OUTSIDE_SCAN_LANE and never reaches contract resolution or order
+    placement, same defense-in-depth principle as every other lane."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "BTC/USD", "recommendation": "BUY", "confidence": 90, "summary": "hallucinated"}])
+        )
+    )
+    _mock_account()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    with caplog.at_level(logging.INFO):
+        summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, OPTIONS_UNIVERSE, limits, AssetClass.OPTION, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.candidates_approved == 0
+    assert order_route.call_count == 0
+    rejected = [r for r in caplog.records if getattr(r, "event", None) == "candidate_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0].reason == "OUTSIDE_SCAN_LANE"
+    assert rejected[0].asset_class == "option"
+
+
+@respx.mock
+async def test_options_scan_cycle_rejects_when_no_eligible_contract(tmp_path, caplog) -> None:
+    """select_contract returning None (empty/ineligible chain) is a clean,
+    fail-closed rejection -- never a crash, never a fabricated contract."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])
+        )
+    )
+    _mock_account()
+    _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
+    respx.get("https://paper-api.alpaca.markets/v2/options/contracts").mock(
+        return_value=httpx.Response(200, json={"option_contracts": [], "next_page_token": None})
+    )
+
+    with caplog.at_level(logging.INFO):
+        summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, OPTIONS_UNIVERSE, limits, AssetClass.OPTION, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.candidates_approved == 0
+    rejected = [r for r in caplog.records if getattr(r, "event", None) == "candidate_rejected"]
+    assert any(r.reason == "NO_ELIGIBLE_OPTION_CONTRACT" for r in rejected)
+
+
+@respx.mock
+async def test_deterministic_gate_fetches_candles_for_underlying_not_contract(tmp_path) -> None:
+    """The composite/momentum gate must run on the UNDERLYING's own candle
+    history -- a contract's own price action is too short-lived/decay-driven
+    to be a meaningful technical signal. Proven by asserting the ONLY bars
+    request made is for AAPL's plain stock-bars endpoint; if the code
+    incorrectly tried to fetch candles for the OCC contract symbol instead,
+    no mock would match that URL and respx would fail this test."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])
+        )
+    )
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    bars_route = respx.get("https://data.alpaca.markets/v2/stocks/AAPL/bars").mock(
+        return_value=httpx.Response(200, json=_bars_json(_BULLISH_CLOSES))
+    )
+    occ_symbol = "AAPL" + (NOW + timedelta(days=30)).date().strftime("%y%m%d") + "C00205000"
+    _mock_options_chain(occ_symbol)
+    _mock_options_quote(occ_symbol)
+    order_route = _mock_options_dynamic_full_fill(occ_symbol)
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, OPTIONS_UNIVERSE, limits, AssetClass.OPTION, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert bars_route.call_count == 1
+    assert summary.orders_submitted == 1
+    assert order_route.call_count == 1
+    submitted_symbol = order_route.calls[0].request.content
+    assert occ_symbol.encode() in submitted_symbol
+
+
+@respx.mock
+async def test_full_options_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
+    """Proves the WHOLE chain stays asset-agnostic end to end for the
+    options lane -- options prompt -> underlying candidate -> underlying
+    quote/bars/deterministic gate -> options chain -> deterministic
+    (non-AI) contract selection -> the contract's own premium quote ->
+    flat pct-of-premium stop (never ATR, never Greeks) -> multiplier-aware
+    dynamic sizing -> equity-style market-hours gating (never crypto's
+    continuous exemption) -> canonical options contract identity ->
+    execution reservation -> gateway -> mocked broker fill -> settlement ->
+    a Holding row keyed correctly for the resolved contract, not the
+    underlying."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    ai_route = respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])
+        )
+    )
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
+    occ_symbol = "AAPL" + (NOW + timedelta(days=30)).date().strftime("%y%m%d") + "C00205000"
+    _mock_options_chain(occ_symbol)
+    _mock_options_quote(occ_symbol)
+    order_route = _mock_options_dynamic_full_fill(occ_symbol)
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, OPTIONS_UNIVERSE, limits, AssetClass.OPTION, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert ai_route.call_count == 1
+    assert order_route.call_count == 1
+    assert summary.status == ScanRunStatus.COMPLETED
+    assert summary.candidates_discovered == 1
+    assert summary.candidates_approved == 1
+    assert summary.orders_submitted == 1
+    assert summary.execution_results[0].status == "filled"
+
+    scan_row = await repositories.scan_runs.get(summary.scan_run_id)
+    scan_run = hydrate("scan_runs", scan_row["payload"])
+    assert scan_run.asset_class == AssetClass.OPTION
+
+    opp_rows = await repositories.opportunities.list_all()
+    assert len(opp_rows) == 1
+    opportunity = hydrate("opportunities", opp_rows[0]["payload"])
+    assert opportunity.asset.symbol == occ_symbol  # the resolved CONTRACT, not "AAPL"
+    assert opportunity.asset.asset_class == AssetClass.OPTION
+    assert opportunity.asset.metadata["underlying_symbol"] == "AAPL"
+
+    contract_asset = AssetIdentity(
+        occ_symbol, AssetClass.OPTION, f"alpaca:{occ_symbol}",
+        metadata={"underlying_symbol": "AAPL", "contract_multiplier": "100"},
+    )
+    holding_row = await repositories.holdings.get(asset_identity_key(contract_asset))
+    assert holding_row is not None
+    holding = hydrate("holdings", holding_row["payload"])
+    assert holding.quantity > 0  # whole contracts
+    assert holding.quantity == holding.quantity.to_integral_value()
+    assert holding.stop_loss is not None
+    assert holding.stop_loss < Decimal("2.02")  # a real pct-of-premium protective distance below the mocked ask
+
+
 @respx.mock
 async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)

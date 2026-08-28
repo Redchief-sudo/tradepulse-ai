@@ -479,3 +479,109 @@ def test_all_dynamic_controls_combine_and_still_approve_a_smaller_but_valid_quan
     assert final_notional <= remaining_sector
     assert final_notional <= remaining_exposure
     assert final_notional <= cash_check.max_affordable_notional
+
+
+def test_options_contract_multiplier_scales_notional_caps_100x_versus_equivalent_equity() -> None:
+    """A 'known-good ratio' proof the multiplier is applied at all: an
+    options position and an equity position with IDENTICAL per-unit price/
+    stop/quantity math, differing only in contract_multiplier=100 vs 1,
+    must be sized so the option's real dollar notional is exactly 100x the
+    equity's for the same requested_quantity, both landing on the same
+    max_position_pct cap."""
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("10000000"))
+    snapshot = _snapshot(total_equity=Decimal("1000000"))
+    limits = replace(LIMITS, max_position_pct=Decimal("50"), max_sector_pct=Decimal("90"), max_total_exposure_pct=Decimal("95"))
+
+    equity_decision = evaluate_risk(
+        _buy(asset_class=AssetClass.EQUITY, requested_quantity=Decimal("100000"), price=Decimal("100"), confidence=Decimal("100")),
+        snapshot, limits, opts,
+    )
+    option_decision = evaluate_risk(
+        _buy(asset_class=AssetClass.OPTION, requested_quantity=Decimal("100000"), price=Decimal("100"), confidence=Decimal("100"), contract_multiplier=Decimal("100")),
+        snapshot, limits, opts,
+    )
+
+    assert equity_decision.approved and option_decision.approved
+    equity_notional = equity_decision.approved_quantity * Decimal("100")
+    option_notional = option_decision.approved_quantity * Decimal("100") * Decimal("100")  # price * multiplier
+    # Both hit the SAME max_position_pct cap ($500,000 = 50% of $1,000,000)
+    # -- the option's approved_quantity is naturally 100x smaller (contracts,
+    # not shares) so the two notionals land on the identical dollar cap.
+    assert equity_notional == Decimal("500000")
+    assert option_notional == Decimal("500000")
+    assert option_decision.approved_quantity * 100 == equity_decision.approved_quantity
+
+
+def test_risk_based_sizing_applies_multiplier_before_dividing_never_only_to_downstream_caps() -> None:
+    """Regression test for the exact defect flagged in plan review: applying
+    contract_multiplier only to the downstream notional caps (not to
+    unit_risk before the division that derives risk_based_qty) would
+    transiently size ~100x too large at the risk-based-sizing step itself.
+    Here every OTHER cap is deliberately set generous enough that it would
+    NOT be the binding constraint for the CORRECT answer (10 contracts) but
+    WOULD still catch and reduce the wrong answer (1000 contracts) down to a
+    different, distinguishable value (250) -- proving the two formulas are
+    not just theoretically different but produce different observable
+    approved_quantity values, and that this implementation lands on the
+    correct one."""
+    limits = replace(LIMITS, max_risk_per_trade_pct=Decimal("1.0"), max_position_pct=Decimal("50"), max_sector_pct=Decimal("50"), max_total_exposure_pct=Decimal("90"))
+    snapshot = _snapshot(total_equity=Decimal("100000"))
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("1000000"))
+    # risk_budget = 1% * $100,000 = $1,000 (confidence=100 avoids any
+    # confidence-multiplier scaling so this stays exact).
+    # CORRECT: unit_risk = (2.00 - 1.00) * 100 = 100 -> qty = 1000/100 = 10.
+    # WRONG (multiplier applied only downstream): qty = 1000/1.00 = 1000,
+    # which max_position_pct (50% * $100,000 = $50,000 / (2.00*100) = 250)
+    # would then catch and reduce to 250 -- a different, wrong answer.
+    buy = _buy(
+        asset_class=AssetClass.OPTION, requested_quantity=Decimal("2000"), price=Decimal("2.00"),
+        stop_loss=Decimal("1.00"), confidence=Decimal("100"), contract_multiplier=Decimal("100"),
+    )
+
+    decision = evaluate_risk(buy, snapshot, limits, opts)
+
+    assert decision.approved
+    assert decision.approved_quantity == Decimal("10")
+    assert any("POSITION_CAPPED_TO_10_BY_RISK_BASED_SIZING" in r for r in decision.reasons)
+    assert not any("BY_MAX_POSITION_PCT" in r for r in decision.reasons)  # never reached -- risk-based sizing already won
+
+
+def test_options_decision_satisfies_both_stop_based_risk_and_premium_commitment_invariants() -> None:
+    """The two invariants from plan review, asserted SEPARATELY so they can
+    never be silently conflated: stop-based risk answers 'how much can this
+    lose if the stop is honored', premium commitment answers 'how much is
+    actually spent up front' -- for a long option the max possible loss is
+    the whole premium, not just the stop-to-entry distance, so a position
+    could pass one check while still failing the other if either were
+    missing multiplier-awareness."""
+    limits = replace(LIMITS, max_risk_per_trade_pct=Decimal("0.5"), max_position_pct=Decimal("10"), max_sector_pct=Decimal("50"), max_total_exposure_pct=Decimal("50"))
+    total_equity = Decimal("100000")
+    snapshot = _snapshot(total_equity=total_equity)
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("50000"))
+    price = Decimal("2.00")
+    stop_loss = Decimal("1.30")
+    multiplier = Decimal("100")
+    buy = _buy(
+        asset_class=AssetClass.OPTION, requested_quantity=Decimal("500"), price=price,
+        stop_loss=stop_loss, confidence=limits.min_confidence, contract_multiplier=multiplier,
+    )
+
+    decision = evaluate_risk(buy, snapshot, limits, opts)
+
+    assert decision.approved
+    assert decision.approved_quantity > 0
+    confidence_multiplier = limits.min_position_size_multiplier  # confidence pinned at exactly min_confidence
+    adjusted_risk_budget = (limits.max_risk_per_trade_pct / 100) * total_equity * confidence_multiplier
+
+    # Invariant 1 -- stop-based risk never exceeds the confidence-adjusted budget.
+    stop_based_risk = decision.approved_quantity * abs(price - stop_loss) * multiplier
+    assert stop_based_risk <= adjusted_risk_budget
+
+    # Invariant 2 -- total premium committed never exceeds available cash
+    # or remaining exposure/sector/position capacity, independent of
+    # whatever the stop-based risk figure was.
+    premium_committed = decision.approved_quantity * price * multiplier
+    assert premium_committed <= opts.available_cash
+    assert premium_committed <= (limits.max_position_pct / 100) * total_equity
+    assert premium_committed <= (limits.max_sector_pct / 100) * total_equity
+    assert premium_committed <= (limits.max_total_exposure_pct / 100) * total_equity

@@ -22,6 +22,7 @@ from .types import (
     AlpacaAccount,
     AlpacaActivity,
     AlpacaClock,
+    AlpacaOptionContract,
     AlpacaOrderRequest,
     AlpacaOrderResponse,
     AlpacaPosition,
@@ -109,7 +110,13 @@ class AlpacaClient:
         rows = data if isinstance(data, list) else []
         positions: list[AlpacaPosition] = []
         for row in rows:
-            asset_class = AssetClass.CRYPTO if row.get("asset_class") == "crypto" else AssetClass.EQUITY
+            raw_class = row.get("asset_class")
+            # Verified live against Alpaca's docs 2026-08-26: "crypto",
+            # "us_option", "us_equity" are the three values this field
+            # actually takes.
+            asset_class = (
+                AssetClass.CRYPTO if raw_class == "crypto" else AssetClass.OPTION if raw_class == "us_option" else AssetClass.EQUITY
+            )
             positions.append(
                 AlpacaPosition(
                     symbol=normalize_alpaca_symbol(str(row.get("symbol", "")), asset_class),
@@ -126,8 +133,15 @@ class AlpacaClient:
     async def get_latest_quote(self, symbol: str, asset_class: AssetClass) -> RawQuote:
         normalized = str(symbol).upper().replace("-", "/")
         is_crypto = asset_class == AssetClass.CRYPTO
+        is_option = asset_class == AssetClass.OPTION
         if is_crypto:
             url = f"{DATA_BASE}/v1beta3/crypto/us/latest/quotes"
+            response = await self._client.get(url, headers=self._headers, params={"symbols": normalized})
+        elif is_option:
+            # Verified live against Alpaca's docs 2026-08-26: same
+            # {"quotes": {symbol: {bp, ap, t}}} envelope shape as crypto's
+            # quotes endpoint, keyed by the OCC symbol.
+            url = f"{DATA_BASE}/v1beta1/options/quotes/latest"
             response = await self._client.get(url, headers=self._headers, params={"symbols": normalized})
         else:
             url = f"{DATA_BASE}/v2/stocks/{normalized}/quotes/latest"
@@ -135,15 +149,59 @@ class AlpacaClient:
         if not response.is_success:
             raise_alpaca_error(response, "getLatestQuote")
         data = response.json()
-        quote = (data.get("quotes") or {}).get(normalized) if is_crypto else data.get("quote")
+        quote = (data.get("quotes") or {}).get(normalized) if (is_crypto or is_option) else data.get("quote")
         quote = quote or {}
+        source = "alpaca_crypto" if is_crypto else "alpaca_options" if is_option else "alpaca_iex"
         return RawQuote(
             symbol=normalized,
             bid=_decimal_or_none(quote.get("bp")),
             ask=_decimal_or_none(quote.get("ap")),
             timestamp=_parse_timestamp(quote.get("t")),
-            source="alpaca_crypto" if is_crypto else "alpaca_iex",
+            source=source,
         )
+
+    async def get_options_chain(
+        self, underlying_symbol: str, expiration_gte: str, expiration_lte: str
+    ) -> list[AlpacaOptionContract]:
+        """GET /v2/options/contracts -- contract metadata/eligibility, NOT
+        price data, so it lives on the TRADING API host, not DATA_BASE.
+        Verified live against Alpaca's docs 2026-08-26. Only active,
+        tradable contracts within [expiration_gte, expiration_lte]
+        (YYYY-MM-DD) for one underlying -- callers apply their own DTE
+        window on top of this (strategy/options_selection.py)."""
+        contracts: list[AlpacaOptionContract] = []
+        page_token: str | None = None
+        while True:
+            params: dict[str, str] = {
+                "underlying_symbols": underlying_symbol.upper(), "status": "active",
+                "expiration_date_gte": expiration_gte, "expiration_date_lte": expiration_lte,
+                "limit": "500",
+            }
+            if page_token:
+                params["page_token"] = page_token
+            response = await self._client.get(f"{self._trading_base}/options/contracts", headers=self._headers, params=params)
+            if not response.is_success:
+                raise_alpaca_error(response, "getOptionsChain")
+            data = response.json()
+            for row in data.get("option_contracts") or []:
+                if not row.get("tradable", True):
+                    continue
+                contracts.append(
+                    AlpacaOptionContract(
+                        occ_symbol=str(row.get("symbol", "")).upper(),
+                        underlying_symbol=str(row.get("underlying_symbol", "")).upper(),
+                        option_type=str(row.get("type", "")).lower(),
+                        strike_price=_decimal(row.get("strike_price", "0")),
+                        expiration_date=str(row.get("expiration_date", "")),
+                        multiplier=_decimal(row.get("multiplier", "100")),
+                        status=str(row.get("status", "")),
+                        tradable=bool(row.get("tradable", True)),
+                    )
+                )
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+        return contracts
 
     async def get_bars(
         self, symbol: str, asset_class: AssetClass, start: datetime, end: datetime, limit: int = 250

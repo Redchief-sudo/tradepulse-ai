@@ -27,6 +27,7 @@ from tradepulse.settlement import SettlementProcessor
 
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)
 QUOTE_TS = NOW.isoformat().replace("+00:00", "Z")
+LIMITS = risk_limits_for_profile("balanced")
 
 
 def _aapl() -> AssetIdentity:
@@ -112,7 +113,7 @@ async def test_long_position_breaching_stop_triggers_sell(tmp_path) -> None:
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "10", "135")))
     _mock_fill_activities("act-1", "10", "135")
 
-    summary = await run_position_monitor(repositories, broker, gateway, alerts, clock=lambda: NOW)
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.status == "ok"
@@ -135,7 +136,7 @@ async def test_long_position_breaching_target_triggers_sell(tmp_path) -> None:
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "10", "175")))
     _mock_fill_activities("act-1", "10", "175")
 
-    summary = await run_position_monitor(repositories, broker, gateway, alerts, clock=lambda: NOW)
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.exits_triggered == 1
@@ -154,7 +155,7 @@ async def test_short_position_breaching_inverted_thresholds_triggers_buy(tmp_pat
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "10", "165", side="buy")))
     _mock_fill_activities("act-1", "10", "165", side="buy")
 
-    summary = await run_position_monitor(repositories, broker, gateway, alerts, clock=lambda: NOW)
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.exits_triggered == 1
@@ -168,7 +169,7 @@ async def test_no_local_holding_is_skipped(tmp_path) -> None:
     _mock_positions(qty="10", current_price="100")  # would breach any threshold, but nothing on file
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
-    summary = await run_position_monitor(repositories, broker, gateway, alerts, clock=lambda: NOW)
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.positions_checked == 1
@@ -183,7 +184,71 @@ async def test_holding_with_no_thresholds_is_skipped(tmp_path) -> None:
     _mock_positions(qty="10", current_price="1")
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
-    summary = await run_position_monitor(repositories, broker, gateway, alerts, clock=lambda: NOW)
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.exits_triggered == 0
+    assert order_route.call_count == 0
+
+
+def _aapl_call() -> AssetIdentity:
+    return AssetIdentity(
+        "AAPL251219C00150000", AssetClass.OPTION, "alpaca:AAPL251219C00150000",
+        metadata={"underlying_symbol": "AAPL", "expiry": "2026-08-25", "contract_multiplier": "100"},
+    )
+
+
+@respx.mock
+async def test_option_within_forced_close_window_exits_even_without_breach(tmp_path) -> None:
+    """An OPTION holding whose expiry falls within
+    options_forced_close_days_before_expiry closes regardless of stop/
+    target state -- NOW is 2026-08-24, expiry is 2026-08-25 (1 day out),
+    LIMITS' threshold is 2 days -- current_price sits strictly between
+    stop_loss and target_price so _breached alone would never trigger."""
+    repositories, broker, gateway, alerts = await _setup(tmp_path)
+    holding = Holding(
+        asset=_aapl_call(), quantity=Decimal("1"), average_price=Decimal("2.00"), updated_at=NOW,
+        stop_loss=Decimal("1.00"), target_price=Decimal("5.00"),
+    )
+    await repositories.holdings.create_once(asset_identity_key(_aapl_call()), holding)
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[{
+        "symbol": "AAPL251219C00150000", "asset_class": "us_option", "qty": "1", "avg_entry_price": "2.00",
+        "market_value": "0", "current_price": "2.50", "unrealized_pl": "0",
+    }]))
+    _mock_account()
+    respx.get("https://data.alpaca.markets/v1beta1/options/quotes/latest").mock(
+        return_value=httpx.Response(200, json={"quotes": {"AAPL251219C00150000": {"bp": 2.49, "ap": 2.50, "t": QUOTE_TS}}})
+    )
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(
+        return_value=httpx.Response(200, json={"id": "order-1", "status": "accepted", "symbol": "AAPL251219C00150000", "side": "sell", "filled_qty": "0", "filled_avg_price": None, "submitted_at": QUOTE_TS})
+    )
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
+        return_value=httpx.Response(200, json={"id": "order-1", "status": "filled", "symbol": "AAPL251219C00150000", "side": "sell", "filled_qty": "1", "filled_avg_price": "2.50", "submitted_at": QUOTE_TS})
+    )
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(return_value=httpx.Response(200, json=[{
+        "id": "act-1", "activity_type": "FILL", "symbol": "AAPL251219C00150000", "side": "sell",
+        "qty": "1", "price": "2.50", "transaction_time": QUOTE_TS, "order_id": "order-1",
+    }]))
+
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.exits_triggered == 1
+    assert order_route.call_count == 1
+    request_body = order_route.calls[0].request.content
+    assert b'"side":"sell"' in request_body
+
+
+@respx.mock
+async def test_equity_holding_near_its_own_far_future_date_is_unaffected_by_near_expiry_check(tmp_path) -> None:
+    """The near-expiry trigger is OPTION-only -- an equity holding with no
+    breach and (obviously) no expiry metadata must never be force-closed."""
+    repositories, broker, gateway, alerts = await _setup(tmp_path)
+    await _seed_holding(repositories)  # stop_loss=140, target_price=170
+    _mock_positions(qty="10", current_price="155")  # comfortably between both
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.exits_triggered == 0
@@ -202,7 +267,7 @@ async def test_breach_with_in_flight_intent_is_skipped(tmp_path) -> None:
     await repositories.trade_intents.create_once("ti-scan-1", in_flight, status=in_flight.status.value, unique_value=in_flight.idempotency_key)
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
-    summary = await run_position_monitor(repositories, broker, gateway, alerts, clock=lambda: NOW)
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.exits_triggered == 0
@@ -215,7 +280,7 @@ async def test_broker_outage_reports_degraded_status_and_alerts(tmp_path) -> Non
     await _seed_holding(repositories)
     respx.get("https://paper-api.alpaca.markets/v2/positions").mock(side_effect=httpx.ConnectError("connection refused"))
 
-    summary = await run_position_monitor(repositories, broker, gateway, alerts, clock=lambda: NOW)
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.status == "degraded"
@@ -239,7 +304,7 @@ async def test_breach_is_skipped_when_symbol_execution_lock_already_held(tmp_pat
     database = repositories.trade_intents.database
     assert await reserve_symbol_for_execution(database, _aapl(), "another-coordinator") is True
 
-    summary = await run_position_monitor(repositories, broker, gateway, alerts, clock=lambda: NOW)
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
     await broker.aclose()
 
     assert summary.exits_triggered == 0
@@ -256,7 +321,7 @@ async def test_monitor_stops_starting_new_work_when_lease_already_lost(tmp_path)
     lease_lost = asyncio.Event()
     lease_lost.set()
 
-    summary = await run_position_monitor(repositories, broker, gateway, alerts, clock=lambda: NOW, lease_lost=lease_lost)
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW, lease_lost=lease_lost)
     await broker.aclose()
 
     assert summary.exits_triggered == 0
