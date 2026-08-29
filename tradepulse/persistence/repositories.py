@@ -191,6 +191,29 @@ class RecordRepository:
 
         return await self.database.run(select)
 
+    async def list_recent(self, limit: int = 50) -> list[Mapping[str, Any]]:
+        """Newest-first, unlike list_all (oldest-first) -- for "recent
+        activity" reads (the dashboard's primary read pattern). Uses the
+        exact same `created_at` column list_all/list_by_status already sort
+        by, just descending -- verified present identically on every table
+        in TABLES (see persistence/database.py's schema), never a
+        caller-supplied column name."""
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+
+        def select(connection: sqlite3.Connection) -> list[Mapping[str, Any]]:
+            rows = connection.execute(
+                f"SELECT * FROM {self.table} ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                item["payload"] = decode_payload(item["payload"])
+                result.append(item)
+            return result
+
+        return await self.database.run(select)
+
     async def list_by_status(self, status: str, limit: int = 100) -> list[Mapping[str, Any]]:
         if self.table not in STATUS_TABLES:
             raise ValueError(f"{self.table} has no status")

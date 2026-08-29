@@ -657,6 +657,19 @@ async def test_buy_with_partial_cash_sizes_down_instead_of_rejecting(tmp_path) -
     assert result.status != "rejected"
     assert Decimal("0") < result.filled_quantity < Decimal("5")
 
+    # risk_snapshot must survive all the way to the terminal (filled) intent,
+    # not just the RISK_APPROVED row it was written on -- explains WHY this
+    # was sized down, still readable long after the process that decided it
+    # has exited (this is what a "why was this sized this way" dashboard
+    # panel would read).
+    intent_row = await repositories.trade_intents.get(result.trade_intent_id)
+    intent = hydrate("trade_intents", intent_row["payload"])
+    assert any("BY_AVAILABLE_CASH" in r for r in intent.risk_snapshot["reasons"])
+    assert intent.risk_snapshot["requested_quantity"] == "5"
+    assert Decimal("0") < Decimal(intent.risk_snapshot["approved_quantity"]) < Decimal("5")
+    assert intent.risk_snapshot["risk_profile"] == "balanced"
+    assert intent.risk_snapshot["entry_price"] == "199.6"  # the authoritative quote's side-appropriate price -- ask, for a BUY
+
 
 @respx.mock
 async def test_buy_rejected_when_daily_loss_exceeds_limit(tmp_path) -> None:

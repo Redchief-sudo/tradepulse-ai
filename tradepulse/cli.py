@@ -62,20 +62,30 @@ from tradepulse.broker import AlpacaClient, AlpacaError
 from tradepulse.config import Settings, SettingsError, default_strategy_weights, risk_limits_for_profile
 from tradepulse.config.logging import configure_logging
 from tradepulse.execution import ExecutionGateway
-from tradepulse.models import AssetClass, AuditEvent, ExecutionMode, SessionState, TradingSession
+from tradepulse.models import AssetClass
 from tradepulse.monitor import MonitorCycleSummary, run_position_monitor
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, release_lock, run_with_lock_renewal
 from tradepulse.providers import (
     AIProvider,
     AlpacaMarketDataProvider,
     AnthropicAIProvider,
+    MarketDataCapabilities,
     MarketDataCapabilityError,
     OpenAIProvider,
     resolve_market_data_capabilities,
 )
 from tradepulse.reconciliation import run_reconciliation
-from tradepulse.risk import SESSION_RECORD_ID, load_session, transition_session
 from tradepulse.scanner import ScanCycleSummary, run_scan_cycle
+from tradepulse.session_commands import (
+    build_broker as _build_broker,
+    build_gateway as _build_gateway,
+    require_credentials as _require_credentials,
+    run_reset_integrity as _run_reset_integrity,
+    run_reset_risk as _run_reset_risk,
+    run_start as _run_start,
+    run_status as _run_status,
+    run_stop as _run_stop,
+)
 from tradepulse.settlement import SettlementProcessor
 from tradepulse.strategy import load_executable_universe
 
@@ -85,18 +95,6 @@ SCAN_LOCK_KEY = "scan"
 MONITOR_LOCK_KEY = "monitor"
 SETTLE_LOCK_KEY = "settle"
 RECONCILE_LOCK_KEY = "reconcile"
-# States `start` refuses unconditionally: RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED
-# need their own explicit reset-risk/reset-integrity command first;
-# SYSTEM_DEGRADED/MARKET_CLOSED are system-derived states this command has
-# no way to safely verify have actually cleared (see cli.py's session
-# commands section below).
-_START_HARD_BLOCKED_STATES = frozenset(
-    {SessionState.RISK_STOPPED, SessionState.FINANCIAL_INTEGRITY_BLOCKED, SessionState.SYSTEM_DEGRADED, SessionState.MARKET_CLOSED}
-)
-# `stop` must never downgrade an active safety block into a plain
-# MANUALLY_STOPPED -- that would erase the reason and the reset
-# requirement, letting a bare `start` through even though nothing was reset.
-_STOP_PRESERVED_STATES = frozenset({SessionState.RISK_STOPPED, SessionState.FINANCIAL_INTEGRITY_BLOCKED})
 # Generous ceilings above any realistic single run -- long enough to never
 # steal a live run's lease, short enough that a crashed process doesn't
 # block that command indefinitely. Monitor's and settle's are shorter since
@@ -114,23 +112,6 @@ def scan_lock_key(asset_class: AssetClass) -> str:
     return f"{SCAN_LOCK_KEY}:{asset_class.value}"
 
 
-def _require_credentials(settings: Settings, *, require_ai: bool) -> None:
-    checks = [("ALPACA_API_KEY", settings.alpaca_api_key), ("ALPACA_API_SECRET", settings.alpaca_api_secret)]
-    if require_ai:
-        if settings.ai_provider == "openai":
-            checks.append(("OPENAI_API_KEY", settings.openai_api_key))
-        else:
-            checks.append(("ANTHROPIC_API_KEY", settings.anthropic_api_key))
-    missing = [name for name, value in checks if not value]
-    if missing:
-        raise SettingsError(f"this command requires {', '.join(missing)} to be set")
-
-
-def _build_broker(settings: Settings) -> AlpacaClient:
-    assert settings.alpaca_api_key and settings.alpaca_api_secret
-    return AlpacaClient(settings.alpaca_api_key, settings.alpaca_api_secret, settings.execution_mode, settings.broker_timeout_seconds)
-
-
 def _build_ai_provider(settings: Settings) -> AIProvider:
     if settings.ai_provider == "openai":
         assert settings.openai_api_key
@@ -139,16 +120,7 @@ def _build_ai_provider(settings: Settings) -> AIProvider:
     return AnthropicAIProvider(settings.anthropic_api_key, settings.anthropic_model, settings.ai_timeout_seconds, settings.anthropic_base_url)
 
 
-def _build_gateway(
-    settings: Settings, repositories: PersistenceRepositories, broker: AlpacaClient,
-    market_data: AlpacaMarketDataProvider, alerts: TelegramAlerter,
-) -> ExecutionGateway:
-    settlement = SettlementProcessor(repositories, alerts)
-    risk_limits = risk_limits_for_profile(settings.risk_profile)
-    return ExecutionGateway(repositories, broker, market_data, settlement, alerts, risk_limits, ExecutionMode(settings.execution_mode))
-
-
-async def _resolve_and_apply_market_data_feeds(broker: AlpacaClient, settings: Settings) -> None:
+async def _resolve_and_apply_market_data_feeds(broker: AlpacaClient, settings: Settings) -> MarketDataCapabilities:
     """Resolves which Alpaca feeds this account is entitled to (see
     providers/market_data_capability.py) and applies them to `broker`
     ONCE, before any market-data work starts -- called from both
@@ -159,7 +131,10 @@ async def _resolve_and_apply_market_data_feeds(broker: AlpacaClient, settings: S
     probe outcome (auth/rate-limit/transport/malformed-response) -- is
     normalized to MarketDataCapabilityError so main() has exactly one
     clean, expected exception type to report for this whole class of
-    startup problem."""
+    startup problem. Returns the resolved capabilities so callers can stamp
+    them onto whatever they persist (see ScanRun.market_data_tier/
+    equity_feed/option_feed) -- a durable record of what feed was actually
+    used, not something a later reader has to re-probe Alpaca to learn."""
     try:
         capabilities = await resolve_market_data_capabilities(broker, settings.alpaca_market_data_tier)
     except MarketDataCapabilityError:
@@ -174,6 +149,7 @@ async def _resolve_and_apply_market_data_feeds(broker: AlpacaClient, settings: S
             "equity_feed": capabilities.equity_feed, "option_feed": capabilities.option_feed,
         },
     )
+    return capabilities
 
 
 def _lease_lost_signal(
@@ -201,6 +177,7 @@ async def _run_scan_leg(
     database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, ai_provider: AIProvider,
     market_data: AlpacaMarketDataProvider, broker: AlpacaClient, gateway: ExecutionGateway,
     settings: Settings, alerts: TelegramAlerter, asset_class: AssetClass,
+    capabilities: MarketDataCapabilities | None = None,
 ) -> ScanCycleSummary | None:
     lock_key = scan_lock_key(asset_class)
     owner_token = str(uuid4())
@@ -216,7 +193,7 @@ async def _run_scan_leg(
             database, lock_key, owner_token, SCAN_LOCK_TTL_SECONDS,
             run_scan_cycle(
                 repositories, ai_provider, market_data, broker, gateway, universe, risk_limits, asset_class,
-                strategy_weights=strategy_weights, lease_lost=lease_lost,
+                strategy_weights=strategy_weights, lease_lost=lease_lost, capabilities=capabilities,
             ),
             on_renewal_failed=on_lease_lost,
         )
@@ -310,14 +287,14 @@ async def _run_scan(settings: Settings, asset_classes: list[AssetClass]) -> int:
     broker = _build_broker(settings)
     ai_provider = _build_ai_provider(settings)
     try:
-        await _resolve_and_apply_market_data_feeds(broker, settings)
+        capabilities = await _resolve_and_apply_market_data_feeds(broker, settings)
 
         market_data = AlpacaMarketDataProvider(broker)
         alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
         gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
 
         scan_legs = [
-            _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings, alerts, asset_class)
+            _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings, alerts, asset_class, capabilities)
             for asset_class in asset_classes
         ]
         *scan_results, monitor_result = await asyncio.gather(
@@ -438,241 +415,38 @@ async def _run_reconcile(settings: Settings) -> int:
     return 0
 
 
-async def _run_start(settings: Settings) -> int:
-    """`tradepulse start`: the sole operator path to ACTIVE. Refuses
-    unconditionally from RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED (run
-    reset-risk/reset-integrity first) and from SYSTEM_DEGRADED/MARKET_CLOSED
-    (system-derived states this command has no way to safely clear). From
-    any other state, proves the broker is actually reachable via a live
-    get_account() call before activating -- configured-but-broken
-    credentials must never produce ACTIVE."""
-    _require_credentials(settings, require_ai=False)
-
-    database = AsyncSQLiteDatabase(settings.database_url)
-    await database.initialize()
-    repositories = PersistenceRepositories.create(database)
-
-    current = await load_session(repositories)
-    if current.state in _START_HARD_BLOCKED_STATES:
-        logger.error(
-            "start_refused",
-            extra={
-                "event": "start_refused", "state": current.state.value,
-                "kill_switch_reason": current.kill_switch_reason, "financial_integrity_reason": current.financial_integrity_reason,
-            },
-        )
-        return 1
-    if current.state == SessionState.ACTIVE:
-        logger.info("start_noop_already_active", extra={"event": "start_noop_already_active"})
-        return 0
-
-    broker = _build_broker(settings)
+async def _run_dashboard(settings: Settings, port: int) -> int:
+    """`tradepulse dashboard`: the local operator dashboard -- read-only
+    observability (session state, positions, opportunities, fills/
+    settlement, PnL, risk exposure, reconciliation/audit alerts) plus the
+    exact same session-control authority as `start`/`stop`/`reset-risk`/
+    `reset-integrity` (see tradepulse/web/app.py -- every control route
+    calls straight into tradepulse.session_commands, never a second
+    implementation). ALWAYS binds 127.0.0.1 -- there is no --host flag and
+    no escape hatch: with no authentication/authorization layer yet,
+    anything network-reachable here would be unauthenticated
+    start/stop/reset-risk/reset-integrity access. Remote access is a later
+    phase that must ship WITH authentication, not an opt-in flag that
+    bypasses having one."""
     try:
-        await broker.get_account()
-    except (AlpacaError, httpx.HTTPError) as exc:
-        # AlpacaError covers a definitive HTTP error response; httpx.HTTPError
-        # covers everything else (DNS failure, connection refused, timeout)
-        # that get_account() doesn't wrap -- broker health being unproven
-        # must refuse cleanly either way, never crash with an uncaught
-        # traceback or activate on ambiguous connectivity.
-        logger.error("start_refused_broker_unreachable", extra={"event": "start_refused_broker_unreachable", "error": str(exc)})
-        return 1
+        import uvicorn
+    except ImportError as exc:
+        raise SettingsError(
+            "`tradepulse dashboard` requires the optional web dependencies -- install with `pip install -e '.[web]'`"
+        ) from exc
+    from tradepulse.web import build_app_state, create_app
+
+    _require_credentials(settings, require_ai=False)
+    state = await build_app_state(settings)
+    frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+    app = create_app(state, frontend_dist=frontend_dist if frontend_dist.is_dir() else None)
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level=settings.log_level.lower())
+    server = uvicorn.Server(config)
+    logger.info("dashboard_starting", extra={"event": "dashboard_starting", "host": "127.0.0.1", "port": port})
+    try:
+        await server.serve()
     finally:
-        await broker.aclose()
-
-    now = datetime.now(UTC)
-
-    def decide(session: TradingSession) -> tuple[TradingSession, AuditEvent] | None:
-        if session.state in _START_HARD_BLOCKED_STATES or session.state == SessionState.ACTIVE:
-            return None
-        new_session = TradingSession(SESSION_RECORD_ID, SessionState.ACTIVE, True, now)
-        event = AuditEvent(
-            event_id=str(uuid4()), event_type="session_transition", severity="info",
-            message=f"{session.state.value} -> active via start", occurred_at=now,
-            entity_type="trading_session", entity_id=SESSION_RECORD_ID,
-            details={"action": "start", "previous_state": session.state.value, "new_state": "active"},
-        )
-        return new_session, event
-
-    result = await transition_session(repositories, decide)
-    if result is None:
-        logger.info("start_noop_state_changed_concurrently", extra={"event": "start_noop_state_changed_concurrently"})
-        return 0
-    logger.info("session_started", extra={"event": "session_started", "previous_state": current.state.value})
-    return 0
-
-
-async def _run_stop(settings: Settings) -> int:
-    """`tradepulse stop`: always invokable, even with broken or missing
-    credentials -- an operator must always be able to halt the runtime."""
-    database = AsyncSQLiteDatabase(settings.database_url)
-    await database.initialize()
-    repositories = PersistenceRepositories.create(database)
-
-    now = datetime.now(UTC)
-
-    def decide(session: TradingSession) -> tuple[TradingSession, AuditEvent] | None:
-        if session.state in _STOP_PRESERVED_STATES:
-            return None
-        if session.state in (SessionState.DISABLED, SessionState.MANUALLY_STOPPED) and not session.trading_active:
-            return None
-        new_session = TradingSession(SESSION_RECORD_ID, SessionState.MANUALLY_STOPPED, False, now)
-        event = AuditEvent(
-            event_id=str(uuid4()), event_type="session_transition", severity="info",
-            message=f"{session.state.value} -> manually_stopped via stop", occurred_at=now,
-            entity_type="trading_session", entity_id=SESSION_RECORD_ID,
-            details={"action": "stop", "previous_state": session.state.value, "new_state": "manually_stopped"},
-        )
-        return new_session, event
-
-    result = await transition_session(repositories, decide)
-    if result is None:
-        current = await load_session(repositories)
-        logger.info(
-            "stop_noop",
-            extra={
-                "event": "stop_noop", "state": current.state.value,
-                "kill_switch_reason": current.kill_switch_reason, "financial_integrity_reason": current.financial_integrity_reason,
-            },
-        )
-        return 0
-    logger.info("session_stopped", extra={"event": "session_stopped"})
-    return 0
-
-
-async def _run_status(settings: Settings) -> int:
-    """`tradepulse status`: read-only, always invokable regardless of
-    credentials -- reading local session state must never depend on broker
-    config being correct."""
-    database = AsyncSQLiteDatabase(settings.database_url)
-    await database.initialize()
-    repositories = PersistenceRepositories.create(database)
-
-    session = await load_session(repositories)
-    logger.info(
-        "session_status",
-        extra={
-            "event": "session_status", "state": session.state.value, "trading_active": session.trading_active,
-            "kill_switch_reason": session.kill_switch_reason, "kill_switch_reset_required": session.kill_switch_reset_required,
-            "financial_integrity_reason": session.financial_integrity_reason,
-            "financial_integrity_manual_reenable_required": session.financial_integrity_manual_reenable_required,
-            "updated_at": session.updated_at.isoformat(),
-        },
-    )
-    return 0
-
-
-async def _run_reset_risk(settings: Settings) -> int:
-    """`tradepulse reset-risk`: the only way to clear RISK_STOPPED --
-    acknowledges the kill-switch and lands on MANUALLY_STOPPED; a separate
-    `start` is still required to actually resume trading. Never requires
-    credentials -- clears a local flag only, never touches the broker."""
-    database = AsyncSQLiteDatabase(settings.database_url)
-    await database.initialize()
-    repositories = PersistenceRepositories.create(database)
-
-    now = datetime.now(UTC)
-
-    def decide(session: TradingSession) -> tuple[TradingSession, AuditEvent] | None:
-        if session.state != SessionState.RISK_STOPPED:
-            return None
-        new_session = TradingSession(SESSION_RECORD_ID, SessionState.MANUALLY_STOPPED, False, now)
-        event = AuditEvent(
-            event_id=str(uuid4()), event_type="session_transition", severity="info",
-            message="risk_stopped -> manually_stopped via reset-risk", occurred_at=now,
-            entity_type="trading_session", entity_id=SESSION_RECORD_ID,
-            details={
-                "action": "reset_risk", "previous_state": "risk_stopped", "new_state": "manually_stopped",
-                "reason": session.kill_switch_reason,
-            },
-        )
-        return new_session, event
-
-    result = await transition_session(repositories, decide)
-    if result is None:
-        logger.info("reset_risk_noop", extra={"event": "reset_risk_noop"})
-        return 0
-    logger.info("session_risk_reset", extra={"event": "session_risk_reset"})
-    return 0
-
-
-async def _run_reset_integrity(settings: Settings, *, force: bool) -> int:
-    """`tradepulse reset-integrity`: the only way to clear
-    FINANCIAL_INTEGRITY_BLOCKED. By default runs a real reconciliation pass
-    first and requires it to come back clean -- an operator's word alone is
-    not evidence that a financial-integrity condition has actually
-    resolved. `--force` skips that check for a genuine emergency override,
-    but is unmistakably logged as an unverified critical action."""
-    database = AsyncSQLiteDatabase(settings.database_url)
-    await database.initialize()
-    repositories = PersistenceRepositories.create(database)
-
-    current = await load_session(repositories)
-    if current.state != SessionState.FINANCIAL_INTEGRITY_BLOCKED:
-        logger.info("reset_integrity_noop", extra={"event": "reset_integrity_noop"})
-        return 0
-
-    now = datetime.now(UTC)
-    reconciliation_details: dict[str, Any] = {}
-
-    if not force:
-        _require_credentials(settings, require_ai=False)
-        broker = _build_broker(settings)
-        try:
-            alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
-            settlement = SettlementProcessor(repositories, alerts)
-            summary = await run_reconciliation(repositories, broker, settlement, alerts)
-        finally:
-            await broker.aclose()
-        if summary.status != "ok" or summary.accounting_drift_detected > 0 or summary.missed_fills_detected > 0:
-            logger.error(
-                "reset_integrity_refused_drift_detected",
-                extra={
-                    "event": "reset_integrity_refused_drift_detected", "reconciliation_status": summary.status,
-                    "accounting_drift_detected": summary.accounting_drift_detected,
-                    "missed_fills_detected": summary.missed_fills_detected,
-                },
-            )
-            return 1
-        reconciliation_details = {
-            "reconciliation_status": summary.status,
-            "positions_checked": str(summary.positions_checked),
-            "accounting_drift_detected": str(summary.accounting_drift_detected),
-            "missed_fills_detected": str(summary.missed_fills_detected),
-        }
-
-    def decide(session: TradingSession) -> tuple[TradingSession, AuditEvent] | None:
-        if session.state != SessionState.FINANCIAL_INTEGRITY_BLOCKED:
-            return None
-        new_session = TradingSession(SESSION_RECORD_ID, SessionState.MANUALLY_STOPPED, False, now)
-        if force:
-            event = AuditEvent(
-                event_id=str(uuid4()), event_type="session_transition", severity="critical",
-                message="financial_integrity_blocked force-cleared WITHOUT a verifying reconciliation pass", occurred_at=now,
-                entity_type="trading_session", entity_id=SESSION_RECORD_ID,
-                details={
-                    "action": "reset_integrity_forced", "previous_state": "financial_integrity_blocked",
-                    "new_state": "manually_stopped", "reason": session.financial_integrity_reason,
-                },
-            )
-        else:
-            event = AuditEvent(
-                event_id=str(uuid4()), event_type="session_transition", severity="info",
-                message="financial_integrity_blocked cleared after a clean reconciliation pass", occurred_at=now,
-                entity_type="trading_session", entity_id=SESSION_RECORD_ID,
-                details={
-                    "action": "reset_integrity", "previous_state": "financial_integrity_blocked",
-                    "new_state": "manually_stopped", "reason": session.financial_integrity_reason,
-                    **reconciliation_details,
-                },
-            )
-        return new_session, event
-
-    result = await transition_session(repositories, decide)
-    if result is None:
-        logger.info("reset_integrity_noop_state_changed_concurrently", extra={"event": "reset_integrity_noop_state_changed_concurrently"})
-        return 0
-    logger.info("session_integrity_reset", extra={"event": "session_integrity_reset", "forced": force})
+        await state.broker.aclose()
     return 0
 
 
@@ -700,6 +474,10 @@ def _build_parser() -> argparse.ArgumentParser:
     reset_integrity_parser.add_argument(
         "--force", action="store_true", help="skip the verifying reconciliation pass (emergency override, logged as a critical unverified action)"
     )
+    dashboard_parser = subparsers.add_parser(
+        "dashboard", help="run the local operator dashboard (read-only observability + start/stop/reset controls); always binds 127.0.0.1, no remote option"
+    )
+    dashboard_parser.add_argument("--port", type=int, default=8000, help="port to bind on 127.0.0.1 (default: 8000)")
     return parser
 
 
@@ -740,6 +518,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_run_reset_integrity(settings, force=args.force))
         if args.command == "scan":
             return asyncio.run(_run_scan(settings, [AssetClass(v) for v in args.asset_class]))
+        if args.command == "dashboard":
+            return asyncio.run(_run_dashboard(settings, args.port))
         return asyncio.run(_COMMANDS[args.command](settings))
     except (SettingsError, MarketDataCapabilityError) as exc:
         print(f"tradepulse: {exc}", file=sys.stderr)

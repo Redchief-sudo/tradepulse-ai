@@ -327,7 +327,28 @@ class ExecutionGateway:
                 await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
                 return ExecutionResult("rejected", trade_intent_id, risk.reasons, Decimal("0"), None)
 
-            approved = replace(intent, status=TradeIntentStatus.RISK_APPROVED, requested_quantity=risk.approved_quantity)
+            # Captures values already computed above (risk_input, risk,
+            # quote, self._risk_limits) -- nothing here is recomputed or
+            # newly derived. Without this, the sizing story (why this
+            # quantity, which caps bound it) only ever existed as
+            # RiskDecision.reasons, transient in-memory for the one process
+            # that computed it -- gone the moment this function returns, and
+            # unrecoverable for any later "why was this sized this way"
+            # read (a dashboard, an audit, a human).
+            risk_snapshot = {
+                "reasons": list(risk.reasons),
+                "confidence": str(request.confidence) if request.confidence is not None else None,
+                "entry_price": str(quote.price),
+                "stop_loss": str(request.stop_loss) if request.stop_loss is not None else None,
+                "contract_multiplier": str(risk_input.contract_multiplier),
+                "requested_quantity": str(request.requested_quantity),
+                "approved_quantity": str(risk.approved_quantity),
+                "risk_profile": self._risk_limits.profile_id,
+            }
+            approved = replace(
+                intent, status=TradeIntentStatus.RISK_APPROVED, requested_quantity=risk.approved_quantity,
+                risk_snapshot=risk_snapshot,
+            )
             await self._repositories.trade_intents.update(trade_intent_id, approved, status=approved.status.value)
 
         # External quote/account/risk calls may take long enough for an

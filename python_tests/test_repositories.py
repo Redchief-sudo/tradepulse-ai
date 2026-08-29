@@ -42,6 +42,32 @@ async def test_list_all_orders_by_created_at_ascending(tmp_path) -> None:
     assert [row["record_id"] for row in rows] == ["holding-0", "holding-1", "holding-2"]
 
 
+async def test_list_recent_orders_by_created_at_descending(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    asset = AssetIdentity("AAPL", AssetClass.EQUITY, "alpaca:AAPL")
+    for i in range(3):
+        await repositories.holdings.create_once(f"holding-{i}", Holding(asset, Decimal(i + 1), Decimal("150"), NOW))
+    rows = await repositories.holdings.list_recent()
+    assert [row["record_id"] for row in rows] == ["holding-2", "holding-1", "holding-0"]  # newest first, reverse of list_all
+
+
+async def test_list_recent_respects_limit_bounds(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    with pytest.raises(ValueError, match="limit"):
+        await repositories.holdings.list_recent(limit=0)
+    with pytest.raises(ValueError, match="limit"):
+        await repositories.holdings.list_recent(limit=1001)
+
+
+async def test_list_recent_respects_limit_count(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    asset = AssetIdentity("AAPL", AssetClass.EQUITY, "alpaca:AAPL")
+    for i in range(5):
+        await repositories.holdings.create_once(f"holding-{i}", Holding(asset, Decimal(i + 1), Decimal("150"), NOW))
+    rows = await repositories.holdings.list_recent(limit=2)
+    assert [row["record_id"] for row in rows] == ["holding-4", "holding-3"]
+
+
 async def test_delete_is_permitted_on_holdings(tmp_path) -> None:
     repositories = await _repositories(tmp_path)
     asset = AssetIdentity("AAPL", AssetClass.EQUITY, "alpaca:AAPL")

@@ -60,6 +60,7 @@ from tradepulse.persistence import PersistenceRepositories, hydrate, run_with_lo
 from tradepulse.providers import (
     AIProvider,
     AlpacaMarketDataProvider,
+    MarketDataCapabilities,
     OpportunityCandidate,
     ProviderDataFailure,
     ProviderError,
@@ -241,6 +242,7 @@ async def run_scan_cycle(
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     strategy_weights: StrategyWeights | None = None,
     lease_lost: asyncio.Event | None = None,
+    capabilities: MarketDataCapabilities | None = None,
 ) -> ScanCycleSummary:
     now = clock()
     strategy_weights = strategy_weights or default_strategy_weights(now)
@@ -250,6 +252,9 @@ async def run_scan_cycle(
     scan_run = ScanRun(
         scan_run_id=scan_run_id, scan_generation=scan_generation, trigger=trigger, asset_class=asset_class,
         status=ScanRunStatus.RUNNING, started_at=now, lock_owner_token=str(uuid4()),
+        market_data_tier=capabilities.tier_label if capabilities is not None else None,
+        equity_feed=capabilities.equity_feed if capabilities is not None else None,
+        option_feed=capabilities.option_feed if capabilities is not None else None,
     )
     await repositories.scan_runs.create_once(scan_run_id, scan_run, status=scan_run.status.value)
 

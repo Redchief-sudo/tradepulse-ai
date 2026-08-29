@@ -1,0 +1,162 @@
+.dashboard {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+header h1 {
+  margin: 0 0 4px;
+  font-size: 1.4rem;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  gap: 16px;
+  margin-top: 20px;
+}
+
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  min-width: 0;
+}
+
+.panel h2 {
+  margin: 0 0 12px;
+  font-size: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel h3 {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin: 16px 0 6px;
+}
+
+.panel-loading {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  display: inline-block;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.panel-error {
+  background: rgba(240, 97, 109, 0.12);
+  border: 1px solid var(--negative);
+  color: var(--negative);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 0.8rem;
+  margin-bottom: 10px;
+}
+
+.panel-body {
+  overflow-x: auto;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.kv dt {
+  color: var(--muted);
+}
+
+.kv dd {
+  margin: 0;
+}
+
+.badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 0.8rem;
+  margin-bottom: 10px;
+}
+
+.badge-active {
+  border-color: var(--positive);
+  color: var(--positive);
+}
+
+.badge-blocked {
+  border-color: var(--negative);
+  color: var(--negative);
+}
+
+.button-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+  align-items: center;
+}
+
+.danger-zone {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+}
+
+.confirm-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 0.85rem;
+}
+
+.confirm-box code {
+  background: var(--bg);
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+.positive {
+  color: var(--positive);
+}
+
+.negative {
+  color: var(--negative);
+}
+
+.row-danger {
+  background: rgba(240, 97, 109, 0.08);
+}
+
+.row-warning {
+  background: rgba(232, 183, 74, 0.08);
+}
+
+.reasons {
+  max-width: 320px;
+  white-space: normal;
+  font-size: 0.75rem;
+  color: var(--muted);
+}

@@ -21,6 +21,14 @@ class ScanRun:
     candidates_approved: int = 0
     orders_submitted: int = 0
     error: str | None = None
+    # Resolved Alpaca market-data capability for this cycle (see
+    # providers/market_data_capability.py) -- optional/defaulting to None
+    # so no backfill is needed for existing rows. Lets a durable reader
+    # (e.g. a dashboard) see "what feed was actually used" without ever
+    # probing Alpaca itself.
+    market_data_tier: str | None = None
+    equity_feed: str | None = None
+    option_feed: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.trigger, ScanTrigger):

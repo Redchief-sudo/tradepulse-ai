@@ -316,6 +316,9 @@ def decode_scan_run(d: Mapping[str, Any]) -> ScanRun:
         candidates_approved=d.get("candidates_approved", 0),
         orders_submitted=d.get("orders_submitted", 0),
         error=d.get("error"),
+        market_data_tier=d.get("market_data_tier"),
+        equity_feed=d.get("equity_feed"),
+        option_feed=d.get("option_feed"),
     )
 
 

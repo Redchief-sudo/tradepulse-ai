@@ -7,12 +7,12 @@ import pytest
 import respx
 
 from tradepulse.broker import AlpacaClient
-from tradepulse.cli import (
-    _run_reset_integrity,
-    _run_reset_risk,
-    _run_start,
-    _run_status,
-    _run_stop,
+from tradepulse.session_commands import (
+    run_reset_integrity as _run_reset_integrity,
+    run_reset_risk as _run_reset_risk,
+    run_start as _run_start,
+    run_status as _run_status,
+    run_stop as _run_stop,
 )
 from tradepulse.config import Settings
 from tradepulse.models import (

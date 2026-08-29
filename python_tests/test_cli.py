@@ -48,6 +48,23 @@ def test_scan_subcommand_parses() -> None:
     assert args.asset_class == ["equity"]  # a single value still parses to a one-element list, not a bare string
 
 
+def test_dashboard_subcommand_parses_with_default_port() -> None:
+    args = _build_parser().parse_args(["dashboard"])
+    assert args.command == "dashboard"
+    assert args.port == 8000
+
+
+def test_dashboard_subcommand_accepts_only_port_no_host_flag() -> None:
+    """No --host flag exists at all -- proves there's no configurable
+    escape hatch to bind anywhere but 127.0.0.1 (that bind address is a
+    hardcoded constant in _run_dashboard, not something argparse ever
+    exposes)."""
+    args = _build_parser().parse_args(["dashboard", "--port", "9000"])
+    assert args.port == 9000
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(["dashboard", "--host", "0.0.0.0"])
+
+
 def test_scan_subcommand_parses_multiple_asset_classes() -> None:
     args = _build_parser().parse_args(["scan", "--asset-class", "equity", "crypto", "option"])
     assert args.asset_class == ["equity", "crypto", "option"]

@@ -49,6 +49,20 @@ Example crontab:
 
 An overlapping invocation of the same command is blocked at the application level by a per-command database-enforced lease (not by cron/flock discipline) -- a caller that loses the race exits cleanly (status 0) rather than racing the live run. `scan` runs discovery and position protection under separate leases in the same process, so a slow AI call never delays protective exits.
 
+## Dashboard
+
+A local-only operator dashboard -- read-only observability (session state, positions, opportunities, fills/settlement, PnL, risk exposure, reconciliation/audit alerts) plus start/stop/reset-risk/reset-integrity controls. Every control calls the exact same functions `tradepulse start`/`stop`/`reset-risk`/`reset-integrity` do (`tradepulse/session_commands.py`) -- a dashboard button is never a second implementation of the session state machine.
+
+```bash
+.venv/bin/pip install -e ".[web]"
+cd frontend && npm install && npm run build && cd ..
+.venv/bin/tradepulse dashboard  # serves both the API and the built frontend at http://127.0.0.1:8000
+```
+
+For frontend development with hot-reload, run `npm run dev` inside `frontend/` (proxies `/api/*` to a `tradepulse dashboard` process running separately) instead of building.
+
+**Always binds `127.0.0.1` -- there is no `--host` flag and no remote-access option.** With no authentication/authorization layer yet, anything network-reachable would be unauthenticated `start`/`stop`/`reset-risk`/`reset-integrity` control-plane access; remote access is a later phase that must ship with real auth, not a flag that bypasses having one.
+
 ## Status
 
 The core runtime (models, persistence, broker client, risk engine, execution gateway, settlement pipeline, AI-driven scan cycle gated by both AI and deterministic technical/momentum/risk signals, position monitor, broker reconciliation) is built and tested. The execution gateway and reconciliation share one canonical path (`execution/fill_attribution.py`) that creates every local `Fill`/`SettlementEvent` from Alpaca's real, validated per-fill activity ID -- never a locally-synthesized one -- whether attributed live during polling or recovered later by reconciliation for an order the live poll window already gave up on. Known deferred items: session start/stop/status as the sole authority for the trading session (a missing session row correctly fails closed to disabled, but there's no normal operator command to enable one), equity market-hours enforcement via Alpaca's own clock endpoint (currently relies on cron scheduling), and wiring in the deterministic market-regime classifier once an intraday candle source exists (its volatility math currently assumes 5-minute bars; this codebase only fetches daily ones). See `docs/` for the full audit history.

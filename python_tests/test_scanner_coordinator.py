@@ -13,7 +13,7 @@ from tradepulse.config import risk_limits_for_profile
 from tradepulse.execution import ExecutionGateway, reserve_symbol_for_execution
 from tradepulse.models import AssetClass, AssetIdentity, Candle, ExecutionMode, ScanRun, ScanRunStatus, ScanTrigger, SessionState, TradingSession, asset_identity_key
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
-from tradepulse.providers import AlpacaMarketDataProvider, AnthropicAIProvider
+from tradepulse.providers import AlpacaMarketDataProvider, AnthropicAIProvider, MarketDataCapabilities
 from tradepulse.providers.anthropic_ai import SCAN_TOOL_NAME
 from tradepulse.risk import load_session, save_session
 from tradepulse.scanner import run_scan_cycle
@@ -170,6 +170,50 @@ async def test_equity_lane_prompt_contains_only_equity_symbols(tmp_path) -> None
     assert "AAPL" in prompt
     assert "BTC/USD" not in prompt
     assert "equity" in prompt.lower() or "ETF" in prompt
+
+
+@respx.mock
+async def test_scan_run_stamps_resolved_market_data_capabilities_when_provided(tmp_path) -> None:
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(200, json=_tool_use_response([])))
+    capabilities = MarketDataCapabilities(equity_feed="sip", option_feed="opra")
+
+    summary = await run_scan_cycle(
+        repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY,
+        clock=lambda: NOW, capabilities=capabilities,
+    )
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    scan_row = await repositories.scan_runs.get(summary.scan_run_id)
+    scan_run = hydrate("scan_runs", scan_row["payload"])
+    assert scan_run.market_data_tier == "algo_trader_plus"
+    assert scan_run.equity_feed == "sip"
+    assert scan_run.option_feed == "opra"
+
+
+@respx.mock
+async def test_scan_run_leaves_capability_fields_none_when_omitted(tmp_path) -> None:
+    """Every EXISTING call site (this codebase's ~20 direct run_scan_cycle
+    calls in tests, and any caller not yet capability-aware) omits
+    `capabilities` entirely -- must stay a true no-op, never crash or stamp
+    a guessed value."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(200, json=_tool_use_response([])))
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    scan_row = await repositories.scan_runs.get(summary.scan_run_id)
+    scan_run = hydrate("scan_runs", scan_row["payload"])
+    assert scan_run.market_data_tier is None
+    assert scan_run.equity_feed is None
+    assert scan_run.option_feed is None
 
 
 @respx.mock
