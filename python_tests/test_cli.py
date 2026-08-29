@@ -1,29 +1,44 @@
 import asyncio
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from os import environ
+from typing import Any
 
 import httpx
 import pytest
 import respx
 
 from tradepulse.alerts import TelegramAlerter
+from tradepulse.broker import AlpacaClock, AlpacaError
 from tradepulse.cli import (
+    CRYPTO_SCAN_INTERVAL_SECONDS,
+    EQUITY_SCAN_INTERVAL_SECONDS,
+    MARKET_CLOCK_RETRY_SECONDS,
     MONITOR_LOCK_KEY,
+    OPTION_SCAN_INTERVAL_SECONDS,
     RECONCILE_LOCK_KEY,
+    RUN_LOCK_KEY,
     SCAN_LOCK_KEY,
     SETTLE_LOCK_KEY,
     _build_ai_provider,
     _build_parser,
+    _check_market_state,
     _lease_lost_signal,
     _load_dotenv,
+    _periodic_loop,
     _require_credentials,
+    _run_application,
     _run_monitor,
     _run_reconcile,
     _run_scan,
     _run_scan_leg,
     _run_settle,
+    _run_settle_leg,
+    _run_trading_supervisor,
+    _scan_action,
+    _supervised_lane,
     scan_lock_key,
 )
 from tradepulse.config import Settings, SettingsError
@@ -38,8 +53,9 @@ from tradepulse.models import (
     TradeIntent,
     asset_identity_key,
 )
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate, release_lock
 from tradepulse.providers import AnthropicAIProvider, MarketDataCapabilities, OpenAIProvider
+from tradepulse.settlement import SettlementProcessor
 
 
 def test_scan_subcommand_parses() -> None:
@@ -63,6 +79,24 @@ def test_dashboard_subcommand_accepts_only_port_no_host_flag() -> None:
     assert args.port == 9000
     with pytest.raises(SystemExit):
         _build_parser().parse_args(["dashboard", "--host", "0.0.0.0"])
+
+
+def test_run_subcommand_parses_with_default_port_and_browser_open() -> None:
+    args = _build_parser().parse_args(["run"])
+    assert args.command == "run"
+    assert args.port == 8000
+    assert args.no_browser is False
+
+
+def test_run_subcommand_accepts_port_and_no_browser_no_host_flag() -> None:
+    """Mirrors the existing dashboard parser test -- no --host flag exists at
+    all, proving there's no configurable escape hatch to bind anywhere but
+    127.0.0.1 for `run` either."""
+    args = _build_parser().parse_args(["run", "--port", "9000", "--no-browser"])
+    assert args.port == 9000
+    assert args.no_browser is True
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(["run", "--host", "0.0.0.0"])
 
 
 def test_scan_subcommand_parses_multiple_asset_classes() -> None:
@@ -401,3 +435,488 @@ async def test_scan_leg_alerts_and_stops_new_work_when_its_lease_is_reclaimed(tm
     assert observed_lease_lost["event"].is_set()
     skipped = [r for r in caplog.records if getattr(r, "event", None) == "telegram_alert_skipped_no_credentials"]
     assert any("Lock renewal failed for '" + scan_lock_key(AssetClass.EQUITY) + "'" in r.alert_message for r in skipped)
+
+
+# ---- `tradepulse run` -- one-command interactive supervisor ---------------
+
+
+class _StubClockBroker:
+    """Duck-typed broker.get_clock() stub for _check_market_state/_scan_action
+    tests -- tri-state (open / closed / a raised error), no real HTTP."""
+
+    def __init__(self, *, is_open: bool | None = None, error: Exception | None = None) -> None:
+        self._is_open = is_open
+        self._error = error
+        self.call_count = 0
+
+    async def get_clock(self) -> AlpacaClock:
+        self.call_count += 1
+        if self._error is not None:
+            raise self._error
+        return AlpacaClock(is_open=bool(self._is_open), next_open=None, next_close=None, timestamp=None)
+
+
+async def _wait_until(predicate: Callable[[], bool], timeout: float = 2.0, interval: float = 0.01) -> None:
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() > deadline:
+            raise AssertionError("condition not met before timeout")
+        await asyncio.sleep(interval)
+
+
+async def test_check_market_state_reports_open_and_closed() -> None:
+    assert await _check_market_state(_StubClockBroker(is_open=True)) == "open"
+    assert await _check_market_state(_StubClockBroker(is_open=False)) == "closed"
+
+
+async def test_check_market_state_is_indeterminate_on_alpaca_error_not_closed() -> None:
+    broker = _StubClockBroker(error=AlpacaError("boom", 500, None, None, "getClock"))
+    assert await _check_market_state(broker) == "indeterminate"
+
+
+async def test_check_market_state_is_indeterminate_on_transport_error_not_closed() -> None:
+    broker = _StubClockBroker(error=httpx.ConnectError("boom"))
+    assert await _check_market_state(broker) == "indeterminate"
+
+
+async def test_scan_action_crypto_never_checks_market_state(tmp_path, monkeypatch) -> None:
+    """Crypto is a continuous market -- no clock gating, matching scan's own
+    standalone behavior."""
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    alerts = TelegramAlerter(None, None)
+    settings = _settings(database_url)
+
+    calls: list[AssetClass] = []
+
+    async def _stub_scan_cycle(repositories, ai_provider, market_data, broker, gateway, universe, risk_limits, asset_class, **kwargs):
+        calls.append(asset_class)
+
+    monkeypatch.setattr("tradepulse.cli.run_scan_cycle", _stub_scan_cycle)
+    broker = _StubClockBroker(is_open=False)  # would report "closed" if it were ever checked
+
+    wait_seconds = await _scan_action(
+        AssetClass.CRYPTO, CRYPTO_SCAN_INTERVAL_SECONDS, database, repositories, None, None, broker, None,
+        settings, alerts, MarketDataCapabilities("sip", "opra"),
+    )
+
+    assert wait_seconds == CRYPTO_SCAN_INTERVAL_SECONDS
+    assert calls == [AssetClass.CRYPTO]
+    assert broker.call_count == 0
+
+
+async def test_scan_action_confirmed_closed_skips_cycle_and_waits_full_interval(tmp_path, monkeypatch) -> None:
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    alerts = TelegramAlerter(None, None)
+    settings = _settings(database_url)
+
+    called = False
+
+    async def _stub_scan_cycle(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("tradepulse.cli.run_scan_cycle", _stub_scan_cycle)
+    broker = _StubClockBroker(is_open=False)
+
+    wait_seconds = await _scan_action(
+        AssetClass.EQUITY, EQUITY_SCAN_INTERVAL_SECONDS, database, repositories, None, None, broker, None,
+        settings, alerts, MarketDataCapabilities("sip", "opra"),
+    )
+
+    assert wait_seconds == EQUITY_SCAN_INTERVAL_SECONDS
+    assert called is False  # no cycle run, no AI call spent while the market is confirmed closed
+
+
+async def test_scan_action_indeterminate_market_state_uses_bounded_retry_not_full_interval(tmp_path, monkeypatch) -> None:
+    """The corrected behavior: a broker/clock hiccup must never be silently
+    folded into the full 15/20-minute lane interval -- that's only correct
+    once the market is CONFIRMED closed (see the test above)."""
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    alerts = TelegramAlerter(None, None)
+    settings = _settings(database_url)
+
+    called = False
+
+    async def _stub_scan_cycle(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("tradepulse.cli.run_scan_cycle", _stub_scan_cycle)
+    broker = _StubClockBroker(error=httpx.ConnectError("boom"))
+
+    wait_seconds = await _scan_action(
+        AssetClass.OPTION, OPTION_SCAN_INTERVAL_SECONDS, database, repositories, None, None, broker, None,
+        settings, alerts, MarketDataCapabilities("sip", "opra"),
+    )
+
+    assert wait_seconds == MARKET_CLOCK_RETRY_SECONDS
+    assert wait_seconds != OPTION_SCAN_INTERVAL_SECONDS
+    assert called is False
+
+
+async def test_periodic_loop_calls_action_repeatedly_and_respects_its_returned_wait() -> None:
+    shutdown = asyncio.Event()
+    call_count = 0
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    async def action() -> float:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 3:
+            shutdown.set()
+        return 2.0
+
+    await _periodic_loop(action, shutdown, sleep=fake_sleep)
+
+    assert call_count == 3
+    # Two full 2-tick gaps (after calls 1 and 2); the wait after call 3 is
+    # skipped entirely since shutdown is already set by then.
+    assert sleep_calls == [1, 1, 1, 1]
+
+
+async def test_periodic_loop_awaits_inflight_action_to_completion_after_shutdown() -> None:
+    """Never cancels in-flight work -- shutdown is only checked BETWEEN
+    calls."""
+    shutdown = asyncio.Event()
+    entered = asyncio.Event()
+    completed = False
+
+    async def action() -> float:
+        entered.set()
+        await asyncio.sleep(0.05)
+        nonlocal completed
+        completed = True
+        return 999.0
+
+    task = asyncio.create_task(_periodic_loop(action, shutdown, sleep=asyncio.sleep))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    shutdown.set()  # fires WHILE action() is still in flight
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert completed is True
+
+
+async def test_supervised_lane_reraises_cancellation() -> None:
+    async def _cancel() -> None:
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _supervised_lane("monitor", _cancel(), None, TelegramAlerter(None, None))
+
+
+async def test_supervised_lane_persists_critical_audit_event_and_sends_alert_on_unhandled_exception(tmp_path, caplog) -> None:
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    alerts = TelegramAlerter(None, None)
+
+    async def _boom() -> None:
+        raise RuntimeError("simulated lane crash")
+
+    with caplog.at_level("WARNING"):
+        await _supervised_lane("equity", _boom(), repositories, alerts)  # must not raise
+
+    rows = await repositories.audit_events.list_all()
+    events = [hydrate("audit_events", row["payload"]) for row in rows]
+    failures = [e for e in events if e.event_type == "trading_supervisor_lane_failed"]
+    assert len(failures) == 1
+    assert failures[0].severity == "critical"
+    assert failures[0].entity_type == "trading_supervisor"
+    assert failures[0].entity_id == "equity"
+    skipped = [r for r in caplog.records if getattr(r, "event", None) == "telegram_alert_skipped_no_credentials"]
+    assert len(skipped) == 1  # alerts.send was actually invoked
+
+
+async def test_run_settle_leg_skipped_when_lock_held(tmp_path) -> None:
+    """Direct proof _run_settle_leg is the exact function tradepulse settle
+    now delegates to (see _run_settle) -- a held lease is a clean, logged
+    no-op, not an error."""
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    alerts = TelegramAlerter(None, None)
+    settlement = SettlementProcessor(repositories, alerts)
+    assert await acquire_lock(database, SETTLE_LOCK_KEY, "other-owner", "settle", ttl_seconds=300) is True
+
+    result = await _run_settle_leg(database, repositories, settlement, alerts)
+
+    assert result is None
+
+
+def _supervisor_stub_scan_cycle(
+    started: "list[AssetClass] | set[AssetClass]",
+    *,
+    block: "dict[AssetClass, tuple[asyncio.Event, asyncio.Event]] | None" = None,
+):
+    async def _stub(repositories, ai_provider, market_data, broker, gateway, universe, risk_limits, asset_class, **kwargs):
+        if isinstance(started, set):
+            started.add(asset_class)
+        else:
+            started.append(asset_class)
+        if block and asset_class in block:
+            blocked_signal, may_proceed = block[asset_class]
+            blocked_signal.set()
+            await may_proceed.wait()
+
+    return _stub
+
+
+async def test_run_trading_supervisor_genuine_concurrency_not_serial(tmp_path, monkeypatch) -> None:
+    """The corrected design's central proof: a slow equity lane must never
+    block crypto/option from starting -- each lane is its own independent
+    asyncio task, not a shared serial loop that would leave crypto/option
+    waiting behind equity."""
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    alerts = TelegramAlerter(None, None)
+    settings = _settings(database_url)
+    settlement = SettlementProcessor(repositories, alerts)
+
+    equity_blocked = asyncio.Event()
+    equity_may_proceed = asyncio.Event()
+    started: set[AssetClass] = set()
+
+    monkeypatch.setattr(
+        "tradepulse.cli.run_scan_cycle",
+        _supervisor_stub_scan_cycle(started, block={AssetClass.EQUITY: (equity_blocked, equity_may_proceed)}),
+    )
+
+    async def _stub_monitor(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("tradepulse.cli.run_position_monitor", _stub_monitor)
+    monkeypatch.setattr(settlement, "process_pending", _stub_monitor)
+
+    shutdown = asyncio.Event()
+
+    async def fake_sleep(seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    broker = _StubClockBroker(is_open=True)
+    capabilities = MarketDataCapabilities("sip", "opra")
+
+    task = asyncio.create_task(
+        _run_trading_supervisor(
+            database, repositories, None, None, broker, None, settlement, settings, alerts, shutdown, capabilities,
+            sleep=fake_sleep,
+        )
+    )
+    try:
+        await asyncio.wait_for(equity_blocked.wait(), timeout=2.0)
+        await _wait_until(lambda: AssetClass.CRYPTO in started and AssetClass.OPTION in started, timeout=2.0)
+
+        # Equity is STILL blocked (never proceeded) while crypto and option
+        # have already started -- proves siblings don't wait behind a slow
+        # lane, which a shared serial loop would fail.
+        assert not equity_may_proceed.is_set()
+        assert AssetClass.CRYPTO in started
+        assert AssetClass.OPTION in started
+    finally:
+        equity_may_proceed.set()
+        shutdown.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+
+async def test_run_trading_supervisor_settlement_fires_independently(tmp_path, monkeypatch) -> None:
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    alerts = TelegramAlerter(None, None)
+    settings = _settings(database_url)
+    settlement = SettlementProcessor(repositories, alerts)
+
+    settle_calls = 0
+
+    async def _stub_settle(*args, **kwargs):
+        nonlocal settle_calls
+        settle_calls += 1
+
+    monkeypatch.setattr(settlement, "process_pending", _stub_settle)
+    monkeypatch.setattr("tradepulse.cli.run_scan_cycle", _supervisor_stub_scan_cycle([]))
+
+    async def _stub_monitor(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("tradepulse.cli.run_position_monitor", _stub_monitor)
+
+    shutdown = asyncio.Event()
+
+    async def fake_sleep(seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    broker = _StubClockBroker(is_open=True)
+    capabilities = MarketDataCapabilities("sip", "opra")
+
+    task = asyncio.create_task(
+        _run_trading_supervisor(
+            database, repositories, None, None, broker, None, settlement, settings, alerts, shutdown, capabilities,
+            sleep=fake_sleep,
+        )
+    )
+    await _wait_until(lambda: settle_calls >= 1, timeout=2.0)
+    shutdown.set()
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert settle_calls >= 1
+
+
+async def test_run_trading_supervisor_lane_failure_is_isolated_and_recorded(tmp_path, monkeypatch) -> None:
+    """A crashed lane must never take its siblings down with it, and must
+    never be misreported via RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED."""
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    alerts = TelegramAlerter(None, None)
+    settings = _settings(database_url)
+    settlement = SettlementProcessor(repositories, alerts)
+
+    other_activity: set[str] = set()
+
+    async def _stub_scan_cycle(repositories, ai_provider, market_data, broker, gateway, universe, risk_limits, asset_class, **kwargs):
+        if asset_class == AssetClass.EQUITY:
+            raise RuntimeError("simulated equity lane crash")
+        other_activity.add(asset_class.value)
+
+    monkeypatch.setattr("tradepulse.cli.run_scan_cycle", _stub_scan_cycle)
+
+    async def _stub_monitor(*args, **kwargs):
+        other_activity.add("monitor")
+
+    monkeypatch.setattr("tradepulse.cli.run_position_monitor", _stub_monitor)
+
+    async def _stub_settle(*args, **kwargs):
+        other_activity.add("settle")
+
+    monkeypatch.setattr(settlement, "process_pending", _stub_settle)
+
+    shutdown = asyncio.Event()
+
+    async def fake_sleep(seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    broker = _StubClockBroker(is_open=True)
+    capabilities = MarketDataCapabilities("sip", "opra")
+
+    task = asyncio.create_task(
+        _run_trading_supervisor(
+            database, repositories, None, None, broker, None, settlement, settings, alerts, shutdown, capabilities,
+            sleep=fake_sleep,
+        )
+    )
+    await _wait_until(lambda: {"crypto", "option", "monitor", "settle"} <= other_activity, timeout=2.0)
+    shutdown.set()
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert "equity" not in other_activity  # the crashed lane never got to append anything
+
+    rows = await repositories.audit_events.list_all()
+    events = [hydrate("audit_events", row["payload"]) for row in rows]
+    failures = [e for e in events if e.event_type == "trading_supervisor_lane_failed"]
+    assert len(failures) == 1
+    assert failures[0].entity_id == "equity"
+    assert failures[0].severity == "critical"
+
+
+def _stub_build_dashboard_server(state: Any, port: int, log_level: str) -> Any:
+    return object()
+
+
+async def test_run_application_lock_lifecycle_refuses_duplicate_and_releases_on_shutdown(tmp_path, monkeypatch) -> None:
+    """Per review: run_with_lock_renewal only ever RENEWS an already-held
+    lease -- _run_application must explicitly acquire_lock before it and
+    release_lock in finally, with the SAME owner_token throughout. This
+    proves that whole lifecycle: a concurrent second invocation refuses
+    immediately (never reaching the trading supervisor), and the first
+    invocation's own release actually frees the lease for a later caller."""
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    settings = _settings(database_url)
+
+    async def _stub_run_dashboard_server(server, shutdown) -> None:
+        shutdown.set()
+
+    async def _stub_run_start(settings) -> int:
+        return 0
+
+    supervisor_calls = 0
+
+    async def _stub_run_trading_supervisor(*args, **kwargs) -> None:
+        nonlocal supervisor_calls
+        supervisor_calls += 1
+
+    monkeypatch.setattr("tradepulse.cli._build_dashboard_server", _stub_build_dashboard_server)
+    monkeypatch.setattr("tradepulse.cli._run_dashboard_server", _stub_run_dashboard_server)
+    monkeypatch.setattr("tradepulse.cli._run_start", _stub_run_start)
+    monkeypatch.setattr("tradepulse.cli._run_trading_supervisor", _stub_run_trading_supervisor)
+
+    assert await acquire_lock(database, RUN_LOCK_KEY, "other-owner", "run", ttl_seconds=60) is True
+    exit_code = await _run_application(settings, 8123, False)
+    assert exit_code == 1
+    assert supervisor_calls == 0  # refused before ever reaching the supervisor
+    await release_lock(database, RUN_LOCK_KEY, "other-owner")
+
+    exit_code = await _run_application(settings, 8123, False)
+    assert exit_code == 0
+    assert supervisor_calls == 1
+
+    # The first run's own release actually cleared the row -- a later
+    # caller can acquire it again, not just wait out an expiry.
+    assert await acquire_lock(database, RUN_LOCK_KEY, "post-check", "run", ttl_seconds=60) is True
+
+
+async def test_run_application_never_starts_supervisor_when_session_activation_refused(tmp_path, monkeypatch) -> None:
+    """The second correction: a refused `run_start()` (RISK_STOPPED,
+    FINANCIAL_INTEGRITY_BLOCKED, broker unreachable, ...) must never launch
+    scan/monitor/settlement work, even though downstream execution gates
+    would separately also refuse orders -- honoring the refusal must not
+    depend on those gates catching it. The dashboard stays up regardless,
+    so an operator can see why and fix it."""
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    settings = _settings(database_url)
+
+    dashboard_ran = False
+
+    async def _stub_run_dashboard_server(server, shutdown) -> None:
+        nonlocal dashboard_ran
+        dashboard_ran = True
+        shutdown.set()
+
+    async def _stub_run_start(settings) -> int:
+        return 1
+
+    supervisor_calls = 0
+
+    async def _stub_run_trading_supervisor(*args, **kwargs) -> None:
+        nonlocal supervisor_calls
+        supervisor_calls += 1
+
+    monkeypatch.setattr("tradepulse.cli._build_dashboard_server", _stub_build_dashboard_server)
+    monkeypatch.setattr("tradepulse.cli._run_dashboard_server", _stub_run_dashboard_server)
+    monkeypatch.setattr("tradepulse.cli._run_start", _stub_run_start)
+    monkeypatch.setattr("tradepulse.cli._run_trading_supervisor", _stub_run_trading_supervisor)
+
+    exit_code = await _run_application(settings, 8124, False)
+
+    assert exit_code == 0  # the process itself doesn't fail -- the dashboard stays up for diagnosis
+    assert dashboard_ran is True
+    assert supervisor_calls == 0

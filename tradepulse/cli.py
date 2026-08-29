@@ -40,6 +40,16 @@ lease per command (see persistence/lock.py) -- it does not depend on the
 operator's cron/flock configuration being correct. A caller that can't
 acquire its lease exits cleanly (status 0, logged as skipped), not as a
 failure.
+
+`tradepulse run` is the ONE deliberate, explicit exception to "no internal
+scheduling loop" above -- not a repeal of it. It's the normal interactive
+startup: resolves capabilities, opens the local dashboard, activates the
+session, then keeps independent equity/crypto/option scan lanes, the
+position monitor, and settlement cycling concurrently (one asyncio task
+per lane, genuinely parallel -- never a shared serial loop) until Ctrl+C.
+`scan`/`monitor`/`settle`/`reconcile` remain one-shot and cron-external;
+`run` just re-invokes their exact same per-cycle leg functions on a timer
+instead of a different execution path. See _run_application.
 """
 
 from __future__ import annotations
@@ -47,12 +57,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import signal
 import sys
+import webbrowser
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from os import environ
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import httpx
@@ -62,9 +74,15 @@ from tradepulse.broker import AlpacaClient, AlpacaError
 from tradepulse.config import Settings, SettingsError, default_strategy_weights, risk_limits_for_profile
 from tradepulse.config.logging import configure_logging
 from tradepulse.execution import ExecutionGateway
-from tradepulse.models import AssetClass
+from tradepulse.models import AssetClass, AuditEvent
 from tradepulse.monitor import MonitorCycleSummary, run_position_monitor
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, release_lock, run_with_lock_renewal
+from tradepulse.persistence import (
+    AsyncSQLiteDatabase,
+    PersistenceRepositories,
+    acquire_lock,
+    release_lock,
+    run_with_lock_renewal,
+)
 from tradepulse.providers import (
     AIProvider,
     AlpacaMarketDataProvider,
@@ -86,7 +104,7 @@ from tradepulse.session_commands import (
     run_status as _run_status,
     run_stop as _run_stop,
 )
-from tradepulse.settlement import SettlementProcessor
+from tradepulse.settlement import SettlementBatchSummary, SettlementProcessor
 from tradepulse.strategy import load_executable_universe
 
 logger = logging.getLogger(__name__)
@@ -103,6 +121,24 @@ SCAN_LOCK_TTL_SECONDS = 600
 MONITOR_LOCK_TTL_SECONDS = 300
 SETTLE_LOCK_TTL_SECONDS = 300
 RECONCILE_LOCK_TTL_SECONDS = 600
+
+# `tradepulse run` -- the whole supervisor's lifetime lease, distinct from
+# every per-cycle lock above (see _run_application). Cadences below match
+# the README's own crontab example exactly -- not configurable in this pass.
+RUN_LOCK_KEY = "run"
+RUN_LOCK_TTL_SECONDS = 60
+EQUITY_SCAN_INTERVAL_SECONDS = 900
+CRYPTO_SCAN_INTERVAL_SECONDS = 600
+OPTION_SCAN_INTERVAL_SECONDS = 1200
+MONITOR_INTERVAL_SECONDS = 120
+SETTLE_INTERVAL_SECONDS = 60
+# Bounded retry after an INDETERMINATE market-clock check (broker/network
+# trouble) -- distinct from a CONFIRMED-closed result, which correctly
+# waits the full lane interval instead (see _scan_action). Short enough to
+# recover quickly from a transient hiccup, long enough to never hammer.
+MARKET_CLOCK_RETRY_SECONDS = 30
+BROWSER_OPEN_MAX_WAIT_SECONDS = 5.0
+BROWSER_OPEN_POLL_SECONDS = 0.2
 
 
 def scan_lock_key(asset_class: AssetClass) -> str:
@@ -335,6 +371,29 @@ async def _run_monitor(settings: Settings) -> int:
     return 1 if _log_monitor_result(result) else 0
 
 
+async def _run_settle_leg(
+    database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, settlement: SettlementProcessor,
+    alerts: TelegramAlerter,
+) -> SettlementBatchSummary | None:
+    """The exact acquire/renew/release logic `tradepulse settle` runs once --
+    extracted so a supervised settle task under `tradepulse run` (see
+    _settle_action) and the standalone command call ONE function, never two
+    copies of this lock plumbing."""
+    owner_token = str(uuid4())
+    if not await acquire_lock(database, SETTLE_LOCK_KEY, owner_token, "settle", SETTLE_LOCK_TTL_SECONDS):
+        logger.info("settle_skipped_lock_held", extra={"event": "settle_skipped_lock_held"})
+        return None
+    try:
+        lease_lost, on_lease_lost = _lease_lost_signal(alerts, SETTLE_LOCK_KEY, owner_token)
+        return await run_with_lock_renewal(
+            database, SETTLE_LOCK_KEY, owner_token, SETTLE_LOCK_TTL_SECONDS,
+            settlement.process_pending(lease_lost=lease_lost),
+            on_renewal_failed=on_lease_lost,
+        )
+    finally:
+        await release_lock(database, SETTLE_LOCK_KEY, owner_token)
+
+
 async def _run_settle(settings: Settings) -> int:
     """`tradepulse settle`: independently drains any due settlement retry --
     the only production caller otherwise is the gateway's own post-fill hook,
@@ -347,19 +406,9 @@ async def _run_settle(settings: Settings) -> int:
 
     alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
     settlement = SettlementProcessor(repositories, alerts)
-    owner_token = str(uuid4())
-    if not await acquire_lock(database, SETTLE_LOCK_KEY, owner_token, "settle", SETTLE_LOCK_TTL_SECONDS):
-        logger.info("settle_skipped_lock_held", extra={"event": "settle_skipped_lock_held"})
+    summary = await _run_settle_leg(database, repositories, settlement, alerts)
+    if summary is None:
         return 0
-    try:
-        lease_lost, on_lease_lost = _lease_lost_signal(alerts, SETTLE_LOCK_KEY, owner_token)
-        summary = await run_with_lock_renewal(
-            database, SETTLE_LOCK_KEY, owner_token, SETTLE_LOCK_TTL_SECONDS,
-            settlement.process_pending(lease_lost=lease_lost),
-            on_renewal_failed=on_lease_lost,
-        )
-    finally:
-        await release_lock(database, SETTLE_LOCK_KEY, owner_token)
 
     logger.info(
         "settle_finished",
@@ -450,6 +499,278 @@ async def _run_dashboard(settings: Settings, port: int) -> int:
     return 0
 
 
+async def _check_market_state(broker: AlpacaClient) -> Literal["open", "closed", "indeterminate"]:
+    """The same live broker.get_clock() call the execution gateway's own
+    submission-boundary gate already relies on, but returning a TRI-STATE
+    result instead of a bool -- a broker/network failure is `"indeterminate"`,
+    never silently folded into `"closed"`. This is what lets _scan_action
+    (below) use a short bounded retry on a clock-check failure instead of
+    either hammering (a 1s retry) or wrongly sitting quiet for a full lane
+    interval (which is only correct once the market is CONFIRMED closed)."""
+    try:
+        clock = await broker.get_clock()
+    except (AlpacaError, httpx.HTTPError) as exc:
+        logger.warning("run_market_clock_check_failed", extra={"event": "run_market_clock_check_failed", "error": str(exc)})
+        return "indeterminate"
+    return "open" if clock.is_open else "closed"
+
+
+async def _scan_action(
+    asset_class: AssetClass, interval: int, database: AsyncSQLiteDatabase, repositories: PersistenceRepositories,
+    ai_provider: AIProvider, market_data: AlpacaMarketDataProvider, broker: AlpacaClient, gateway: ExecutionGateway,
+    settings: Settings, alerts: TelegramAlerter, capabilities: MarketDataCapabilities,
+) -> float:
+    """One tick of a supervised scan lane under `tradepulse run` -- decides
+    whether to run a cycle right now and how long to wait before the next
+    check, then delegates the actual work to _run_scan_leg unchanged. Crypto
+    is a continuous market -- no clock gating, matching scan's own standalone
+    behavior."""
+    if asset_class != AssetClass.CRYPTO:
+        market_state = await _check_market_state(broker)
+        if market_state == "indeterminate":
+            return MARKET_CLOCK_RETRY_SECONDS
+        if market_state == "closed":
+            logger.info("run_scan_skipped_market_closed", extra={"event": "run_scan_skipped_market_closed", "asset_class": asset_class.value})
+            return interval
+    await _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings, alerts, asset_class, capabilities)
+    return interval
+
+
+async def _monitor_action(
+    database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, broker: AlpacaClient,
+    gateway: ExecutionGateway, alerts: TelegramAlerter, settings: Settings,
+) -> float:
+    await _run_monitor_leg(database, repositories, broker, gateway, alerts, settings)
+    return MONITOR_INTERVAL_SECONDS
+
+
+async def _settle_action(
+    database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, settlement: SettlementProcessor,
+    alerts: TelegramAlerter,
+) -> float:
+    await _run_settle_leg(database, repositories, settlement, alerts)
+    return SETTLE_INTERVAL_SECONDS
+
+
+async def _periodic_loop(
+    action: Callable[[], Awaitable[float]], shutdown: asyncio.Event,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Calls `action` repeatedly until shutdown -- `action` ITSELF decides how
+    long to wait before the next call (its return value, in seconds). That's
+    what lets _scan_action use a short bounded retry after an INDETERMINATE
+    market-clock check vs. the full lane interval otherwise -- one generic
+    primitive, not two. Never cancels an in-flight `action()` -- shutdown is
+    only ever checked BETWEEN calls, in ~1s ticks, so it stays responsive
+    without needing cancellation."""
+    while not shutdown.is_set():
+        wait_seconds = await action()
+        waited = 0.0
+        while waited < wait_seconds and not shutdown.is_set():
+            await sleep(1)
+            waited += 1
+
+
+async def _supervised_lane(
+    name: str, loop_coro: Awaitable[None], repositories: PersistenceRepositories, alerts: TelegramAlerter,
+) -> None:
+    """A lane dying must never (a) silently vanish with no trace, (b) take
+    down its siblings, or (c) leave the session looking healthy/ACTIVE while
+    nothing is actually scanning. Deliberately NOT RISK_STOPPED/
+    FINANCIAL_INTEGRITY_BLOCKED -- real domain states with their own specific
+    meanings this must not borrow. The persisted, typed AuditEvent below is
+    already queryable and dashboard-visible today via the existing
+    AlertsPanel (polls audit_events, highlights severity="critical") -- zero
+    new dashboard code required."""
+    try:
+        await loop_coro
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- a lane dying unhandled IS the critical condition to report; must never crash the whole supervisor or vanish silently
+        message = f"TRADING_SUPERVISOR_LANE_FAILED: {name} stopped scheduling after an unhandled error: {exc}"
+        logger.error("trading_supervisor_lane_failed", extra={"event": "trading_supervisor_lane_failed", "lane": name, "error": str(exc)})
+        await alerts.send("critical", message, {"lane": name})
+        event = AuditEvent(
+            event_id=str(uuid4()), event_type="trading_supervisor_lane_failed", severity="critical",
+            message=message, occurred_at=datetime.now(UTC), entity_type="trading_supervisor", entity_id=name,
+            details={"lane": name, "error": str(exc)},
+        )
+        await repositories.audit_events.create_once(event.event_id, event)
+
+
+async def _run_trading_supervisor(
+    database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, ai_provider: AIProvider,
+    market_data: AlpacaMarketDataProvider, broker: AlpacaClient, gateway: ExecutionGateway,
+    settlement: SettlementProcessor, settings: Settings, alerts: TelegramAlerter, shutdown: asyncio.Event,
+    capabilities: MarketDataCapabilities, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Launches ONE independent asyncio task per lane (equity, crypto,
+    option, monitor, settle) -- genuine concurrency, never a shared serial
+    loop, so a slow equity AI call can never delay a simultaneously-due
+    crypto/option cycle or the position monitor. Each lane is wrapped in
+    _supervised_lane so one lane's crash never affects its siblings.
+    asyncio.gather only returns once every lane's task has ended (i.e. at
+    shutdown, since _supervised_lane catches each lane's own exceptions
+    rather than letting them propagate) -- this still correctly waits for
+    any lane's in-flight cycle to finish before returning, upholding "never
+    cancel in-flight work" at the whole-supervisor level too."""
+    lanes: dict[str, Awaitable[None]] = {
+        "equity": _periodic_loop(
+            lambda: _scan_action(
+                AssetClass.EQUITY, EQUITY_SCAN_INTERVAL_SECONDS, database, repositories, ai_provider, market_data,
+                broker, gateway, settings, alerts, capabilities,
+            ),
+            shutdown, sleep,
+        ),
+        "crypto": _periodic_loop(
+            lambda: _scan_action(
+                AssetClass.CRYPTO, CRYPTO_SCAN_INTERVAL_SECONDS, database, repositories, ai_provider, market_data,
+                broker, gateway, settings, alerts, capabilities,
+            ),
+            shutdown, sleep,
+        ),
+        "option": _periodic_loop(
+            lambda: _scan_action(
+                AssetClass.OPTION, OPTION_SCAN_INTERVAL_SECONDS, database, repositories, ai_provider, market_data,
+                broker, gateway, settings, alerts, capabilities,
+            ),
+            shutdown, sleep,
+        ),
+        "monitor": _periodic_loop(lambda: _monitor_action(database, repositories, broker, gateway, alerts, settings), shutdown, sleep),
+        "settle": _periodic_loop(lambda: _settle_action(database, repositories, settlement, alerts), shutdown, sleep),
+    }
+    await asyncio.gather(*(_supervised_lane(name, coro, repositories, alerts) for name, coro in lanes.items()))
+
+
+def _build_dashboard_server(state: Any, port: int, log_level: str) -> Any:
+    """Returns an unstarted uvicorn.Server -- shared construction helper for
+    `_run_application`'s task-based dashboard, mirroring _run_dashboard's own
+    app/config assembly but not literally reusing that function, since the
+    standalone command's own SIGINT/SIGTERM handling (uvicorn's default) must
+    stay exactly as it is today (see _run_dashboard's docstring)."""
+    import uvicorn
+
+    from tradepulse.web import create_app
+
+    frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+    app = create_app(state, frontend_dist=frontend_dist if frontend_dist.is_dir() else None)
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level=log_level.lower())
+    return uvicorn.Server(config)
+
+
+async def _run_dashboard_server(server: Any, shutdown: asyncio.Event) -> None:
+    """Runs `server` until `shutdown` fires, then asks uvicorn to stop and
+    awaits it -- the task-based counterpart to _run_dashboard's blocking
+    `await server.serve()`, so `tradepulse run` can manage the dashboard
+    alongside the trading supervisor instead of blocking on it."""
+    logger.info("dashboard_starting", extra={"event": "dashboard_starting", "host": "127.0.0.1", "port": server.config.port})
+    serve_task = asyncio.create_task(server.serve())
+    await shutdown.wait()
+    server.should_exit = True
+    await serve_task
+
+
+async def _open_browser_when_ready(
+    server: Any, port: int, shutdown: asyncio.Event,
+    poll_interval: float = BROWSER_OPEN_POLL_SECONDS, max_wait: float = BROWSER_OPEN_MAX_WAIT_SECONDS,
+) -> None:
+    """Non-fatal by construction: a headless box, no $DISPLAY, or an
+    unsupported platform must never affect the dashboard or trading
+    supervisor -- any failure here is caught and only logged."""
+    waited = 0.0
+    while not server.started and waited < max_wait and not shutdown.is_set():
+        await asyncio.sleep(poll_interval)
+        waited += poll_interval
+    if shutdown.is_set():
+        return
+    try:
+        webbrowser.open(f"http://127.0.0.1:{port}")
+    except Exception as exc:  # noqa: BLE001 -- browser-launch failure must never affect the dashboard/trading supervisor
+        logger.warning("run_browser_open_failed", extra={"event": "run_browser_open_failed", "error": str(exc)})
+
+
+async def _run_application(settings: Settings, port: int, open_browser: bool) -> int:
+    """`tradepulse run`: the normal one-command interactive startup -- opens
+    the local dashboard, activates the trading session, and keeps the
+    equity/crypto/option scan lanes, position monitor, and settlement
+    cycling on their own independent schedules (see _run_trading_supervisor)
+    until Ctrl+C. See the module docstring for how this relates to every
+    other, one-shot command."""
+    _require_credentials(settings, require_ai=True)  # run always scans -- needs both broker AND AI creds
+    try:
+        import uvicorn  # noqa: F401 -- checked early so a missing web extra fails fast, before any broker/DB setup
+    except ImportError as exc:
+        raise SettingsError(
+            "`tradepulse run` requires the optional web dependencies -- install with `pip install -e '.[web]'`"
+        ) from exc
+    from tradepulse.web import AppState
+
+    database = AsyncSQLiteDatabase(settings.database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    broker = _build_broker(settings)
+    ai_provider = _build_ai_provider(settings)
+    alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
+
+    async def work() -> int:
+        capabilities = await _resolve_and_apply_market_data_feeds(broker, settings)
+        market_data = AlpacaMarketDataProvider(broker)
+        gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
+        settlement = SettlementProcessor(repositories, alerts)
+        dashboard_state = AppState(settings=settings, repositories=repositories, broker=broker, market_data=market_data)
+        server = _build_dashboard_server(dashboard_state, port, settings.log_level)
+
+        shutdown = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, shutdown.set)
+
+        dashboard_task = asyncio.create_task(_run_dashboard_server(server, shutdown))
+        if open_browser:
+            asyncio.create_task(_open_browser_when_ready(server, port, shutdown))
+
+        start_result = await _run_start(settings)
+        trading_task: asyncio.Task[None] | None = None
+        if start_result != 0:
+            logger.error("run_session_activation_failed", extra={"event": "run_session_activation_failed"})
+            # Dashboard still comes up -- an operator needs to SEE why
+            # activation failed (RISK_STOPPED? FINANCIAL_INTEGRITY_BLOCKED?
+            # broker unreachable?) and use its controls to fix it. But no
+            # scan/monitor/settlement task may start against a session the
+            # authoritative activation command just refused -- downstream
+            # execution gates are not a substitute for honoring that
+            # refusal. v1 does not auto-detect a later fix and auto-start
+            # the supervisor -- restart `tradepulse run` after correcting
+            # the condition.
+        else:
+            trading_task = asyncio.create_task(
+                _run_trading_supervisor(
+                    database, repositories, ai_provider, market_data, broker, gateway, settlement, settings, alerts,
+                    shutdown, capabilities,
+                )
+            )
+
+        await shutdown.wait()
+        # ---- graceful shutdown: stop scheduling, let in-flight work finish, stop the server, done ----
+        if trading_task is not None:
+            await trading_task
+        await dashboard_task
+        return 0
+
+    owner_token = str(uuid4())
+    if not await acquire_lock(database, RUN_LOCK_KEY, owner_token, "run", RUN_LOCK_TTL_SECONDS):
+        logger.error("run_already_active", extra={"event": "run_already_active"})
+        await broker.aclose()
+        await ai_provider.aclose()
+        return 1
+    try:
+        return await run_with_lock_renewal(database, RUN_LOCK_KEY, owner_token, RUN_LOCK_TTL_SECONDS, work())
+    finally:
+        await release_lock(database, RUN_LOCK_KEY, owner_token)
+        await broker.aclose()
+        await ai_provider.aclose()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tradepulse", description="TradePulse AI trading runtime")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -478,6 +799,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "dashboard", help="run the local operator dashboard (read-only observability + start/stop/reset controls); always binds 127.0.0.1, no remote option"
     )
     dashboard_parser.add_argument("--port", type=int, default=8000, help="port to bind on 127.0.0.1 (default: 8000)")
+    run_parser = subparsers.add_parser(
+        "run",
+        help="one-command interactive startup: dashboard + session activation + parallel equity/crypto/option scan "
+        "lanes, monitor, and settlement, cycling independently until Ctrl+C; always binds 127.0.0.1, no remote option",
+    )
+    run_parser.add_argument("--port", type=int, default=8000, help="port to bind the dashboard on 127.0.0.1 (default: 8000)")
+    run_parser.add_argument("--no-browser", action="store_true", help="don't automatically open the dashboard in a browser")
     return parser
 
 
@@ -520,6 +848,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_run_scan(settings, [AssetClass(v) for v in args.asset_class]))
         if args.command == "dashboard":
             return asyncio.run(_run_dashboard(settings, args.port))
+        if args.command == "run":
+            return asyncio.run(_run_application(settings, args.port, not args.no_browser))
         return asyncio.run(_COMMANDS[args.command](settings))
     except (SettingsError, MarketDataCapabilityError) as exc:
         print(f"tradepulse: {exc}", file=sys.stderr)
