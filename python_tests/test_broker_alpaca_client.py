@@ -1,4 +1,5 @@
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -6,8 +7,9 @@ import httpx
 import pytest
 import respx
 
-from tradepulse.broker import AlpacaClient, AlpacaDataIntegrityError, AlpacaError, default_time_in_force, is_definitive_rejection
-from tradepulse.models import AssetClass
+from tradepulse.broker import AlpacaClient, AlpacaDataIntegrityError, AlpacaError, AlpacaOrderRequest, default_time_in_force, is_definitive_rejection
+from tradepulse.broker.alpaca_client import RATE_LIMIT_BASE_BACKOFF_SECONDS, RATE_LIMIT_JITTER_FRACTION, RATE_LIMIT_MAX_RETRIES
+from tradepulse.models import AssetClass, Side
 
 
 def _crypto_bar(day: "datetime") -> dict:
@@ -360,6 +362,188 @@ def test_is_definitive_rejection_false_below_400() -> None:
 def test_is_definitive_rejection_false_for_non_alpaca_exceptions() -> None:
     assert is_definitive_rejection(httpx.ConnectError("connection refused")) is False
     assert is_definitive_rejection(httpx.TimeoutException("timed out")) is False
+
+
+# ---- Rate-limit-aware _request: backoff, retry bounds, telemetry ----------
+
+
+def _account_json() -> dict:
+    return {"equity": "100000.00", "last_equity": "99500.00", "cash": "50000.00", "buying_power": "200000.00", "portfolio_value": "100000.00"}
+
+
+def _sleep_recorder() -> tuple[list[float], Callable[[float], object]]:
+    calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        calls.append(seconds)
+
+    return calls, fake_sleep
+
+
+@respx.mock
+async def test_429_then_200_retries_transparently_and_succeeds() -> None:
+    sleep_calls, fake_sleep = _sleep_recorder()
+    route = respx.get("https://paper-api.alpaca.markets/v2/account").mock(
+        side_effect=[httpx.Response(429), httpx.Response(200, json=_account_json())]
+    )
+    client = AlpacaClient("key", "secret", "paper", 10, sleep=fake_sleep)
+    try:
+        account = await client.get_account()
+    finally:
+        await client.aclose()
+
+    assert account.equity == Decimal("100000.00")
+    assert route.call_count == 2
+    assert len(sleep_calls) == 1
+    assert sleep_calls[0] >= RATE_LIMIT_BASE_BACKOFF_SECONDS
+
+
+@respx.mock
+async def test_429_exhausts_all_retries_then_raises_alpaca_error() -> None:
+    sleep_calls, fake_sleep = _sleep_recorder()
+    route = respx.get("https://paper-api.alpaca.markets/v2/account").mock(return_value=httpx.Response(429))
+    client = AlpacaClient("key", "secret", "paper", 10, sleep=fake_sleep)
+    try:
+        with pytest.raises(AlpacaError) as exc_info:
+            await client.get_account()
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.status_code == 429
+    assert route.call_count == RATE_LIMIT_MAX_RETRIES + 1  # 1 initial + 4 retries, never unbounded
+    assert len(sleep_calls) == RATE_LIMIT_MAX_RETRIES
+
+
+@respx.mock
+async def test_500_does_not_trigger_rate_limit_retry() -> None:
+    sleep_calls, fake_sleep = _sleep_recorder()
+    route = respx.get("https://paper-api.alpaca.markets/v2/account").mock(return_value=httpx.Response(500))
+    client = AlpacaClient("key", "secret", "paper", 10, sleep=fake_sleep)
+    try:
+        with pytest.raises(AlpacaError) as exc_info:
+            await client.get_account()
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.status_code == 500
+    assert route.call_count == 1  # no retry loop entered at all
+    assert sleep_calls == []
+
+
+@respx.mock
+async def test_rate_limit_headers_on_success_populate_snapshot() -> None:
+    reset_at = datetime(2026, 8, 28, 12, 0, 0, tzinfo=UTC)
+    respx.get("https://paper-api.alpaca.markets/v2/account").mock(
+        return_value=httpx.Response(
+            200, json=_account_json(),
+            headers={"X-RateLimit-Limit": "200", "X-RateLimit-Remaining": "150", "X-RateLimit-Reset": str(int(reset_at.timestamp()))},
+        )
+    )
+    client = AlpacaClient("key", "secret", "paper", 10)
+    try:
+        assert client.rate_limit_snapshot is None  # nothing observed yet
+        await client.get_account()
+    finally:
+        await client.aclose()
+
+    snapshot = client.rate_limit_snapshot
+    assert snapshot is not None
+    assert snapshot.limit == 200
+    assert snapshot.remaining == 150
+    assert snapshot.reset_at == reset_at
+
+
+@respx.mock
+async def test_429_with_no_rate_limit_headers_still_retries_via_pure_exponential_backoff() -> None:
+    """Reproduces the confirmed real-world gap: Alpaca can omit the
+    X-RateLimit-* headers specifically on 429 responses -- backoff must
+    never depend on them being present."""
+    sleep_calls, fake_sleep = _sleep_recorder()
+    respx.get("https://paper-api.alpaca.markets/v2/account").mock(
+        side_effect=[httpx.Response(429), httpx.Response(200, json=_account_json())]
+    )
+    client = AlpacaClient("key", "secret", "paper", 10, sleep=fake_sleep)
+    try:
+        await client.get_account()
+    finally:
+        await client.aclose()
+
+    assert len(sleep_calls) == 1
+    # Pure exponential (attempt 0): base 1.0s plus up to +25% jitter, no floor.
+    assert RATE_LIMIT_BASE_BACKOFF_SECONDS <= sleep_calls[0] <= RATE_LIMIT_BASE_BACKOFF_SECONDS * (1 + RATE_LIMIT_JITTER_FRACTION)
+
+
+@respx.mock
+async def test_429_retry_after_header_raises_the_wait_floor() -> None:
+    sleep_calls, fake_sleep = _sleep_recorder()
+    respx.get("https://paper-api.alpaca.markets/v2/account").mock(
+        side_effect=[httpx.Response(429, headers={"Retry-After": "5"}), httpx.Response(200, json=_account_json())]
+    )
+    client = AlpacaClient("key", "secret", "paper", 10, sleep=fake_sleep)
+    try:
+        await client.get_account()
+    finally:
+        await client.aclose()
+
+    assert len(sleep_calls) == 1
+    assert sleep_calls[0] >= 5.0  # floor honored even though the exponential base (1.0s) is much smaller
+
+
+@respx.mock
+async def test_malformed_rate_limit_reset_header_is_ignored_without_raising() -> None:
+    sleep_calls, fake_sleep = _sleep_recorder()
+    respx.get("https://paper-api.alpaca.markets/v2/account").mock(
+        side_effect=[httpx.Response(429, headers={"X-RateLimit-Reset": "not-a-number"}), httpx.Response(200, json=_account_json())]
+    )
+    client = AlpacaClient("key", "secret", "paper", 10, sleep=fake_sleep)
+    try:
+        account = await client.get_account()  # must not raise while computing backoff
+    finally:
+        await client.aclose()
+
+    assert account.equity == Decimal("100000.00")
+    assert len(sleep_calls) == 1
+    assert RATE_LIMIT_BASE_BACKOFF_SECONDS <= sleep_calls[0] <= RATE_LIMIT_BASE_BACKOFF_SECONDS * (1 + RATE_LIMIT_JITTER_FRACTION)
+
+
+@respx.mock
+async def test_cancel_order_retries_on_429() -> None:
+    """Unlike place_order, cancel_order has no production caller and no
+    duplicate-economic-order risk -- it stays in the standard retry set."""
+    sleep_calls, fake_sleep = _sleep_recorder()
+    route = respx.delete("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
+        side_effect=[httpx.Response(429), httpx.Response(204)]
+    )
+    client = AlpacaClient("key", "secret", "paper", 10, sleep=fake_sleep)
+    try:
+        await client.cancel_order("order-1")  # must not raise
+    finally:
+        await client.aclose()
+
+    assert route.call_count == 2
+    assert len(sleep_calls) == 1
+
+
+@respx.mock
+async def test_place_order_does_not_retry_on_429() -> None:
+    """The one deliberate exception: a 429 from POST /orders must propagate
+    immediately (never auto-replayed) so it reaches execute_intent's
+    existing ambiguous-submission recovery path (see
+    execution/gateway.py::_recover_unknown_submission) instead of TradePulse
+    silently deciding on its own that the order was never processed."""
+    sleep_calls, fake_sleep = _sleep_recorder()
+    route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(429))
+    client = AlpacaClient("key", "secret", "paper", 10, sleep=fake_sleep)
+    order = AlpacaOrderRequest(symbol="AAPL", qty=Decimal(5), side=Side.BUY, client_order_id="intent-1")
+    try:
+        with pytest.raises(AlpacaError) as exc_info:
+            await client.place_order(order)
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.status_code == 429
+    assert route.call_count == 1  # never auto-retried
+    assert sleep_calls == []
 
 
 @pytest.mark.integration

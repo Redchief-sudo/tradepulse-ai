@@ -1155,6 +1155,62 @@ async def test_ambiguous_5xx_error_routes_through_recovery_not_straight_to_rejec
 
 
 @respx.mock
+async def test_ambiguous_429_error_from_place_order_routes_through_recovery_not_retried(tmp_path) -> None:
+    """A 429 from place_order is deliberately NOT auto-retried at the
+    AlpacaClient layer (see broker/alpaca_client.py's
+    retry_on_rate_limit=False on that one call site) -- it must reach this
+    exact same ambiguous-submission recovery path unchanged, the same way
+    a 5xx or a transport error already does above."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_market_open()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(429))
+    lookup_route = respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(
+        return_value=httpx.Response(200, json=_order_json("accepted", "0", None))
+    )
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities(_fill_activity("act-1"))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "filled"  # recovery found broker truth -- never a second place_order call
+    assert order_route.call_count == 1  # never auto-retried at the HTTP layer
+    assert lookup_route.call_count == 1
+    assert lookup_route.calls[0].request.url.params["client_order_id"] == result.trade_intent_id  # same original client_order_id, no new one minted
+
+
+@respx.mock
+async def test_ambiguous_429_error_from_place_order_with_no_broker_record_ends_submission_unknown(tmp_path) -> None:
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_market_open()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(429))
+    lookup_route = respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(return_value=httpx.Response(404))
+
+    request = ExecutionRequest(
+        asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test",
+        decision_id="decision-429-unknown", confidence=Decimal("90"),
+    )
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "pending"
+    assert order_route.call_count == 1
+    assert lookup_route.call_count == 1
+
+    intent_row = await repositories.trade_intents.get(result.trade_intent_id)
+    assert intent_row["status"] == "submission_unknown"  # exactly the same safety outcome as every other ambiguous-outcome type
+
+
+@respx.mock
 async def test_recovery_lookup_404_ends_submission_unknown_and_never_resubmits(tmp_path) -> None:
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))

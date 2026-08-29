@@ -210,6 +210,15 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
             "option_feed": capabilities.option_feed,
         })
 
+    @app.get("/api/rate-limit")
+    async def get_rate_limit(request: Request) -> Response:
+        """The most recently observed Alpaca X-RateLimit-* snapshot from
+        real request traffic (see AlpacaClient.rate_limit_snapshot) --
+        opportunistic telemetry, not a live probe. null until at least one
+        request has actually carried the headers."""
+        s = _state(request)
+        return _json(s.broker.rate_limit_snapshot)
+
     # ---- Recent-activity reads --------------------------------------------
 
     def _recent_route(table: str, path: str) -> None:

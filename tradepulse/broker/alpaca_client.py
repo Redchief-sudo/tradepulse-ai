@@ -7,10 +7,14 @@ stay minimal and explicit.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import random
 import re
-from datetime import datetime
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 
@@ -26,13 +30,30 @@ from .types import (
     AlpacaOrderRequest,
     AlpacaOrderResponse,
     AlpacaPosition,
+    AlpacaRateLimitSnapshot,
     RawBar,
     RawQuote,
 )
 
+logger = logging.getLogger(__name__)
+
 PAPER_TRADING_BASE = "https://paper-api.alpaca.markets/v2"
 LIVE_TRADING_BASE = "https://api.alpaca.markets/v2"
 DATA_BASE = "https://data.alpaca.markets"
+
+# Verified live against Alpaca's own rate-limit docs/forum reports
+# 2026-08-28: Basic throttles the Trading + Market Data APIs at 200
+# requests/minute/account, returning 429 over the limit; X-RateLimit-*
+# headers are present on successful responses but confirmed UNRELIABLE
+# specifically on 429s (sometimes absent) -- so backoff must never depend
+# on them, only use them opportunistically. 4 retries (5 total attempts),
+# exponential 1/2/4/8s capped at 16s, positive jitter so concurrent
+# callers don't retry in lockstep -- comfortably inside every lane's own
+# lock TTL (see cli.py).
+RATE_LIMIT_MAX_RETRIES = 4
+RATE_LIMIT_BASE_BACKOFF_SECONDS = 1.0
+RATE_LIMIT_MAX_BACKOFF_SECONDS = 16.0
+RATE_LIMIT_JITTER_FRACTION = 0.25
 
 _FRACTION_RE = re.compile(r"(\.\d{6})\d+")
 
@@ -57,6 +78,7 @@ class AlpacaClient:
     def __init__(
         self, api_key: str, api_secret: str, mode: Literal["paper", "live"], timeout_seconds: int,
         equity_feed: Literal["iex", "sip"] = "iex", option_feed: Literal["indicative", "opra"] = "indicative",
+        *, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._api_key = api_key
         self._api_secret = api_secret
@@ -69,6 +91,8 @@ class AlpacaClient:
         # market-data work starts -- never mid-session.
         self._equity_feed = equity_feed
         self._option_feed = option_feed
+        self._sleep = sleep
+        self._rate_limit: AlpacaRateLimitSnapshot | None = None
 
     def set_market_data_feeds(self, *, equity_feed: Literal["iex", "sip"], option_feed: Literal["indicative", "opra"]) -> None:
         self._equity_feed = equity_feed
@@ -82,6 +106,14 @@ class AlpacaClient:
     def _headers(self) -> dict[str, str]:
         return {"APCA-API-KEY-ID": self._api_key, "APCA-API-SECRET-KEY": self._api_secret}
 
+    @property
+    def rate_limit_snapshot(self) -> AlpacaRateLimitSnapshot | None:
+        """The most recently observed X-RateLimit-* headers -- None until at
+        least one response has actually carried them. Opportunistic
+        telemetry, never a live probe (see tradepulse/web/app.py's
+        GET /api/rate-limit)."""
+        return self._rate_limit
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
@@ -91,8 +123,64 @@ class AlpacaClient:
     async def __aexit__(self, *exc_info: object) -> None:
         await self.aclose()
 
+    def _record_rate_limit(self, response: httpx.Response) -> None:
+        limit = response.headers.get("x-ratelimit-limit")
+        remaining = response.headers.get("x-ratelimit-remaining")
+        reset = response.headers.get("x-ratelimit-reset")
+        if limit is None and remaining is None and reset is None:
+            # Confirmed live: these headers can be absent specifically on
+            # 429 responses -- leave the last-known snapshot in place
+            # rather than blanking out otherwise-good telemetry.
+            return
+        try:
+            self._rate_limit = AlpacaRateLimitSnapshot(
+                limit=int(limit) if limit is not None else None,
+                remaining=int(remaining) if remaining is not None else None,
+                reset_at=datetime.fromtimestamp(int(reset), tz=UTC) if reset is not None else None,
+                observed_at=datetime.now(UTC),
+            )
+        except (ValueError, OSError):
+            pass  # malformed header value -- never let telemetry parsing break a real request
+
+    def _rate_limit_backoff_seconds(self, response: httpx.Response, attempt: int) -> float:
+        base = min(RATE_LIMIT_BASE_BACKOFF_SECONDS * (2**attempt), RATE_LIMIT_MAX_BACKOFF_SECONDS)
+        floor = 0.0
+        retry_after = response.headers.get("retry-after")
+        reset = response.headers.get("x-ratelimit-reset")
+        if retry_after is not None:
+            try:
+                floor = float(retry_after)
+            except ValueError:
+                pass
+        elif reset is not None:
+            try:
+                floor = (datetime.fromtimestamp(int(reset), tz=UTC) - datetime.now(UTC)).total_seconds()
+            except (ValueError, OSError):
+                pass
+        wait = max(base, floor, 0.0)
+        wait = min(wait, RATE_LIMIT_MAX_BACKOFF_SECONDS)  # a bogus/huge Reset value must never stall a cycle far past a lane's own lock TTL
+        return wait + wait * RATE_LIMIT_JITTER_FRACTION * random.random()
+
+    async def _request(self, method: str, url: str, *, retry_on_rate_limit: bool = True, **kwargs: Any) -> httpx.Response:
+        attempt = 0
+        while True:
+            response = await self._client.request(method, url, headers=self._headers, **kwargs)
+            self._record_rate_limit(response)  # always captured, even when retry is skipped below
+            if response.status_code != 429 or not retry_on_rate_limit or attempt >= RATE_LIMIT_MAX_RETRIES:
+                return response
+            wait_seconds = self._rate_limit_backoff_seconds(response, attempt)
+            logger.warning(
+                "alpaca_rate_limited_retrying",
+                extra={
+                    "event": "alpaca_rate_limited_retrying", "operation": f"{method} {url}",
+                    "attempt": attempt + 1, "wait_seconds": round(wait_seconds, 2),
+                },
+            )
+            await self._sleep(wait_seconds)
+            attempt += 1
+
     async def get_clock(self) -> AlpacaClock:
-        response = await self._client.get(f"{self._trading_base}/clock", headers=self._headers)
+        response = await self._request("GET", f"{self._trading_base}/clock")
         if not response.is_success:
             raise_alpaca_error(response, "getClock")
         data = response.json()
@@ -104,7 +192,7 @@ class AlpacaClient:
         )
 
     async def get_account(self) -> AlpacaAccount:
-        response = await self._client.get(f"{self._trading_base}/account", headers=self._headers)
+        response = await self._request("GET", f"{self._trading_base}/account")
         if not response.is_success:
             raise_alpaca_error(response, "getAccount")
         data = response.json()
@@ -117,7 +205,7 @@ class AlpacaClient:
         )
 
     async def get_positions(self) -> list[AlpacaPosition]:
-        response = await self._client.get(f"{self._trading_base}/positions", headers=self._headers)
+        response = await self._request("GET", f"{self._trading_base}/positions")
         if not response.is_success:
             raise_alpaca_error(response, "getPositions")
         data = response.json()
@@ -168,7 +256,7 @@ class AlpacaClient:
         is_option = asset_class == AssetClass.OPTION
         if is_crypto:
             url = f"{DATA_BASE}/v1beta3/crypto/us/latest/quotes"
-            response = await self._client.get(url, headers=self._headers, params={"symbols": normalized})
+            response = await self._request("GET", url, params={"symbols": normalized})
         elif is_option:
             # Verified live against Alpaca's docs 2026-08-26: same
             # {"quotes": {symbol: {bp, ap, t}}} envelope shape as crypto's
@@ -182,11 +270,11 @@ class AlpacaClient:
             # fallback with no signal which feed actually served the quote.
             option_feed = feed_override or self._option_feed
             url = f"{DATA_BASE}/v1beta1/options/quotes/latest"
-            response = await self._client.get(url, headers=self._headers, params={"symbols": normalized, "feed": option_feed})
+            response = await self._request("GET", url, params={"symbols": normalized, "feed": option_feed})
         else:
             equity_feed = feed_override or self._equity_feed
             url = f"{DATA_BASE}/v2/stocks/{normalized}/quotes/latest"
-            response = await self._client.get(url, headers=self._headers, params={"feed": equity_feed})
+            response = await self._request("GET", url, params={"feed": equity_feed})
         if not response.is_success:
             raise_alpaca_error(response, "getLatestQuote")
         data = response.json()
@@ -225,7 +313,7 @@ class AlpacaClient:
             }
             if page_token:
                 params["page_token"] = page_token
-            response = await self._client.get(f"{self._trading_base}/options/contracts", headers=self._headers, params=params)
+            response = await self._request("GET", f"{self._trading_base}/options/contracts", params=params)
             if not response.is_success:
                 raise_alpaca_error(response, "getOptionsChain")
             data = response.json()
@@ -272,10 +360,10 @@ class AlpacaClient:
         }
         if is_crypto:
             url = f"{DATA_BASE}/v1beta3/crypto/us/bars"
-            response = await self._client.get(url, headers=self._headers, params={**params, "symbols": normalized})
+            response = await self._request("GET", url, params={**params, "symbols": normalized})
         else:
             url = f"{DATA_BASE}/v2/stocks/{normalized}/bars"
-            response = await self._client.get(url, headers=self._headers, params={**params, "feed": self._equity_feed})
+            response = await self._request("GET", url, params={**params, "feed": self._equity_feed})
         if not response.is_success:
             raise_alpaca_error(response, "getBars")
         data = response.json()
@@ -314,13 +402,22 @@ class AlpacaClient:
             body["limit_price"] = str(order.limit_price)
         if order.order_type in ("stop", "stop_limit") and order.stop_price is not None:
             body["stop_price"] = str(order.stop_price)
-        response = await self._client.post(f"{self._trading_base}/orders", headers=self._headers, json=body)
+        # retry_on_rate_limit=False -- deliberately NOT auto-retried on 429.
+        # A 429 here already flows through is_definitive_rejection (which
+        # excludes 429) into execute_intent's existing ambiguous-submission
+        # recovery path (_recover_unknown_submission, execution/gateway.py):
+        # look up the SAME client_order_id, adopt broker truth if Alpaca
+        # actually has it, else mark SUBMISSION_UNKNOWN and alert a human.
+        # Financial correctness must never depend on assuming a 429 proves
+        # Alpaca never processed the order -- so this call is never silently
+        # replayed, only the existing, purpose-built recovery path handles it.
+        response = await self._request("POST", f"{self._trading_base}/orders", json=body, retry_on_rate_limit=False)
         if not response.is_success:
             raise_alpaca_error(response, "placeOrder")
         return self._parse_order_response(response)
 
     async def get_order(self, broker_order_id: str) -> AlpacaOrderResponse:
-        response = await self._client.get(f"{self._trading_base}/orders/{broker_order_id}", headers=self._headers)
+        response = await self._request("GET", f"{self._trading_base}/orders/{broker_order_id}")
         if not response.is_success:
             raise_alpaca_error(response, "getOrder")
         return self._parse_order_response(response)
@@ -331,10 +428,8 @@ class AlpacaClient:
         genuine 404 (Alpaca never received/created this order) -- any other
         non-success response is still an ambiguous outcome and must raise,
         not be silently treated as "not found"."""
-        response = await self._client.get(
-            f"{self._trading_base}/orders:by_client_order_id",
-            headers=self._headers,
-            params={"client_order_id": client_order_id},
+        response = await self._request(
+            "GET", f"{self._trading_base}/orders:by_client_order_id", params={"client_order_id": client_order_id},
         )
         if response.status_code == 404:
             return None
@@ -343,7 +438,11 @@ class AlpacaClient:
         return self._parse_order_response(response)
 
     async def cancel_order(self, broker_order_id: str) -> None:
-        response = await self._client.delete(f"{self._trading_base}/orders/{broker_order_id}", headers=self._headers)
+        """Unlike place_order, a 429 here is safely auto-retried by the
+        standard _request wrapper -- no production caller exists today, and
+        a duplicate cancel attempt carries none of place_order's
+        duplicate-economic-order risk."""
+        response = await self._request("DELETE", f"{self._trading_base}/orders/{broker_order_id}")
         if not response.is_success:
             raise_alpaca_error(response, "cancelOrder")
 
@@ -358,7 +457,7 @@ class AlpacaClient:
                 params["after"] = since.isoformat()
             if page_token:
                 params["page_token"] = page_token
-            response = await self._client.get(f"{self._trading_base}/account/activities", headers=self._headers, params=params)
+            response = await self._request("GET", f"{self._trading_base}/account/activities", params=params)
             if not response.is_success:
                 raise_alpaca_error(response, "getActivities")
             page = response.json()

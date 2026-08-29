@@ -103,6 +103,18 @@ class AlpacaOptionContract:
 
 
 @dataclass(frozen=True, slots=True)
+class AlpacaRateLimitSnapshot:
+    """The most recently observed X-RateLimit-* headers from a real Alpaca
+    response -- opportunistic telemetry, not a live probe. See
+    AlpacaClient._record_rate_limit."""
+
+    limit: int | None
+    remaining: int | None
+    reset_at: datetime | None
+    observed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class AlpacaActivity:
     activity_id: str
     activity_type: str

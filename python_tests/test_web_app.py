@@ -213,6 +213,44 @@ async def test_market_data_capability_reads_from_scan_runs_not_live_probe(tmp_pa
 
 
 @respx.mock
+async def test_rate_limit_route_returns_null_before_any_request(tmp_path) -> None:
+    client, state = await _client_for(tmp_path)
+
+    response = await client.get("/api/rate-limit")
+    await client.aclose()
+    await state.broker.aclose()
+
+    assert response.status_code == 200
+    assert response.json() is None
+
+
+@respx.mock
+async def test_rate_limit_route_returns_latest_observed_snapshot(tmp_path) -> None:
+    """The dashboard route reads AlpacaClient.rate_limit_snapshot directly --
+    opportunistic telemetry from real request traffic, never a fresh probe.
+    Exercised end to end: a real broker call populates it, then the route
+    reports exactly what was observed."""
+    client, state = await _client_for(tmp_path)
+    respx.get("https://paper-api.alpaca.markets/v2/account").mock(
+        return_value=httpx.Response(
+            200,
+            json={"equity": "100000", "last_equity": "99500", "cash": "50000", "buying_power": "100000", "portfolio_value": "100000"},
+            headers={"X-RateLimit-Limit": "200", "X-RateLimit-Remaining": "199", "X-RateLimit-Reset": str(int(NOW.timestamp()))},
+        )
+    )
+    await state.broker.get_account()
+
+    response = await client.get("/api/rate-limit")
+    await client.aclose()
+    await state.broker.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["limit"] == 200
+    assert body["remaining"] == 199
+
+
+@respx.mock
 async def test_get_opportunities_returns_hydrated_recent_rows(tmp_path) -> None:
     client, state = await _client_for(tmp_path)
     quote = MarketQuote(_aapl(), Decimal("190"), NOW, NOW, "alpaca_iex", 0, bid=Decimal("189.9"), ask=Decimal("190.1"))
