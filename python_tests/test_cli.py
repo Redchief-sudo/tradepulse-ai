@@ -47,14 +47,17 @@ from tradepulse.models import (
     AssetIdentity,
     ExecutionMode,
     Fill,
+    SessionState,
     SettlementEvent,
     SettlementStatus,
     Side,
     TradeIntent,
+    TradingSession,
     asset_identity_key,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate, release_lock
 from tradepulse.providers import AnthropicAIProvider, MarketDataCapabilities, OpenAIProvider
+from tradepulse.risk import SESSION_RECORD_ID, save_session
 from tradepulse.settlement import SettlementProcessor
 
 
@@ -919,4 +922,79 @@ async def test_run_application_never_starts_supervisor_when_session_activation_r
 
     assert exit_code == 0  # the process itself doesn't fail -- the dashboard stays up for diagnosis
     assert dashboard_ran is True
+    assert supervisor_calls == 0
+
+
+async def test_run_application_starts_supervisor_when_session_already_market_closed(tmp_path, monkeypatch) -> None:
+    """Regression test for a live defect: a session already sitting in
+    MARKET_CLOSED (the routine overnight state sync_market_session leaves
+    an ACTIVE session in -- trading_active stays True) must NOT be routed
+    through _run_start, which hard-refuses from MARKET_CLOSED for
+    STANDALONE `tradepulse start`'s own good reasons (it can't re-verify
+    anything changed) but would wrongly block the entire supervisor --
+    including crypto (a continuous market unaffected by equity hours) and
+    monitor/settlement. _run_start must never even be called in this case;
+    the supervisor must start directly."""
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    await save_session(repositories, TradingSession(SESSION_RECORD_ID, SessionState.MARKET_CLOSED, True, datetime.now(UTC)))
+    settings = _settings(database_url)
+
+    async def _stub_run_dashboard_server(server, shutdown) -> None:
+        shutdown.set()
+
+    async def _stub_run_start(settings) -> int:
+        raise AssertionError("run_start must not be called when the session is already MARKET_CLOSED")
+
+    supervisor_calls = 0
+
+    async def _stub_run_trading_supervisor(*args, **kwargs) -> None:
+        nonlocal supervisor_calls
+        supervisor_calls += 1
+
+    monkeypatch.setattr("tradepulse.cli._build_dashboard_server", _stub_build_dashboard_server)
+    monkeypatch.setattr("tradepulse.cli._run_dashboard_server", _stub_run_dashboard_server)
+    monkeypatch.setattr("tradepulse.cli._run_start", _stub_run_start)
+    monkeypatch.setattr("tradepulse.cli._run_trading_supervisor", _stub_run_trading_supervisor)
+
+    exit_code = await _run_application(settings, 8125, False)
+
+    assert exit_code == 0
+    assert supervisor_calls == 1  # crypto/monitor/settle must still get scheduled
+
+
+async def test_run_application_still_refuses_supervisor_from_a_fresh_disabled_session(tmp_path, monkeypatch) -> None:
+    """Symmetry check: the MARKET_CLOSED bypass above must not accidentally
+    widen to every state -- a brand-new (DISABLED) session still goes
+    through the real _run_start gate exactly as before."""
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    settings = _settings(database_url)
+
+    async def _stub_run_dashboard_server(server, shutdown) -> None:
+        shutdown.set()
+
+    run_start_calls = 0
+
+    async def _stub_run_start(settings) -> int:
+        nonlocal run_start_calls
+        run_start_calls += 1
+        return 1
+
+    supervisor_calls = 0
+
+    async def _stub_run_trading_supervisor(*args, **kwargs) -> None:
+        nonlocal supervisor_calls
+        supervisor_calls += 1
+
+    monkeypatch.setattr("tradepulse.cli._build_dashboard_server", _stub_build_dashboard_server)
+    monkeypatch.setattr("tradepulse.cli._run_dashboard_server", _stub_run_dashboard_server)
+    monkeypatch.setattr("tradepulse.cli._run_start", _stub_run_start)
+    monkeypatch.setattr("tradepulse.cli._run_trading_supervisor", _stub_run_trading_supervisor)
+
+    exit_code = await _run_application(settings, 8126, False)
+
+    assert exit_code == 0
+    assert run_start_calls == 1  # the real gate still runs for a non-MARKET_CLOSED session
     assert supervisor_calls == 0

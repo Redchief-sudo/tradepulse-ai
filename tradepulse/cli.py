@@ -74,7 +74,7 @@ from tradepulse.broker import AlpacaClient, AlpacaError
 from tradepulse.config import Settings, SettingsError, default_strategy_weights, risk_limits_for_profile
 from tradepulse.config.logging import configure_logging
 from tradepulse.execution import ExecutionGateway
-from tradepulse.models import AssetClass, AuditEvent
+from tradepulse.models import AssetClass, AuditEvent, SessionState
 from tradepulse.monitor import MonitorCycleSummary, run_position_monitor
 from tradepulse.persistence import (
     AsyncSQLiteDatabase,
@@ -93,6 +93,7 @@ from tradepulse.providers import (
     resolve_market_data_capabilities,
 )
 from tradepulse.reconciliation import run_reconciliation
+from tradepulse.risk import load_session
 from tradepulse.scanner import ScanCycleSummary, run_scan_cycle
 from tradepulse.session_commands import (
     build_broker as _build_broker,
@@ -729,7 +730,30 @@ async def _run_application(settings: Settings, port: int, open_browser: bool) ->
         if open_browser:
             asyncio.create_task(_open_browser_when_ready(server, port, shutdown))
 
-        start_result = await _run_start(settings)
+        # MARKET_CLOSED is a routine, expected state -- not a safety fault
+        # like RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED/SYSTEM_DEGRADED.
+        # It only ever arises from sync_market_session flipping a
+        # previously-ACTIVE session overnight (risk/session.py), which
+        # always preserves trading_active=True -- the session is already
+        # properly started, just correctly reflecting that equities are
+        # shut. Calling _run_start here would hard-refuse (matching its
+        # own, correct, conservative behavior for the STANDALONE `start`
+        # command, which has no way to re-verify anything's changed) and
+        # previously blocked the ENTIRE supervisor -- including crypto
+        # (a continuous market that already tolerates MARKET_CLOSED at
+        # the execution boundary, see risk/session.py::execution_session_decision's
+        # CONTINUOUS_ASSET_SESSION branch) and monitor/settlement, which
+        # have nothing to do with equity market hours at all. Skip the
+        # redundant/wrong-shaped activation call in exactly this one case
+        # so the supervisor starts and each lane's own market-clock check
+        # (_scan_action, crypto unaffected) does the correct fine-grained
+        # gating instead.
+        current_session = await load_session(repositories)
+        if current_session.state == SessionState.MARKET_CLOSED:
+            logger.info("run_session_already_active_market_closed", extra={"event": "run_session_already_active_market_closed"})
+            start_result = 0
+        else:
+            start_result = await _run_start(settings)
         trading_task: asyncio.Task[None] | None = None
         if start_result != 0:
             logger.error("run_session_activation_failed", extra={"event": "run_session_activation_failed"})
