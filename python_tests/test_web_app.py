@@ -213,6 +213,43 @@ async def test_market_data_capability_reads_from_scan_runs_not_live_probe(tmp_pa
 
 
 @respx.mock
+async def test_market_data_capability_skips_legacy_row_missing_asset_class(tmp_path) -> None:
+    """Regression test for a live 500: a ScanRun row persisted before
+    asset_class existed as a required field crashes hydration
+    (AssetClass(d["asset_class"]) -> KeyError). The route must skip that
+    row -- never crash, never guess/default its lane -- and still surface
+    the newest CURRENT-schema row per lane underneath it."""
+    client, state = await _client_for(tmp_path)
+    current_run = ScanRun(
+        scan_run_id="run-current", scan_generation="gen-1", trigger=ScanTrigger.SCHEDULED, asset_class=AssetClass.CRYPTO,
+        status=ScanRunStatus.COMPLETED, started_at=NOW, lock_owner_token="owner-1", completed_at=NOW,
+        market_data_tier="basic", equity_feed="iex", option_feed="indicative",
+    )
+    await state.repositories.scan_runs.create_once("run-current", current_run, status=current_run.status.value)
+
+    # Inserted SECOND so it sorts newest-first (list_recent) and is the
+    # FIRST row the route's loop actually encounters -- proving it's
+    # skipped and the loop continues, not just that a working row works.
+    legacy_payload = {
+        "scan_run_id": "run-legacy", "scan_generation": "gen-0", "trigger": "scheduled",
+        "status": "completed", "started_at": NOW.isoformat(), "lock_owner_token": "owner-0",
+        "completed_at": NOW.isoformat(), "candidates_discovered": 0, "candidates_approved": 0,
+        "orders_submitted": 0, "error": None, "market_data_tier": "basic", "equity_feed": "iex", "option_feed": "indicative",
+        # asset_class deliberately omitted -- the exact legacy-row shape from the live incident
+    }
+    await state.repositories.scan_runs.create_once("run-legacy", legacy_payload, status="completed")
+
+    response = await client.get("/api/market-data-capability")
+    await client.aclose()
+    await state.broker.aclose()
+
+    assert response.status_code == 200  # never a 500
+    body = response.json()
+    assert "crypto" in body
+    assert body["crypto"]["equity_feed"] == "iex"
+
+
+@respx.mock
 async def test_rate_limit_route_returns_null_before_any_request(tmp_path) -> None:
     client, state = await _client_for(tmp_path)
 

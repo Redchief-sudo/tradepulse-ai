@@ -187,12 +187,22 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
     async def get_market_data_capability(request: Request) -> Response:
         """Reads from the most recent ScanRun per lane -- what the trading
         invocation actually used, never a fresh probe against Alpaca (which
-        could show something no scan cycle has actually run with yet)."""
+        could show something no scan cycle has actually run with yet). A row
+        that predates a since-added required ScanRun field (or is otherwise
+        structurally incompatible with the current schema) is skipped, not
+        guessed at -- hydration failing is exactly the signal that row's
+        asset_class can't be trusted, so defaulting it (e.g. to equity)
+        would silently lie about which lane it belonged to. The newest
+        CURRENT-schema row per lane still surfaces correctly since list_recent
+        is already newest-first."""
         s = _state(request)
         rows = await s.repositories.scan_runs.list_recent(200)
         by_lane: dict[str, Any] = {}
         for row in rows:
-            scan_run = hydrate("scan_runs", row["payload"])
+            try:
+                scan_run = hydrate("scan_runs", row["payload"])
+            except (KeyError, ValueError, TypeError):
+                continue
             key = scan_run.asset_class.value
             if key in by_lane or scan_run.market_data_tier is None:
                 continue
