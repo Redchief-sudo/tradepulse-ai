@@ -321,6 +321,11 @@ def decode_scan_run(d: Mapping[str, Any]) -> ScanRun:
         option_feed=d.get("option_feed"),
         universe_size=d.get("universe_size", 0),
         ai_response_request_id=d.get("ai_response_request_id"),
+        regime=d.get("regime"),
+        regime_reason=d.get("regime_reason"),
+        regime_confidence=d.get("regime_confidence"),
+        regime_position_multiplier=_decimal_or_none(d.get("regime_position_multiplier")),
+        regime_realized_vol=_decimal_or_none(d.get("regime_realized_vol")),
     )
 
 

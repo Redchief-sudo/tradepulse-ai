@@ -77,6 +77,17 @@ class RiskCheckInput:
     # this once via models/market.py::contract_multiplier_of(asset), the
     # sole authority; evaluate_risk never reads asset metadata itself.
     contract_multiplier: Decimal = Decimal("1")
+    # Market Regime Phase 2 -- a bare Decimal, deliberately: this module's
+    # own docstring states it has "veto authority over every strategy...
+    # deterministic, strategy-independent", so it must never import
+    # strategy.regime types, only accept the already-computed multiplier
+    # a caller derived from one. None means no regime signal was supplied
+    # at all (every existing caller/test that doesn't pass this is
+    # unaffected). evaluate_risk independently validates this is a finite
+    # Decimal in [0, 1] before ever using it -- see the INVALID_REGIME_MULTIPLIER
+    # gate below; it does not trust the caller just because the caller is
+    # expected to only ever supply a value in range.
+    regime_multiplier: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +194,17 @@ def evaluate_risk(
 
     if intent.confidence is not None and intent.confidence < limits.min_confidence:
         reasons.append(f"CONFIDENCE_BELOW_MIN ({intent.confidence} < {limits.min_confidence})")
+    if intent.regime_multiplier is not None and (
+        not intent.regime_multiplier.is_finite() or not (Decimal("0") <= intent.regime_multiplier <= Decimal("1"))
+    ):
+        # The deterministic risk engine validates this itself rather than
+        # trusting the caller -- a regime_multiplier outside [0, 1], or
+        # non-finite (NaN/Infinity), indicates a defect somewhere upstream
+        # in strategy-layer code this module must not blindly trust (see
+        # RiskCheckInput.regime_multiplier's own docstring). An outright
+        # rejection here, not a silent skip/clamp -- this should never
+        # actually trigger in normal operation.
+        reasons.append(f"INVALID_REGIME_MULTIPLIER ({intent.regime_multiplier})")
     if snapshot.trades_today >= limits.max_daily_trades:
         reasons.append(f"MAX_DAILY_TRADES_REACHED ({snapshot.trades_today}/{limits.max_daily_trades})")
     if snapshot.open_positions >= limits.max_open_positions:
@@ -234,6 +256,18 @@ def evaluate_risk(
             if confidence_multiplier < 1:
                 risk_budget *= confidence_multiplier
                 reasons.append(f"RISK_BUDGET_SCALED_BY_CONFIDENCE_TO_{(confidence_multiplier * 100).quantize(Decimal('0.1'))}PCT")
+            # Regime scales the SAME risk budget, same shape as confidence,
+            # applied immediately after it -- by this point regime_multiplier
+            # is already proven finite and in [0, 1] (the INVALID_REGIME_MULTIPLIER
+            # gate above returned before this line could ever run on a bad
+            # value). Never scales up (only `< 1` multiplies); composes
+            # multiplicatively with confidence, not independently capped --
+            # both shrink the SAME budget before the same unconditional hard
+            # caps below, so regime can never enlarge a position past any
+            # existing limit regardless of how confidence_multiplier moved it.
+            if intent.regime_multiplier is not None and intent.regime_multiplier < 1:
+                risk_budget *= intent.regime_multiplier
+                reasons.append(f"RISK_BUDGET_SCALED_BY_REGIME_TO_{(intent.regime_multiplier * 100).quantize(Decimal('0.1'))}PCT")
             unit_risk = abs(price - intent.stop_loss) * intent.contract_multiplier
             if unit_risk > 0:
                 risk_based_qty = _round_qty(risk_budget / unit_risk, intent.asset_class)

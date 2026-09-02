@@ -194,6 +194,17 @@ export interface ScanRun {
   // (see api.getAiResponse) -- null when no AI response was ever obtained
   // for this run (e.g. blocked before the AI call, or a legacy row).
   ai_response_request_id: string | null
+  // Market Regime Phase 2 -- one broad-market benchmark classification per
+  // lane per cycle (SPY for equity/options, BTC/USD for crypto). `regime`
+  // is one of the 5 classified labels, or the literal "unavailable" when
+  // the benchmark fetch/classification failed (see `regime_reason`, only
+  // ever set alongside "unavailable"). All null on a legacy row predating
+  // this field, or before the classifier ran for this cycle.
+  regime: string | null
+  regime_reason: string | null
+  regime_confidence: number | null
+  regime_position_multiplier: string | null
+  regime_realized_vol: string | null
 }
 
 export interface AiCandidate {

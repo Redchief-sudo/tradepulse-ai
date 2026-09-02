@@ -69,6 +69,12 @@ function LaneCard({ label, run }: { label: string; run: ScanRun | undefined }) {
               {run.market_data_tier ?? '—'}
               {feed ? ` (${feed})` : ''}
             </dd>
+            <dt>Regime</dt>
+            <dd>
+              {!run.regime && '—'}
+              {run.regime === 'unavailable' && `unavailable (${run.regime_reason ?? 'unknown'})`}
+              {run.regime && run.regime !== 'unavailable' && `${run.regime} (${run.regime_position_multiplier ?? '?'}x)`}
+            </dd>
           </dl>
           {run.error && <div className="panel-error">{run.error}</div>}
           {aiResponse && aiResponse.result.candidates.length > 0 && (

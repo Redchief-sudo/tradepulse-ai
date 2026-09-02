@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -128,6 +128,14 @@ class ExecutionRequest:
     # default) means the caller isn't participating in the scheme; no new
     # behavior for it.
     symbol_lock_owner_token: str | None = None
+    # Market Regime Phase 2 -- kept deliberately dumb so this module never
+    # depends on strategy.regime (matches risk/engine.py's own
+    # "strategy-independent" principle, one layer up): a bare Decimal
+    # threaded straight into RiskCheckInput.regime_multiplier unchanged,
+    # and a plain, gateway-agnostic dict merged into risk_snapshot
+    # verbatim -- this module never interprets what's inside either.
+    regime_multiplier: Decimal | None = None
+    regime_snapshot: Mapping[str, str | int | None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,6 +312,7 @@ class ExecutionGateway:
                 requested_quantity=request.requested_quantity, price=quote.price,
                 confidence=request.confidence, stop_loss=request.stop_loss, sector=request.sector or "Other",
                 contract_multiplier=contract_multiplier_of(request.asset),
+                regime_multiplier=request.regime_multiplier,
             )
             risk_opts = RiskEvalOptions(
                 protective_exit=protective_exit, bid=quote.bid, ask=quote.ask,
@@ -345,6 +354,20 @@ class ExecutionGateway:
                 "approved_quantity": str(risk.approved_quantity),
                 "risk_profile": self._risk_limits.profile_id,
             }
+            # Market Regime Phase 2 -- merged in verbatim, un-interpreted
+            # (see ExecutionRequest.regime_snapshot's own docstring). Never
+            # lets a regime_snapshot key override one of the established
+            # keys above -- enforced here, not just by convention, so a
+            # future regime_snapshot producer that happened to choose a
+            # colliding key name (e.g. "risk_profile") cannot silently
+            # corrupt this audit trail. Deliberately does not raise: this
+            # runs inside a live scan cycle's execution path, where an
+            # exception here would abort the whole cycle over what is only
+            # a provenance-dict defect, not a sizing/safety one (sizing
+            # already happened correctly via the separate, independently
+            # validated regime_multiplier field).
+            for key, value in (request.regime_snapshot or {}).items():
+                risk_snapshot.setdefault(key, value)
             approved = replace(
                 intent, status=TradeIntentStatus.RISK_APPROVED, requested_quantity=risk.approved_quantity,
                 risk_snapshot=risk_snapshot,

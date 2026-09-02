@@ -22,8 +22,9 @@ deferred), not the scanner's.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import ROUND_FLOOR, Decimal
@@ -69,8 +70,10 @@ from tradepulse.providers import (
 )
 from tradepulse.risk import build_portfolio_snapshot, load_session, sync_market_session
 from tradepulse.strategy import (
+    Calendar,
     ExecutableUniverse,
     atr,
+    classify_regime,
     compute_real_factors,
     is_executable,
     select_contract,
@@ -101,6 +104,133 @@ _MARKET_DATA_AUTHORITY = {
 # real overlap; this only cleans up the audit trail after a crash left a
 # ScanRun stuck at RUNNING forever.
 STALE_SCAN_RUN_SECONDS = 900
+
+# Market Regime Phase 2 -- Architecture A: one broad-market benchmark
+# regime per lane per cycle, applied to every candidate approved that
+# cycle (never a per-candidate/per-instrument classifier). Options
+# inherit the equity/broad-market regime rather than classify the option
+# contract's own price history -- matches the existing deterministic-gate
+# precedent (candles are always fetched for the underlying, never the
+# contract; see test_deterministic_gate_fetches_candles_for_underlying_not_contract).
+_BENCHMARK_ASSETS: dict[AssetClass, AssetIdentity] = {
+    AssetClass.EQUITY: AssetIdentity("SPY", AssetClass.EQUITY, "alpaca:SPY"),
+    AssetClass.OPTION: AssetIdentity("SPY", AssetClass.EQUITY, "alpaca:SPY"),
+    AssetClass.CRYPTO: AssetIdentity("BTC/USD", AssetClass.CRYPTO, "alpaca:BTC/USD"),
+}
+_BENCHMARK_CALENDAR: dict[AssetClass, Calendar] = {
+    AssetClass.EQUITY: "equity", AssetClass.OPTION: "equity", AssetClass.CRYPTO: "crypto",
+}
+
+# Applied whenever the benchmark fetch/classification fails -- deliberately
+# NOT 1.0 (that would treat "we have no signal" as more permissive than "we
+# have a confirmed elevated-risk signal", backwards for a fail-closed
+# system) and NOT 0.0 (that would make an infrastructure hiccup as
+# punishing as a confirmed liquidity crisis, and would amount to inventing
+# a de facto lane-wide kill switch outside the session-state machinery).
+# Matches high_vol_bear's own conservatism: absence of information is
+# treated as AT LEAST as risky as a confirmed elevated-risk regime, never
+# less.
+REGIME_UNAVAILABLE_MULTIPLIER = Decimal("0.5")
+
+
+@dataclass(frozen=True, slots=True)
+class _LaneRegime:
+    multiplier: Decimal  # always populated, always in [0, 1] -- never None
+    snapshot: Mapping[str, str | int | None]  # plain, gateway-agnostic -- execution/gateway.py never interprets this, just copies it
+
+
+def _unavailable_lane_regime(reason: str) -> _LaneRegime:
+    return _LaneRegime(
+        multiplier=REGIME_UNAVAILABLE_MULTIPLIER,
+        snapshot={
+            "regime": "unavailable", "regime_reason": reason,
+            "regime_position_multiplier": str(REGIME_UNAVAILABLE_MULTIPLIER),
+        },
+    )
+
+
+async def _classify_lane_regime(market_data: AlpacaMarketDataProvider, asset_class: AssetClass) -> _LaneRegime:
+    """One benchmark fetch per lane per cycle -- options fetches SPY
+    independently too (not a read of equity's own last result): simpler,
+    self-contained, no cross-lane coupling in the concurrent tradepulse-run
+    supervisor, and matches the ~1-extra-request-per-lane-per-cycle cost
+    already budgeted. Never raises and never blocks candidate evaluation --
+    but a failure degrades to an explicit, conservative, PERSISTED
+    "unavailable" state with a truthful, distinguishable reason, never a
+    silent no-op and never a blanket `except Exception` around everything.
+
+    Three narrow, specific exception surfaces, verified against source
+    (not assumed):
+      - ProviderError (ProviderHttpFailure/ProviderDataFailure) -- covers
+        both a clean HTTP/transport failure AND "insufficient history"
+        (fetch_candles's own MIN_CANDLES=30 gate already raises
+        ProviderDataFailure for that case -- same except clause, same
+        underlying cause class: the provider couldn't supply usable bars).
+      - (ValueError, decimal.InvalidOperation) -- a malformed numeric field
+        in Alpaca's raw bars response. broker/alpaca_client.py::get_bars's
+        own RawBar parsing calls bare Decimal(str(value)) (unguarded --
+        raises decimal.InvalidOperation on non-numeric input), and
+        Candle.__post_init__ raises DomainValidationError (a ValueError
+        subclass) or a bare ValueError ("high cannot be below low") for a
+        semantically invalid bar. Both are real, reachable exception types
+        from a malformed broker response -- distinct from a clean
+        provider-level failure.
+      - Exception, scoped ONLY around the classify_regime call itself
+        (never around the fetch) -- unreachable today: classify_regime
+        never raises for insufficient/non-finite/invalid closes (Phase 1
+        already fails closed internally to "transition" for those), and
+        never raises for timeframe/calendar here (always called with
+        fixed, valid values). Kept as defense-in-depth only, since
+        classify_regime is strategy-layer code this orchestration layer
+        should not blindly assume will never change its contract -- not a
+        real observed failure mode.
+    """
+    from decimal import InvalidOperation
+
+    benchmark = _BENCHMARK_ASSETS[asset_class]
+    calendar = _BENCHMARK_CALENDAR[asset_class]
+    try:
+        candles = await market_data.fetch_candles(benchmark)
+    except ProviderError as exc:
+        logger.warning("regime_benchmark_fetch_failed", extra={"event": "regime_benchmark_fetch_failed", "benchmark": benchmark.symbol, "error": str(exc)})
+        return _unavailable_lane_regime("benchmark_fetch_failed")
+    except (ValueError, InvalidOperation) as exc:
+        logger.warning("regime_benchmark_data_invalid", extra={"event": "regime_benchmark_data_invalid", "benchmark": benchmark.symbol, "error": str(exc)})
+        return _unavailable_lane_regime("benchmark_data_invalid")
+
+    try:
+        classification = classify_regime([c.close for c in candles], timeframe="1day", calendar=calendar)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: unreachable today, deliberate defense-in-depth against strategy-layer code this orchestration layer should not blindly trust
+        logger.error("regime_classification_failed", extra={"event": "regime_classification_failed", "benchmark": benchmark.symbol, "error": str(exc)})
+        return _unavailable_lane_regime("regime_classification_failed")
+
+    return _LaneRegime(
+        multiplier=classification.position_multiplier,
+        snapshot={
+            "regime": classification.regime, "regime_confidence": classification.confidence,
+            "regime_position_multiplier": str(classification.position_multiplier),
+            "regime_realized_vol": str(classification.realized_vol) if classification.realized_vol is not None else None,
+            "regime_timeframe": classification.timeframe, "regime_calendar": classification.calendar,
+        },
+    )
+
+
+def _scan_run_regime_fields(lane_regime: _LaneRegime) -> dict[str, Any]:
+    """Translates a _LaneRegime's plain, gateway-agnostic snapshot dict
+    into ScanRun's typed keyword fields -- the one place that knows
+    ScanRun's specific field names/types, so the snapshot dict itself
+    (also reused verbatim in TradeIntent.risk_snapshot, see execution/gateway.py)
+    can stay generic."""
+    snapshot = lane_regime.snapshot
+    position_multiplier = snapshot.get("regime_position_multiplier")
+    realized_vol = snapshot.get("regime_realized_vol")
+    return {
+        "regime": snapshot.get("regime"),
+        "regime_reason": snapshot.get("regime_reason"),
+        "regime_confidence": snapshot.get("regime_confidence"),
+        "regime_position_multiplier": Decimal(str(position_multiplier)) if position_multiplier is not None else None,
+        "regime_realized_vol": Decimal(str(realized_vol)) if realized_vol is not None else None,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,12 +424,23 @@ async def run_scan_cycle(
         await _finish(ScanRunStatus.FAILED, error="SESSION_BLOCKED")
         return ScanCycleSummary(scan_run_id, ScanRunStatus.FAILED, 0, 0, 0, [], error="SESSION_BLOCKED")
 
+    # Regime benchmark fetch runs concurrently with the AI call -- the two
+    # are independent, so this adds zero serial latency in the common
+    # case. Started only after the session-block check above (no point
+    # spending an API call on a cycle that's about to reject everything).
+    regime_task = asyncio.create_task(_classify_lane_regime(market_data, asset_class))
+
     request = build_scan_request(str(uuid4()), scan_run_id, _build_scan_prompt(lane_symbols, asset_class))
     try:
         ai_response, candidates = await ai_provider.scan_candidates(request)
     except (ProviderHttpFailure, ProviderDataFailure) as exc:
+        regime_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await regime_task
         await _finish(ScanRunStatus.FAILED, error=str(exc))
         return ScanCycleSummary(scan_run_id, ScanRunStatus.FAILED, 0, 0, 0, [], error=str(exc))
+
+    lane_regime: _LaneRegime = await regime_task
 
     await repositories.ai_responses.create_once(ai_response.request_id, ai_response)
 
@@ -308,7 +449,7 @@ async def run_scan_cycle(
     except Exception as exc:  # noqa: BLE001 - a broker outage must fail this scan cleanly, not crash the caller
         await _finish(
             ScanRunStatus.FAILED, candidates_discovered=len(candidates), error=f"BROKER_UNAVAILABLE: {exc}",
-            ai_response_request_id=ai_response.request_id,
+            ai_response_request_id=ai_response.request_id, **_scan_run_regime_fields(lane_regime),
         )
         return ScanCycleSummary(scan_run_id, ScanRunStatus.FAILED, len(candidates), 0, 0, [], error=f"BROKER_UNAVAILABLE: {exc}")
 
@@ -493,6 +634,7 @@ async def run_scan_cycle(
                 asset=trade_asset, side=Side.BUY, requested_quantity=quantity, strategy="ai_scan",
                 decision_id=opportunity.opportunity_id, confidence=Decimal(str(candidate.confidence)),
                 stop_loss=stop_loss, symbol_lock_owner_token=owner_token,
+                regime_multiplier=lane_regime.multiplier, regime_snapshot=lane_regime.snapshot,
             )
             result = await run_with_lock_renewal(
                 database, execution_lock_key(trade_asset), owner_token, SYMBOL_LOCK_TTL_SECONDS, gateway.execute_intent(exec_request),
@@ -506,5 +648,6 @@ async def run_scan_cycle(
     await _finish(
         ScanRunStatus.COMPLETED, candidates_discovered=len(candidates),
         candidates_approved=approved, orders_submitted=submitted, ai_response_request_id=ai_response.request_id,
+        **_scan_run_regime_fields(lane_regime),
     )
     return ScanCycleSummary(scan_run_id, ScanRunStatus.COMPLETED, len(candidates), approved, submitted, execution_results)

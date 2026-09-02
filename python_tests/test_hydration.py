@@ -149,6 +149,52 @@ def test_scan_run_roundtrips() -> None:
     assert roundtrip("scan_runs", original) == original
 
 
+def test_scan_run_roundtrips_with_regime_fields() -> None:
+    original = ScanRun(
+        "scan-2", "gen-2", ScanTrigger.SCHEDULED, AssetClass.EQUITY, ScanRunStatus.COMPLETED, NOW, "owner-2",
+        completed_at=NOW, candidates_discovered=3, candidates_approved=1, orders_submitted=1,
+        universe_size=8, ai_response_request_id="ai-req-2",
+        regime="high_vol_bear", regime_reason=None, regime_confidence=62,
+        regime_position_multiplier=Decimal("0.5"), regime_realized_vol=Decimal("0.21"),
+    )
+    assert roundtrip("scan_runs", original) == original
+
+
+def test_scan_run_roundtrips_with_unavailable_regime_fallback() -> None:
+    """The Market Regime Phase 2 fail-closed fallback path -- regime ==
+    "unavailable" with a truthful regime_reason and no confidence/vol
+    (the classifier was never reached)."""
+    original = ScanRun(
+        "scan-3", "gen-3", ScanTrigger.SCHEDULED, AssetClass.CRYPTO, ScanRunStatus.COMPLETED, NOW, "owner-3",
+        completed_at=NOW, candidates_discovered=0, candidates_approved=0, orders_submitted=0,
+        regime="unavailable", regime_reason="benchmark_fetch_failed",
+        regime_position_multiplier=Decimal("0.5"),
+    )
+    assert roundtrip("scan_runs", original) == original
+
+
+def test_scan_run_hydrates_legacy_row_missing_regime_fields() -> None:
+    """A row persisted before Market Regime Phase 2 shipped -- hydration
+    must default all five regime fields safely (all None), never raise.
+    Mirrors test_scan_run_hydrates_legacy_row_missing_universe_size_and_ai_response_request_id."""
+    legacy_payload = {
+        "scan_run_id": "scan-legacy-regime", "scan_generation": "gen-0", "trigger": "scheduled",
+        "asset_class": "equity", "status": "completed", "started_at": NOW.isoformat(),
+        "lock_owner_token": "owner-0", "completed_at": NOW.isoformat(),
+        "candidates_discovered": 2, "candidates_approved": 1, "orders_submitted": 1, "error": None,
+        "market_data_tier": "basic", "equity_feed": "iex", "option_feed": "indicative",
+        "universe_size": 5, "ai_response_request_id": "ai-req-legacy",
+        # regime / regime_reason / regime_confidence / regime_position_multiplier /
+        # regime_realized_vol deliberately omitted -- the exact pre-Phase-2 row shape
+    }
+    result = hydrate("scan_runs", legacy_payload)
+    assert result.regime is None
+    assert result.regime_reason is None
+    assert result.regime_confidence is None
+    assert result.regime_position_multiplier is None
+    assert result.regime_realized_vol is None
+
+
 def test_scan_run_hydrates_legacy_row_missing_universe_size_and_ai_response_request_id() -> None:
     """A row persisted before these two observability-only fields existed --
     hydration must default them safely (universe_size=0,

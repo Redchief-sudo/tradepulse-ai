@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 
 from .base import require_aware, require_text
 from .enums import AssetClass, ScanRunStatus, ScanTrigger
@@ -42,6 +43,20 @@ class ScanRun:
     # a legacy row predating this field).
     universe_size: int = 0
     ai_response_request_id: str | None = None
+    # Market Regime Phase 2 provenance -- additive, optional/defaulting so
+    # no backfill is needed for existing rows, same treatment as every
+    # field above. `regime` is one of the 5 classified regime labels OR
+    # the literal "unavailable" (benchmark fetch/classification failed
+    # this cycle -- see scanner/coordinator.py::_classify_lane_regime);
+    # `regime_reason` is only ever set alongside "unavailable" (e.g.
+    # "benchmark_fetch_failed"/"benchmark_data_invalid"/
+    # "regime_classification_failed"). Deliberately a loose `str`, not the
+    # strict Regime Literal type, so it can hold "unavailable" too.
+    regime: str | None = None
+    regime_reason: str | None = None
+    regime_confidence: int | None = None
+    regime_position_multiplier: Decimal | None = None
+    regime_realized_vol: Decimal | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.trigger, ScanTrigger):

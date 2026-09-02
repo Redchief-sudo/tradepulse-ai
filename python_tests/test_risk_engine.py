@@ -145,6 +145,110 @@ def test_confidence_none_does_not_scale_risk_budget() -> None:
     assert not any("RISK_BUDGET_SCALED_BY_CONFIDENCE" in r for r in decision.reasons)
 
 
+def test_regime_multiplier_composes_with_confidence_multiplicatively() -> None:
+    """Market Regime Phase 2: regime_multiplier scales the SAME risk_budget
+    confidence already scaled, immediately after it -- the combined effect
+    must be the exact product of both fractions, not either one alone."""
+    stop_loss = Decimal("96")  # risk_per_share = 4 against price=100
+    total_equity = Decimal("100000")
+    base_risk_budget = (LIMITS.max_risk_per_trade_pct / 100) * total_equity
+    confidence_multiplier = LIMITS.min_position_size_multiplier  # confidence == min_confidence -> the floor
+    regime_multiplier = Decimal("0.5")
+    combined_budget = base_risk_budget * confidence_multiplier * regime_multiplier
+
+    buy = _buy(
+        confidence=LIMITS.min_confidence, stop_loss=stop_loss, requested_quantity=Decimal("300"),
+        regime_multiplier=regime_multiplier,
+    )
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("10000000"))
+    decision = evaluate_risk(buy, _snapshot(total_equity=total_equity), LIMITS, opts)
+
+    risk_per_share = Decimal("100") - stop_loss
+    assert decision.approved
+    assert decision.approved_quantity * risk_per_share <= combined_budget
+    assert combined_budget < base_risk_budget * confidence_multiplier  # regime genuinely shrank it further, not a no-op
+    assert any("RISK_BUDGET_SCALED_BY_CONFIDENCE" in r for r in decision.reasons)
+    assert any("RISK_BUDGET_SCALED_BY_REGIME_TO_50.0PCT" in r for r in decision.reasons)
+
+
+def test_regime_multiplier_at_or_above_one_never_scales_risk_budget_up() -> None:
+    stop_loss = Decimal("96")
+    total_equity = Decimal("100000")
+    base_risk_budget = (LIMITS.max_risk_per_trade_pct / 100) * total_equity
+    buy = _buy(confidence=Decimal("100"), stop_loss=stop_loss, requested_quantity=Decimal("300"), regime_multiplier=Decimal("1"))
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("10000000"))
+    decision = evaluate_risk(buy, _snapshot(total_equity=total_equity), LIMITS, opts)
+
+    risk_per_share = Decimal("100") - stop_loss
+    assert decision.approved
+    assert decision.approved_quantity * risk_per_share <= base_risk_budget
+    assert not any("RISK_BUDGET_SCALED_BY_REGIME" in r for r in decision.reasons)  # >= 1 never triggers the scaling branch at all
+
+
+def test_regime_multiplier_zero_produces_insufficient_capacity_rejection() -> None:
+    """The liquidity_crisis path (position_multiplier=0), reusing the
+    EXISTING deterministic rejection semantics -- no new kill-switch/
+    session-state machinery, confirmed directly here without needing the
+    classifier itself."""
+    buy = _buy(confidence=Decimal("100"), stop_loss=Decimal("96"), requested_quantity=Decimal("300"), regime_multiplier=Decimal("0"))
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("10000000"))
+    decision = evaluate_risk(buy, _snapshot(total_equity=Decimal("100000")), LIMITS, opts)
+
+    assert not decision.approved
+    assert decision.approved_quantity == Decimal("0")
+    assert any("INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT" in r for r in decision.reasons)
+
+
+def test_regime_cannot_push_approved_quantity_above_existing_hard_caps() -> None:
+    """regime_multiplier=1 (no risk-budget scaling at all) still lands on
+    the SAME max_position_pct-capped quantity as with no regime signal --
+    proving the existing hard caps remain unconditionally enforced
+    regardless of what regime did or didn't do to the risk budget."""
+    limits = replace(LIMITS, max_risk_per_trade_pct=Decimal("50"))  # deliberately huge so max_position_pct binds instead
+    buy_with_regime = _buy(confidence=Decimal("100"), stop_loss=Decimal("96"), requested_quantity=Decimal("300"), regime_multiplier=Decimal("1"))
+    buy_without_regime = _buy(confidence=Decimal("100"), stop_loss=Decimal("96"), requested_quantity=Decimal("300"))
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("10000000"))
+    snapshot = _snapshot(total_equity=Decimal("100000"))
+
+    with_regime = evaluate_risk(buy_with_regime, snapshot, limits, opts)
+    without_regime = evaluate_risk(buy_without_regime, snapshot, limits, opts)
+
+    assert with_regime.approved and without_regime.approved
+    assert with_regime.approved_quantity == without_regime.approved_quantity
+    assert any("BY_MAX_POSITION_PCT" in r for r in with_regime.reasons)
+
+
+def test_regime_multiplier_none_behaves_identically_to_no_regime_signal() -> None:
+    """Full backward compatibility -- every existing caller/test that never
+    passes regime_multiplier (the default, None) must be completely
+    unaffected. Explicit regression test, not just "every other test in
+    this file still passes"."""
+    buy_explicit_none = _buy(confidence=Decimal("90"), stop_loss=Decimal("96"), requested_quantity=Decimal("300"), regime_multiplier=None)
+    buy_omitted = _buy(confidence=Decimal("90"), stop_loss=Decimal("96"), requested_quantity=Decimal("300"))
+    opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("10000000"))
+    snapshot = _snapshot(total_equity=Decimal("100000"))
+
+    a = evaluate_risk(buy_explicit_none, snapshot, LIMITS, opts)
+    b = evaluate_risk(buy_omitted, snapshot, LIMITS, opts)
+    assert a == b
+
+
+def test_invalid_regime_multiplier_rejects_the_whole_intent_never_ignored_or_clamped() -> None:
+    """Defense-in-depth at the deterministic risk boundary: the risk engine
+    validates regime_multiplier itself rather than trusting the caller.
+    Each case is a genuinely invalid signal (out of [0, 1], or non-finite)
+    that should never reach this module in normal operation -- proving it
+    is rejected outright, not silently skipped or clamped into range."""
+    for bad_multiplier in (Decimal("-0.5"), Decimal("1.25"), Decimal("NaN"), Decimal("Infinity")):
+        buy = _buy(confidence=Decimal("90"), stop_loss=Decimal("96"), requested_quantity=Decimal("300"), regime_multiplier=bad_multiplier)
+        opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("10000000"))
+        decision = evaluate_risk(buy, _snapshot(total_equity=Decimal("100000")), LIMITS, opts)
+
+        assert not decision.approved, f"expected rejection for regime_multiplier={bad_multiplier}"
+        assert decision.approved_quantity == Decimal("0")
+        assert any("INVALID_REGIME_MULTIPLIER" in r for r in decision.reasons), f"missing reason for regime_multiplier={bad_multiplier}: {decision.reasons}"
+
+
 def test_min_lot_notional_rejects_tiny_notional_even_when_quantity_floor_passes() -> None:
     """A low-priced asset where a few units clear the unit-quantity floor
     (0.001) but not the dollar floor (min_lot_notional, $1 default)."""

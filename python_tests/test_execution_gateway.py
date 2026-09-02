@@ -672,6 +672,160 @@ async def test_buy_with_partial_cash_sizes_down_instead_of_rejecting(tmp_path) -
 
 
 @respx.mock
+async def test_regime_multiplier_scales_sizing_and_regime_snapshot_merges_verbatim_uninterpreted(tmp_path) -> None:
+    """Market Regime Phase 2 boundary: ExecutionRequest.regime_multiplier
+    must actually drive sizing (the real regression test for the original
+    fail-open defect -- proving the multiplier was threaded into a real
+    decision, not just that nothing crashed), and ExecutionRequest.regime_snapshot
+    must merge into the persisted risk_snapshot completely unchanged, with
+    the gateway never inspecting or recomputing anything from its contents.
+
+    To prove that second point unambiguously, regime_snapshot's own
+    "regime_position_multiplier" key is deliberately set to a DIFFERENT
+    value ("0.9") than the real regime_multiplier ("0.5") driving sizing.
+    If the gateway ever parsed sizing information out of the snapshot
+    instead of the separate typed field, this test would size wrong.
+    """
+    import json as _json
+
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()  # cash=50000, equity=100000 -- plenty of room; risk-based sizing is the binding cap here, not cash
+    _mock_positions()
+    _mock_quote()  # ask=199.60
+    _mock_market_open()
+
+    state: dict[str, str] = {}
+
+    def _accept(request: httpx.Request) -> httpx.Response:
+        state["qty"] = _json.loads(request.content)["qty"]
+        return httpx.Response(200, json=_order_json("accepted", "0", None))
+
+    def _status(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_order_json("filled", state["qty"], "199.60"))
+
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=_accept)
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(side_effect=_status)
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
+        side_effect=lambda request: httpx.Response(200, json=[{
+            "id": "act-1", "activity_type": "FILL", "symbol": "AAPL", "side": "buy",
+            "qty": state["qty"], "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-1",
+        }])
+    )
+
+    regime_snapshot = {
+        "regime": "high_vol_bear",
+        "regime_confidence": 62,
+        "regime_position_multiplier": "0.9",  # deliberately mismatched vs. the real Decimal("0.5") below -- see docstring
+        "regime_realized_vol": "0.21",
+        "unexpected_extra_key": "should_still_survive_verbatim",
+    }
+    # balanced: max_risk_per_trade_pct=0.30% of 100000 equity = 300, halved by
+    # regime to 150; unit_risk = |199.60 - 190.00| = 9.60 -> risk-based qty =
+    # 150/9.60 = 15.625, well under both the 50-share request and the
+    # max_position_pct (7% of equity = 7000 notional, i.e. ~35 shares) cap --
+    # so the regime-scaled risk-based cap is the one actually binding here.
+    request = ExecutionRequest(
+        asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("50"), strategy="test",
+        confidence=Decimal("100"), stop_loss=Decimal("190.00"),
+        regime_multiplier=Decimal("0.5"), regime_snapshot=regime_snapshot,
+    )
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status != "rejected"
+    assert result.filled_quantity == Decimal("15.625")
+
+    intent_row = await repositories.trade_intents.get(result.trade_intent_id)
+    intent = hydrate("trade_intents", intent_row["payload"])
+    assert any("RISK_BUDGET_SCALED_BY_REGIME_TO_50.0PCT" in r for r in intent.risk_snapshot["reasons"])
+    assert intent.risk_snapshot["approved_quantity"] == "15.625"
+    # existing, pre-Phase-2 keys are untouched by the merge
+    assert intent.risk_snapshot["risk_profile"] == "balanced"
+    assert intent.risk_snapshot["requested_quantity"] == "50"
+    # regime_snapshot's keys merged in verbatim -- including the deliberately
+    # mismatched multiplier string and the arbitrary unexpected key, proving
+    # the gateway copies this mapping without ever parsing or trusting it
+    assert intent.risk_snapshot["regime"] == "high_vol_bear"
+    assert intent.risk_snapshot["regime_confidence"] == 62
+    assert intent.risk_snapshot["regime_position_multiplier"] == "0.9"
+    assert intent.risk_snapshot["regime_realized_vol"] == "0.21"
+    assert intent.risk_snapshot["unexpected_extra_key"] == "should_still_survive_verbatim"
+
+
+@respx.mock
+async def test_regime_snapshot_cannot_override_existing_risk_snapshot_keys(tmp_path) -> None:
+    """A regime_snapshot that names an existing risk_snapshot key (e.g. a
+    future producer bug) must never corrupt that key's real value -- the
+    established provenance ("risk_profile", "approved_quantity", etc.) is
+    always protected, never silently overwritten by regime_snapshot."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_market_open()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "1", "199.60")))
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
+        return_value=httpx.Response(200, json=[{
+            "id": "act-1", "activity_type": "FILL", "symbol": "AAPL", "side": "buy",
+            "qty": "1", "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-1",
+        }])
+    )
+
+    request = ExecutionRequest(
+        asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("1"), strategy="test", confidence=Decimal("90"),
+        regime_snapshot={"risk_profile": "hijacked", "approved_quantity": "999", "brand_new_key": "survives"},
+    )
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status != "rejected"
+    intent_row = await repositories.trade_intents.get(result.trade_intent_id)
+    intent = hydrate("trade_intents", intent_row["payload"])
+    assert intent.risk_snapshot["risk_profile"] == "balanced"  # not "hijacked"
+    assert intent.risk_snapshot["approved_quantity"] == "1"  # not "999"
+    assert intent.risk_snapshot["brand_new_key"] == "survives"  # non-colliding keys still merge through
+
+
+@respx.mock
+async def test_regime_multiplier_none_and_regime_snapshot_none_leave_risk_snapshot_unaffected(tmp_path) -> None:
+    """Backward compatibility: a caller that never sets the two Phase 2
+    fields (every ExecutionRequest constructed before this phase, and any
+    future caller outside scanner/coordinator.py) gets a risk_snapshot with
+    no regime keys at all -- not `None` values, not empty-string
+    placeholders, simply absent, and no RISK_BUDGET_SCALED_BY_REGIME reason."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_market_open()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "1", "199.60")))
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
+        return_value=httpx.Response(200, json=[{
+            "id": "act-1", "activity_type": "FILL", "symbol": "AAPL", "side": "buy",
+            "qty": "1", "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-1",
+        }])
+    )
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("1"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status != "rejected"
+    intent_row = await repositories.trade_intents.get(result.trade_intent_id)
+    intent = hydrate("trade_intents", intent_row["payload"])
+    assert not any("REGIME" in r for r in intent.risk_snapshot["reasons"])
+    assert set(intent.risk_snapshot.keys()) == {
+        "reasons", "confidence", "entry_price", "stop_loss", "contract_multiplier",
+        "requested_quantity", "approved_quantity", "risk_profile",
+    }
+
+
+@respx.mock
 async def test_buy_rejected_when_daily_loss_exceeds_limit(tmp_path) -> None:
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))

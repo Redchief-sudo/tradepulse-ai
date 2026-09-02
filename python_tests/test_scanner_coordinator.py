@@ -17,7 +17,7 @@ from tradepulse.providers import AlpacaMarketDataProvider, AnthropicAIProvider, 
 from tradepulse.providers.anthropic_ai import SCAN_TOOL_NAME
 from tradepulse.risk import load_session, save_session
 from tradepulse.scanner import run_scan_cycle
-from tradepulse.scanner.coordinator import _atr_stop_loss_price, _stop_loss_price
+from tradepulse.scanner.coordinator import REGIME_UNAVAILABLE_MULTIPLIER, _atr_stop_loss_price, _stop_loss_price
 from tradepulse.settlement import SettlementProcessor
 from tradepulse.strategy import ExecutableUniverse, atr
 
@@ -138,11 +138,35 @@ _BULLISH_CLOSES = _synthetic_closes(40, trend=0.4, amplitude=2.0, period=4.0, ph
 # A choppy, mildly declining series -- deterministic signal lands in
 # HOLD/SELL/STRONG_SELL, never BUY/STRONG_BUY.
 _BEARISH_CLOSES = _synthetic_closes(40, trend=-0.3, amplitude=3.0, period=2.0, phase=0.0)
+# A separate fixture for Market Regime Phase 2 benchmark tests -- a smooth,
+# genuinely low-volatility uptrend. Empirically verified (via
+# classify_regime(calendar="equity") directly) to land on low_vol_bull, NOT
+# _BULLISH_CLOSES above, whose sinusoidal noise pushes its realized vol
+# (0.195) just past the real calibrated equity high-vol threshold (0.18) --
+# a real, correct classification for THAT series, just not the one this
+# fixture is for. Never assume a fixture built for the deterministic
+# factor gate also produces a specific regime label without checking.
+_REGIME_LOW_VOL_BULL_CLOSES = [100 + i * 0.5 for i in range(60)]
 
 
 def _mock_bars(closes: list[float]) -> None:
     respx.get("https://data.alpaca.markets/v2/stocks/AAPL/bars").mock(
         return_value=httpx.Response(200, json=_bars_json(closes))
+    )
+
+
+def _mock_spy_bars(closes: list[float] | None = None) -> respx.Route:
+    """Market Regime Phase 2's benchmark fetch for the equity AND options
+    lanes (options inherit the equity/broad-market regime -- see
+    scanner/coordinator.py::_BENCHMARK_ASSETS). Every test that reaches
+    past run_scan_cycle's SESSION_BLOCKED gate for AssetClass.EQUITY/OPTION
+    needs this mocked -- the benchmark fetch happens once per cycle,
+    independent of any candidate. (Crypto's own benchmark is BTC/USD,
+    already satisfied by the existing _mock_crypto_bars -- same URL,
+    keyed the same way, regardless of which symbol's candles a given test
+    was originally mocking it for.)"""
+    return respx.get("https://data.alpaca.markets/v2/stocks/SPY/bars").mock(
+        return_value=httpx.Response(200, json=_bars_json(closes or _BULLISH_CLOSES))
     )
 
 
@@ -153,6 +177,7 @@ async def test_equity_lane_prompt_contains_only_equity_symbols(tmp_path) -> None
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_market_open()
+    _mock_spy_bars()
     universe = ExecutableUniverse(equities=frozenset({"AAPL"}), crypto=frozenset({"BTC/USD"}))
     captured: dict[str, bytes] = {}
 
@@ -177,6 +202,7 @@ async def test_scan_run_stamps_resolved_market_data_capabilities_when_provided(t
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_market_open()
+    _mock_spy_bars()
     respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(200, json=_tool_use_response([])))
     capabilities = MarketDataCapabilities(equity_feed="sip", option_feed="opra")
 
@@ -203,6 +229,7 @@ async def test_scan_run_leaves_capability_fields_none_when_omitted(tmp_path) -> 
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_market_open()
+    _mock_spy_bars()
     respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(200, json=_tool_use_response([])))
 
     summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
@@ -221,6 +248,7 @@ async def test_crypto_lane_prompt_contains_only_crypto_symbols(tmp_path) -> None
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_market_open()
+    _mock_crypto_bars(_BULLISH_CLOSES)
     universe = ExecutableUniverse(equities=frozenset({"AAPL"}), crypto=frozenset({"BTC/USD"}))
     captured: dict[str, bytes] = {}
 
@@ -250,6 +278,7 @@ async def test_candidate_outside_requested_lane_is_rejected(tmp_path, caplog) ->
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_market_open()
+    _mock_crypto_bars(_BULLISH_CLOSES)
     universe = ExecutableUniverse(equities=frozenset({"AAPL"}), crypto=frozenset({"BTC/USD"}))
     respx.post("https://api.anthropic.com/v1/messages").mock(
         return_value=httpx.Response(
@@ -455,6 +484,7 @@ async def test_options_lane_prompt_never_names_a_specific_contract(tmp_path) -> 
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_market_open()
+    _mock_spy_bars()
     captured: dict[str, bytes] = {}
 
     def _capture(request: httpx.Request) -> httpx.Response:
@@ -480,6 +510,7 @@ async def test_option_candidate_outside_requested_lane_is_rejected(tmp_path, cap
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_market_open()
+    _mock_spy_bars()
     respx.post("https://api.anthropic.com/v1/messages").mock(
         return_value=httpx.Response(
             200, json=_tool_use_response([{"symbol": "BTC/USD", "recommendation": "BUY", "confidence": 90, "summary": "hallucinated"}])
@@ -516,6 +547,7 @@ async def test_options_scan_cycle_rejects_when_no_eligible_contract(tmp_path, ca
     _mock_account()
     _mock_quote()
     _mock_bars(_BULLISH_CLOSES)
+    _mock_spy_bars()
     respx.get("https://paper-api.alpaca.markets/v2/options/contracts").mock(
         return_value=httpx.Response(200, json={"option_contracts": [], "next_page_token": None})
     )
@@ -552,6 +584,7 @@ async def test_deterministic_gate_fetches_candles_for_underlying_not_contract(tm
     bars_route = respx.get("https://data.alpaca.markets/v2/stocks/AAPL/bars").mock(
         return_value=httpx.Response(200, json=_bars_json(_BULLISH_CLOSES))
     )
+    _mock_spy_bars()
     occ_symbol = "AAPL" + (NOW + timedelta(days=30)).date().strftime("%y%m%d") + "C00205000"
     _mock_options_chain(occ_symbol)
     _mock_options_quote(occ_symbol)
@@ -592,6 +625,7 @@ async def test_full_options_scan_cycle_executes_ai_recommended_buy(tmp_path) -> 
     _mock_positions()
     _mock_quote()
     _mock_bars(_BULLISH_CLOSES)
+    _mock_spy_bars()
     occ_symbol = "AAPL" + (NOW + timedelta(days=30)).date().strftime("%y%m%d") + "C00205000"
     _mock_options_chain(occ_symbol)
     _mock_options_quote(occ_symbol)
@@ -647,6 +681,7 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
     _mock_positions()
     _mock_quote()
     _mock_bars(_BULLISH_CLOSES)
+    _mock_spy_bars()
     order_route = _mock_dynamic_full_fill()
 
     summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
@@ -704,6 +739,186 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
     assert snapshot.source == "broker"
 
 
+# ---- Market Regime Phase 2 -----------------------------------------------
+
+
+@respx.mock
+async def test_regime_valid_benchmark_produces_real_calibrated_classification(tmp_path) -> None:
+    """The success path: a real SPY benchmark fetch produces a genuine
+    calibrated regime, persisted on both ScanRun and the approved
+    TradeIntent's risk_snapshot -- no "unavailable" reason present."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])
+        )
+    )
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
+    _mock_spy_bars(_REGIME_LOW_VOL_BULL_CLOSES)  # a real, low-vol steady uptrend -- low_vol_bull, multiplier 1.0
+    order_route = _mock_dynamic_full_fill()
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    assert order_route.call_count == 1
+
+    scan_row = await repositories.scan_runs.get(summary.scan_run_id)
+    scan_run = hydrate("scan_runs", scan_row["payload"])
+    assert scan_run.regime == "low_vol_bull"
+    assert scan_run.regime_reason is None
+    assert scan_run.regime_position_multiplier == Decimal("1.0")
+    assert scan_run.regime_confidence is not None
+    assert scan_run.regime_realized_vol is not None
+
+    intent_rows = await repositories.trade_intents.list_all()
+    assert len(intent_rows) == 1
+    intent = hydrate("trade_intents", intent_rows[0]["payload"])
+    assert intent.risk_snapshot["regime"] == "low_vol_bull"
+    assert intent.risk_snapshot["regime_position_multiplier"] == "1.0"
+    assert intent.risk_snapshot["regime_timeframe"] == "1day"
+    assert intent.risk_snapshot["regime_calendar"] == "equity"
+
+
+@respx.mock
+async def test_regime_benchmark_http_failure_falls_back_to_unavailable_conservative_multiplier(tmp_path) -> None:
+    """Direct regression test for the original fail-open defect: a
+    benchmark HTTP failure must never behave as "no regime reduction" --
+    the resulting TradeIntent must actually carry the conservative
+    REGIME_UNAVAILABLE_MULTIPLIER (0.5), not a multiplier of 1.0 or None,
+    and the scan cycle itself must not fail."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])
+        )
+    )
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
+    respx.get("https://data.alpaca.markets/v2/stocks/SPY/bars").mock(return_value=httpx.Response(500, json={"message": "internal error"}))
+    order_route = _mock_dynamic_full_fill()
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED  # never fails the cycle over a regime-infra hiccup
+    assert order_route.call_count == 1  # trading still proceeds, at the conservative fallback size
+
+    scan_row = await repositories.scan_runs.get(summary.scan_run_id)
+    scan_run = hydrate("scan_runs", scan_row["payload"])
+    assert scan_run.regime == "unavailable"
+    assert scan_run.regime_reason == "benchmark_fetch_failed"
+    assert scan_run.regime_position_multiplier == REGIME_UNAVAILABLE_MULTIPLIER
+
+    intent_rows = await repositories.trade_intents.list_all()
+    assert len(intent_rows) == 1
+    intent = hydrate("trade_intents", intent_rows[0]["payload"])
+    assert intent.risk_snapshot["regime"] == "unavailable"
+    assert intent.risk_snapshot["regime_reason"] == "benchmark_fetch_failed"
+    assert intent.risk_snapshot["regime_position_multiplier"] == str(REGIME_UNAVAILABLE_MULTIPLIER)
+    assert any("RISK_BUDGET_SCALED_BY_REGIME_TO_50.0PCT" in r for r in intent.risk_snapshot["reasons"])
+
+
+@respx.mock
+async def test_regime_benchmark_insufficient_history_also_falls_back_to_unavailable(tmp_path) -> None:
+    """Same underlying cause class as an HTTP failure -- fetch_candles's own
+    MIN_CANDLES gate raises the exact same ProviderDataFailure, caught by
+    the exact same except clause -- proving this explicitly rather than
+    assuming it, per review."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(200, json=_tool_use_response([])))
+    respx.get("https://data.alpaca.markets/v2/stocks/SPY/bars").mock(return_value=httpx.Response(200, json={"bars": []}))
+    _mock_account()  # reached unconditionally after the AI call, regardless of candidate count
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    scan_row = await repositories.scan_runs.get(summary.scan_run_id)
+    scan_run = hydrate("scan_runs", scan_row["payload"])
+    assert scan_run.regime == "unavailable"
+    assert scan_run.regime_reason == "benchmark_fetch_failed"
+    assert scan_run.regime_position_multiplier == REGIME_UNAVAILABLE_MULTIPLIER
+
+
+@respx.mock
+async def test_regime_benchmark_malformed_data_falls_back_to_unavailable_with_distinct_reason(tmp_path) -> None:
+    """A non-numeric field in Alpaca's raw bars response (get_bars's own
+    unguarded Decimal(str(value)) parsing raises decimal.InvalidOperation)
+    -- distinct, truthful reason from a clean HTTP/provider-level failure,
+    never a blanket except swallowing both into the same label."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(200, json=_tool_use_response([])))
+    respx.get("https://data.alpaca.markets/v2/stocks/SPY/bars").mock(
+        return_value=httpx.Response(200, json={"bars": [
+            {"t": NOW.isoformat().replace("+00:00", "Z"), "o": 1.0, "h": 1.0, "l": 1.0, "c": "not-a-number", "v": 1.0}
+        ]})
+    )
+    _mock_account()  # reached unconditionally after the AI call, regardless of candidate count
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    scan_row = await repositories.scan_runs.get(summary.scan_run_id)
+    scan_run = hydrate("scan_runs", scan_row["payload"])
+    assert scan_run.regime == "unavailable"
+    assert scan_run.regime_reason == "benchmark_data_invalid"
+    assert scan_run.regime_position_multiplier == REGIME_UNAVAILABLE_MULTIPLIER
+
+
+@respx.mock
+async def test_options_lane_benchmark_fetch_requests_spy_never_the_contract(tmp_path) -> None:
+    """Options inherit the equity/broad-market regime -- the benchmark
+    fetch must request SPY, never the resolved OCC contract symbol, and
+    must succeed even though the contract itself is only resolved deep
+    inside the per-candidate loop, well after the benchmark fetch starts."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])
+        )
+    )
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
+    spy_route = _mock_spy_bars(_REGIME_LOW_VOL_BULL_CLOSES)
+    occ_symbol = "AAPL" + (NOW + timedelta(days=30)).date().strftime("%y%m%d") + "C00205000"
+    _mock_options_chain(occ_symbol)
+    _mock_options_quote(occ_symbol)
+    _mock_options_dynamic_full_fill(occ_symbol)
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, OPTIONS_UNIVERSE, limits, AssetClass.OPTION, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    assert spy_route.call_count == 1
+    scan_row = await repositories.scan_runs.get(summary.scan_run_id)
+    scan_run = hydrate("scan_runs", scan_row["payload"])
+    assert scan_run.regime == "low_vol_bull"  # a real classification, resolved from SPY -- proves the fetch actually targeted SPY, not the contract
+
+
 @respx.mock
 async def test_opportunity_metadata_carries_resolved_market_data_provenance(tmp_path) -> None:
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
@@ -719,6 +934,7 @@ async def test_opportunity_metadata_carries_resolved_market_data_provenance(tmp_
     _mock_positions()
     _mock_quote()
     _mock_bars(_BULLISH_CLOSES)
+    _mock_spy_bars()
     _mock_dynamic_full_fill()
 
     await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
@@ -745,6 +961,7 @@ async def test_mixed_capability_provenance_is_independently_correct_per_lane(tmp
     _mock_market_open()
     _mock_account()
     _mock_positions()
+    _mock_spy_bars()  # shared benchmark for both lanes below -- options inherits the equity/broad-market regime
 
     # ---- Equity lane ----
     respx.post("https://api.anthropic.com/v1/messages").mock(
@@ -798,6 +1015,7 @@ async def test_deterministic_gate_rejects_ai_buy_when_composite_disagrees(tmp_pa
     _mock_account()
     _mock_quote()
     _mock_bars(_BEARISH_CLOSES)
+    _mock_spy_bars()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
     with caplog.at_level(logging.INFO):
@@ -832,6 +1050,7 @@ async def test_deterministic_gate_fails_closed_on_insufficient_candle_history(tm
     respx.get("https://data.alpaca.markets/v2/stocks/AAPL/bars").mock(
         return_value=httpx.Response(200, json={"bars": []})  # fewer than MIN_CANDLES
     )
+    _mock_spy_bars()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
     summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
@@ -853,6 +1072,7 @@ async def test_scan_cycle_skips_candidate_outside_executable_universe(tmp_path, 
         )
     )
     _mock_account()
+    _mock_spy_bars()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
     with caplog.at_level(logging.INFO):
@@ -900,6 +1120,7 @@ async def test_scan_cycle_marks_failed_when_ai_provider_errors(tmp_path) -> None
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_market_open()
+    _mock_spy_bars()  # defensive -- the regime benchmark fetch races the AI call; mock it so this test never depends on cancellation timing
     respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(429, json={"error": {"message": "rate limited"}}))
 
     summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
@@ -923,6 +1144,7 @@ async def test_scan_cycle_links_ai_response_even_when_broker_becomes_unavailable
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_market_open()
+    _mock_spy_bars()
     ai_route = respx.post("https://api.anthropic.com/v1/messages").mock(
         return_value=httpx.Response(
             200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])
@@ -997,6 +1219,7 @@ async def test_scan_cycle_syncs_session_to_market_closed_before_evaluating_candi
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_market_open(is_open=False)
+    _mock_spy_bars()
     ai_route = respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(200, json=_tool_use_response([])))
 
     await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
@@ -1017,6 +1240,7 @@ async def test_scan_cycle_never_checks_market_clock_when_session_is_disabled(tmp
     later at the gateway). Proven via respx: no /v2/clock mock is
     registered, so an unexpected call fails the test."""
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    _mock_spy_bars()
     ai_route = respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(200, json=_tool_use_response([])))
 
     summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
@@ -1043,6 +1267,7 @@ async def test_scan_cycle_rejects_candidate_when_symbol_execution_lock_already_h
     _mock_account()
     _mock_quote()
     _mock_bars(_BULLISH_CLOSES)
+    _mock_spy_bars()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
     database = repositories.trade_intents.database
@@ -1077,6 +1302,7 @@ async def test_scan_cycle_stops_starting_new_work_when_lease_already_lost(tmp_pa
     _mock_account()
     _mock_quote()
     _mock_bars(_BULLISH_CLOSES)
+    _mock_spy_bars()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
     lease_lost = asyncio.Event()

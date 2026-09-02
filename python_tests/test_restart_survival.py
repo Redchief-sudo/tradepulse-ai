@@ -157,6 +157,15 @@ def _mock_bars(closes: list[float]) -> None:
     )
 
 
+def _mock_spy_bars(closes: list[float] | None = None) -> None:
+    """Market Regime Phase 2's equity/options benchmark fetch -- see
+    scanner/coordinator.py::_BENCHMARK_ASSETS. Needed by any test that
+    reaches run_scan_cycle's equity lane past the SESSION_BLOCKED gate."""
+    respx.get("https://data.alpaca.markets/v2/stocks/SPY/bars").mock(
+        return_value=httpx.Response(200, json=_bars_json(closes or _BULLISH_CLOSES))
+    )
+
+
 @respx.mock
 async def test_resume_after_crash_before_broker_submission(tmp_path) -> None:
     db_url = f"sqlite:///{tmp_path}/test.db"
@@ -366,6 +375,7 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
         )
     )
     _mock_bars(_BULLISH_CLOSES)
+    _mock_spy_bars()
 
     scan_summary = await run_scan_cycle(repositories_a, ai_provider_a, market_data_a, broker_a, gateway_a, universe, limits_a, AssetClass.EQUITY, clock=lambda: NOW)
     await broker_a.aclose()
@@ -471,6 +481,7 @@ async def test_simultaneous_equity_and_crypto_scan_legs_coexist_against_same_dat
     _mock_quote()
     _mock_market_open()
     _mock_bars(_BULLISH_CLOSES)
+    _mock_spy_bars()
     respx.get("https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes").mock(
         return_value=httpx.Response(200, json={"quotes": {"BTC/USD": {"bp": 60000.0, "ap": 60010.0, "t": QUOTE_TS}}})
     )
