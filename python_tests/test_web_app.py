@@ -6,6 +6,7 @@ import respx
 
 from tradepulse.config import Settings
 from tradepulse.models import (
+    AIResponse,
     AssetClass,
     AssetIdentity,
     AuditEvent,
@@ -285,6 +286,64 @@ async def test_rate_limit_route_returns_latest_observed_snapshot(tmp_path) -> No
     body = response.json()
     assert body["limit"] == 200
     assert body["remaining"] == 199
+
+
+@respx.mock
+async def test_ai_response_route_returns_the_persisted_candidate_list(tmp_path) -> None:
+    client, state = await _client_for(tmp_path)
+    ai_response = AIResponse(
+        request_id="ai-req-1", provider="anthropic", model="claude-haiku-4-5", schema_version="1.0",
+        completed_at=NOW, result={"candidates": [{"symbol": "BTC/USD", "recommendation": "BUY", "confidence": 82.0, "summary": "Momentum breakout."}]},
+        latency_ms=350,
+    )
+    await state.repositories.ai_responses.create_once(ai_response.request_id, ai_response)
+
+    response = await client.get("/api/ai-responses/ai-req-1")
+    await client.aclose()
+    await state.broker.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["provider"] == "anthropic"
+    assert body["result"]["candidates"] == [{"symbol": "BTC/USD", "recommendation": "BUY", "confidence": 82.0, "summary": "Momentum breakout."}]
+
+
+@respx.mock
+async def test_ai_response_route_returns_null_for_unknown_or_legacy_request_id(tmp_path) -> None:
+    """No matching AIResponse row -- e.g. a legacy ScanRun with no
+    ai_response_request_id at all, or an id that was never persisted --
+    must return null (200), matching this app's existing "missing record"
+    convention, never a 404."""
+    client, state = await _client_for(tmp_path)
+
+    response = await client.get("/api/ai-responses/does-not-exist")
+    await client.aclose()
+    await state.broker.aclose()
+
+    assert response.status_code == 200
+    assert response.json() is None
+
+
+@respx.mock
+async def test_scan_runs_route_still_returns_universe_size_and_ai_response_request_id(tmp_path) -> None:
+    """Existing /api/scan-runs behavior stays compatible -- the two new
+    observability fields just ride along on the same already-exposed row."""
+    client, state = await _client_for(tmp_path)
+    scan_run = ScanRun(
+        scan_run_id="run-1", scan_generation="gen-1", trigger=ScanTrigger.SCHEDULED, asset_class=AssetClass.CRYPTO,
+        status=ScanRunStatus.COMPLETED, started_at=NOW, lock_owner_token="owner-1", completed_at=NOW,
+        universe_size=5, ai_response_request_id="ai-req-1",
+    )
+    await state.repositories.scan_runs.create_once("run-1", scan_run, status=scan_run.status.value)
+
+    response = await client.get("/api/scan-runs")
+    await client.aclose()
+    await state.broker.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body[0]["universe_size"] == 5
+    assert body[0]["ai_response_request_id"] == "ai-req-1"
 
 
 @respx.mock

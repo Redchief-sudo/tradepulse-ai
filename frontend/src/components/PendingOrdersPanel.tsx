@@ -30,7 +30,14 @@ export function PendingOrdersPanel() {
           </select>
         </label>
       </div>
-      {shown && shown.length === 0 && <p className="muted">Nothing to show.</p>}
+      {shown && shown.length === 0 && (
+        <p className="muted">
+          {status
+            ? 'Nothing to show.'
+            : 'No pending/unknown trade intents right now -- this does not mean no trades happened. ' +
+              'Filled and rejected trades are hidden by this default filter; switch it above to see them.'}
+        </p>
+      )}
       {shown && shown.length > 0 && (
         <table>
           <thead>

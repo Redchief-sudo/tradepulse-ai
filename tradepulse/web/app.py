@@ -245,6 +245,22 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
     _recent_route("audit_events", "/api/audit-events")
     _recent_route("scan_runs", "/api/scan-runs")
 
+    @app.get("/api/ai-responses/{request_id}")
+    async def get_ai_response(request_id: str, request: Request) -> Response:
+        """The durable AI candidate list for one scan cycle (symbol/
+        recommendation/confidence/summary) -- linked via
+        ScanRun.ai_response_request_id, keyed by the exact AIResponse.request_id
+        persisted at scan time (scanner/coordinator.py). Returns null (200),
+        never 404, when there's no matching row -- e.g. a legacy ScanRun
+        predating this linkage, or a cycle that never reached the AI call --
+        matching this app's existing "missing record" convention (see
+        get_positions's holding lookup above)."""
+        s = _state(request)
+        row = await s.repositories.ai_responses.get(request_id)
+        if row is None:
+            return _json(None)
+        return _json(hydrate("ai_responses", row["payload"]))
+
     @app.get("/api/trade-intents")
     async def get_trade_intents(request: Request, status: str | None = None, limit: int = 50) -> Response:
         s = _state(request)

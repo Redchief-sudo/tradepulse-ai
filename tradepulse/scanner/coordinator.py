@@ -249,12 +249,22 @@ async def run_scan_cycle(
     await _reclaim_stale_scan_runs(repositories, now)
     scan_run_id = str(uuid4())
     scan_generation = now.strftime("%Y%m%dT%H%M%SZ")
+    # Computed here (before session/AI calls) purely so universe_size can be
+    # stamped on the ScanRun from its very first (RUNNING) persisted row --
+    # a pure function of universe/asset_class, no decision logic moved.
+    if asset_class == AssetClass.CRYPTO:
+        lane_symbols = sorted(universe.crypto)
+    elif asset_class == AssetClass.OPTION:
+        lane_symbols = sorted(universe.options_underlyings)
+    else:
+        lane_symbols = sorted(universe.equities)
     scan_run = ScanRun(
         scan_run_id=scan_run_id, scan_generation=scan_generation, trigger=trigger, asset_class=asset_class,
         status=ScanRunStatus.RUNNING, started_at=now, lock_owner_token=str(uuid4()),
         market_data_tier=capabilities.tier_label if capabilities is not None else None,
         equity_feed=capabilities.equity_feed if capabilities is not None else None,
         option_feed=capabilities.option_feed if capabilities is not None else None,
+        universe_size=len(lane_symbols),
     )
     await repositories.scan_runs.create_once(scan_run_id, scan_run, status=scan_run.status.value)
 
@@ -284,12 +294,6 @@ async def run_scan_cycle(
         await _finish(ScanRunStatus.FAILED, error="SESSION_BLOCKED")
         return ScanCycleSummary(scan_run_id, ScanRunStatus.FAILED, 0, 0, 0, [], error="SESSION_BLOCKED")
 
-    if asset_class == AssetClass.CRYPTO:
-        lane_symbols = sorted(universe.crypto)
-    elif asset_class == AssetClass.OPTION:
-        lane_symbols = sorted(universe.options_underlyings)
-    else:
-        lane_symbols = sorted(universe.equities)
     request = build_scan_request(str(uuid4()), scan_run_id, _build_scan_prompt(lane_symbols, asset_class))
     try:
         ai_response, candidates = await ai_provider.scan_candidates(request)
@@ -302,7 +306,10 @@ async def run_scan_cycle(
     try:
         account = await broker.get_account()
     except Exception as exc:  # noqa: BLE001 - a broker outage must fail this scan cleanly, not crash the caller
-        await _finish(ScanRunStatus.FAILED, candidates_discovered=len(candidates), error=f"BROKER_UNAVAILABLE: {exc}")
+        await _finish(
+            ScanRunStatus.FAILED, candidates_discovered=len(candidates), error=f"BROKER_UNAVAILABLE: {exc}",
+            ai_response_request_id=ai_response.request_id,
+        )
         return ScanCycleSummary(scan_run_id, ScanRunStatus.FAILED, len(candidates), 0, 0, [], error=f"BROKER_UNAVAILABLE: {exc}")
 
     # Persist one broker-truth equity snapshot per cycle -- the sole source
@@ -498,6 +505,6 @@ async def run_scan_cycle(
 
     await _finish(
         ScanRunStatus.COMPLETED, candidates_discovered=len(candidates),
-        candidates_approved=approved, orders_submitted=submitted,
+        candidates_approved=approved, orders_submitted=submitted, ai_response_request_id=ai_response.request_id,
     )
     return ScanCycleSummary(scan_run_id, ScanRunStatus.COMPLETED, len(candidates), approved, submitted, execution_results)

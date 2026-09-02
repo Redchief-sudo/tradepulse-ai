@@ -663,9 +663,14 @@ async def test_full_scan_cycle_executes_ai_recommended_buy(tmp_path) -> None:
 
     scan_row = await repositories.scan_runs.get(summary.scan_run_id)
     assert scan_row["status"] == "completed"
+    persisted_scan_run = hydrate("scan_runs", scan_row["payload"])
+    assert persisted_scan_run.universe_size == len(UNIVERSE.equities)  # the CONFIGURED universe, not candidates_discovered
 
     ai_rows = await repositories.ai_responses.list_all()
     assert len(ai_rows) == 1
+    ai_response = hydrate("ai_responses", ai_rows[0]["payload"])
+    assert persisted_scan_run.ai_response_request_id == ai_response.request_id  # exact linkage, not a guess/join
+    assert ai_response.result["candidates"] == [{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90.0, "summary": "Strong momentum."}]
 
     opp_rows = await repositories.opportunities.list_all()
     assert len(opp_rows) == 1
@@ -884,6 +889,11 @@ async def test_scan_cycle_skips_entirely_when_session_is_kill_switched(tmp_path)
     assert summary.status == ScanRunStatus.FAILED
     assert summary.error == "SESSION_BLOCKED"
 
+    scan_row = await repositories.scan_runs.get(summary.scan_run_id)
+    persisted_scan_run = hydrate("scan_runs", scan_row["payload"])
+    assert persisted_scan_run.universe_size == len(UNIVERSE.equities)  # computed before the session gate, so still set on an early failure
+    assert persisted_scan_run.ai_response_request_id is None  # the AI was never called -- nothing to link
+
 
 @respx.mock
 async def test_scan_cycle_marks_failed_when_ai_provider_errors(tmp_path) -> None:
@@ -902,6 +912,39 @@ async def test_scan_cycle_marks_failed_when_ai_provider_errors(tmp_path) -> None
 
     scan_row = await repositories.scan_runs.get(summary.scan_run_id)
     assert scan_row["status"] == "failed"
+
+
+@respx.mock
+async def test_scan_cycle_links_ai_response_even_when_broker_becomes_unavailable_after_ai_succeeds(tmp_path) -> None:
+    """The AI call and its persistence both complete successfully before the
+    broker outage -- the resulting FAILED ScanRun must still link the real
+    AIResponse that was actually obtained, not leave it None just because
+    the cycle later failed for an unrelated reason."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    ai_route = respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])
+        )
+    )
+    respx.get("https://paper-api.alpaca.markets/v2/account").mock(return_value=httpx.Response(500, json={"message": "internal error"}))
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert ai_route.call_count == 1
+    assert summary.status == ScanRunStatus.FAILED
+    assert summary.error is not None and summary.error.startswith("BROKER_UNAVAILABLE")
+
+    ai_rows = await repositories.ai_responses.list_all()
+    assert len(ai_rows) == 1  # the AI response was persisted before the broker outage
+    ai_response = hydrate("ai_responses", ai_rows[0]["payload"])
+
+    scan_row = await repositories.scan_runs.get(summary.scan_run_id)
+    persisted_scan_run = hydrate("scan_runs", scan_row["payload"])
+    assert persisted_scan_run.ai_response_request_id == ai_response.request_id  # linked despite the later failure
 
 
 @respx.mock

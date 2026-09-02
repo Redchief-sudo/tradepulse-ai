@@ -1,4 +1,5 @@
 import type {
+  AiResponse,
   AlpacaAccount,
   AuditEvent,
   EnrichedPosition,
@@ -70,4 +71,5 @@ export const api = {
   getReconciliation: (limit = 50) => get<ReconciliationRecord[]>(`/api/reconciliation?limit=${limit}`),
   getAuditEvents: (limit = 50) => get<AuditEvent[]>(`/api/audit-events?limit=${limit}`),
   getScanRuns: (limit = 20) => get<ScanRun[]>(`/api/scan-runs?limit=${limit}`),
+  getAiResponse: (requestId: string) => get<AiResponse | null>(`/api/ai-responses/${requestId}`),
 }

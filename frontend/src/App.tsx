@@ -7,6 +7,7 @@ import { PendingOrdersPanel } from './components/PendingOrdersPanel'
 import { PnlPanel } from './components/PnlPanel'
 import { PositionsPanel } from './components/PositionsPanel'
 import { RiskExposurePanel } from './components/RiskExposurePanel'
+import { ScannerActivityPanel } from './components/ScannerActivityPanel'
 import { SessionPanel } from './components/SessionPanel'
 
 function App() {
@@ -23,6 +24,7 @@ function App() {
         <RiskExposurePanel />
         <PositionsPanel />
         <PnlPanel />
+        <ScannerActivityPanel />
         <PendingOrdersPanel />
         <OpportunitiesPanel />
         <FillsSettlementsPanel />

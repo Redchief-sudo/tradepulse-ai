@@ -29,6 +29,19 @@ class ScanRun:
     market_data_tier: str | None = None
     equity_feed: str | None = None
     option_feed: str | None = None
+    # Observability-only additions (dashboard Scanner Activity panel) --
+    # optional/defaulting so no backfill is needed for existing rows, same
+    # treatment as market_data_tier/equity_feed/option_feed above.
+    # universe_size: len(lane_symbols) actually offered to the AI this
+    # cycle -- the CONFIGURED universe, never to be confused with
+    # candidates_discovered (what the AI returned) or candidates_approved
+    # (what cleared the full gate chain). ai_response_request_id: links to
+    # the AIResponse row already durably persisted for this cycle (see
+    # scanner/coordinator.py) -- None whenever no AI response was ever
+    # obtained for this run (e.g. SESSION_BLOCKED before the AI call, or
+    # a legacy row predating this field).
+    universe_size: int = 0
+    ai_response_request_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.trigger, ScanTrigger):
@@ -42,7 +55,7 @@ class ScanRun:
         object.__setattr__(self, "started_at", require_aware(self.started_at, "started_at"))
         if self.completed_at is not None:
             object.__setattr__(self, "completed_at", require_aware(self.completed_at, "completed_at"))
-        for name in ("candidates_discovered", "candidates_approved", "orders_submitted"):
+        for name in ("candidates_discovered", "candidates_approved", "orders_submitted", "universe_size"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be nonnegative")
         if self.status in (ScanRunStatus.COMPLETED, ScanRunStatus.FAILED) and self.completed_at is None:

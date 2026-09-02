@@ -179,6 +179,10 @@ export interface ScanRun {
   status: 'running' | 'completed' | 'failed'
   started_at: string
   completed_at: string | null
+  // The CONFIGURED universe offered to the AI this cycle -- distinct from
+  // candidates_discovered (what the AI returned) and candidates_approved
+  // (what cleared the full gate chain). 0 on a legacy row predating this field.
+  universe_size: number
   candidates_discovered: number
   candidates_approved: number
   orders_submitted: number
@@ -186,4 +190,24 @@ export interface ScanRun {
   market_data_tier: string | null
   equity_feed: string | null
   option_feed: string | null
+  // Links to the AIResponse row holding this cycle's raw candidate list
+  // (see api.getAiResponse) -- null when no AI response was ever obtained
+  // for this run (e.g. blocked before the AI call, or a legacy row).
+  ai_response_request_id: string | null
+}
+
+export interface AiCandidate {
+  symbol: string
+  recommendation: string
+  confidence: number
+  summary: string
+}
+
+export interface AiResponse {
+  request_id: string
+  provider: string
+  model: string
+  completed_at: string
+  result: { candidates: AiCandidate[] }
+  latency_ms: number
 }

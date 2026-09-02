@@ -319,6 +319,8 @@ def decode_scan_run(d: Mapping[str, Any]) -> ScanRun:
         market_data_tier=d.get("market_data_tier"),
         equity_feed=d.get("equity_feed"),
         option_feed=d.get("option_feed"),
+        universe_size=d.get("universe_size", 0),
+        ai_response_request_id=d.get("ai_response_request_id"),
     )
 
 

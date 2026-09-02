@@ -144,8 +144,28 @@ def test_scan_run_roundtrips() -> None:
     original = ScanRun(
         "scan-1", "gen-1", ScanTrigger.SCHEDULED, AssetClass.EQUITY, ScanRunStatus.COMPLETED, NOW, "owner-1",
         completed_at=NOW, candidates_discovered=5, candidates_approved=2, orders_submitted=1,
+        universe_size=12, ai_response_request_id="ai-req-1",
     )
     assert roundtrip("scan_runs", original) == original
+
+
+def test_scan_run_hydrates_legacy_row_missing_universe_size_and_ai_response_request_id() -> None:
+    """A row persisted before these two observability-only fields existed --
+    hydration must default them safely (universe_size=0,
+    ai_response_request_id=None), never raise. Mirrors the earlier
+    asset_class-missing dashboard incident: an optional field added later
+    must never break an old row."""
+    legacy_payload = {
+        "scan_run_id": "scan-legacy", "scan_generation": "gen-0", "trigger": "scheduled",
+        "asset_class": "equity", "status": "completed", "started_at": NOW.isoformat(),
+        "lock_owner_token": "owner-0", "completed_at": NOW.isoformat(),
+        "candidates_discovered": 2, "candidates_approved": 1, "orders_submitted": 1, "error": None,
+        "market_data_tier": "basic", "equity_feed": "iex", "option_feed": "indicative",
+        # universe_size / ai_response_request_id deliberately omitted -- the exact legacy-row shape
+    }
+    result = hydrate("scan_runs", legacy_payload)
+    assert result.universe_size == 0
+    assert result.ai_response_request_id is None
 
 
 def test_equity_snapshot_roundtrips() -> None:
