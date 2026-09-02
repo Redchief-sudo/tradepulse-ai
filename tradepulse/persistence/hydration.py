@@ -43,6 +43,7 @@ from tradepulse.models import (
     SettlementEvent,
     SettlementStatus,
     Side,
+    TradeAttribution,
     TradeIntent,
     TradeIntentStatus,
     TradingSession,
@@ -198,6 +199,7 @@ def decode_settlement(d: Mapping[str, Any]) -> SettlementEvent:
         broker_fill_id=d.get("broker_fill_id"),
         client_order_id=d.get("client_order_id"),
         lot_projected=d.get("lot_projected", False),
+        attribution_projected=d.get("attribution_projected", False),
         cash_projected=d.get("cash_projected", False),
         holding_projected=d.get("holding_projected", False),
         trade_projected=d.get("trade_projected", False),
@@ -235,6 +237,30 @@ def decode_position_lot(d: Mapping[str, Any]) -> PositionLot:
         opened_at=_datetime(d["opened_at"]),
         closures={k: _decimal(v) for k, v in (d.get("closures") or {}).items()},
         realized_pnl=_decimal(d.get("realized_pnl", "0")),
+        mfe_price=_decimal_or_none(d.get("mfe_price")),
+        mae_price=_decimal_or_none(d.get("mae_price")),
+    )
+
+
+def decode_trade_attribution(d: Mapping[str, Any]) -> TradeAttribution:
+    return TradeAttribution(
+        attribution_id=d["attribution_id"],
+        asset=_asset_identity(d["asset"]),
+        lot_id=d["lot_id"],
+        opening_trade_intent_id=d["opening_trade_intent_id"],
+        closing_trade_intent_id=d["closing_trade_intent_id"],
+        closing_fill_id=d["closing_fill_id"],
+        quantity=_decimal(d["quantity"]),
+        entry_price=_decimal(d["entry_price"]),
+        entry_at=_datetime(d["entry_at"]),
+        exit_price=_decimal(d["exit_price"]),
+        exit_at=_datetime(d["exit_at"]),
+        realized_pnl=_decimal(d["realized_pnl"]),
+        created_at=_datetime(d["created_at"]),
+        exit_reason=d.get("exit_reason"),
+        max_favorable_excursion=_decimal_or_none(d.get("max_favorable_excursion")),
+        max_adverse_excursion=_decimal_or_none(d.get("max_adverse_excursion")),
+        entry_context=d.get("entry_context") or {},
     )
 
 
@@ -373,3 +399,4 @@ register("audit_events", decode_audit_event)
 register("scan_runs", decode_scan_run)
 register("equity_snapshots", decode_equity_snapshot)
 register("ai_responses", decode_ai_response)
+register("trade_attributions", decode_trade_attribution)

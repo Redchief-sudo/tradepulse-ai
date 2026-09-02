@@ -26,6 +26,7 @@ from tradepulse.models import (
     SettlementEvent,
     SettlementStatus,
     Side,
+    TradeAttribution,
     TradeIntent,
     TradingSession,
 )
@@ -104,6 +105,53 @@ def test_position_lot_roundtrips() -> None:
         closures={"fill-2": Decimal("0.2")}, realized_pnl=Decimal("3.40"),
     )
     assert roundtrip("position_lots", original) == original
+
+
+def test_position_lot_roundtrips_with_mfe_mae() -> None:
+    original = PositionLot(
+        "lot-2", "fill-3", asset(), "long", Decimal("0.5"), Decimal("0.5"), Decimal("64000"), NOW,
+        mfe_price=Decimal("66500"), mae_price=Decimal("63200"),
+    )
+    assert roundtrip("position_lots", original) == original
+
+
+def test_position_lot_hydrates_legacy_row_missing_mfe_mae() -> None:
+    """A row persisted before Outcome Attribution shipped -- hydration must
+    default mfe_price/mae_price to None, never raise."""
+    legacy_payload = {
+        "lot_id": "lot-legacy", "originating_fill_id": "fill-legacy", "asset": {
+            "symbol": "BTC/USD", "asset_class": "crypto", "native_asset_id": "alpaca:BTC/USD",
+            "venue": "alpaca", "metadata": {"quote": "USD"},
+        },
+        "position_side": "long", "opened_quantity": "0.5", "remaining_quantity": "0.5",
+        "acquisition_price": "64000", "opened_at": NOW.isoformat(),
+        # mfe_price / mae_price deliberately omitted -- the exact pre-Outcome-Attribution row shape
+    }
+    result = hydrate("position_lots", legacy_payload)
+    assert result.mfe_price is None
+    assert result.mae_price is None
+
+
+def test_trade_attribution_roundtrips() -> None:
+    original = TradeAttribution(
+        attribution_id="lot-1:fill-2", asset=asset(), lot_id="lot-1", opening_trade_intent_id="ti-1",
+        closing_trade_intent_id="ti-2", closing_fill_id="fill-2", quantity=Decimal("0.2"),
+        entry_price=Decimal("64000"), entry_at=NOW, exit_price=Decimal("66000"), exit_at=NOW,
+        realized_pnl=Decimal("400"), created_at=NOW, exit_reason="target_price",
+        max_favorable_excursion=Decimal("66500"), max_adverse_excursion=Decimal("63200"),
+        entry_context={"risk_snapshot": {"regime": "low_vol_bull"}, "opportunity_metadata": {"composite_score": "82"}},
+    )
+    assert roundtrip("trade_attributions", original) == original
+
+
+def test_trade_attribution_roundtrips_with_none_optional_fields() -> None:
+    original = TradeAttribution(
+        attribution_id="lot-3:fill-4", asset=asset(), lot_id="lot-3", opening_trade_intent_id="ti-3",
+        closing_trade_intent_id="ti-4", closing_fill_id="fill-4", quantity=Decimal("0.1"),
+        entry_price=Decimal("64000"), entry_at=NOW, exit_price=Decimal("63500"), exit_at=NOW,
+        realized_pnl=Decimal("-50"), created_at=NOW,
+    )
+    assert roundtrip("trade_attributions", original) == original
 
 
 def test_cash_ledger_entry_roundtrips() -> None:

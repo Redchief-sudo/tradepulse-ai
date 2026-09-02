@@ -14,13 +14,14 @@ from tradepulse.models import (
     AssetIdentity,
     ExecutionMode,
     Holding,
+    PositionLot,
     Side,
     TradeIntent,
     TradeIntentStatus,
     asset_identity_key,
 )
 from tradepulse.monitor import run_position_monitor
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.providers import AlpacaMarketDataProvider
 from tradepulse.settlement import SettlementProcessor
 
@@ -100,6 +101,116 @@ async def _seed_holding(repositories: PersistenceRepositories, *, quantity: str 
         target_price=Decimal(target_price) if target_price else None,
     )
     await repositories.holdings.create_once(asset_identity_key(_aapl()), holding)
+
+
+async def _seed_lot(
+    repositories: PersistenceRepositories, *, lot_id: str = "lot-1", quantity: str = "10",
+    acquisition_price: str = "150", position_side: str = "long", opened_at: datetime = NOW,
+    mfe_price: str | None = None, mae_price: str | None = None, remaining_quantity: str | None = None,
+) -> None:
+    lot = PositionLot(
+        lot_id=lot_id, originating_fill_id=f"fill-{lot_id}", asset=_aapl(), position_side=position_side,
+        opened_quantity=Decimal(quantity),
+        remaining_quantity=Decimal(remaining_quantity) if remaining_quantity is not None else Decimal(quantity),
+        acquisition_price=Decimal(acquisition_price), opened_at=opened_at,
+        mfe_price=Decimal(mfe_price) if mfe_price is not None else None,
+        mae_price=Decimal(mae_price) if mae_price is not None else None,
+    )
+    await repositories.position_lots.create_once(lot_id, lot, unique_value=lot.originating_fill_id)
+
+
+async def _get_lot(repositories: PersistenceRepositories, lot_id: str) -> PositionLot:
+    row = await repositories.position_lots.get(lot_id)
+    return hydrate("position_lots", row["payload"])
+
+
+@respx.mock
+async def test_monitor_initializes_lot_mfe_mae_on_first_observation(tmp_path) -> None:
+    repositories, broker, gateway, alerts = await _setup(tmp_path)
+    await _seed_holding(repositories)  # stop_loss=140, target_price=170
+    await _seed_lot(repositories)  # no mfe/mae yet
+    _mock_positions(qty="10", current_price="155")  # comfortably between stop/target -- no exit
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    summary = await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.exits_triggered == 0
+    assert order_route.call_count == 0
+    lot = await _get_lot(repositories, "lot-1")
+    assert lot.mfe_price == Decimal("155")
+    assert lot.mae_price == Decimal("155")
+
+
+@respx.mock
+async def test_monitor_extends_mfe_on_a_new_high_and_leaves_mae_untouched(tmp_path) -> None:
+    repositories, broker, gateway, alerts = await _setup(tmp_path)
+    await _seed_holding(repositories)
+    await _seed_lot(repositories, mfe_price="152", mae_price="148")
+    _mock_positions(qty="10", current_price="160")  # a new high, still no breach
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
+    await broker.aclose()
+
+    lot = await _get_lot(repositories, "lot-1")
+    assert lot.mfe_price == Decimal("160")
+    assert lot.mae_price == Decimal("148")  # unchanged -- 160 is not a new low
+
+
+@respx.mock
+async def test_monitor_does_not_narrow_existing_extrema(tmp_path) -> None:
+    repositories, broker, gateway, alerts = await _setup(tmp_path)
+    await _seed_holding(repositories)
+    await _seed_lot(repositories, mfe_price="160", mae_price="145")
+    _mock_positions(qty="10", current_price="150")  # strictly inside the existing [145, 160] range
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
+    await broker.aclose()
+
+    lot = await _get_lot(repositories, "lot-1")
+    assert lot.mfe_price == Decimal("160")
+    assert lot.mae_price == Decimal("145")
+
+
+@respx.mock
+async def test_two_open_lots_for_same_asset_track_independent_extrema(tmp_path) -> None:
+    """Direct regression test for tracking mfe/mae per-lot, not per-Holding
+    -- a scale-in's second lot must never inherit the first lot's excursion
+    history."""
+    repositories, broker, gateway, alerts = await _setup(tmp_path)
+    await _seed_holding(repositories, quantity="20")
+    await _seed_lot(repositories, lot_id="lot-1", opened_at=NOW, mfe_price="200", mae_price="150")
+    await _seed_lot(repositories, lot_id="lot-2", opened_at=NOW, mfe_price=None, mae_price=None)  # freshly opened, no history yet
+    _mock_positions(qty="20", current_price="155")
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
+    await broker.aclose()
+
+    lot1 = await _get_lot(repositories, "lot-1")
+    lot2 = await _get_lot(repositories, "lot-2")
+    assert lot1.mfe_price == Decimal("200")  # untouched -- 155 doesn't beat its own prior high
+    assert lot1.mae_price == Decimal("150")
+    assert lot2.mfe_price == Decimal("155")  # its own first-ever observation
+    assert lot2.mae_price == Decimal("155")
+
+
+@respx.mock
+async def test_monitor_never_updates_a_lot_already_fully_closed(tmp_path) -> None:
+    repositories, broker, gateway, alerts = await _setup(tmp_path)
+    await _seed_holding(repositories)
+    await _seed_lot(repositories, quantity="10", remaining_quantity="0", mfe_price="152", mae_price="148")  # closed
+    _mock_positions(qty="10", current_price="155")  # comfortably between stop/target -- no exit
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    await run_position_monitor(repositories, broker, gateway, alerts, LIMITS, clock=lambda: NOW)
+    await broker.aclose()
+
+    lot = await _get_lot(repositories, "lot-1")
+    assert lot.mfe_price == Decimal("152")  # unchanged -- a closed lot is never in open_lots_by_asset
+    assert lot.mae_price == Decimal("148")
 
 
 @respx.mock

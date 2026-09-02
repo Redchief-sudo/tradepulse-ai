@@ -30,6 +30,7 @@ system's architecture:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -38,7 +39,18 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter
-from tradepulse.models import AssetIdentity, Holding, PositionLot, SettlementEvent, SettlementStatus, asset_identity_key
+from tradepulse.models import (
+    AssetIdentity,
+    ExitReason,
+    Holding,
+    PositionLot,
+    SettlementEvent,
+    SettlementStatus,
+    TradeAttribution,
+    asset_identity_key,
+    contract_multiplier_of,
+    fold_price_extremum,
+)
 from tradepulse.persistence import PersistenceRepositories, hydrate
 from tradepulse.risk import latch_financial_integrity_block
 
@@ -50,6 +62,8 @@ from .stages import (
     run_settlement_stages,
 )
 
+logger = logging.getLogger(__name__)
+
 
 async def _project_lot(repositories: PersistenceRepositories, event: SettlementEvent) -> Mapping[str, Any]:
     lot_rows = await repositories.position_lots.list_all(limit=10000)
@@ -58,13 +72,23 @@ async def _project_lot(repositories: PersistenceRepositories, event: SettlementE
     plan = plan_signed_lot_fill(symbol_lots, event)
 
     for closure in plan.closures:
-        updated_lot = replace(
-            closure.lot,
-            remaining_quantity=closure.lot.remaining_quantity - closure.quantity,
-            closures={**closure.lot.closures, event.fill_id: closure.quantity},
-            realized_pnl=closure.lot.realized_pnl + closure.pnl,
-        )
-        await repositories.position_lots.update(closure.lot.lot_id, updated_lot)
+        # mutate() (not update()) -- Outcome Attribution made position_lots a
+        # two-writer table (the position monitor also folds observed prices
+        # into mfe/mae, concurrently with settlement -- see
+        # monitor/coordinator.py). Re-derives the delta against the FRESHLY
+        # re-read row inside one atomic transaction, not the possibly-stale
+        # `closure.lot` snapshot plan_signed_lot_fill computed against, so a
+        # concurrent monitor write in between is never lost.
+        def _decide(current: PositionLot, closure: Any = closure) -> PositionLot:
+            mfe, mae = fold_price_extremum(current.position_side, current.mfe_price, current.mae_price, event.price)
+            return replace(
+                current,
+                remaining_quantity=current.remaining_quantity - closure.quantity,
+                closures={**current.closures, event.fill_id: closure.quantity},
+                realized_pnl=current.realized_pnl + closure.pnl,
+                mfe_price=mfe, mae_price=mae,
+            )
+        await repositories.position_lots.mutate(closure.lot.lot_id, _decide)
 
     if plan.opening_quantity > 0:
         new_lot = PositionLot(
@@ -76,6 +100,8 @@ async def _project_lot(repositories: PersistenceRepositories, event: SettlementE
             remaining_quantity=plan.opening_quantity,
             acquisition_price=event.price,
             opened_at=event.occurred_at,
+            mfe_price=event.price,
+            mae_price=event.price,
         )
         # create_once is idempotent on originating_fill_id (a real DB UNIQUE
         # constraint) -- a resumed/retried run silently no-ops here instead
@@ -84,6 +110,112 @@ async def _project_lot(repositories: PersistenceRepositories, event: SettlementE
         await repositories.position_lots.create_once(new_lot.lot_id, new_lot, unique_value=event.fill_id)
 
     return {"realized_pnl": plan.realized_pnl}
+
+
+def _infer_exit_reason(
+    position_side: str, stop_loss: Decimal | None, target_price: Decimal | None, exit_price: Decimal
+) -> ExitReason | None:
+    """Inferred after the fact from already-persisted facts (the OPENING
+    intent's own protective levels vs. the actual exit price) -- nothing is
+    threaded through the live execution path to produce this; see
+    _project_attribution's docstring. Mirrors monitor/coordinator.py::
+    _breached's exact direction-aware comparisons (stop checked first as an
+    arbitrary, documented tie-break for the edge case both conditions hold,
+    which requires a misconfigured stop/target pair to reach). Returns None
+    (unknown) when no protective levels existed at all to classify against
+    -- distinct from "other" (a real exit that matched neither)."""
+    if stop_loss is None and target_price is None:
+        return None
+    is_long = position_side == "long"
+    stop_hit = stop_loss is not None and ((exit_price <= stop_loss) if is_long else (exit_price >= stop_loss))
+    if stop_hit:
+        return "stop_loss"
+    target_hit = target_price is not None and ((exit_price >= target_price) if is_long else (exit_price <= target_price))
+    if target_hit:
+        return "target_price"
+    return "other"
+
+
+async def _project_attribution(repositories: PersistenceRepositories, event: SettlementEvent) -> None:
+    """Pure, write-only observability -- persists why a completed round-trip
+    trade happened and what happened to it. Never reads back into any
+    decision path (risk/engine.py, execution/gateway.py, scanner/coordinator.py
+    never reference TradeAttribution or PositionLot.mfe_price/mae_price).
+
+    Runs immediately after project_lot, so `event.fill_id in lot.closures`
+    already reflects this event's own closures. One attribution record per
+    (lot, closing event) pair -- a single closing fill can FIFO-close more
+    than one older lot at once."""
+    lot_rows = await repositories.position_lots.list_all(limit=10000)
+    lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
+    closed_lots = [
+        lot for lot in lots
+        if asset_identity_key(lot.asset) == asset_identity_key(event.asset) and event.fill_id in lot.closures
+    ]
+    if not closed_lots:
+        return None  # a pure opening fill -- nothing has round-tripped yet
+
+    multiplier = contract_multiplier_of(event.asset)
+    for lot in closed_lots:
+        quantity = lot.closures[event.fill_id]
+        # Recomputed locally rather than threaded from project_lot's own
+        # plan.closures (a separate stage call, no shared state) --
+        # verified equivalent to settlement/lots.py::plan_signed_lot_fill's
+        # own per-closure formula (lines 88-92 there).
+        pnl = (
+            (event.price - lot.acquisition_price) * quantity * multiplier
+            if lot.position_side == "long"
+            else (lot.acquisition_price - event.price) * quantity * multiplier
+        )
+
+        opening_intent = None
+        opening_fill_row = await repositories.fills.get(lot.originating_fill_id)
+        if opening_fill_row is not None:
+            opening_fill = hydrate("fills", opening_fill_row["payload"])
+            intent_row = await repositories.trade_intents.get(opening_fill.trade_intent_id)
+            if intent_row is not None:
+                opening_intent = hydrate("trade_intents", intent_row["payload"])
+
+        if opening_intent is None:
+            # Should not happen in practice (every lot's originating_fill_id
+            # traces back to a real Fill/TradeIntent via fill_attribution.py)
+            # -- degrade by skipping this lot's attribution record rather
+            # than fabricating a required opening_trade_intent_id.
+            logger.warning(
+                "attribution_opening_intent_missing",
+                extra={"event": "attribution_opening_intent_missing", "lot_id": lot.lot_id, "originating_fill_id": lot.originating_fill_id},
+            )
+            continue
+
+        opportunity = None
+        opportunity_row = await repositories.opportunities.get(opening_intent.correlation_id)
+        if opportunity_row is not None:
+            opportunity = hydrate("opportunities", opportunity_row["payload"])
+
+        attribution = TradeAttribution(
+            attribution_id=f"{lot.lot_id}:{event.fill_id}",
+            asset=event.asset,
+            lot_id=lot.lot_id,
+            opening_trade_intent_id=opening_intent.trade_intent_id,
+            closing_trade_intent_id=event.trade_intent_id,
+            closing_fill_id=event.fill_id,
+            quantity=quantity,
+            entry_price=lot.acquisition_price,
+            entry_at=lot.opened_at,
+            exit_price=event.price,
+            exit_at=event.occurred_at,
+            realized_pnl=pnl,
+            created_at=event.occurred_at,
+            exit_reason=_infer_exit_reason(lot.position_side, opening_intent.stop_loss, opening_intent.target_price, event.price),
+            max_favorable_excursion=lot.mfe_price,
+            max_adverse_excursion=lot.mae_price,
+            entry_context={
+                "risk_snapshot": dict(opening_intent.risk_snapshot),
+                "opportunity_metadata": dict(opportunity.metadata) if opportunity is not None else None,
+            },
+        )
+        await repositories.trade_attributions.create_once(attribution.attribution_id, attribution)
+    return None
 
 
 def _holding_record_id(asset: AssetIdentity) -> str:
@@ -246,6 +378,10 @@ class SettlementProcessor:
         async def project_lot(state: SettlementEvent) -> Mapping[str, Any]:
             return await _project_lot(self._repositories, state)
 
+        async def project_attribution(state: SettlementEvent) -> None:
+            await _project_attribution(self._repositories, state)
+            return None
+
         async def project_cash(state: SettlementEvent) -> None:
             return None  # Alpaca is the cash authority in this MVP -- see module docstring.
 
@@ -263,6 +399,7 @@ class SettlementProcessor:
 
         return {
             "project_lot": project_lot,
+            "project_attribution": project_attribution,
             "project_cash": project_cash,
             "project_holding": project_holding,
             "project_trade": project_trade,

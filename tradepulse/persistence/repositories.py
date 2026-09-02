@@ -15,6 +15,7 @@ TABLES = {
     "opportunities", "trade_intents", "orders", "fills", "settlements", "holdings",
     "position_lots", "cash_ledger", "pnl_records", "reconciliation_records",
     "trading_sessions", "audit_events", "scan_runs", "equity_snapshots", "ai_responses",
+    "trade_attributions",
 }
 STATUS_TABLES = {"trade_intents", "orders", "settlements", "trading_sessions", "scan_runs"}
 UNIQUE_FIELDS = {
@@ -174,6 +175,41 @@ class RecordRepository:
 
         return await self.database.run(op, write=True)
 
+    async def mutate(self, record_id: str, decide: Callable[[Any], Any | None]) -> Any | None:
+        """Atomic read-hydrate-decide-write for holdings/position_lots -- the
+        non-status sibling of claim_if_processable, needed once a table has
+        more than one concurrent writer (Outcome Attribution: both
+        settlement's _project_lot and the position monitor now write
+        position_lots, running on independent concurrent asyncio lanes --
+        see cli.py::_run_trading_supervisor). A plain get()-then-update()
+        pair spans two separate database.run() calls and is NOT atomic
+        against a concurrent writer in between; this does the read, the
+        caller's decision, and the write inside ONE BEGIN IMMEDIATE
+        transaction, exactly like claim_if_processable already does for
+        STATUS_TABLES. `decide` returns a new value to persist, or None to
+        leave the row unchanged (not found, or the caller determines no
+        update is needed -- e.g. the observed extremum didn't move, or the
+        row's state no longer qualifies by the time the transaction runs)."""
+        if self.table not in {"holdings", "position_lots"}:
+            raise ValueError(f"mutate requires an updatable current-state table: {self.table}")
+
+        def op(connection: sqlite3.Connection) -> Any | None:
+            row = connection.execute(f"SELECT * FROM {self.table} WHERE record_id=?", (record_id,)).fetchone()
+            if row is None:
+                return None
+            current = hydrate(self.table, decode_payload(row["payload"]))
+            new_value = decide(current)
+            if new_value is None:
+                return None
+            now = utc_now()
+            connection.execute(
+                f"UPDATE {self.table} SET payload=?, updated_at=? WHERE record_id=?",
+                (encode_payload(new_value), now, record_id),
+            )
+            return new_value
+
+        return await self.database.run(op, write=True)
+
     async def list_all(self, limit: int = 1000) -> list[Mapping[str, Any]]:
         if limit < 1 or limit > 10000:
             raise ValueError("limit must be between 1 and 10000")
@@ -252,6 +288,7 @@ class PersistenceRepositories:
     scan_runs: RecordRepository
     equity_snapshots: RecordRepository
     ai_responses: RecordRepository
+    trade_attributions: RecordRepository
 
     @classmethod
     def create(cls, database: AsyncSQLiteDatabase) -> PersistenceRepositories:

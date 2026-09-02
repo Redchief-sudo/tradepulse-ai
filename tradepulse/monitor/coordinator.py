@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Literal
 from uuid import uuid4
 
@@ -33,7 +34,16 @@ from tradepulse.execution import (
     release_symbol_reservation,
     reserve_symbol_for_execution,
 )
-from tradepulse.models import AssetClass, Holding, RiskLimits, Side, asset_key_from_broker_symbol
+from tradepulse.models import (
+    AssetClass,
+    Holding,
+    PositionLot,
+    RiskLimits,
+    Side,
+    asset_identity_key,
+    asset_key_from_broker_symbol,
+    fold_price_extremum,
+)
 from tradepulse.persistence import PersistenceRepositories, hydrate, run_with_lock_renewal
 
 MonitorStatus = Literal["ok", "degraded"]
@@ -106,6 +116,26 @@ def _near_expiry(holding: Holding, today: date, min_days_to_expiry: int) -> bool
     return (expiry - today).days <= min_days_to_expiry
 
 
+async def _fold_lot_extrema(repositories: PersistenceRepositories, lots: list[PositionLot], price: Decimal) -> None:
+    """Outcome Attribution -- folds this cycle's broker-observed price into
+    every OPEN/PARTIALLY_CLOSED lot for one asset's running mfe_price/
+    mae_price (see models/portfolio.py::fold_price_extremum). Pure
+    observability: never reads back into _breached or any exit decision.
+    Uses RecordRepository.mutate() (atomic read-decide-write), not a plain
+    get()-then-update(), because position_lots now has two concurrent
+    writers -- this monitor and settlement's _project_lot, running on
+    independent asyncio lanes (see cli.py::_run_trading_supervisor)."""
+    for lot in lots:
+        def _decide(current: PositionLot, price: Decimal = price) -> PositionLot | None:
+            if current.status not in ("open", "partially_closed"):
+                return None  # closed by a concurrent settlement event since the pre-fetch snapshot -- nothing to fold
+            mfe, mae = fold_price_extremum(current.position_side, current.mfe_price, current.mae_price, price)
+            if mfe == current.mfe_price and mae == current.mae_price:
+                return None  # no-op -- neither extremum moved
+            return replace(current, mfe_price=mfe, mae_price=mae)
+        await repositories.position_lots.mutate(lot.lot_id, _decide)
+
+
 async def run_position_monitor(
     repositories: PersistenceRepositories,
     broker: AlpacaClient,
@@ -125,6 +155,18 @@ async def run_position_monitor(
     execution_results: list[ExecutionResult] = []
     exits_triggered = 0
 
+    # Outcome Attribution -- one pre-fetch of ALL open/partially-closed lots,
+    # grouped by asset, rather than a per-position table scan. A symbol can
+    # have more than one open lot (a scale-in); every open lot for a symbol
+    # sees the SAME broker-observed price this cycle, just folds it against
+    # its own individually-tracked extremes.
+    lot_rows = await repositories.position_lots.list_all(limit=10000)
+    open_lots_by_asset: dict[str, list[PositionLot]] = {}
+    for row in lot_rows:
+        lot = hydrate("position_lots", row["payload"])
+        if lot.status in ("open", "partially_closed"):
+            open_lots_by_asset.setdefault(asset_identity_key(lot.asset), []).append(lot)
+
     for position in positions:
         if lease_lost is not None and lease_lost.is_set():
             continue  # monitor's own command lease may no longer be exclusive -- stop starting new work
@@ -132,6 +174,9 @@ async def run_position_monitor(
         if holding_row is None:
             continue  # nothing on file (e.g. opened outside this system) -- no threshold to check
         holding = hydrate("holdings", holding_row["payload"])
+        matching_lots = open_lots_by_asset.get(asset_identity_key(holding.asset), [])
+        if matching_lots:
+            await _fold_lot_extrema(repositories, matching_lots, position.current_price)
         if _option_expiry_metadata_invalid(holding):
             await alerts.send(
                 "critical",

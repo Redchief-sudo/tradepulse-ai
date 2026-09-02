@@ -55,6 +55,19 @@ class PositionLot:
     # which existed only because its entity fields couldn't hold nested data.
     closures: Mapping[str, Decimal] = field(default_factory=dict)
     realized_pnl: Decimal = Decimal("0")
+    # Outcome Attribution -- running price extremes observed while this lot
+    # was open, folded in from two independent sources: settlement's own
+    # opening/closing fill prices (settlement/engine.py::_project_lot) and
+    # the position monitor's periodic broker-price observations
+    # (monitor/coordinator.py::run_position_monitor). "Favorable"/"adverse"
+    # are direction-aware per position_side: for a long lot mfe_price is the
+    # highest price seen (mfe_price >= mae_price); for a short lot it's the
+    # lowest (mfe_price <= mae_price) -- no cross-field invariant is
+    # enforced here since the direction flips with position_side. Both
+    # additive/optional so every pre-existing PositionLot construction
+    # (tests, legacy rows) stays valid unchanged.
+    mfe_price: Decimal | None = None
+    mae_price: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.position_side not in ("long", "short"):
@@ -67,6 +80,10 @@ class PositionLot:
         object.__setattr__(self, "opened_at", require_aware(self.opened_at, "opened_at"))
         object.__setattr__(self, "closures", immutable_metadata(self.closures))
         object.__setattr__(self, "realized_pnl", decimal_value(self.realized_pnl, "realized_pnl"))
+        if self.mfe_price is not None:
+            object.__setattr__(self, "mfe_price", decimal_value(self.mfe_price, "mfe_price", positive=True))
+        if self.mae_price is not None:
+            object.__setattr__(self, "mae_price", decimal_value(self.mae_price, "mae_price", positive=True))
         if self.remaining_quantity > self.opened_quantity:
             raise ValueError("remaining_quantity cannot exceed opened_quantity")
 
@@ -81,6 +98,26 @@ class PositionLot:
     @property
     def signed_quantity(self) -> Decimal:
         return -self.remaining_quantity if self.position_side == "short" else self.remaining_quantity
+
+
+def fold_price_extremum(
+    position_side: PositionSide, mfe_price: Decimal | None, mae_price: Decimal | None, price: Decimal
+) -> tuple[Decimal, Decimal]:
+    """Direction-aware running price extremes for a PositionLot -- favorable
+    = higher price for a long lot, lower for a short (mirrors
+    monitor/coordinator.py::_breached's own long/short branching). Extends,
+    never narrows, whatever was already recorded; initializes both to
+    `price` when nothing existed yet. Shared by settlement/engine.py
+    (folding each fill's own price) and monitor/coordinator.py (folding
+    each cycle's broker-observed price) -- both write to PositionLot.mfe_price
+    /mae_price, so this single function is the one place that logic lives."""
+    if position_side == "long":
+        new_mfe = price if mfe_price is None else max(mfe_price, price)
+        new_mae = price if mae_price is None else min(mae_price, price)
+    else:
+        new_mfe = price if mfe_price is None else min(mfe_price, price)
+        new_mae = price if mae_price is None else max(mae_price, price)
+    return new_mfe, new_mae
 
 
 @dataclass(frozen=True, slots=True)

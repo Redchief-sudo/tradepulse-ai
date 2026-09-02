@@ -13,9 +13,10 @@ from .market import AssetIdentity
 class SettlementEvent:
     """One fill's journey through the single-writer settlement pipeline --
     port of the Base44 SettlementEvent entity, carrying the staged-projection
-    checkpoint flags (lot/cash/holding/trade_projected, integrity_verified)
-    directly so a crash mid-projection resumes at the next incomplete stage
-    rather than restarting (settlement/stages.py::run_settlement_stages).
+    checkpoint flags (lot/attribution/cash/holding/trade_projected,
+    integrity_verified) directly so a crash mid-projection resumes at the
+    next incomplete stage rather than restarting
+    (settlement/stages.py::run_settlement_stages).
 
     `trade_projected` covers updating the originating TradeIntent's
     cumulative fill/realized-pnl summary -- there is no separate "Trade"
@@ -38,6 +39,7 @@ class SettlementEvent:
     broker_fill_id: str | None = None
     client_order_id: str | None = None
     lot_projected: bool = False
+    attribution_projected: bool = False
     cash_projected: bool = False
     holding_projected: bool = False
     trade_projected: bool = False

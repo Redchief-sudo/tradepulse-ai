@@ -13,6 +13,7 @@ from tradepulse.models import SettlementEvent, SettlementStatus
 
 SETTLEMENT_STAGES: tuple[tuple[str, str], ...] = (
     ("lot_projected", "project_lot"),
+    ("attribution_projected", "project_attribution"),
     ("cash_projected", "project_cash"),
     ("holding_projected", "project_holding"),
     ("trade_projected", "project_trade"),

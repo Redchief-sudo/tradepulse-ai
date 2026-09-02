@@ -9,6 +9,8 @@ from tradepulse.models import (
     AssetIdentity,
     ExecutionMode,
     Fill,
+    MarketQuote,
+    Opportunity,
     PositionLot,
     SessionState,
     SettlementEvent,
@@ -522,3 +524,192 @@ async def test_settlement_retryable_failure_does_not_latch_financial_integrity(t
 
     session = await load_session(repositories)
     assert session.state != SessionState.FINANCIAL_INTEGRITY_BLOCKED
+
+
+# ---- Outcome Attribution ---------------------------------------------------
+
+
+def _quote() -> MarketQuote:
+    return MarketQuote(asset(), Decimal("150"), NOW, NOW, "test", 1)
+
+
+async def _seed_buy_with_protective_levels(
+    repositories: PersistenceRepositories, *, fill_id: str = "fill-1", quantity: str = "10", price: str = "150",
+    stop_loss: Decimal | None = None, target_price: Decimal | None = None, opportunity_id: str | None = None,
+) -> None:
+    """Like _seed_buy, but a scanner-shaped ("ai_scan") intent carrying
+    protective levels and risk_snapshot provenance -- and, if opportunity_id
+    is given, a linked Opportunity row too -- so attribution's entry_context
+    and exit_reason inference have real data to work with."""
+    intent = TradeIntent(
+        "ti-1", "idem-1", opportunity_id or "corr-1", asset(), Side.BUY, ExecutionMode.PAPER, "ai_scan", NOW,
+        requested_quantity=Decimal(quantity), stop_loss=stop_loss, target_price=target_price,
+        risk_snapshot={"regime": "low_vol_bull", "confidence": "90"},
+    )
+    await repositories.trade_intents.create_once("ti-1", intent, status=intent.status.value, unique_value=intent.idempotency_key)
+    fill = Fill(fill_id, "ti-1", "order-1", asset(), Side.BUY, ExecutionMode.PAPER, Decimal(quantity), Decimal(price), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once(fill_id, fill, unique_value=None)
+    event = SettlementEvent("se-1", fill_id, "ti-1", asset(), Side.BUY, ExecutionMode.PAPER, Decimal(quantity), Decimal(price), NOW)
+    await repositories.settlements.create_once("se-1", event, status=event.status.value, unique_value=fill_id)
+    if opportunity_id is not None:
+        opportunity = Opportunity(opportunity_id, "gen-1", asset(), _quote(), "anthropic", NOW, confidence=90, metadata={"composite_score": "82"})
+        await repositories.opportunities.create_once(opportunity_id, opportunity)
+
+
+async def _seed_sell(
+    repositories: PersistenceRepositories, *, quantity: str, price: str, at: datetime = NOW,
+) -> None:
+    sell_intent = TradeIntent(
+        "ti-2", "idem-2", "monitor-AAPL", asset(), Side.SELL, ExecutionMode.PAPER, "position_monitor", at,
+        requested_quantity=Decimal(quantity),
+    )
+    await repositories.trade_intents.create_once("ti-2", sell_intent, status=sell_intent.status.value, unique_value=sell_intent.idempotency_key)
+    sell_fill = Fill("fill-2", "ti-2", "order-2", asset(), Side.SELL, ExecutionMode.PAPER, Decimal(quantity), Decimal(price), Decimal("0"), Decimal("0"), at)
+    await repositories.fills.create_once("fill-2", sell_fill, unique_value=None)
+    sell_event = SettlementEvent("se-2", "fill-2", "ti-2", asset(), Side.SELL, ExecutionMode.PAPER, Decimal(quantity), Decimal(price), at)
+    await repositories.settlements.create_once("se-2", sell_event, status=sell_event.status.value, unique_value="fill-2")
+
+
+async def test_full_round_trip_produces_one_trade_attribution_with_correct_fields(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await _seed_buy_with_protective_levels(repositories, stop_loss=Decimal("140"), target_price=Decimal("170"), opportunity_id="opp-1")
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending()
+
+    later = NOW + timedelta(hours=1)
+    await _seed_sell(repositories, quantity="10", price="165", at=later)
+    summary = await processor.process_pending()
+    assert summary.completed == 1
+
+    rows = await repositories.trade_attributions.list_all()
+    assert len(rows) == 1
+    attribution = hydrate("trade_attributions", rows[0]["payload"])
+    assert attribution.asset == asset()
+    assert attribution.lot_id
+    assert attribution.opening_trade_intent_id == "ti-1"
+    assert attribution.closing_trade_intent_id == "ti-2"
+    assert attribution.closing_fill_id == "fill-2"
+    assert attribution.quantity == Decimal("10")
+    assert attribution.entry_price == Decimal("150")
+    assert attribution.entry_at == NOW
+    assert attribution.exit_price == Decimal("165")
+    assert attribution.exit_at == later
+    assert attribution.realized_pnl == Decimal("150")  # (165-150)*10
+    assert attribution.exit_reason == "other"  # 165 is strictly between stop(140) and target(170)
+    # Only two prices were ever observed for this lot -- the entry fill (150)
+    # and the exit fill (165) -- so mfe/mae are exactly those two.
+    assert attribution.max_favorable_excursion == Decimal("165")
+    assert attribution.max_adverse_excursion == Decimal("150")
+    assert attribution.entry_context["risk_snapshot"]["regime"] == "low_vol_bull"
+    assert attribution.entry_context["opportunity_metadata"]["composite_score"] == "82"
+
+
+async def test_partial_close_attributes_only_the_closed_portion(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await _seed_buy(repositories, quantity="10", price="150")
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending()
+
+    await _seed_sell(repositories, quantity="4", price="160")
+    summary = await processor.process_pending()
+    assert summary.completed == 1
+
+    rows = await repositories.trade_attributions.list_all()
+    assert len(rows) == 1
+    attribution = hydrate("trade_attributions", rows[0]["payload"])
+    assert attribution.quantity == Decimal("4")
+    assert attribution.realized_pnl == Decimal("40")  # (160-150)*4
+
+    lot_rows = await repositories.position_lots.list_all()
+    lot = hydrate("position_lots", lot_rows[0]["payload"])
+    assert lot.status == "partially_closed"
+    assert lot.remaining_quantity == Decimal("6")
+
+
+async def test_single_closing_fill_that_fifo_closes_two_lots_produces_two_attribution_records(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+
+    await _seed_buy(repositories, fill_id="fill-1", quantity="5", price="100")
+    await processor.process_pending()
+
+    later_open = NOW + timedelta(minutes=1)
+    intent2 = TradeIntent("ti-1b", "idem-1b", "corr-1b", asset(), Side.BUY, ExecutionMode.PAPER, "manual", later_open, requested_quantity=Decimal("5"))
+    await repositories.trade_intents.create_once("ti-1b", intent2, status=intent2.status.value, unique_value=intent2.idempotency_key)
+    fill2 = Fill("fill-1b", "ti-1b", "order-1b", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("5"), Decimal("120"), Decimal("0"), Decimal("0"), later_open)
+    await repositories.fills.create_once("fill-1b", fill2, unique_value=None)
+    event2 = SettlementEvent("se-1b", "fill-1b", "ti-1b", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("5"), Decimal("120"), later_open)
+    await repositories.settlements.create_once("se-1b", event2, status=event2.status.value, unique_value="fill-1b")
+    await processor.process_pending()
+
+    assert len(await repositories.position_lots.list_all()) == 2
+
+    later_close = NOW + timedelta(minutes=2)
+    await _seed_sell(repositories, quantity="10", price="150", at=later_close)
+    summary = await processor.process_pending()
+    assert summary.completed == 1
+
+    rows = await repositories.trade_attributions.list_all()
+    assert len(rows) == 2
+    attributions = sorted((hydrate("trade_attributions", r["payload"]) for r in rows), key=lambda a: a.entry_price)
+    assert attributions[0].entry_price == Decimal("100")
+    assert attributions[0].realized_pnl == Decimal("250")  # (150-100)*5
+    assert attributions[1].entry_price == Decimal("120")
+    assert attributions[1].realized_pnl == Decimal("150")  # (150-120)*5
+
+
+async def test_exit_reason_inferred_as_stop_loss_when_exit_at_or_beyond_stop(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await _seed_buy_with_protective_levels(repositories, stop_loss=Decimal("140"), target_price=Decimal("170"))
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending()
+    await _seed_sell(repositories, quantity="10", price="138")  # at/below stop
+    await processor.process_pending()
+
+    attribution = hydrate("trade_attributions", (await repositories.trade_attributions.list_all())[0]["payload"])
+    assert attribution.exit_reason == "stop_loss"
+
+
+async def test_exit_reason_inferred_as_target_price_when_exit_at_or_beyond_target(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await _seed_buy_with_protective_levels(repositories, stop_loss=Decimal("140"), target_price=Decimal("170"))
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending()
+    await _seed_sell(repositories, quantity="10", price="172")  # at/above target
+    await processor.process_pending()
+
+    attribution = hydrate("trade_attributions", (await repositories.trade_attributions.list_all())[0]["payload"])
+    assert attribution.exit_reason == "target_price"
+
+
+async def test_exit_reason_is_none_when_opening_intent_had_no_protective_levels(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await _seed_buy(repositories, quantity="10", price="150")  # no stop_loss/target_price
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending()
+    await _seed_sell(repositories, quantity="10", price="160")
+    await processor.process_pending()
+
+    attribution = hydrate("trade_attributions", (await repositories.trade_attributions.list_all())[0]["payload"])
+    assert attribution.exit_reason is None
+
+
+async def test_project_attribution_is_idempotent_on_replay(tmp_path) -> None:
+    """Simulates a crash-resume: replaying the same closing SettlementEvent
+    through _project_attribution a second time must not create a duplicate
+    record -- create_once's primary-key idempotency alone must be sufficient."""
+    from tradepulse.settlement.engine import _project_attribution
+
+    repositories = await _repositories(tmp_path)
+    await _seed_buy(repositories, quantity="10", price="150")
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending()
+    await _seed_sell(repositories, quantity="10", price="160")
+    await processor.process_pending()
+    assert len(await repositories.trade_attributions.list_all()) == 1
+
+    sell_event_row = await repositories.settlements.get("se-2")
+    sell_event = hydrate("settlements", sell_event_row["payload"])
+    await _project_attribution(repositories, sell_event)
+
+    assert len(await repositories.trade_attributions.list_all()) == 1
