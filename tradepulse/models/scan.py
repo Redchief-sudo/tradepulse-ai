@@ -57,6 +57,11 @@ class ScanRun:
     regime_confidence: int | None = None
     regime_position_multiplier: Decimal | None = None
     regime_realized_vol: Decimal | None = None
+    # Strategy Sophistication Phase 1 -- which regime-conditioned weight
+    # profile (see config/strategy_weights.py::regime_conditioned_weights)
+    # was in effect for this scan cycle, e.g. "v1+regime:low_vol_bull".
+    # Purely observational/additive, same treatment as every field above.
+    regime_weight_profile: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.trigger, ScanTrigger):

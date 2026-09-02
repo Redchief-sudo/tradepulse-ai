@@ -109,6 +109,24 @@ def atr(highs: list[float], lows: list[float], closes: list[float], period: int 
     return value
 
 
+def obv(closes: list[float], volumes: list[float]) -> list[float] | None:
+    """On-Balance Volume -- cumulative running series, signed by each bar's
+    close direction versus the prior bar (unchanged closes carry volume
+    forward flat). None on empty or length-mismatched input, matching every
+    other indicator's None-on-insufficient-input convention."""
+    if not closes or not volumes or len(closes) != len(volumes):
+        return None
+    series = [volumes[0]]
+    for i in range(1, len(closes)):
+        if closes[i] > closes[i - 1]:
+            series.append(series[-1] + volumes[i])
+        elif closes[i] < closes[i - 1]:
+            series.append(series[-1] - volumes[i])
+        else:
+            series.append(series[-1])
+    return series
+
+
 def momentum(closes: list[float], period: int = 14) -> float | None:
     if not closes or len(closes) < period + 1:
         return None

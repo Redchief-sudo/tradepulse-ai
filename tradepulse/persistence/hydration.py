@@ -326,6 +326,7 @@ def decode_scan_run(d: Mapping[str, Any]) -> ScanRun:
         regime_confidence=d.get("regime_confidence"),
         regime_position_multiplier=_decimal_or_none(d.get("regime_position_multiplier")),
         regime_realized_vol=_decimal_or_none(d.get("regime_realized_vol")),
+        regime_weight_profile=d.get("regime_weight_profile"),
     )
 
 

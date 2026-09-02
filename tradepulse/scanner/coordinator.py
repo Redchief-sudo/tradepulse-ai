@@ -32,7 +32,7 @@ from typing import Any
 from uuid import uuid4
 
 from tradepulse.broker import AlpacaClient
-from tradepulse.config import default_strategy_weights
+from tradepulse.config import default_strategy_weights, regime_conditioned_weights
 from tradepulse.execution import (
     SYMBOL_LOCK_TTL_SECONDS,
     ExecutionGateway,
@@ -72,9 +72,12 @@ from tradepulse.risk import build_portfolio_snapshot, load_session, sync_market_
 from tradepulse.strategy import (
     Calendar,
     ExecutableUniverse,
+    FactorScores,
+    Signal,
     atr,
     classify_regime,
     compute_real_factors,
+    factor_breakdown,
     is_executable,
     select_contract,
     signal_from_composite,
@@ -137,6 +140,13 @@ REGIME_UNAVAILABLE_MULTIPLIER = Decimal("0.5")
 class _LaneRegime:
     multiplier: Decimal  # always populated, always in [0, 1] -- never None
     snapshot: Mapping[str, str | int | None]  # plain, gateway-agnostic -- execution/gateway.py never interprets this, just copies it
+    # Strategy Sophistication Phase 1 -- the SAME benchmark candle closes
+    # already fetched to classify this lane's regime this cycle, oldest-
+    # first, threaded out so compute_real_factors's relative-strength
+    # factor can reuse them without a duplicate fetch. None on every
+    # benchmark-unavailable path (by omission, matching multiplier/snapshot's
+    # own fail-closed treatment).
+    benchmark_closes: list[Decimal] | None = None
 
 
 def _unavailable_lane_regime(reason: str) -> _LaneRegime:
@@ -212,10 +222,11 @@ async def _classify_lane_regime(market_data: AlpacaMarketDataProvider, asset_cla
             "regime_realized_vol": str(classification.realized_vol) if classification.realized_vol is not None else None,
             "regime_timeframe": classification.timeframe, "regime_calendar": classification.calendar,
         },
+        benchmark_closes=[c.close for c in candles],
     )
 
 
-def _scan_run_regime_fields(lane_regime: _LaneRegime) -> dict[str, Any]:
+def _scan_run_regime_fields(lane_regime: _LaneRegime, effective_weights: StrategyWeights) -> dict[str, Any]:
     """Translates a _LaneRegime's plain, gateway-agnostic snapshot dict
     into ScanRun's typed keyword fields -- the one place that knows
     ScanRun's specific field names/types, so the snapshot dict itself
@@ -230,6 +241,7 @@ def _scan_run_regime_fields(lane_regime: _LaneRegime) -> dict[str, Any]:
         "regime_confidence": snapshot.get("regime_confidence"),
         "regime_position_multiplier": Decimal(str(position_multiplier)) if position_multiplier is not None else None,
         "regime_realized_vol": Decimal(str(realized_vol)) if realized_vol is not None else None,
+        "regime_weight_profile": effective_weights.version,
     }
 
 
@@ -242,6 +254,20 @@ class ScanCycleSummary:
     orders_submitted: int
     execution_results: list[ExecutionResult]
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ScoredCandidate:
+    """Strategy Sophistication Phase 1 -- carries pass 1's (scoring/gating)
+    results into pass 2 (ranking/execution), so pass 2 never re-fetches
+    candles or re-derives scores for a candidate it already evaluated."""
+
+    candidate: OpportunityCandidate
+    asset: AssetIdentity
+    candles: list[Candle]
+    scores: FactorScores
+    composite: Decimal
+    deterministic_signal: Signal
 
 
 def _round_quantity(qty: Decimal, asset_class: AssetClass) -> Decimal:
@@ -441,6 +467,13 @@ async def run_scan_cycle(
         return ScanCycleSummary(scan_run_id, ScanRunStatus.FAILED, 0, 0, 0, [], error=str(exc))
 
     lane_regime: _LaneRegime = await regime_task
+    # Strategy Sophistication Phase 1 -- which strategy logic gets trusted
+    # more this cycle is conditioned on the SAME lane-wide regime already
+    # classified above, a deterministic modifier applied once per cycle
+    # (never per-candidate), fully independent of and never a bypass around
+    # risk/engine.py's own regime_multiplier sizing gate.
+    regime_label = str(lane_regime.snapshot.get("regime", "unavailable"))
+    effective_weights = regime_conditioned_weights(strategy_weights, regime_label, now)
 
     await repositories.ai_responses.create_once(ai_response.request_id, ai_response)
 
@@ -449,7 +482,7 @@ async def run_scan_cycle(
     except Exception as exc:  # noqa: BLE001 - a broker outage must fail this scan cleanly, not crash the caller
         await _finish(
             ScanRunStatus.FAILED, candidates_discovered=len(candidates), error=f"BROKER_UNAVAILABLE: {exc}",
-            ai_response_request_id=ai_response.request_id, **_scan_run_regime_fields(lane_regime),
+            ai_response_request_id=ai_response.request_id, **_scan_run_regime_fields(lane_regime, effective_weights),
         )
         return ScanCycleSummary(scan_run_id, ScanRunStatus.FAILED, len(candidates), 0, 0, [], error=f"BROKER_UNAVAILABLE: {exc}")
 
@@ -468,6 +501,20 @@ async def run_scan_cycle(
     execution_results: list[ExecutionResult] = []
     approved = 0
     submitted = 0
+
+    # Strategy Sophistication Phase 1 -- PASS 1: score and gate every
+    # candidate (no execution, no locks, no writes beyond _reject logging).
+    # Exactly today's pre-Phase-1 checks, in unchanged order, up through
+    # the deterministic-signal gate, plus one new liquidity_crisis gate.
+    # Deferred to pass 2 (unchanged in content/order/reject-reasons):
+    # live quote fetch, options chain/contract selection, symbol lock/
+    # in-flight checks, sizing, Opportunity creation, execution -- these
+    # are execution-adjacent (a quote fetched here could go stale before a
+    # lower-ranked candidate's turn; the gateway re-fetches its own
+    # authoritative quote regardless) or naturally 1:1 with actually
+    # attempting to spend the budget, so they shouldn't be paid for
+    # candidates that never get a shot at it.
+    scored: list[_ScoredCandidate] = []
     for candidate in candidates:
         if lease_lost is not None and lease_lost.is_set():
             _reject(candidate.symbol, "COMMAND_LEASE_LOST")
@@ -477,6 +524,17 @@ async def run_scan_cycle(
             continue
         if candidate.confidence < risk_limits.min_confidence:
             _reject(candidate.symbol, "CONFIDENCE_BELOW_MIN", confidence=candidate.confidence, min_confidence=str(risk_limits.min_confidence))
+            continue
+        if regime_label == "liquidity_crisis":
+            # Signal-layer suppression -- explicit block, not a raised
+            # composite threshold (more auditable than disguising
+            # suppression as an unreachable bar). Belt-and-suspenders:
+            # risk/engine.py's regime_multiplier=0 hard block (already
+            # wired, untouched below) remains the actual sizing-layer
+            # backstop even if this gate were ever bypassed or
+            # misconfigured. Placed before any candle/quote fetch to avoid
+            # wasted I/O during a crisis regime.
+            _reject(candidate.symbol, "LIQUIDITY_CRISIS_NEW_ENTRIES_SUPPRESSED", regime=regime_label)
             continue
         # For the OPTIONS lane, `asset` is only ever the UNDERLYING's plain
         # equity identity -- the AI proposes a directional view on the
@@ -508,21 +566,15 @@ async def run_scan_cycle(
                 continue
 
         try:
-            quote = await market_data.fetch_quote(asset)
-        except ProviderError as exc:
-            _reject(candidate.symbol, "QUOTE_FETCH_FAILED", error=str(exc))
-            continue  # one bad quote must not abort the rest of the scan
-
-        try:
             candles = await market_data.fetch_candles(asset)
         except ProviderError as exc:
             _reject(candidate.symbol, "CANDLE_FETCH_FAILED", error=str(exc))
             continue  # insufficient candle history or a data-fetch failure -- fail closed, same as every other provider boundary here
-        scores = compute_real_factors(candles)
+        scores = compute_real_factors(candles, calendar=_BENCHMARK_CALENDAR[asset_class], benchmark_closes=lane_regime.benchmark_closes)
         if scores is None:
             _reject(candidate.symbol, "INSUFFICIENT_FACTOR_DATA")
             continue
-        composite = weighted_composite(scores, strategy_weights)
+        composite = weighted_composite(scores, effective_weights)
         deterministic_signal = signal_from_composite(composite)
         if deterministic_signal not in _DETERMINISTIC_ACTIONABLE_SIGNALS:
             _reject(
@@ -530,6 +582,39 @@ async def run_scan_cycle(
                 deterministic_signal=deterministic_signal, composite_score=str(composite),
             )
             continue  # AI proposed it, but the deterministic technical/momentum/risk read disagrees, on the UNDERLYING's own technicals
+
+        scored.append(_ScoredCandidate(candidate, asset, candles, scores, composite, deterministic_signal))
+
+    # RANK: best composite first, deterministic tie-breaks (confidence,
+    # then symbol) -- never incidental list/sort-stability order. This is
+    # what makes ranking meaningful: the real cross-candidate capital
+    # scarcity is evaluate_risk's fresh-broker-cash check inside
+    # risk/engine.py (account.cash refetched on every execute_intent
+    # below), now simply invoked in ranked-best-first order.
+    ranked = sorted(scored, key=lambda s: (s.composite, Decimal(str(s.candidate.confidence)), s.candidate.symbol), reverse=True)
+
+    # PASS 2: execute in ranked order. Everything below is today's
+    # unchanged post-gate code, operating on the already-scored/fetched
+    # values instead of re-deriving them.
+    for rank, scored_candidate in enumerate(ranked, start=1):
+        candidate, asset, candles, scores, composite, deterministic_signal = (
+            scored_candidate.candidate, scored_candidate.asset, scored_candidate.candles,
+            scored_candidate.scores, scored_candidate.composite, scored_candidate.deterministic_signal,
+        )
+        if lease_lost is not None and lease_lost.is_set():
+            # Re-checked here (not just in pass 1) -- splitting scoring
+            # from execution introduces a real time gap the old single-pass
+            # loop didn't have to guard against (pass 1 may have taken
+            # several awaited fetches, or pass 2 itself may be mid-way
+            # through executing earlier-ranked candidates).
+            _reject(candidate.symbol, "COMMAND_LEASE_LOST")
+            continue
+
+        try:
+            quote = await market_data.fetch_quote(asset)
+        except ProviderError as exc:
+            _reject(candidate.symbol, "QUOTE_FETCH_FAILED", error=str(exc))
+            continue  # one bad quote must not abort the rest of the scan
 
         # trade_asset/trade_quote are what actually gets sized, stopped, and
         # executed -- equal to the underlying's own asset/quote for every
@@ -621,6 +706,15 @@ async def run_scan_cycle(
                     "deterministic_signal": deterministic_signal, "composite_score": str(composite),
                     "technical_score": str(scores.technical_score), "momentum_score": str(scores.momentum_score),
                     "risk_score": str(scores.risk_score),
+                    # Strategy Sophistication Phase 1 -- transparent factor
+                    # breakdown and ranking provenance.
+                    "liquidity_score": str(scores.liquidity_score), "risk_quality_score": str(scores.risk_quality_score),
+                    "relative_strength_score": (
+                        str(scores.relative_strength_score) if scores.relative_strength_score is not None else None
+                    ),
+                    "factor_breakdown": factor_breakdown(scores),
+                    "regime_weight_profile": effective_weights.version,
+                    "composite_rank": rank, "candidates_ranked_total": len(ranked),
                     "stop_loss": str(stop_loss) if stop_loss is not None else None,
                     "market_data_provider": "alpaca",
                     "market_data_feed": trade_quote.provider.removeprefix("alpaca_"),
@@ -648,6 +742,6 @@ async def run_scan_cycle(
     await _finish(
         ScanRunStatus.COMPLETED, candidates_discovered=len(candidates),
         candidates_approved=approved, orders_submitted=submitted, ai_response_request_id=ai_response.request_id,
-        **_scan_run_regime_fields(lane_regime),
+        **_scan_run_regime_fields(lane_regime, effective_weights),
     )
     return ScanCycleSummary(scan_run_id, ScanRunStatus.COMPLETED, len(candidates), approved, submitted, execution_results)

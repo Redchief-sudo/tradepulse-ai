@@ -59,6 +59,15 @@ def _mock_quote(bid: str = "199.50", ask: str = "199.60") -> None:
     )
 
 
+def _mock_quote_for(symbol: str, bid: str = "199.50", ask: str = "199.60") -> None:
+    """Multi-candidate ranking tests need more than one symbol's quote --
+    _mock_quote above stays AAPL-only (every existing single-candidate test
+    relies on that), this is the generic version."""
+    respx.get(f"https://data.alpaca.markets/v2/stocks/{symbol}/quotes/latest").mock(
+        return_value=httpx.Response(200, json={"symbol": symbol, "quote": {"bp": float(bid), "ap": float(ask), "t": QUOTE_TS}})
+    )
+
+
 def _mock_positions(*positions: dict) -> None:
     respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=list(positions)))
 
@@ -109,6 +118,46 @@ def _mock_dynamic_full_fill(price: str = "199.60", activity_id: str = "act-1") -
     return order_route
 
 
+def _mock_multi_symbol_dynamic_full_fill(price: str = "199.60") -> list[str]:
+    """Like _mock_dynamic_full_fill, but tracks orders for MULTIPLE symbols
+    submitted within the same test (needed for cross-opportunity ranking
+    tests, which execute more than one candidate per cycle). Returns the
+    list this function appends each submitted order's symbol to, IN
+    SUBMISSION ORDER -- the direct way to assert ranking actually changed
+    execution order, not just that both candidates eventually filled."""
+    import json as _json
+
+    call_order: list[str] = []
+    order_state: dict[str, str] = {}  # order_id -> submitted qty
+
+    def _accept(request: httpx.Request) -> httpx.Response:
+        body = _json.loads(request.content)
+        symbol = body["symbol"]
+        order_id = f"order-{symbol}"
+        call_order.append(symbol)
+        order_state[order_id] = body["qty"]
+        return httpx.Response(200, json=_order_json("accepted", "0", None) | {"id": order_id, "symbol": symbol})
+
+    def _status(request: httpx.Request) -> httpx.Response:
+        order_id = request.url.path.rsplit("/", 1)[-1]
+        symbol = order_id.removeprefix("order-")
+        return httpx.Response(200, json=_order_json("filled", order_state[order_id], price) | {"id": order_id, "symbol": symbol})
+
+    def _activities(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[
+            {
+                "id": f"act-{order_id}", "activity_type": "FILL", "symbol": order_id.removeprefix("order-"),
+                "side": "buy", "qty": qty, "price": price, "transaction_time": QUOTE_TS, "order_id": order_id,
+            }
+            for order_id, qty in order_state.items()
+        ])
+
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=_accept)
+    respx.get(url__regex=r".*/v2/orders/order-\w+$").mock(side_effect=_status)
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(side_effect=_activities)
+    return call_order
+
+
 def _synthetic_closes(n: int, trend: float, amplitude: float, period: float, phase: float) -> list[float]:
     price = 100.0
     closes = []
@@ -118,16 +167,22 @@ def _synthetic_closes(n: int, trend: float, amplitude: float, period: float, pha
     return closes
 
 
-def _bars_json(closes: list[float]) -> dict:
+def _bars_json(closes: list[float], volumes: list[float] | None = None, band: float = 0.006) -> dict:
     """Daily bars, most-recent-first (matches the `sort=desc` the client
-    requests) -- oldest day first in `closes`, so build newest-first here."""
+    requests) -- oldest day first in `closes`, so build newest-first here.
+    `volumes`/`band` are optional overrides (default: constant 1,000,000
+    volume, symmetric 0.6% high/low band) -- used by Strategy Sophistication
+    Phase 1 ranking tests to give one candidate a deliberately different
+    liquidity/risk_quality profile than another, real inputs rather than a
+    hand-picked composite_score."""
     end = NOW
+    volumes = volumes if volumes is not None else [1_000_000.0] * len(closes)
     rows = []
-    for offset, close in enumerate(closes):
+    for offset, (close, volume) in enumerate(zip(closes, volumes)):
         day = end - timedelta(days=len(closes) - 1 - offset)
         rows.append({
-            "t": day.isoformat().replace("+00:00", "Z"), "o": close * 0.998, "h": close * 1.006,
-            "l": close * 0.994, "c": close, "v": 1_000_000.0,
+            "t": day.isoformat().replace("+00:00", "Z"), "o": close * (1 - band / 3), "h": close * (1 + band),
+            "l": close * (1 - band), "c": close, "v": volume,
         })
     return {"bars": list(reversed(rows))}  # newest-first
 
@@ -153,6 +208,57 @@ def _mock_bars(closes: list[float]) -> None:
     respx.get("https://data.alpaca.markets/v2/stocks/AAPL/bars").mock(
         return_value=httpx.Response(200, json=_bars_json(closes))
     )
+
+
+def _mock_bars_for(symbol: str, closes: list[float], volumes: list[float] | None = None, band: float = 0.006) -> None:
+    respx.get(f"https://data.alpaca.markets/v2/stocks/{symbol}/bars").mock(
+        return_value=httpx.Response(200, json=_bars_json(closes, volumes, band))
+    )
+
+
+# Strategy Sophistication Phase 1 -- a second BUY-signal fixture, empirically
+# verified (via compute_real_factors/weighted_composite -- WITH _BULLISH_CLOSES
+# supplied as benchmark_closes, matching the default _mock_spy_bars() fixture
+# every test below reuses as its regime benchmark, and against the
+# "transition" regime-conditioned weight profile that benchmark actually
+# classifies to) to produce a composite score NOTABLY HIGHER than
+# _BULLISH_CLOSES's own composite against that same benchmark (~68.5 vs.
+# ~65.7) while still landing on BUY -- needed to test that cross-opportunity
+# ranking genuinely reorders execution by composite, not just AI-return
+# order. Price shape alone gives only a slim margin here (relative_strength
+# scales with excess momentum over the benchmark, but technical_score is
+# RSI-mean-reversion-flavored and penalizes a much steeper trend) -- the
+# real separation comes from _STRONGER_BULLISH_VOLUMES (rising, elevated
+# volume -> higher liquidity_score) and _STRONGER_BULLISH_BAND (a tighter
+# high/low range -> higher ATR-based risk_quality_score) below, paired via
+# _mock_bars_for's volumes/band overrides. Never assume relative composite
+# ordering between two fixtures without checking directly.
+_STRONGER_BULLISH_CLOSES = _synthetic_closes(40, trend=0.7, amplitude=2.0, period=4.0, phase=0.5)
+_STRONGER_BULLISH_VOLUMES = [300_000.0 + i * 50_000.0 for i in range(40)]
+_STRONGER_BULLISH_BAND = 0.0008
+
+# A real, verified liquidity_crisis-classifying series (crash-shaped: steep
+# decline, high realized vol) -- constructed via repeated random daily
+# returns and checked directly against classify_regime(calendar="equity")
+# until one actually produced "liquidity_crisis" (position_multiplier=0.0),
+# same discipline as _REGIME_LOW_VOL_BULL_CLOSES above. Do not replace with
+# a fixture that "looks like a crash" without re-verifying the label.
+_REGIME_LIQUIDITY_CRISIS_CLOSES = [
+    100.0, 101.51074962440077, 101.6399428092463, 96.28264909979139, 88.71740170613893, 85.32874787545875,
+    80.61770179771135, 81.05366412922953, 75.26076168583758, 71.96851824940211, 70.0499186119367,
+    71.82204577024578, 69.00302307112158, 63.83428642729546, 63.89356758420021, 62.54790767906409,
+    57.54914235958569, 59.02006396376602, 61.2183061534585, 61.808129703691186, 63.31294455189201,
+    58.85720814314001, 58.66728062465411, 60.06439064191993, 59.42995625758801, 56.78786885494842,
+    50.888301711926005, 48.31678828367774, 47.24134913941894, 48.4734870721543, 50.153433627015445,
+    47.96281009861746, 48.84770420552889, 45.021891913000026, 45.418285013798034, 43.95544783109865,
+    38.779547566409924, 38.59157339766798, 36.42318107034235, 36.85935581512247, 36.37666457062264,
+    32.01811633492645, 30.70449174254832, 31.28224109439134, 28.749184780076806, 26.795180257013484,
+    27.31166799783523, 24.86920559304305, 24.14306752743878, 22.167646700574892, 22.939223566428737,
+    23.134406884021534, 22.016439711899146, 19.657847828749052, 18.3055596437861, 17.59659452287791,
+    18.111354950075995, 16.254022013306702, 15.737188964217223, 15.627812756014993,
+]
+
+UNIVERSE_TWO_EQUITIES = ExecutableUniverse(equities=frozenset({"AAPL", "MSFT"}), crypto=frozenset())
 
 
 def _mock_spy_bars(closes: list[float] | None = None) -> respx.Route:
@@ -1321,6 +1427,250 @@ async def test_scan_cycle_stops_starting_new_work_when_lease_already_lost(tmp_pa
     rejected = [r for r in caplog.records if getattr(r, "event", None) == "candidate_rejected"]
     assert len(rejected) == 1
     assert rejected[0].reason == "COMMAND_LEASE_LOST"
+
+
+# ---- Strategy Sophistication Phase 1 --------------------------------------
+
+
+@respx.mock
+async def test_multiple_candidates_execute_in_composite_rank_order_not_ai_return_order(tmp_path) -> None:
+    """The AI returns AAPL (weaker composite, ~68.5) before MSFT (stronger
+    composite, ~72.8) -- both real, calibrated BUY signals under the
+    "transition" regime-conditioned weight profile (the default _mock_spy_bars()
+    benchmark classifies to "transition"). Cross-opportunity ranking must
+    submit MSFT FIRST despite AI-return order, proving pass 2 genuinely
+    executes best-edge-first rather than preserving AI order."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json=_tool_use_response([
+                {"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Momentum."},
+                {"symbol": "MSFT", "recommendation": "BUY", "confidence": 90, "summary": "Stronger setup."},
+            ]),
+        )
+    )
+    _mock_account(cash="50000")
+    _mock_positions()
+    _mock_quote_for("AAPL")
+    _mock_quote_for("MSFT")
+    _mock_bars_for("AAPL", _BULLISH_CLOSES)
+    _mock_bars_for("MSFT", _STRONGER_BULLISH_CLOSES, _STRONGER_BULLISH_VOLUMES, _STRONGER_BULLISH_BAND)
+    _mock_spy_bars()
+    call_order = _mock_multi_symbol_dynamic_full_fill()
+
+    summary = await run_scan_cycle(
+        repositories, ai_provider, market_data, broker, gateway, UNIVERSE_TWO_EQUITIES, limits, AssetClass.EQUITY, clock=lambda: NOW,
+    )
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    assert summary.candidates_approved == 2
+    assert summary.orders_submitted == 2
+    assert call_order == ["MSFT", "AAPL"]  # higher composite executes first, despite AI listing AAPL first
+
+    opp_rows = await repositories.opportunities.list_all()
+    opportunities = {hydrate("opportunities", row["payload"]).asset.symbol: hydrate("opportunities", row["payload"]) for row in opp_rows}
+    assert opportunities["MSFT"].metadata["composite_rank"] == 1
+    assert opportunities["AAPL"].metadata["composite_rank"] == 2
+    assert opportunities["MSFT"].metadata["candidates_ranked_total"] == 2
+    assert Decimal(opportunities["MSFT"].metadata["composite_score"]) > Decimal(opportunities["AAPL"].metadata["composite_score"])
+
+
+@respx.mock
+async def test_lower_ranked_candidate_still_executes_when_budget_and_cash_allow(tmp_path) -> None:
+    """Ranking changes ORDER, not whether a candidate gets a chance -- with
+    ample cash for both, the lower-ranked candidate must still fill."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json=_tool_use_response([
+                {"symbol": "MSFT", "recommendation": "BUY", "confidence": 90, "summary": "Stronger setup."},
+                {"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Momentum."},
+            ]),
+        )
+    )
+    _mock_account(cash="50000")
+    _mock_positions()
+    _mock_quote_for("AAPL")
+    _mock_quote_for("MSFT")
+    _mock_bars_for("AAPL", _BULLISH_CLOSES)
+    _mock_bars_for("MSFT", _STRONGER_BULLISH_CLOSES, _STRONGER_BULLISH_VOLUMES, _STRONGER_BULLISH_BAND)
+    _mock_spy_bars()
+    call_order = _mock_multi_symbol_dynamic_full_fill()
+
+    summary = await run_scan_cycle(
+        repositories, ai_provider, market_data, broker, gateway, UNIVERSE_TWO_EQUITIES, limits, AssetClass.EQUITY, clock=lambda: NOW,
+    )
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.orders_submitted == 2
+    assert set(call_order) == {"AAPL", "MSFT"}
+    assert all(r.status == "filled" for r in summary.execution_results)
+
+
+@respx.mock
+async def test_pass_two_rejection_on_top_ranked_candidate_does_not_block_lower_ranked_one(tmp_path, caplog) -> None:
+    """MSFT (higher composite, ranked first) has its symbol execution lock
+    already held by another coordinator -- pass 2 must still reach AAPL
+    (lower-ranked), not abort the whole cycle."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json=_tool_use_response([
+                {"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Momentum."},
+                {"symbol": "MSFT", "recommendation": "BUY", "confidence": 90, "summary": "Stronger setup."},
+            ]),
+        )
+    )
+    _mock_account(cash="50000")
+    _mock_positions()
+    _mock_quote_for("AAPL")
+    _mock_quote_for("MSFT")
+    _mock_bars_for("AAPL", _BULLISH_CLOSES)
+    _mock_bars_for("MSFT", _STRONGER_BULLISH_CLOSES, _STRONGER_BULLISH_VOLUMES, _STRONGER_BULLISH_BAND)
+    _mock_spy_bars()
+    call_order = _mock_multi_symbol_dynamic_full_fill()
+
+    database = repositories.trade_intents.database
+    msft = AssetIdentity("MSFT", AssetClass.EQUITY, "alpaca:MSFT")
+    assert await reserve_symbol_for_execution(database, msft, "another-coordinator") is True
+
+    with caplog.at_level(logging.INFO):
+        summary = await run_scan_cycle(
+            repositories, ai_provider, market_data, broker, gateway, UNIVERSE_TWO_EQUITIES, limits, AssetClass.EQUITY, clock=lambda: NOW,
+        )
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.candidates_approved == 1
+    assert call_order == ["AAPL"]  # MSFT (ranked first) was rejected in pass 2; AAPL still got its turn
+    rejected = [r for r in caplog.records if getattr(r, "event", None) == "candidate_rejected" and r.reason == "SYMBOL_EXECUTION_LOCKED"]
+    assert len(rejected) == 1
+    assert rejected[0].symbol == "MSFT"
+
+
+@respx.mock
+async def test_liquidity_crisis_regime_suppresses_all_new_entries_before_any_fetch(tmp_path, caplog) -> None:
+    """The signal-layer gate: every candidate is rejected with
+    LIQUIDITY_CRISIS_NEW_ENTRIES_SUPPRESSED, before any candle/quote fetch
+    for that candidate (no order ever placed)."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Momentum."}])
+        )
+    )
+    _mock_account()
+    _mock_positions()
+    _mock_spy_bars(_REGIME_LIQUIDITY_CRISIS_CLOSES)
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+    # Deliberately NOT mocking AAPL's own quote/bars -- if the gate below
+    # didn't fire before those fetches, this test would fail with a
+    # respx AllMockedAssertionError instead of the expected rejection,
+    # which is itself proof the suppression happens before any I/O for
+    # the candidate.
+
+    with caplog.at_level(logging.INFO):
+        summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    assert summary.candidates_approved == 0
+    assert order_route.call_count == 0
+
+    scan_row = await repositories.scan_runs.get(summary.scan_run_id)
+    scan_run = hydrate("scan_runs", scan_row["payload"])
+    assert scan_run.regime == "liquidity_crisis"
+    assert scan_run.regime_position_multiplier == Decimal("0.0")  # the risk/engine.py sizing-layer backstop value
+
+    rejected = [r for r in caplog.records if getattr(r, "event", None) == "candidate_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0].reason == "LIQUIDITY_CRISIS_NEW_ENTRIES_SUPPRESSED"
+
+
+@respx.mock
+async def test_low_vol_bull_regime_weight_profile_recorded_on_scan_run_and_opportunity(tmp_path) -> None:
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Momentum."}])
+        )
+    )
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
+    _mock_spy_bars(_REGIME_LOW_VOL_BULL_CLOSES)
+    order_route = _mock_dynamic_full_fill()
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    assert order_route.call_count == 1
+
+    scan_row = await repositories.scan_runs.get(summary.scan_run_id)
+    scan_run = hydrate("scan_runs", scan_row["payload"])
+    assert scan_run.regime == "low_vol_bull"
+    assert scan_run.regime_weight_profile == "v1+regime:low_vol_bull"
+
+    opp_rows = await repositories.opportunities.list_all()
+    assert len(opp_rows) == 1
+    opportunity = hydrate("opportunities", opp_rows[0]["payload"])
+    assert opportunity.metadata["regime_weight_profile"] == "v1+regime:low_vol_bull"
+    assert "liquidity_score" in opportunity.metadata
+    assert "risk_quality_score" in opportunity.metadata
+    assert opportunity.metadata["factor_breakdown"]["relative_strength"] != "unavailable"  # SPY benchmark was available this cycle
+
+
+@respx.mock
+async def test_relative_strength_factor_reuses_lane_regime_benchmark_without_duplicate_fetch(tmp_path) -> None:
+    """The relative-strength factor consumes the SAME benchmark candles
+    already fetched to classify the lane's regime -- the SPY bars route
+    must be hit exactly once per cycle, not twice."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Momentum."}])
+        )
+    )
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
+    spy_route = _mock_spy_bars(_REGIME_LOW_VOL_BULL_CLOSES)
+    order_route = _mock_dynamic_full_fill()
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    assert order_route.call_count == 1
+    assert spy_route.call_count == 1
+
+    opp_rows = await repositories.opportunities.list_all()
+    opportunity = hydrate("opportunities", opp_rows[0]["payload"])
+    assert opportunity.metadata["relative_strength_score"] is not None
 
 
 def _synthetic_candles(closes: list[float], band: float = 0.006) -> list[Candle]:
