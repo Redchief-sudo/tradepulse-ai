@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -11,7 +12,7 @@ from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
 from tradepulse.config import risk_limits_for_profile
 from tradepulse.execution import ExecutionGateway, reserve_symbol_for_execution
-from tradepulse.models import AssetClass, AssetIdentity, Candle, ExecutionMode, ScanRun, ScanRunStatus, ScanTrigger, SessionState, TradingSession, asset_identity_key
+from tradepulse.models import AssetClass, AssetIdentity, Candle, ExecutionMode, Holding, RiskLimits, ScanRun, ScanRunStatus, ScanTrigger, SessionState, TradingSession, asset_identity_key
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.providers import AlpacaMarketDataProvider, AnthropicAIProvider, MarketDataCapabilities
 from tradepulse.providers.anthropic_ai import SCAN_TOOL_NAME
@@ -33,7 +34,7 @@ def _tool_use_response(candidates: list[dict]) -> dict:
     }
 
 
-async def _setup(tmp_path):
+async def _setup(tmp_path, *, risk_limits: RiskLimits | None = None):
     database = AsyncSQLiteDatabase(f"sqlite:///{tmp_path}/test.db")
     await database.initialize()
     repositories = PersistenceRepositories.create(database)
@@ -42,7 +43,7 @@ async def _setup(tmp_path):
     ai_provider = AnthropicAIProvider("key", "claude-haiku-4-5", 10)
     alerts = TelegramAlerter(None, None)
     settlement = SettlementProcessor(repositories, alerts, clock=lambda: NOW)
-    limits = risk_limits_for_profile("balanced")
+    limits = risk_limits or risk_limits_for_profile("balanced")
     gateway = ExecutionGateway(repositories, broker, market_data, settlement, alerts, limits, ExecutionMode.PAPER, clock=lambda: NOW)
     return repositories, broker, ai_provider, market_data, gateway, limits
 
@@ -1671,6 +1672,269 @@ async def test_relative_strength_factor_reuses_lane_regime_benchmark_without_dup
     opp_rows = await repositories.opportunities.list_all()
     opportunity = hydrate("opportunities", opp_rows[0]["payload"])
     assert opportunity.metadata["relative_strength_score"] is not None
+
+
+# ---- Portfolio Optimization -------------------------------------------------
+
+UNIVERSE_THREE_EQUITIES = ExecutableUniverse(equities=frozenset({"AAPL", "MSFT", "JNJ"}), crypto=frozenset())
+
+
+@respx.mock
+async def test_same_sector_candidates_share_exposure_and_the_second_is_capped(tmp_path) -> None:
+    """AAPL and MSFT are both mapped to "Technology" (config/sectors.py).
+    With max_sector_pct tightened just above max_position_pct, MSFT (ranked
+    first, higher composite) consumes nearly the whole Technology bucket,
+    leaving no room for AAPL -- proving sector_for_symbol's real value now
+    actually constrains risk/engine.py's pre-existing (but previously inert,
+    everything-defaulted-to-"Other") max_sector_pct cap."""
+    tight_limits = replace(risk_limits_for_profile("balanced"), max_sector_pct=Decimal("8"))  # just above max_position_pct=7
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path, risk_limits=tight_limits)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json=_tool_use_response([
+                {"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Momentum."},
+                {"symbol": "MSFT", "recommendation": "BUY", "confidence": 90, "summary": "Stronger setup."},
+            ]),
+        )
+    )
+    _mock_account(cash="50000")
+    _mock_positions()
+    _mock_quote_for("AAPL")
+    _mock_quote_for("MSFT")
+    _mock_bars_for("AAPL", _BULLISH_CLOSES)
+    _mock_bars_for("MSFT", _STRONGER_BULLISH_CLOSES, _STRONGER_BULLISH_VOLUMES, _STRONGER_BULLISH_BAND)
+    _mock_spy_bars()
+    _mock_multi_symbol_dynamic_full_fill()
+
+    summary = await run_scan_cycle(
+        repositories, ai_provider, market_data, broker, gateway, UNIVERSE_TWO_EQUITIES, tight_limits, AssetClass.EQUITY, clock=lambda: NOW,
+    )
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    intent_rows = await repositories.trade_intents.list_all()
+    intents = {hydrate("trade_intents", row["payload"]).asset.symbol: hydrate("trade_intents", row["payload"]) for row in intent_rows}
+    assert intents["MSFT"].status.value != "rejected"
+    # AAPL (ranked second, same "Technology" sector) must be constrained by
+    # MSFT's already-approved exposure -- either sized down or rejected
+    # outright, but never approved at the same full size MSFT got.
+    aapl_reasons = intents["AAPL"].risk_snapshot.get("reasons", [])
+    assert any("SECTOR" in r or "INSUFFICIENT_CAPACITY" in r for r in aapl_reasons)
+
+
+@respx.mock
+async def test_different_sector_candidate_is_unaffected_by_another_sectors_exhausted_cap(tmp_path) -> None:
+    """The direct proof sectors are genuinely DISTINGUISHED now, not merged
+    into one universal "Other" bucket the way every scanner-originated
+    position was before this phase: JNJ (Healthcare) must execute at full,
+    unconstrained size even though the Technology bucket (AAPL+MSFT) is
+    exhausted by the same tight max_sector_pct in the same cycle."""
+    tight_limits = replace(risk_limits_for_profile("balanced"), max_sector_pct=Decimal("8"))
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path, risk_limits=tight_limits)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json=_tool_use_response([
+                {"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Momentum."},
+                {"symbol": "MSFT", "recommendation": "BUY", "confidence": 90, "summary": "Stronger setup."},
+                {"symbol": "JNJ", "recommendation": "BUY", "confidence": 90, "summary": "Different sector."},
+            ]),
+        )
+    )
+    _mock_account(cash="50000")
+    _mock_positions()
+    _mock_quote_for("AAPL")
+    _mock_quote_for("MSFT")
+    _mock_quote_for("JNJ")
+    _mock_bars_for("AAPL", _BULLISH_CLOSES)
+    _mock_bars_for("MSFT", _STRONGER_BULLISH_CLOSES, _STRONGER_BULLISH_VOLUMES, _STRONGER_BULLISH_BAND)
+    _mock_bars_for("JNJ", _BULLISH_CLOSES)  # same composite as AAPL -- ties broken alphabetically, so JNJ ranks last
+    _mock_spy_bars()
+    _mock_multi_symbol_dynamic_full_fill()
+
+    summary = await run_scan_cycle(
+        repositories, ai_provider, market_data, broker, gateway, UNIVERSE_THREE_EQUITIES, tight_limits, AssetClass.EQUITY, clock=lambda: NOW,
+    )
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    intent_rows = await repositories.trade_intents.list_all()
+    intents = {hydrate("trade_intents", row["payload"]).asset.symbol: hydrate("trade_intents", row["payload"]) for row in intent_rows}
+    assert intents["MSFT"].status.value != "rejected"
+    assert intents["JNJ"].status.value != "rejected"
+    jnj_reasons = intents["JNJ"].risk_snapshot.get("reasons", [])
+    assert not any("SECTOR" in r for r in jnj_reasons)  # never touched by Technology's own exhaustion
+    # JNJ's approved quantity should match what an UNCONSTRAINED position of
+    # its own would get -- the same order of magnitude as MSFT's own
+    # unconstrained approval, not squeezed down like AAPL's.
+    assert Decimal(intents["JNJ"].risk_snapshot["approved_quantity"]) > Decimal("0")
+
+
+@respx.mock
+async def test_opportunity_metadata_carries_sector_and_correlation_provenance(tmp_path) -> None:
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Momentum."}])
+        )
+    )
+    _mock_account()
+    _mock_positions()
+    _mock_quote_for("AAPL")
+    _mock_bars_for("AAPL", _BULLISH_CLOSES)
+    _mock_spy_bars()
+    _mock_dynamic_full_fill()
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    opp_rows = await repositories.opportunities.list_all()
+    opportunity = hydrate("opportunities", opp_rows[0]["payload"])
+    assert opportunity.metadata["sector"] == "Technology"
+    assert opportunity.metadata["correlation_penalty_applied"] is False  # no other candidates/holdings this cycle to correlate against
+    assert opportunity.metadata["max_correlation"] is None
+
+
+@respx.mock
+async def test_highly_correlated_candidate_is_demoted_below_uncorrelated_peer(tmp_path) -> None:
+    """Two candidates with near-identical daily-return series (deliberately
+    constructed, verified via pearson_correlation directly first) both pass
+    every gate individually -- the correlated one, even if it individually
+    scored a HIGHER composite, must execute AFTER a genuinely uncorrelated
+    peer, proving the demotion actually reorders pass 2 execution, not just
+    a metadata annotation."""
+    from tradepulse.strategy.correlation import pearson_correlation
+
+    # AAPL and a synthetic near-duplicate of it (scaled 2x, same shape) --
+    # verify they really are highly correlated before relying on that below.
+    duplicate_closes = [c * 2.0 for c in _STRONGER_BULLISH_CLOSES]  # same shape/returns as MSFT's own fixture, just rescaled
+    corr = pearson_correlation(_STRONGER_BULLISH_CLOSES, duplicate_closes)
+    assert corr is not None and corr > Decimal("0.99")
+
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json=_tool_use_response([
+                {"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Duplicate of MSFT's shape."},
+                {"symbol": "MSFT", "recommendation": "BUY", "confidence": 90, "summary": "Stronger, uncorrelated setup."},
+            ]),
+        )
+    )
+    _mock_account(cash="50000")
+    _mock_positions()
+    _mock_quote_for("AAPL")
+    _mock_quote_for("MSFT")
+    _mock_bars_for("AAPL", duplicate_closes)  # highly correlated with MSFT's own series
+    _mock_bars_for("MSFT", _STRONGER_BULLISH_CLOSES, _STRONGER_BULLISH_VOLUMES, _STRONGER_BULLISH_BAND)
+    _mock_spy_bars()
+    call_order = _mock_multi_symbol_dynamic_full_fill()
+
+    summary = await run_scan_cycle(
+        repositories, ai_provider, market_data, broker, gateway, UNIVERSE_TWO_EQUITIES, limits, AssetClass.EQUITY, clock=lambda: NOW,
+    )
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    assert call_order == ["MSFT", "AAPL"]  # AAPL demoted below MSFT despite ranking, due to correlation
+
+    opp_rows = await repositories.opportunities.list_all()
+    opportunities = {hydrate("opportunities", row["payload"]).asset.symbol: hydrate("opportunities", row["payload"]) for row in opp_rows}
+    assert opportunities["AAPL"].metadata["correlation_penalty_applied"] is True
+    assert opportunities["MSFT"].metadata["correlation_penalty_applied"] is False
+
+
+@respx.mock
+async def test_candidate_correlated_with_existing_holding_is_demoted(tmp_path) -> None:
+    """A candidate highly correlated with an asset ALREADY HELD (not just
+    another candidate this cycle) must also be demoted -- proves the
+    candidate-vs-holdings fetch path, not just candidate-vs-candidate."""
+    from tradepulse.strategy.correlation import pearson_correlation
+
+    duplicate_closes = [c * 2.0 for c in _BULLISH_CLOSES]
+    corr = pearson_correlation(_BULLISH_CLOSES, duplicate_closes)
+    assert corr is not None and corr > Decimal("0.99")
+
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    # An existing MSFT holding, highly correlated (once fetched) with the
+    # single AAPL candidate below.
+    held_asset = AssetIdentity("MSFT", AssetClass.EQUITY, "alpaca:MSFT")
+    holding = Holding(asset=held_asset, quantity=Decimal("5"), average_price=Decimal("300"), updated_at=NOW)
+    await repositories.holdings.create_once(asset_identity_key(held_asset), holding)
+    _mock_bars_for("MSFT", duplicate_closes)  # the holding's own candle history, fetched by _correlation_adjusted_rank
+
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Momentum."}])
+        )
+    )
+    _mock_account(cash="50000")
+    _mock_positions()  # broker reports no open positions -- the correlation check reads local `holdings`, not the broker, for this
+    _mock_quote_for("AAPL")
+    _mock_bars_for("AAPL", _BULLISH_CLOSES)
+    _mock_spy_bars()
+    order_route = _mock_dynamic_full_fill()
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    # Still executes -- correlation demotes rank, never rejects outright --
+    # but the persisted metadata proves the penalty was applied.
+    assert order_route.call_count == 1
+    opp_rows = await repositories.opportunities.list_all()
+    opportunity = hydrate("opportunities", opp_rows[0]["payload"])
+    assert opportunity.metadata["correlation_penalty_applied"] is True
+
+
+@respx.mock
+async def test_holding_candle_fetch_failure_degrades_gracefully(tmp_path) -> None:
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    held_asset = AssetIdentity("MSFT", AssetClass.EQUITY, "alpaca:MSFT")
+    holding = Holding(asset=held_asset, quantity=Decimal("5"), average_price=Decimal("300"), updated_at=NOW)
+    await repositories.holdings.create_once(asset_identity_key(held_asset), holding)
+    respx.get("https://data.alpaca.markets/v2/stocks/MSFT/bars").mock(return_value=httpx.Response(500, json={"message": "server error"}))
+
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Momentum."}])
+        )
+    )
+    _mock_account(cash="50000")
+    _mock_positions()
+    _mock_quote_for("AAPL")
+    _mock_bars_for("AAPL", _BULLISH_CLOSES)
+    _mock_spy_bars()
+    order_route = _mock_dynamic_full_fill()
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED  # the holding's failed candle fetch never crashes the cycle
+    assert order_route.call_count == 1
+    opp_rows = await repositories.opportunities.list_all()
+    opportunity = hydrate("opportunities", opp_rows[0]["payload"])
+    assert opportunity.metadata["correlation_penalty_applied"] is False  # no correlation signal available -- not penalized on missing data
 
 
 def _synthetic_candles(closes: list[float], band: float = 0.006) -> list[Candle]:

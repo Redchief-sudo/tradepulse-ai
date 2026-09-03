@@ -4,6 +4,12 @@ Numeric values are a direct port of base44/shared/riskEngine.ts's RISK_LIMITS
 table (verified against source, not approximated) — these are the audited,
 already-tuned starting defaults referenced in the migration plan. Adaptive
 tuning is out of MVP scope; these are manually revisited config.
+
+Exit Intelligence (break_even_trigger_pct/trailing_atr_multiplier/max_hold_days)
+and Portfolio Optimization (max_correlation_threshold) fields below are NOT
+part of that ported table -- new to this system, reasoned against each
+profile's existing personality (proportionate to stop_loss_pct/max_daily_trades),
+not backtested. Flag for revisiting once outcome-attribution data exists.
 """
 
 from __future__ import annotations
@@ -23,6 +29,8 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         max_simultaneous_orders=5, min_position_size_multiplier=Decimal("0.65"),
         options_premium_stop_pct=Decimal("45"), options_expiry_min_days=14, options_expiry_max_days=30,
         options_target_otm_pct=Decimal("5"), options_forced_close_days_before_expiry=2,
+        break_even_trigger_pct=Decimal("6"), trailing_atr_multiplier=Decimal("3.0"), max_hold_days=10,
+        max_correlation_threshold=Decimal("0.85"),
     ),
     "balanced": RiskLimits(
         profile_id="balanced",
@@ -34,6 +42,8 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         max_simultaneous_orders=2, min_position_size_multiplier=Decimal("0.5"),
         options_premium_stop_pct=Decimal("35"), options_expiry_min_days=21, options_expiry_max_days=45,
         options_target_otm_pct=Decimal("3"), options_forced_close_days_before_expiry=2,
+        break_even_trigger_pct=Decimal("4"), trailing_atr_multiplier=Decimal("2.5"), max_hold_days=15,
+        max_correlation_threshold=Decimal("0.75"),
     ),
     "conservative": RiskLimits(
         profile_id="conservative",
@@ -45,6 +55,8 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         max_simultaneous_orders=2, min_position_size_multiplier=Decimal("0.35"),
         options_premium_stop_pct=Decimal("25"), options_expiry_min_days=30, options_expiry_max_days=60,
         options_target_otm_pct=Decimal("1.5"), options_forced_close_days_before_expiry=3,
+        break_even_trigger_pct=Decimal("2.5"), trailing_atr_multiplier=Decimal("2.0"), max_hold_days=30,
+        max_correlation_threshold=Decimal("0.65"),
     ),
     "micro": RiskLimits(
         profile_id="micro",
@@ -56,6 +68,8 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         max_simultaneous_orders=2, min_position_size_multiplier=Decimal("0.5"),
         options_premium_stop_pct=Decimal("40"), options_expiry_min_days=14, options_expiry_max_days=35,
         options_target_otm_pct=Decimal("4"), options_forced_close_days_before_expiry=2,
+        break_even_trigger_pct=Decimal("3"), trailing_atr_multiplier=Decimal("2.5"), max_hold_days=12,
+        max_correlation_threshold=Decimal("0.75"),
     ),
 }
 

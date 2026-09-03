@@ -222,6 +222,7 @@ def decode_holding(d: Mapping[str, Any]) -> Holding:
         sector=d.get("sector"),
         stop_loss=_decimal_or_none(d.get("stop_loss")),
         target_price=_decimal_or_none(d.get("target_price")),
+        current_stop=_decimal_or_none(d.get("current_stop")),
     )
 
 

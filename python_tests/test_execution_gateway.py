@@ -821,7 +821,7 @@ async def test_regime_multiplier_none_and_regime_snapshot_none_leave_risk_snapsh
     assert not any("REGIME" in r for r in intent.risk_snapshot["reasons"])
     assert set(intent.risk_snapshot.keys()) == {
         "reasons", "confidence", "entry_price", "stop_loss", "contract_multiplier",
-        "requested_quantity", "approved_quantity", "risk_profile",
+        "requested_quantity", "approved_quantity", "risk_profile", "max_hold_days",
     }
 
 

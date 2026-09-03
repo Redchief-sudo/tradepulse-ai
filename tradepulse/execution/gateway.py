@@ -353,6 +353,14 @@ class ExecutionGateway:
                 "requested_quantity": str(request.requested_quantity),
                 "approved_quantity": str(risk.approved_quantity),
                 "risk_profile": self._risk_limits.profile_id,
+                # Exit Intelligence -- frozen per-trade at entry time so
+                # settlement/engine.py::_infer_exit_reason can classify a
+                # time-stop exit post-hoc without depending on whatever the
+                # CURRENT risk profile config says (profiles are manually
+                # revisited over the life of a running trade -- a live
+                # lookup would drift). Pure provenance, same shape as the
+                # regime_snapshot merge below -- not a decision input.
+                "max_hold_days": str(self._risk_limits.max_hold_days),
             }
             # Market Regime Phase 2 -- merged in verbatim, un-interpreted
             # (see ExecutionRequest.regime_snapshot's own docstring). Never

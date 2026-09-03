@@ -390,7 +390,7 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
     assert stop_loss is not None  # the fix from this same round -- the scanner now sets one
 
     # ---- Restart. Process B: the monitor sees the stop breached, exits. ----
-    _, repositories_b, broker_b, _, gateway_b, _, limits_b = await _fresh_gateway(db_url)
+    _, repositories_b, broker_b, market_data_b, gateway_b, _, limits_b = await _fresh_gateway(db_url)
     alerts_b = TelegramAlerter(None, None)
 
     breach_price = str(stop_loss - Decimal("10"))
@@ -413,7 +413,7 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
         )
     )
 
-    monitor_summary = await run_position_monitor(repositories_b, broker_b, gateway_b, alerts_b, limits_b, clock=lambda: NOW)
+    monitor_summary = await run_position_monitor(repositories_b, broker_b, market_data_b, gateway_b, alerts_b, limits_b, clock=lambda: NOW)
     await broker_b.aclose()
 
     assert monitor_summary.status == "ok"

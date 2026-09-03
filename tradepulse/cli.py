@@ -240,7 +240,7 @@ async def _run_scan_leg(
 
 async def _run_monitor_leg(
     database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, broker: AlpacaClient,
-    gateway: ExecutionGateway, alerts: TelegramAlerter, settings: Settings,
+    market_data: AlpacaMarketDataProvider, gateway: ExecutionGateway, alerts: TelegramAlerter, settings: Settings,
 ) -> MonitorCycleSummary | None:
     owner_token = str(uuid4())
     if not await acquire_lock(database, MONITOR_LOCK_KEY, owner_token, "monitor", MONITOR_LOCK_TTL_SECONDS):
@@ -251,7 +251,7 @@ async def _run_monitor_leg(
         risk_limits = risk_limits_for_profile(settings.risk_profile)
         return await run_with_lock_renewal(
             database, MONITOR_LOCK_KEY, owner_token, MONITOR_LOCK_TTL_SECONDS,
-            run_position_monitor(repositories, broker, gateway, alerts, risk_limits, lease_lost=lease_lost),
+            run_position_monitor(repositories, broker, market_data, gateway, alerts, risk_limits, lease_lost=lease_lost),
             on_renewal_failed=on_lease_lost,
         )
     finally:
@@ -336,7 +336,7 @@ async def _run_scan(settings: Settings, asset_classes: list[AssetClass]) -> int:
         ]
         *scan_results, monitor_result = await asyncio.gather(
             *scan_legs,
-            _run_monitor_leg(database, repositories, broker, gateway, alerts, settings),
+            _run_monitor_leg(database, repositories, broker, market_data, gateway, alerts, settings),
             return_exceptions=True,
         )
     finally:
@@ -365,7 +365,7 @@ async def _run_monitor(settings: Settings) -> int:
         market_data = AlpacaMarketDataProvider(broker)
         alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
         gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
-        result = await _run_monitor_leg(database, repositories, broker, gateway, alerts, settings)
+        result = await _run_monitor_leg(database, repositories, broker, market_data, gateway, alerts, settings)
     finally:
         await broker.aclose()
 
@@ -539,9 +539,9 @@ async def _scan_action(
 
 async def _monitor_action(
     database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, broker: AlpacaClient,
-    gateway: ExecutionGateway, alerts: TelegramAlerter, settings: Settings,
+    market_data: AlpacaMarketDataProvider, gateway: ExecutionGateway, alerts: TelegramAlerter, settings: Settings,
 ) -> float:
-    await _run_monitor_leg(database, repositories, broker, gateway, alerts, settings)
+    await _run_monitor_leg(database, repositories, broker, market_data, gateway, alerts, settings)
     return MONITOR_INTERVAL_SECONDS
 
 
@@ -637,7 +637,7 @@ async def _run_trading_supervisor(
             ),
             shutdown, sleep,
         ),
-        "monitor": _periodic_loop(lambda: _monitor_action(database, repositories, broker, gateway, alerts, settings), shutdown, sleep),
+        "monitor": _periodic_loop(lambda: _monitor_action(database, repositories, broker, market_data, gateway, alerts, settings), shutdown, sleep),
         "settle": _periodic_loop(lambda: _settle_action(database, repositories, settlement, alerts), shutdown, sleep),
     }
     await asyncio.gather(*(_supervised_lane(name, coro, repositories, alerts) for name, coro in lanes.items()))

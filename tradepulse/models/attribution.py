@@ -23,8 +23,8 @@ from typing import Any, Literal, Mapping
 from .base import decimal_value, immutable_metadata, require_aware, require_text
 from .market import AssetIdentity
 
-ExitReason = Literal["stop_loss", "target_price", "other"]
-_EXIT_REASONS = ("stop_loss", "target_price", "other")
+ExitReason = Literal["stop_loss", "target_price", "time_stop", "other"]
+_EXIT_REASONS = ("stop_loss", "target_price", "time_stop", "other")
 
 
 @dataclass(frozen=True, slots=True)

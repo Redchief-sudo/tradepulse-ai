@@ -1,4 +1,5 @@
 from .composite import Signal, factor_breakdown, signal_from_composite, weighted_composite
+from .correlation import pearson_correlation
 from .factors import FactorScores, compute_real_factors
 from .indicators import atr, obv
 from .options_selection import OptionContractSummary, select_contract
@@ -22,6 +23,7 @@ __all__ = [
     "is_executable",
     "load_executable_universe",
     "obv",
+    "pearson_correlation",
     "select_contract",
     "signal_from_composite",
     "weighted_composite",

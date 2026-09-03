@@ -536,15 +536,19 @@ def _quote() -> MarketQuote:
 async def _seed_buy_with_protective_levels(
     repositories: PersistenceRepositories, *, fill_id: str = "fill-1", quantity: str = "10", price: str = "150",
     stop_loss: Decimal | None = None, target_price: Decimal | None = None, opportunity_id: str | None = None,
+    max_hold_days: int | None = None,
 ) -> None:
     """Like _seed_buy, but a scanner-shaped ("ai_scan") intent carrying
     protective levels and risk_snapshot provenance -- and, if opportunity_id
     is given, a linked Opportunity row too -- so attribution's entry_context
     and exit_reason inference have real data to work with."""
+    risk_snapshot: dict[str, str] = {"regime": "low_vol_bull", "confidence": "90"}
+    if max_hold_days is not None:
+        risk_snapshot["max_hold_days"] = str(max_hold_days)
     intent = TradeIntent(
         "ti-1", "idem-1", opportunity_id or "corr-1", asset(), Side.BUY, ExecutionMode.PAPER, "ai_scan", NOW,
         requested_quantity=Decimal(quantity), stop_loss=stop_loss, target_price=target_price,
-        risk_snapshot={"regime": "low_vol_bull", "confidence": "90"},
+        risk_snapshot=risk_snapshot,
     )
     await repositories.trade_intents.create_once("ti-1", intent, status=intent.status.value, unique_value=intent.idempotency_key)
     fill = Fill(fill_id, "ti-1", "order-1", asset(), Side.BUY, ExecutionMode.PAPER, Decimal(quantity), Decimal(price), Decimal("0"), Decimal("0"), NOW)
@@ -713,3 +717,98 @@ async def test_project_attribution_is_idempotent_on_replay(tmp_path) -> None:
     await _project_attribution(repositories, sell_event)
 
     assert len(await repositories.trade_attributions.list_all()) == 1
+
+
+# ---- Exit Intelligence -- exit_reason "time_stop" inference ---------------
+
+
+async def test_infer_exit_reason_classifies_time_stop_when_held_past_max_hold_days(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await _seed_buy_with_protective_levels(repositories, max_hold_days=5)  # no stop_loss/target_price -- isolate the time-stop path
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending()
+
+    exit_at = NOW + timedelta(days=5)  # exactly max_hold_days
+    await _seed_sell(repositories, quantity="10", price="152", at=exit_at)  # a price that hits neither (nonexistent) stop nor target
+    await processor.process_pending()
+
+    attribution = hydrate("trade_attributions", (await repositories.trade_attributions.list_all())[0]["payload"])
+    assert attribution.exit_reason == "time_stop"
+
+
+async def test_infer_exit_reason_falls_back_to_other_when_held_days_below_max_hold_days(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await _seed_buy_with_protective_levels(repositories, max_hold_days=5)
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending()
+
+    exit_at = NOW + timedelta(days=4)  # one day short of max_hold_days
+    await _seed_sell(repositories, quantity="10", price="152", at=exit_at)
+    await processor.process_pending()
+
+    attribution = hydrate("trade_attributions", (await repositories.trade_attributions.list_all())[0]["payload"])
+    assert attribution.exit_reason == "other"
+
+
+async def test_infer_exit_reason_price_based_reason_still_wins_over_time_stop_on_coincidental_tie(tmp_path) -> None:
+    """A price-based reason is checked FIRST -- an exit that's both past
+    max_hold_days AND at/beyond the stop must still classify as stop_loss,
+    the unchanged tie-break precedent."""
+    repositories = await _repositories(tmp_path)
+    await _seed_buy_with_protective_levels(repositories, stop_loss=Decimal("140"), max_hold_days=5)
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending()
+
+    exit_at = NOW + timedelta(days=10)  # well past max_hold_days too
+    await _seed_sell(repositories, quantity="10", price="138", at=exit_at)  # at/below stop
+    await processor.process_pending()
+
+    attribution = hydrate("trade_attributions", (await repositories.trade_attributions.list_all())[0]["payload"])
+    assert attribution.exit_reason == "stop_loss"
+
+
+async def test_current_stop_survives_settlement_rebuild_across_governing_lot_change(tmp_path) -> None:
+    """Exit Intelligence's monotonic ratchet must be immune to the
+    pre-existing PROTECTIVE_THRESHOLD_POLICY="first_entry" instability:
+    when the OLDEST lot closes and a younger lot becomes governing (so
+    stop_loss/target_price legitimately change), Holding.current_stop must
+    be carried forward verbatim, unaffected."""
+    repositories = await _repositories(tmp_path)
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+
+    # Lot 1 (oldest, governing): stop_loss=90
+    await _seed_buy_with_protective_levels(repositories, fill_id="fill-1", quantity="5", price="100", stop_loss=Decimal("90"))
+    await processor.process_pending()
+
+    # Lot 2 (younger, a scale-in): stop_loss=95 -- a distinct TradeIntent/Fill/SettlementEvent
+    later_open = NOW + timedelta(minutes=1)
+    intent2 = TradeIntent(
+        "ti-1b", "idem-1b", "corr-1b", asset(), Side.BUY, ExecutionMode.PAPER, "ai_scan", later_open,
+        requested_quantity=Decimal("5"), stop_loss=Decimal("95"),
+    )
+    await repositories.trade_intents.create_once("ti-1b", intent2, status=intent2.status.value, unique_value=intent2.idempotency_key)
+    fill2 = Fill("fill-1b", "ti-1b", "order-1b", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("5"), Decimal("100"), Decimal("0"), Decimal("0"), later_open)
+    await repositories.fills.create_once("fill-1b", fill2, unique_value=None)
+    event2 = SettlementEvent("se-1b", "fill-1b", "ti-1b", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("5"), Decimal("100"), later_open)
+    await repositories.settlements.create_once("se-1b", event2, status=event2.status.value, unique_value="fill-1b")
+    await processor.process_pending()
+
+    holding_row = await repositories.holdings.get(asset_identity_key(asset()))
+    holding = hydrate("holdings", holding_row["payload"])
+    assert holding.stop_loss == Decimal("90")  # lot 1 (oldest) still governs
+    assert holding.current_stop is None  # nothing has ratcheted yet
+
+    # Simulate the monitor having already ratcheted a stop this cycle.
+    ratcheted = replace(holding, current_stop=Decimal("102"))
+    await repositories.holdings.update(asset_identity_key(asset()), ratcheted)
+
+    # Close lot 1 (the governing lot) fully -- FIFO closes oldest first.
+    later_close = NOW + timedelta(minutes=2)
+    await _seed_sell(repositories, quantity="5", price="105", at=later_close)
+    summary = await processor.process_pending()
+    assert summary.completed == 1
+
+    holding_row = await repositories.holdings.get(asset_identity_key(asset()))
+    holding = hydrate("holdings", holding_row["payload"])
+    assert holding.stop_loss == Decimal("95")  # governing lot changed to lot 2 -- proves the edge case is real, not a no-op
+    assert holding.current_stop == Decimal("102")  # carried forward unchanged despite the rebuild

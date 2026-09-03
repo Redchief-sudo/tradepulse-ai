@@ -112,8 +112,22 @@ async def _project_lot(repositories: PersistenceRepositories, event: SettlementE
     return {"realized_pnl": plan.realized_pnl}
 
 
+def _parse_int_or_none(value: Any) -> int | None:
+    """risk_snapshot values are always stored as strings (see
+    execution/gateway.py's risk_snapshot construction) -- None for a legacy
+    intent predating max_hold_days provenance, never a crash on a malformed
+    value (an audit-trail field, not a decision input)."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _infer_exit_reason(
-    position_side: str, stop_loss: Decimal | None, target_price: Decimal | None, exit_price: Decimal
+    position_side: str, stop_loss: Decimal | None, target_price: Decimal | None, exit_price: Decimal,
+    *, held_days: int | None = None, max_hold_days: int | None = None,
 ) -> ExitReason | None:
     """Inferred after the fact from already-persisted facts (the OPENING
     intent's own protective levels vs. the actual exit price) -- nothing is
@@ -123,8 +137,16 @@ def _infer_exit_reason(
     arbitrary, documented tie-break for the edge case both conditions hold,
     which requires a misconfigured stop/target pair to reach). Returns None
     (unknown) when no protective levels existed at all to classify against
-    -- distinct from "other" (a real exit that matched neither)."""
-    if stop_loss is None and target_price is None:
+    -- distinct from "other" (a real exit that matched neither).
+
+    held_days/max_hold_days (Exit Intelligence) are checked LAST, after both
+    price-based reasons -- a price-based reason still wins on a coincidental
+    tie with a time-stop-eligible hold, unchanged tie-break precedent. A
+    time-stop is independent of stop_loss/target_price ever having been
+    set -- None (unknown) is reserved for when there is truly nothing at
+    all to classify against, not merely no PRICE-based levels."""
+    time_stop_eligible = max_hold_days is not None and max_hold_days > 0 and held_days is not None
+    if stop_loss is None and target_price is None and not time_stop_eligible:
         return None
     is_long = position_side == "long"
     stop_hit = stop_loss is not None and ((exit_price <= stop_loss) if is_long else (exit_price >= stop_loss))
@@ -133,6 +155,8 @@ def _infer_exit_reason(
     target_hit = target_price is not None and ((exit_price >= target_price) if is_long else (exit_price <= target_price))
     if target_hit:
         return "target_price"
+    if time_stop_eligible and held_days >= max_hold_days:
+        return "time_stop"
     return "other"
 
 
@@ -206,7 +230,11 @@ async def _project_attribution(repositories: PersistenceRepositories, event: Set
             exit_at=event.occurred_at,
             realized_pnl=pnl,
             created_at=event.occurred_at,
-            exit_reason=_infer_exit_reason(lot.position_side, opening_intent.stop_loss, opening_intent.target_price, event.price),
+            exit_reason=_infer_exit_reason(
+                lot.position_side, opening_intent.stop_loss, opening_intent.target_price, event.price,
+                held_days=(event.occurred_at.date() - lot.opened_at.date()).days,
+                max_hold_days=_parse_int_or_none(opening_intent.risk_snapshot.get("max_hold_days")),
+            ),
             max_favorable_excursion=lot.mfe_price,
             max_adverse_excursion=lot.mae_price,
             entry_context={
@@ -273,9 +301,20 @@ async def _project_holding(repositories: PersistenceRepositories, event: Settlem
         stop_loss=stop_loss, target_price=target_price,
     )
     if existing_row is not None:
-        await repositories.holdings.update(record_id, holding)
+        # mutate() (not update()) -- Exit Intelligence made holdings a
+        # two-writer table (the position monitor's _ratchet_stop also
+        # writes current_stop, concurrently with settlement -- see
+        # monitor/coordinator.py). current_stop is carried forward
+        # VERBATIM from the freshly re-read row, unconditionally, regardless
+        # of whether the governing (oldest) lot changed -- only
+        # _ratchet_stop is ever allowed to advance it, and only favorably.
+        # A plain update() here would read-then-overwrite with a stale
+        # pre-ratchet value, silently reverting a just-advanced ratchet.
+        def _decide(current: Holding) -> Holding:
+            return replace(holding, current_stop=current.current_stop)
+        await repositories.holdings.mutate(record_id, _decide)
     else:
-        await repositories.holdings.create_once(record_id, holding)
+        await repositories.holdings.create_once(record_id, holding)  # current_stop defaults None -- no ratchet history yet
     return None
 
 

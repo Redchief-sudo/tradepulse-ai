@@ -36,6 +36,7 @@ from tradepulse.execution import (
 )
 from tradepulse.models import (
     AssetClass,
+    AssetIdentity,
     Holding,
     PositionLot,
     RiskLimits,
@@ -45,6 +46,8 @@ from tradepulse.models import (
     fold_price_extremum,
 )
 from tradepulse.persistence import PersistenceRepositories, hydrate, run_with_lock_renewal
+from tradepulse.providers import AlpacaMarketDataProvider, ProviderError
+from tradepulse.strategy import atr
 
 MonitorStatus = Literal["ok", "degraded"]
 
@@ -59,11 +62,16 @@ class MonitorCycleSummary:
 
 
 def _breached(position: AlpacaPosition, holding: Holding) -> bool:
+    # Exit Intelligence -- current_stop (the live, ratcheted floor) is the
+    # EFFECTIVE stop whenever set, overriding the static entry-derived
+    # stop_loss -- never the other way around (current_stop only ever
+    # moves favorably, so it's always at least as tight as stop_loss).
+    effective_stop = holding.current_stop if holding.current_stop is not None else holding.stop_loss
     if position.qty > 0:
-        return (holding.stop_loss is not None and position.current_price <= holding.stop_loss) or (
+        return (effective_stop is not None and position.current_price <= effective_stop) or (
             holding.target_price is not None and position.current_price >= holding.target_price
         )
-    return (holding.stop_loss is not None and position.current_price >= holding.stop_loss) or (
+    return (effective_stop is not None and position.current_price >= effective_stop) or (
         holding.target_price is not None and position.current_price <= holding.target_price
     )
 
@@ -136,9 +144,91 @@ async def _fold_lot_extrema(repositories: PersistenceRepositories, lots: list[Po
         await repositories.position_lots.mutate(lot.lot_id, _decide)
 
 
+async def _fetch_atr(market_data: AlpacaMarketDataProvider, asset: AssetIdentity) -> Decimal | None:
+    """A 30-day lookback -- ATR(14) needs no more, versus the scanner's
+    200-day default sized for regime/composite scoring. None on ANY
+    failure (ProviderError, insufficient history, or atr() itself
+    returning None) -- see run_position_monitor's own docstring note: an
+    unguarded fetch here would propagate out of this module, out of
+    _periodic_loop, and PERMANENTLY end this lane's scheduling
+    (cli.py::_supervised_lane never restarts a lane after an unhandled
+    exception) -- the position-protection safety net going dark silently
+    for the rest of the run. Degrading to "skip the trailing update this
+    cycle, keep whatever stop is already in force" is the only acceptable
+    failure mode here."""
+    try:
+        candles = await market_data.fetch_candles(asset, lookback_days=30)
+    except ProviderError:
+        return None
+    value = atr([float(c.high) for c in candles], [float(c.low) for c in candles], [float(c.close) for c in candles])
+    return Decimal(str(value)) if value is not None else None
+
+
+async def _ratchet_stop(
+    repositories: PersistenceRepositories, risk_limits: RiskLimits, market_data: AlpacaMarketDataProvider,
+    holding: Holding, lots: list[PositionLot], price: Decimal,
+) -> Holding | None:
+    """Exit Intelligence -- break-even ratchet + ATR trailing stop, both
+    monotonic (favorable-direction-only). Returns the updated Holding (or
+    the original, unchanged, if there was nothing to do), or None if the
+    holding vanished (closed concurrently by settlement) since it was read.
+    No candle fetch, no write, for the common case of a position that
+    hasn't earned break-even yet -- see _fetch_atr's own cost-bounding note."""
+    if holding.stop_loss is None:
+        return holding  # not under TradePulse protective management -- ratchet never invents a stop from nothing
+    is_long = holding.quantity > 0
+    gain_pct = (
+        (price - holding.average_price) / holding.average_price * 100 if is_long
+        else (holding.average_price - price) / holding.average_price * 100
+    )
+    if holding.current_stop is None and gain_pct < risk_limits.break_even_trigger_pct:
+        return holding  # break-even not yet earned this cycle
+
+    candidate = holding.average_price  # the break-even floor, once earned, is never given back
+    # ATR trailing is equity/crypto only -- options never get an ATR trail,
+    # matching the existing entry-time precedent (scanner/coordinator.py's
+    # options branch uses a flat pct-of-premium stop, never ATR: a contract's
+    # own candle history is too short-lived/decay-driven to be a meaningful
+    # momentum signal, and Alpaca's stocks-bars endpoint doesn't even serve
+    # option contracts). Break-even alone still applies to options.
+    if holding.asset.asset_class != AssetClass.OPTION:
+        extremes = [lot.mfe_price for lot in lots if lot.mfe_price is not None]
+        running_extreme = (max(extremes) if is_long else min(extremes)) if extremes else None
+        if running_extreme is not None and risk_limits.trailing_atr_multiplier > 0:
+            atr_value = await _fetch_atr(market_data, holding.asset)
+            if atr_value is not None:
+                distance = atr_value * risk_limits.trailing_atr_multiplier
+                trail = running_extreme - distance if is_long else running_extreme + distance
+                candidate = max(candidate, trail) if is_long else min(candidate, trail)
+
+    def _decide(current: Holding) -> Holding | None:
+        if current.current_stop is None:
+            merged = candidate
+        else:
+            merged = max(current.current_stop, candidate) if is_long else min(current.current_stop, candidate)
+        if merged == current.current_stop:
+            return None  # already at least this favorable -- no-op, matches _fold_lot_extrema's convention
+        return replace(current, current_stop=merged)
+
+    return await repositories.holdings.mutate(asset_identity_key(holding.asset), _decide)
+
+
+def _time_stopped(lots: list[PositionLot], today: date, max_hold_days: int) -> bool:
+    """Deliberately stateless and NOT preserved across a governing-lot
+    change -- recomputed fresh every cycle from whichever lot is currently
+    oldest, exactly matching stop_loss/target_price's own already-accepted
+    "re-source from new oldest lot" behavior at the same event
+    (PROTECTIVE_THRESHOLD_POLICY). No new inconsistency introduced."""
+    if max_hold_days <= 0 or not lots:
+        return False  # 0 disables -- mirrors atr_stop_multiplier's existing "0 = off" convention
+    oldest_lot = min(lots, key=lambda lot: lot.opened_at)
+    return (today - oldest_lot.opened_at.date()).days >= max_hold_days
+
+
 async def run_position_monitor(
     repositories: PersistenceRepositories,
     broker: AlpacaClient,
+    market_data: AlpacaMarketDataProvider,
     gateway: ExecutionGateway,
     alerts: TelegramAlerter,
     risk_limits: RiskLimits,
@@ -177,6 +267,10 @@ async def run_position_monitor(
         matching_lots = open_lots_by_asset.get(asset_identity_key(holding.asset), [])
         if matching_lots:
             await _fold_lot_extrema(repositories, matching_lots, position.current_price)
+        ratcheted = await _ratchet_stop(repositories, risk_limits, market_data, holding, matching_lots, position.current_price)
+        if ratcheted is None:
+            continue  # holding vanished (closed concurrently by settlement) -- same treatment as holding_row is None above
+        holding = ratcheted
         if _option_expiry_metadata_invalid(holding):
             await alerts.send(
                 "critical",
@@ -185,9 +279,10 @@ async def run_position_monitor(
                 {"symbol": position.symbol, "asset_class": holding.asset.asset_class.value},
             )
         expiring = _near_expiry(holding, clock().date(), risk_limits.options_forced_close_days_before_expiry)
-        if holding.stop_loss is None and holding.target_price is None and not expiring:
+        time_stopped = _time_stopped(matching_lots, clock().date(), risk_limits.max_hold_days)
+        if holding.stop_loss is None and holding.target_price is None and not expiring and not time_stopped:
             continue
-        if not _breached(position, holding) and not expiring:
+        if not _breached(position, holding) and not expiring and not time_stopped:
             continue
 
         database = repositories.trade_intents.database

@@ -32,7 +32,7 @@ from typing import Any
 from uuid import uuid4
 
 from tradepulse.broker import AlpacaClient
-from tradepulse.config import default_strategy_weights, regime_conditioned_weights
+from tradepulse.config import default_strategy_weights, regime_conditioned_weights, sector_for_symbol
 from tradepulse.execution import (
     SYMBOL_LOCK_TTL_SECONDS,
     ExecutionGateway,
@@ -55,6 +55,7 @@ from tradepulse.models import (
     SessionState,
     Side,
     StrategyWeights,
+    asset_identity_key,
     contract_multiplier_of,
 )
 from tradepulse.persistence import PersistenceRepositories, hydrate, run_with_lock_renewal
@@ -79,6 +80,7 @@ from tradepulse.strategy import (
     compute_real_factors,
     factor_breakdown,
     is_executable,
+    pearson_correlation,
     select_contract,
     signal_from_composite,
     weighted_composite,
@@ -268,6 +270,61 @@ class _ScoredCandidate:
     scores: FactorScores
     composite: Decimal
     deterministic_signal: Signal
+    # Portfolio Optimization -- set by _correlation_adjusted_rank, None
+    # until that step runs. max_correlation is the highest absolute Pearson
+    # correlation found against anything already approved this cycle or
+    # already held; correlation_penalty_applied records whether it crossed
+    # risk_limits.max_correlation_threshold (a rank demotion, never a
+    # rejection).
+    max_correlation: Decimal | None = None
+    correlation_penalty_applied: bool = False
+
+
+async def _correlation_adjusted_rank(
+    repositories: PersistenceRepositories, market_data: AlpacaMarketDataProvider,
+    ranked: list[_ScoredCandidate], risk_limits: RiskLimits,
+) -> list[_ScoredCandidate]:
+    """Portfolio Optimization -- a stable partition (never a hard reject):
+    candidates highly correlated (absolute Pearson, daily returns) with
+    something already approved this cycle or already held are demoted below
+    non-correlated peers, preserving each bucket's own relative order.
+    Candidate-vs-candidate correlation is free (candles already fetched in
+    pass 1); candidate-vs-holdings needs one new fetch per DISTINCT held
+    asset not already among this cycle's candidates -- a data-fetch failure
+    for one holding degrades to "no correlation signal for that holding,"
+    never crashes the cycle."""
+    candidate_keys = {asset_identity_key(sc.asset) for sc in ranked}
+    selected_closes: dict[str, list[Decimal]] = {}
+    holdings_rows = await repositories.holdings.list_all(limit=1000)
+    for row in holdings_rows:
+        held_asset = hydrate("holdings", row["payload"]).asset
+        key = asset_identity_key(held_asset)
+        if key in candidate_keys:
+            continue  # already have this cycle's own candle fetch for it, via a candidate sharing the same asset
+        try:
+            candles = await market_data.fetch_candles(held_asset)
+            selected_closes[key] = [c.close for c in candles]
+        except ProviderError:
+            continue  # no correlation signal available for this holding this cycle -- degrade gracefully, don't block ranking
+
+    prioritized: list[_ScoredCandidate] = []
+    penalized: list[_ScoredCandidate] = []
+    for sc in ranked:
+        own_closes = [float(c.close) for c in sc.candles]
+        correlations = (
+            abs(v) for other in selected_closes.values()
+            if (v := pearson_correlation(own_closes, [float(c) for c in other])) is not None
+        )
+        max_corr = max(correlations, default=None)
+        max_corr_decimal = Decimal(str(round(max_corr, 6))) if max_corr is not None else None
+        penalize = max_corr is not None and max_corr >= risk_limits.max_correlation_threshold
+        sc = replace(sc, max_correlation=max_corr_decimal, correlation_penalty_applied=penalize)
+        if penalize:
+            penalized.append(sc)
+        else:
+            prioritized.append(sc)
+            selected_closes[asset_identity_key(sc.asset)] = [c.close for c in sc.candles]
+    return prioritized + penalized
 
 
 def _round_quantity(qty: Decimal, asset_class: AssetClass) -> Decimal:
@@ -592,6 +649,7 @@ async def run_scan_cycle(
     # risk/engine.py (account.cash refetched on every execute_intent
     # below), now simply invoked in ranked-best-first order.
     ranked = sorted(scored, key=lambda s: (s.composite, Decimal(str(s.candidate.confidence)), s.candidate.symbol), reverse=True)
+    ranked = await _correlation_adjusted_rank(repositories, market_data, ranked, risk_limits)
 
     # PASS 2: execute in ranked order. Everything below is today's
     # unchanged post-gate code, operating on the already-scored/fetched
@@ -715,6 +773,12 @@ async def run_scan_cycle(
                     "factor_breakdown": factor_breakdown(scores),
                     "regime_weight_profile": effective_weights.version,
                     "composite_rank": rank, "candidates_ranked_total": len(ranked),
+                    # Portfolio Optimization -- sector (real, once
+                    # sector_for_symbol resolves it -- see ExecutionRequest
+                    # below) and correlation-aware ranking provenance.
+                    "sector": sector_for_symbol(asset.symbol, asset.asset_class),
+                    "max_correlation": str(scored_candidate.max_correlation) if scored_candidate.max_correlation is not None else None,
+                    "correlation_penalty_applied": scored_candidate.correlation_penalty_applied,
                     "stop_loss": str(stop_loss) if stop_loss is not None else None,
                     "market_data_provider": "alpaca",
                     "market_data_feed": trade_quote.provider.removeprefix("alpaca_"),
@@ -729,6 +793,13 @@ async def run_scan_cycle(
                 decision_id=opportunity.opportunity_id, confidence=Decimal(str(candidate.confidence)),
                 stop_loss=stop_loss, symbol_lock_owner_token=owner_token,
                 regime_multiplier=lane_regime.multiplier, regime_snapshot=lane_regime.snapshot,
+                # Portfolio Optimization -- always the UNDERLYING's sector
+                # (asset, not trade_asset -- for options, trade_asset is the
+                # OCC contract symbol, never in the sector map), so options
+                # correctly inherit their underlying's sector. Feeds
+                # risk/engine.py's existing max_sector_pct cap, which has
+                # always been wired correctly but never received a real value.
+                sector=sector_for_symbol(asset.symbol, asset.asset_class),
             )
             result = await run_with_lock_renewal(
                 database, execution_lock_key(trade_asset), owner_token, SYMBOL_LOCK_TTL_SECONDS, gateway.execute_intent(exec_request),

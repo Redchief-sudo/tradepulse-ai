@@ -25,6 +25,14 @@ class Holding:
     # settlement/engine.py::_project_holding for how these are derived.
     stop_loss: Decimal | None = None
     target_price: Decimal | None = None
+    # Exit Intelligence -- the monitor's own LIVE, mutable protective floor,
+    # distinct from stop_loss (immutable, entry-derived, re-sourced from the
+    # governing lot on every settlement event). None until break-even first
+    # triggers; once set, monotonically ratchets favorable-only -- see
+    # monitor/coordinator.py::_ratchet_stop, the sole writer.
+    # monitor/coordinator.py::_breached treats this as the EFFECTIVE stop
+    # whenever set, overriding stop_loss -- never the other way around.
+    current_stop: Decimal | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "quantity", decimal_value(self.quantity, "quantity"))
@@ -36,6 +44,8 @@ class Holding:
             object.__setattr__(self, "stop_loss", decimal_value(self.stop_loss, "stop_loss", positive=True))
         if self.target_price is not None:
             object.__setattr__(self, "target_price", decimal_value(self.target_price, "target_price", positive=True))
+        if self.current_stop is not None:
+            object.__setattr__(self, "current_stop", decimal_value(self.current_stop, "current_stop", positive=True))
 
 
 @dataclass(frozen=True, slots=True)
