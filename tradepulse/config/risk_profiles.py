@@ -7,9 +7,16 @@ tuning is out of MVP scope; these are manually revisited config.
 
 Exit Intelligence (break_even_trigger_pct/trailing_atr_multiplier/max_hold_days)
 and Portfolio Optimization (max_correlation_threshold) fields below are NOT
-part of that ported table -- new to this system, reasoned against each
-profile's existing personality (proportionate to stop_loss_pct/max_daily_trades),
-not backtested. Flag for revisiting once outcome-attribution data exists.
+part of that ported table -- new to this system. See
+docs/exit-intelligence-portfolio-optimization-calibration.md for the full
+empirical grounding pass (real historical Alpaca data, not simulated P&L):
+max_correlation_threshold below is set from real pairwise correlation
+percentiles across the default universe; trailing_atr_multiplier was
+validated against real ATR% distributions and kept unchanged;
+break_even_trigger_pct and max_hold_days remain reasoned judgment calls (no
+clean market-statistic answers "how much gain to lock in" or "how long is
+too long without a real backtest/paper-trade dataset) -- flagged for
+revisiting once Outcome Attribution has real trade outcomes.
 """
 
 from __future__ import annotations
@@ -30,7 +37,9 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         options_premium_stop_pct=Decimal("45"), options_expiry_min_days=14, options_expiry_max_days=30,
         options_target_otm_pct=Decimal("5"), options_forced_close_days_before_expiry=2,
         break_even_trigger_pct=Decimal("6"), trailing_atr_multiplier=Decimal("3.0"), max_hold_days=10,
-        max_correlation_threshold=Decimal("0.85"),
+        # ~p95 of real equity pairwise |correlation| across the default
+        # universe -- see docs/exit-intelligence-portfolio-optimization-calibration.md
+        max_correlation_threshold=Decimal("0.75"),
     ),
     "balanced": RiskLimits(
         profile_id="balanced",
@@ -43,7 +52,8 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         options_premium_stop_pct=Decimal("35"), options_expiry_min_days=21, options_expiry_max_days=45,
         options_target_otm_pct=Decimal("3"), options_forced_close_days_before_expiry=2,
         break_even_trigger_pct=Decimal("4"), trailing_atr_multiplier=Decimal("2.5"), max_hold_days=15,
-        max_correlation_threshold=Decimal("0.75"),
+        # ~p90 -- catches JPM/BAC-level (0.82) sector concentration
+        max_correlation_threshold=Decimal("0.65"),
     ),
     "conservative": RiskLimits(
         profile_id="conservative",
@@ -56,7 +66,8 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         options_premium_stop_pct=Decimal("25"), options_expiry_min_days=30, options_expiry_max_days=60,
         options_target_otm_pct=Decimal("1.5"), options_forced_close_days_before_expiry=3,
         break_even_trigger_pct=Decimal("2.5"), trailing_atr_multiplier=Decimal("2.0"), max_hold_days=30,
-        max_correlation_threshold=Decimal("0.65"),
+        # ~p85 -- catches AAPL/MSFT-level (0.55) relatedness, most cautious
+        max_correlation_threshold=Decimal("0.55"),
     ),
     "micro": RiskLimits(
         profile_id="micro",
@@ -69,7 +80,8 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         options_premium_stop_pct=Decimal("40"), options_expiry_min_days=14, options_expiry_max_days=35,
         options_target_otm_pct=Decimal("4"), options_forced_close_days_before_expiry=2,
         break_even_trigger_pct=Decimal("3"), trailing_atr_multiplier=Decimal("2.5"), max_hold_days=12,
-        max_correlation_threshold=Decimal("0.75"),
+        # same posture as balanced -- ~p90
+        max_correlation_threshold=Decimal("0.65"),
     ),
 }
 
