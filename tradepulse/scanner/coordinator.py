@@ -179,15 +179,19 @@ async def _classify_lane_regime(market_data: AlpacaMarketDataProvider, asset_cla
         (fetch_candles's own MIN_CANDLES=30 gate already raises
         ProviderDataFailure for that case -- same except clause, same
         underlying cause class: the provider couldn't supply usable bars).
-      - (ValueError, decimal.InvalidOperation) -- a malformed numeric field
-        in Alpaca's raw bars response. broker/alpaca_client.py::get_bars's
-        own RawBar parsing calls bare Decimal(str(value)) (unguarded --
-        raises decimal.InvalidOperation on non-numeric input), and
-        Candle.__post_init__ raises DomainValidationError (a ValueError
-        subclass) or a bare ValueError ("high cannot be below low") for a
-        semantically invalid bar. Both are real, reachable exception types
-        from a malformed broker response -- distinct from a clean
-        provider-level failure.
+      - (ValueError, decimal.InvalidOperation) -- defense-in-depth, not the
+        primary guard: providers/alpaca_market_data.py::fetch_candles now
+        normalizes a malformed numeric bar field (get_bars's own bare
+        Decimal(str(value)), raising decimal.InvalidOperation) or a
+        semantically invalid bar (Candle.__post_init__, e.g. high < low)
+        into ProviderDataFailure itself, so this branch should already be
+        unreachable in practice -- the `except ProviderError` clause above
+        catches it first, reported as "benchmark_fetch_failed" rather than
+        the more specific "benchmark_data_invalid" this branch would give.
+        Kept as a second layer rather than removed, matching this
+        function's own `except Exception` precedent below -- this
+        orchestration layer should not permanently depend on the provider
+        boundary staying correct forever.
       - Exception, scoped ONLY around the classify_regime call itself
         (never around the fetch) -- unreachable today: classify_regime
         never raises for insufficient/non-finite/invalid closes (Phase 1

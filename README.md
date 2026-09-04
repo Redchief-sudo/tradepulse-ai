@@ -78,3 +78,19 @@ If session activation is refused (`RISK_STOPPED`, `FINANCIAL_INTEGRITY_BLOCKED`,
 ## Status
 
 The core runtime (models, persistence, broker client, risk engine, execution gateway, settlement pipeline, AI-driven scan cycle gated by both AI and deterministic technical/momentum/risk signals, position monitor, broker reconciliation) is built and tested. The execution gateway and reconciliation share one canonical path (`execution/fill_attribution.py`) that creates every local `Fill`/`SettlementEvent` from Alpaca's real, validated per-fill activity ID -- never a locally-synthesized one -- whether attributed live during polling or recovered later by reconciliation for an order the live poll window already gave up on. Session start/stop/status is the sole, live authority for the trading session (`tradepulse/session_commands.py`), and equity market-hours enforcement is synchronized against Alpaca's own clock endpoint, not cron scheduling alone (`risk/session.py::sync_market_session`, plus an independent, always-fresh check at the execution submission boundary). The deterministic market-regime classifier (`strategy/regime.py::classify_regime`) is wired into production sizing: `scanner/coordinator.py` classifies one broad-market benchmark (SPY for equity/options, BTC/USD for crypto) per lane per scan cycle, and `risk/engine.py` scales the risk-based sizing budget by the resulting position multiplier -- never able to increase a position past any existing hard cap, and falling back to an explicit, conservative, truthfully-labeled "unavailable" multiplier (never a silent no-op) if the benchmark fetch or classification fails. Calibrated against real historical daily SPY/BTC-USD closes rather than the original 5-minute-bar assumption; see `docs/regime-classifier-phase1-calibration.md` for the full calibration record. This shipped 2026-09-01 and marks a new paper-trading sizing baseline -- every `TradeIntent.risk_snapshot` from this point on carries its regime provenance per trade. See `docs/` for the full audit history.
+
+### Ownership and provenance
+
+TradePulse is proprietary software created and developed by Damien Johnson Fisher.
+
+Copyright © 2025-2026 Damien Johnson Fisher. All rights reserved.
+
+Silvereyes Technologies, LLC is the associated company/publisher.
+
+Build and source provenance can be inspected using:
+
+```bash
+tradepulse provenance
+```
+
+which prints creator/copyright identity, the installed software version, the git commit, and a deterministic SHA-256 build fingerprint (`tradepulse/provenance.py`) -- requires no broker/AI credentials or active trading session. The same information is available at `GET /api/provenance` on the dashboard, and `tradepulse release-manifest` writes it to `release_manifest.json` for a given release. See `COPYRIGHT` at the repository root for the full notice, including third-party dependency terms.

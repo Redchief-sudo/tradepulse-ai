@@ -1,5 +1,6 @@
+import asyncio
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from tradepulse.config import risk_limits_for_profile
@@ -9,6 +10,7 @@ from tradepulse.models import (
     ExecutionMode,
     Fill,
     Holding,
+    PnlRecord,
     PortfolioSnapshot,
     Side,
     TradeIntent,
@@ -393,6 +395,25 @@ async def test_max_drawdown_uses_current_equity_as_peak_when_no_history(tmp_path
     assert check.peak_equity == Decimal("50000")
 
 
+async def test_max_drawdown_finds_a_real_peak_buried_behind_a_large_lower_history(tmp_path) -> None:
+    """Rev.83 RISK-002: check_max_drawdown used to scan list_all(limit=1000)
+    -- oldest-first -- so a genuine peak recorded AFTER 1000 older, lower
+    snapshots existed could fall outside that window and be missed
+    entirely, understating drawdown. Now max_by_json_field does one
+    full-table SQL aggregation, so the real peak is found regardless of
+    how much lower history exists."""
+    repositories = await _repositories(tmp_path)
+    await asyncio.gather(*(_seed_equity_snapshot(repositories, Decimal("50000"), f"old-snap-{i}") for i in range(1100)))
+    await _seed_equity_snapshot(repositories, Decimal("120000"), "real-peak")  # the genuine, higher, newer peak
+    limits = replace(LIMITS, max_drawdown_pct=Decimal("15"))
+
+    check = await check_max_drawdown(repositories, Decimal("105000"), limits)
+
+    assert check.peak_equity == Decimal("120000")
+    assert check.drawdown_pct == Decimal("12.5")
+    assert check.breached is False  # 12.5% < 15% limit -- would have wrongly read as 0% (or breached the wrong way) against the old $50000 "peak"
+
+
 def _aapl() -> AssetIdentity:
     return AssetIdentity("AAPL", AssetClass.EQUITY, "alpaca:AAPL")
 
@@ -542,6 +563,78 @@ async def test_trades_today_excludes_fills_from_a_prior_day(tmp_path) -> None:
     snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
 
     assert snapshot.trades_today == 1
+
+
+async def test_risk_day_boundary_is_exact_at_ny_midnight(tmp_path) -> None:
+    """NOW (2026-08-15T00:00:00+00:00) is 2026-08-14T20:00 EDT -- inside NY
+    risk-day Aug 14, which runs [2026-08-14T04:00 UTC, 2026-08-15T04:00 UTC).
+    A fill one second before that boundary counts; one exactly at/after it
+    does not."""
+    repositories = await _repositories(tmp_path)
+    just_before = datetime(2026, 8, 15, 3, 59, 59, tzinfo=UTC)
+    at_boundary = datetime(2026, 8, 15, 4, 0, 0, tzinfo=UTC)
+    await _seed_fill(repositories, fill_id="fill-in", trade_intent_id="ti-in", quantity=Decimal("5"), filled_at=just_before)
+    await _seed_fill(repositories, fill_id="fill-out", trade_intent_id="ti-out", quantity=Decimal("5"), filled_at=at_boundary)
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
+
+    assert snapshot.trades_today == 1
+
+
+async def test_risk_day_boundary_resolves_utc_vs_ny_session_mismatch(tmp_path) -> None:
+    """Rev.83 RISK-003: the risk day is now NY-midnight-to-NY-midnight, not
+    a UTC calendar day. A fill at 2026-08-14T12:00 UTC has UTC date()
+    2026-08-14, different from NOW's UTC date() (2026-08-15) -- the OLD
+    `f.filled_at.date() == now.date()` comparison would have wrongly
+    EXCLUDED it, even though it falls squarely inside the same NY trading
+    session as NOW (NY-day Aug 14 runs 04:00 UTC Aug 14 -> 04:00 UTC
+    Aug 15). Proves this is a real behavior change, not just a rename."""
+    repositories = await _repositories(tmp_path)
+    same_ny_day_different_utc_date = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
+    await _seed_fill(repositories, fill_id="fill-1", trade_intent_id="ti-1", quantity=Decimal("5"), filled_at=same_ny_day_different_utc_date)
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
+
+    assert snapshot.trades_today == 1  # old UTC-date comparison would have given 0
+
+
+async def test_trades_today_counts_one_trade_despite_a_large_partial_fill_backlog_in_the_window(tmp_path) -> None:
+    """A single TradeIntent with far more than 1000 partial Fill rows
+    inside one risk day still counts as exactly one trade -- both because
+    trades_today counts distinct trade_intent_id (Rev.81 fix) AND because
+    the fetch itself no longer truncates at any row count (Rev.83 fix)."""
+    repositories = await _repositories(tmp_path)
+
+    async def _seed(i: int) -> None:
+        await _seed_fill(repositories, fill_id=f"fill-{i}", trade_intent_id="ti-1", quantity=Decimal("0.001"), filled_at=NOW)
+
+    await asyncio.gather(*(_seed(i) for i in range(1100)))
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
+
+    assert snapshot.trades_today == 1
+
+
+async def _seed_pnl(repositories: PersistenceRepositories, *, record_id: str, realized: Decimal, as_of: datetime) -> None:
+    record = PnlRecord(record_id, _aapl(), realized, Decimal("0"), as_of)
+    await repositories.pnl_records.create_once(record_id, record)
+
+
+async def test_daily_realized_sums_exactly_over_a_large_backlog_in_the_window(tmp_path) -> None:
+    """Rev.83: daily_realized's fetch is no longer list_all(limit=1000) --
+    proves a window containing far more than 1000 PnL records is summed
+    completely, and the sum stays an exact Decimal (never a lossy float
+    round-trip through SQL aggregation)."""
+    repositories = await _repositories(tmp_path)
+
+    async def _seed(i: int) -> None:
+        await _seed_pnl(repositories, record_id=f"pnl-{i}", realized=Decimal("0.01"), as_of=NOW)
+
+    await asyncio.gather(*(_seed(i) for i in range(1100)))
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), account_equity=Decimal("100000"), now=NOW)
+
+    assert snapshot.daily_pnl_pct == (Decimal("1100") * Decimal("0.01") / Decimal("100000")) * 100
 
 
 async def test_pending_risk_approved_intent_reserves_capacity_for_the_next_snapshot(tmp_path) -> None:

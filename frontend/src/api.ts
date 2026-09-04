@@ -8,6 +8,7 @@ import type {
   Opportunity,
   PnlResponse,
   PortfolioSnapshot,
+  Provenance,
   ReconciliationRecord,
   ScanRun,
   SessionActionResult,
@@ -72,4 +73,6 @@ export const api = {
   getAuditEvents: (limit = 50) => get<AuditEvent[]>(`/api/audit-events?limit=${limit}`),
   getScanRuns: (limit = 20) => get<ScanRun[]>(`/api/scan-runs?limit=${limit}`),
   getAiResponse: (requestId: string) => get<AiResponse | null>(`/api/ai-responses/${requestId}`),
+
+  getProvenance: () => get<Provenance>('/api/provenance'),
 }

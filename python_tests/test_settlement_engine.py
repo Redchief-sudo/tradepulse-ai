@@ -812,3 +812,31 @@ async def test_current_stop_survives_settlement_rebuild_across_governing_lot_cha
     holding = hydrate("holdings", holding_row["payload"])
     assert holding.stop_loss == Decimal("95")  # governing lot changed to lot 2 -- proves the edge case is real, not a no-op
     assert holding.current_stop == Decimal("102")  # carried forward unchanged despite the rebuild
+
+
+async def test_process_pending_still_sees_a_new_pending_event_behind_a_large_completed_backlog(tmp_path) -> None:
+    """Rev.83 FIN-001: process_pending's fetch used to be
+    list_all(limit=1000) -- oldest-first across EVERY status, including
+    long-COMPLETED history. Once more than 1000 total settlement rows
+    existed, a new PENDING event could fall outside that oldest-1000
+    window and never be seen. Seeds a backlog comfortably larger than the
+    old threshold (1100 COMPLETED rows, cheap to seed since a COMPLETED
+    row needs no real settlement processing) plus one genuinely new
+    PENDING event, and proves it's still found and processed."""
+    repositories = await _repositories(tmp_path)
+
+    async def _seed_completed(i: int) -> None:
+        fill_id = f"old-fill-{i}"
+        event = SettlementEvent(f"old-se-{i}", fill_id, f"old-ti-{i}", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("1"), Decimal("100"), NOW - timedelta(days=1))
+        completed = replace(event, status=SettlementStatus.COMPLETED, integrity_verified=True)
+        await repositories.settlements.create_once(f"old-se-{i}", completed, status=completed.status.value, unique_value=fill_id)
+
+    await asyncio.gather(*(_seed_completed(i) for i in range(1100)))
+    await _seed_buy(repositories)  # the one genuinely new PENDING event (se-1, from the standard fixture)
+
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    summary = await processor.process_pending()
+
+    assert summary.completed == 1  # the new event was found and processed, not hidden behind 1100 older rows
+    event_row = await repositories.settlements.get("se-1")
+    assert event_row["status"] == SettlementStatus.COMPLETED.value

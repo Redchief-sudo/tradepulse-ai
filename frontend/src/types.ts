@@ -15,6 +15,19 @@ export type SessionState =
   | 'manually_stopped'
   | 'financial_integrity_blocked'
 
+export interface Provenance {
+  product_name: string
+  creator_name: string
+  copyright_owner: string
+  company_name: string
+  copyright_years: string
+  software_version: string
+  git_commit: string
+  build_timestamp: string
+  provenance_version: string
+  build_fingerprint: string
+}
+
 export interface TradingSession {
   session_id: string
   state: SessionState

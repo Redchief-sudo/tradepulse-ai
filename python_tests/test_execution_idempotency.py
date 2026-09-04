@@ -91,6 +91,28 @@ async def test_different_venue_sharing_symbol_and_class_is_unaffected(tmp_path) 
     assert await has_in_flight_intent(repositories, _aapl_other_venue()) is False
 
 
+async def test_in_flight_detection_is_correct_behind_a_large_non_blocking_backlog(tmp_path) -> None:
+    """Rev.83 RISK-001: has_in_flight_intent used to fetch list_all(limit=1000)
+    then filter in Python -- oldest-first, so a new blocking-status intent
+    for this exact asset could fall outside the oldest-1000 window and be
+    missed once enough history existed. Now a true SQL EXISTS check
+    (exists_with_status_and_asset), proven here against a backlog well
+    past the old threshold."""
+    repositories = await _repositories(tmp_path)
+
+    async def _seed(i: int) -> None:
+        intent = TradeIntent(
+            f"old-ti-{i}", f"old-idem-{i}", f"old-corr-{i}", _aapl(), Side.BUY, ExecutionMode.PAPER, "manual", NOW,
+            requested_quantity=Decimal("5"), status=TradeIntentStatus.FILLED,
+        )
+        await repositories.trade_intents.create_once(f"old-ti-{i}", intent, status=TradeIntentStatus.FILLED.value, unique_value=intent.idempotency_key)
+
+    await asyncio.gather(*(_seed(i) for i in range(1100)))  # same asset, non-blocking terminal status -- pure noise
+    await _seed_intent(repositories, TradeIntentStatus.ACCEPTED)  # the one genuinely blocking intent, "ti-1"
+
+    assert await has_in_flight_intent(repositories, _aapl()) is True
+
+
 def test_derive_idempotency_key_differs_across_asset_classes_sharing_ticker_text() -> None:
     equity_key = derive_idempotency_key("ai_scan", "decision-1", None, _aapl(), Side.BUY)
     crypto_key = derive_idempotency_key("ai_scan", "decision-1", None, _aapl_crypto(), Side.BUY)

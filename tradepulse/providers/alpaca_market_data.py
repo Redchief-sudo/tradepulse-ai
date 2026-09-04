@@ -7,6 +7,7 @@ ProviderError; none returns fabricated, zero-filled, or interpolated data.
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+from decimal import InvalidOperation
 
 from tradepulse.broker import AlpacaClient, AlpacaError
 from tradepulse.models import AssetIdentity, Candle, MarketQuote
@@ -50,6 +51,19 @@ class AlpacaMarketDataProvider:
         )
 
     async def fetch_candles(self, asset: AssetIdentity, lookback_days: int = 200) -> list[Candle]:
+        """Every failure path here raises ProviderError -- including
+        malformed data, not just transport/HTTP failures. Two narrow,
+        specific exception surfaces, verified against source (not
+        assumed): get_bars's own raw-bar parsing (broker/alpaca_client.py's
+        _decimal()/_decimal_or_none() helpers are bare Decimal(str(value)),
+        raising decimal.InvalidOperation on a non-numeric field) and
+        Candle.__post_init__ (raises DomainValidationError, a ValueError
+        subclass, e.g. "high cannot be below low"). Normalizing BOTH into
+        ProviderDataFailure here -- not leaving callers to independently
+        discover and catch them -- means every existing `except
+        ProviderError` in this codebase (scanner, correlation-ranking,
+        monitor, regime classifier) already handles a malformed bar
+        correctly, with no caller-side change needed."""
         end = datetime.now(UTC)
         # Calendar-day buffer for weekends/holidays so `lookback_days` trading
         # sessions actually fit in the requested window.
@@ -60,6 +74,11 @@ class AlpacaMarketDataProvider:
             )
         except AlpacaError as exc:
             raise ProviderHttpFailure("alpaca", asset.symbol, "fetch_candles", exc.status_code, exc.message) from exc
+        except (ValueError, InvalidOperation) as exc:
+            raise ProviderDataFailure(
+                "alpaca", asset.symbol, "fetch_candles", "ALPACA_BAR_MALFORMED",
+                f"malformed numeric field in bar response for {asset.symbol}: {exc}", retryable=False,
+            ) from exc
 
         if len(raw_bars) < MIN_CANDLES:
             raise ProviderDataFailure(
@@ -67,10 +86,16 @@ class AlpacaMarketDataProvider:
                 f"{asset.symbol} returned {len(raw_bars)} bars, need >= {MIN_CANDLES}", retryable=False,
             )
 
-        return [
-            Candle(date=bar.date, open=bar.open, high=bar.high, low=bar.low, close=bar.close, volume=bar.volume)
-            for bar in raw_bars
-        ]
+        try:
+            return [
+                Candle(date=bar.date, open=bar.open, high=bar.high, low=bar.low, close=bar.close, volume=bar.volume)
+                for bar in raw_bars
+            ]
+        except (ValueError, InvalidOperation) as exc:
+            raise ProviderDataFailure(
+                "alpaca", asset.symbol, "fetch_candles", "ALPACA_BAR_INVALID",
+                f"semantically invalid bar for {asset.symbol}: {exc}", retryable=False,
+            ) from exc
 
     async def fetch_option_chain(
         self, underlying_symbol: str, min_dte: int, max_dte: int, now: date

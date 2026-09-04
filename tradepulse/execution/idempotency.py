@@ -7,7 +7,7 @@ symbol-level coordination that didn't exist in the audited source.
 from __future__ import annotations
 
 from tradepulse.models import AssetIdentity, Side, TradeIntentStatus, asset_identity_key
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate, release_lock
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, release_lock
 
 # Defined here (not in gateway.py, which imports from this module) to avoid a
 # circular import -- gateway.py imports IN_FLIGHT_STATUSES from here instead.
@@ -52,16 +52,16 @@ async def has_in_flight_intent(repositories: PersistenceRepositories, asset: Ass
     opposite sides. Callers must hold the asset's execution reservation
     while calling this -- checking it alone, without the reservation, would
     reopen the exact check-then-submit race the reservation exists to
-    close. Matches via asset_identity_key (asset class + venue + native ID),
-    not display symbol alone -- two economically distinct instruments must
-    never be treated as the same asset just because they share ticker text."""
-    rows = await repositories.trade_intents.list_all(limit=1000)
-    blocking = {status.value for status in IN_FLIGHT_STATUSES} | {TradeIntentStatus.SUBMISSION_UNKNOWN.value}
-    target_key = asset_identity_key(asset)
-    return any(
-        row["status"] in blocking and asset_identity_key(hydrate("trade_intents", row["payload"]).asset) == target_key
-        for row in rows
-    )
+    close. Matches via asset_identity_key's own composition (asset class +
+    venue + native ID), not display symbol alone -- two economically
+    distinct instruments must never be treated as the same asset just
+    because they share ticker text.
+
+    A true SQL EXISTS check (repositories.trade_intents.exists_with_status_and_asset),
+    not a fetch-then-filter -- correct regardless of how much trade_intent
+    history exists, never a row-count blind spot."""
+    blocking = [status.value for status in IN_FLIGHT_STATUSES] + [TradeIntentStatus.SUBMISSION_UNKNOWN.value]
+    return await repositories.trade_intents.exists_with_status_and_asset(blocking, asset)
 
 
 def execution_lock_key(asset: AssetIdentity) -> str:

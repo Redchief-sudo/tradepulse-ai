@@ -14,9 +14,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from tradepulse.models import (
     AssetClass,
@@ -27,7 +28,23 @@ from tradepulse.models import (
     asset_identity_key,
     contract_multiplier_of,
 )
-from tradepulse.persistence import PersistenceRepositories, hydrate
+from tradepulse.persistence import PersistenceRepositories, hydrate, list_all_by_json_time_range, list_all_by_statuses
+
+# Risk-day boundary for trades_today/daily_realized (resolves the previous
+# UTC-calendar-day simplification): a single NY-midnight-to-NY-midnight
+# window, DST-aware, applied uniformly across the whole account regardless
+# of asset class. max_daily_trades/daily_pnl_pct are already single
+# account-wide limits spanning equity+crypto+options together in one
+# PortfolioSnapshot -- splitting the day boundary per asset class would mean
+# two different "days" governing one shared counter, which doesn't resolve
+# cleanly under that single-cap architecture. Matches this module's own
+# prior nyDayStart()-referencing comment rather than inventing a new policy.
+_NY_TZ = ZoneInfo("America/New_York")
+
+
+def _risk_day_bounds(now: datetime) -> tuple[datetime, datetime]:
+    ny_midnight = now.astimezone(_NY_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    return ny_midnight.astimezone(UTC), (ny_midnight + timedelta(days=1)).astimezone(UTC)
 
 
 def _round_qty(qty: Decimal, asset_class: AssetClass) -> Decimal:
@@ -341,9 +358,10 @@ async def build_portfolio_snapshot(
     ticker-shaped symbol can be shared by economically distinct instruments,
     so the caller (see execution/gateway.py) must build it the same way.
 
-    Note: "today" is the caller's UTC calendar day, not an NY-session
-    trading day -- a known simplification versus the audited system's
-    nyDayStart() handling, acceptable for MVP scope.
+    "today" is a single NY-midnight-to-NY-midnight risk day (see
+    _risk_day_bounds), applied uniformly across the whole account
+    regardless of asset class -- resolves the prior UTC-calendar-day
+    simplification.
     """
     now = now or datetime.now(UTC)
     mark_prices = mark_prices or {}
@@ -360,7 +378,16 @@ async def build_portfolio_snapshot(
         sector = holding.sector or "Other"
         sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + notional
 
-    intent_rows = await repositories.trade_intents.list_all(limit=1000)
+    # Status-filtered, unbounded pagination -- NOT list_all(limit=1000),
+    # which is oldest-first and can silently undercount pending exposure
+    # once 1000 older (any-status) trade_intents exist. See
+    # persistence/repositories.py::list_all_by_statuses.
+    _pending_notional_statuses = [
+        TradeIntentStatus.RISK_APPROVED.value, TradeIntentStatus.SUBMITTED.value,
+        TradeIntentStatus.ACCEPTED.value, TradeIntentStatus.PARTIALLY_FILLED.value,
+        TradeIntentStatus.SUBMISSION_UNKNOWN.value,
+    ]
+    intent_rows = await list_all_by_statuses(repositories.trade_intents, _pending_notional_statuses)
 
     # Pending-intent notional reservation: capital already committed by an
     # approved-but-not-yet-settled TradeIntent must count as exposure too,
@@ -370,14 +397,7 @@ async def build_portfolio_snapshot(
     # settled into the holdings table" and independently approves capital
     # that's already spoken for. The RISK_APPROVED row itself IS the
     # durable reservation -- no separate ledger needed.
-    _pending_notional_statuses = {
-        TradeIntentStatus.RISK_APPROVED.value, TradeIntentStatus.SUBMITTED.value,
-        TradeIntentStatus.ACCEPTED.value, TradeIntentStatus.PARTIALLY_FILLED.value,
-        TradeIntentStatus.SUBMISSION_UNKNOWN.value,
-    }
     for row in intent_rows:
-        if row["status"] not in _pending_notional_statuses:
-            continue
         intent = hydrate("trade_intents", row["payload"])
         # requested_quantity is overwritten with the RISK-APPROVED (possibly
         # downsized) quantity once past PROPOSED -- see execution/gateway.py's
@@ -405,21 +425,29 @@ async def build_portfolio_snapshot(
     }
     outstanding_orders = sum(1 for row in intent_rows if row["status"] in outstanding_values)
 
-    fill_rows = await repositories.fills.list_all(limit=1000)
+    risk_day_start, risk_day_end = _risk_day_bounds(now)
+    # Time-window query, unbounded pagination -- NOT list_all(limit=1000)
+    # filtered by now.date() in Python. A single economic trade can produce
+    # many partial-fill rows (confirmed live: one order filled in 5
+    # pieces), so "a day's rows are under 1000" is not a safe assumption;
+    # this fetches every fill in the risk day regardless of row count.
+    fill_rows = await list_all_by_json_time_range(repositories.fills, "filled_at", risk_day_start, risk_day_end)
     fills = [hydrate("fills", row["payload"]) for row in fill_rows]
-    today = now.date()
     # Distinct trades, not fill rows -- a single order can fill in several
-    # partial broker fills (confirmed live: one order filled in 5 pieces),
-    # which must count once against max_daily_trades, not once per fill.
-    trades_today = len({f.trade_intent_id for f in fills if f.filled_at.date() == today})
+    # partial broker fills, which must count once against max_daily_trades,
+    # not once per fill.
+    trades_today = len({f.trade_intent_id for f in fills})
 
     if broker_prev_close_equity and broker_prev_close_equity > 0 and account_equity and account_equity > 0:
         daily_pnl_pct = ((account_equity - broker_prev_close_equity) / broker_prev_close_equity) * 100
         source = "broker"
     else:
-        pnl_rows = await repositories.pnl_records.list_all(limit=1000)
+        pnl_rows = await list_all_by_json_time_range(repositories.pnl_records, "as_of", risk_day_start, risk_day_end)
         pnl_records = [hydrate("pnl_records", row["payload"]) for row in pnl_rows]
-        daily_realized = sum((p.realized for p in pnl_records if p.as_of.date() == today), Decimal("0"))
+        # Exact Decimal sum over every persisted record in the window --
+        # never a SQL SUM/AVG aggregate, which would force a lossy float
+        # round-trip on a financial total.
+        daily_realized = sum((p.realized for p in pnl_records), Decimal("0"))
         daily_pnl_pct = (daily_realized / total_equity) * 100 if total_equity > 0 else Decimal("0")
         source = "holdings"
 
@@ -443,12 +471,17 @@ async def check_max_drawdown(
 ) -> DrawdownCheck:
     if not limits.max_drawdown_pct or limits.max_drawdown_pct <= 0:
         return DrawdownCheck(False, None, None, limits.max_drawdown_pct)
-    rows = await repositories.equity_snapshots.list_all(limit=1000)
+    # A genuine all-time-peak search, not a row-capped scan -- SQL finds the
+    # single largest-total_equity row directly (see
+    # persistence/repositories.py::max_by_json_field), so a real historical
+    # peak can never be missed just because the equity_snapshots table has
+    # grown past some fixed limit.
+    peak_row = await repositories.equity_snapshots.max_by_json_field("total_equity")
     peak = current_equity
-    for row in rows:
-        equity = Decimal(str(row["payload"]["total_equity"]))
-        if equity > peak:
-            peak = equity
+    if peak_row is not None:
+        historical_peak = Decimal(str(peak_row["payload"]["total_equity"]))
+        if historical_peak > peak:
+            peak = historical_peak
     if peak <= 0:
         return DrawdownCheck(False, None, peak, limits.max_drawdown_pct)
     drawdown_pct = ((peak - current_equity) / peak) * 100

@@ -348,6 +348,30 @@ async def test_scan_runs_route_still_returns_universe_size_and_ai_response_reque
 
 
 @respx.mock
+async def test_get_provenance_exposes_only_approved_non_sensitive_fields(tmp_path) -> None:
+    """No repositories/broker involved -- must work without any of the
+    mocks the other routes need, and must never leak credentials or
+    environment contents."""
+    client, state = await _client_for(tmp_path)
+
+    response = await client.get("/api/provenance")
+    await client.aclose()
+    await state.broker.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {
+        "product_name", "creator_name", "copyright_owner", "company_name", "copyright_years",
+        "software_version", "git_commit", "build_timestamp", "provenance_version", "build_fingerprint",
+    }
+    assert body["creator_name"] == "Damien Johnson Fisher"
+    assert body["company_name"] == "Silvereyes Technologies, LLC"
+    # The exact-keys assertion above IS the whitelist proof -- no field
+    # beyond the approved 10 exists to leak a credential through in the
+    # first place (this route never even receives Settings/broker state).
+
+
+@respx.mock
 async def test_get_rejected_candidates_returns_hydrated_recent_rows(tmp_path) -> None:
     client, state = await _client_for(tmp_path)
     rejection = RejectedCandidate(

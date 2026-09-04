@@ -51,7 +51,7 @@ from tradepulse.models import (
     contract_multiplier_of,
     fold_price_extremum,
 )
-from tradepulse.persistence import PersistenceRepositories, hydrate
+from tradepulse.persistence import PersistenceRepositories, hydrate, list_all_by_statuses
 from tradepulse.risk import latch_financial_integrity_block
 
 from .lots import IntegrityViolationError, plan_signed_lot_fill
@@ -457,7 +457,15 @@ class SettlementProcessor:
         lease_lost: asyncio.Event | None = None,
     ) -> SettlementBatchSummary:
         now = self._clock()
-        rows = await self._repositories.settlements.list_all(limit=1000)
+        # Status-filtered, unbounded pagination -- NOT list_all(limit=1000),
+        # which is oldest-first and silently loses visibility into new
+        # pending settlements once 1000 older (any-status, including
+        # long-completed) rows exist. A genuinely large unresolved backlog
+        # is still fully seen; see persistence/repositories.py::list_all_by_statuses.
+        rows = await list_all_by_statuses(
+            self._repositories.settlements,
+            [SettlementStatus.PENDING.value, SettlementStatus.RETRYABLE_FAILED.value, SettlementStatus.PROCESSING.value],
+        )
         events = [hydrate("settlements", row["payload"]) for row in rows]
         due = sorted(
             (e for e in events if is_settlement_processable(e, now, stale_lease_seconds, force_retry)),
@@ -525,8 +533,16 @@ class SettlementProcessor:
                     )
                     await latch_financial_integrity_block(self._repositories, reason, clock=self._clock)
 
-        refreshed_rows = await self._repositories.settlements.list_all(limit=1000)
-        unresolved = [row for row in refreshed_rows if row.get("status") != SettlementStatus.COMPLETED.value]
+        # Same unbounded-pagination fix -- "unresolved" is every non-COMPLETED
+        # status, expressed directly rather than re-scanning the whole table
+        # (including old COMPLETED rows) and filtering them out in Python.
+        unresolved = await list_all_by_statuses(
+            self._repositories.settlements,
+            [
+                SettlementStatus.PENDING.value, SettlementStatus.PROCESSING.value, SettlementStatus.RETRYABLE_FAILED.value,
+                SettlementStatus.INTEGRITY_BLOCKED.value, SettlementStatus.TERMINAL_FAILED.value,
+            ],
+        )
         pending = sum(1 for row in unresolved if row.get("status") in (SettlementStatus.PENDING.value, SettlementStatus.PROCESSING.value))
 
         return SettlementBatchSummary(

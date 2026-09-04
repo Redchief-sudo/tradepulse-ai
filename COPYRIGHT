@@ -1,0 +1,17 @@
+Copyright © 2025-2026 Damien Johnson Fisher.
+All rights reserved.
+
+TradePulse is proprietary software created and developed by Damien Johnson Fisher.
+
+Company / Publisher:
+Silvereyes Technologies, LLC
+
+The original TradePulse source code, architecture, documentation, user interface, trading-system implementation, and related proprietary materials are copyrighted by Damien Johnson Fisher unless otherwise identified.
+
+Unauthorized reproduction, redistribution, publication, sublicensing, commercial resale, or creation of unauthorized derivative works is prohibited except where expressly authorized in writing or permitted by applicable law.
+
+Third-party software, libraries, APIs, algorithms, and other externally licensed materials remain the property of their respective owners and are governed by their respective licenses and terms. This project depends on (without vendoring or redistributing source from) open-source packages including httpx, FastAPI, uvicorn, pytest, React, and Vite -- see pyproject.toml and frontend/package.json for the complete dependency lists, and each package's own project for its license terms.
+
+Build and source provenance can be inspected using:
+
+    tradepulse provenance

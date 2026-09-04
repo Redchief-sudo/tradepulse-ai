@@ -995,11 +995,16 @@ async def test_regime_benchmark_insufficient_history_also_falls_back_to_unavaila
 
 
 @respx.mock
-async def test_regime_benchmark_malformed_data_falls_back_to_unavailable_with_distinct_reason(tmp_path) -> None:
+async def test_regime_benchmark_malformed_data_falls_back_to_unavailable(tmp_path) -> None:
     """A non-numeric field in Alpaca's raw bars response (get_bars's own
     unguarded Decimal(str(value)) parsing raises decimal.InvalidOperation)
-    -- distinct, truthful reason from a clean HTTP/provider-level failure,
-    never a blanket except swallowing both into the same label."""
+    -- providers/alpaca_market_data.py::fetch_candles now normalizes this
+    into ProviderDataFailure (a ProviderError) at the provider boundary
+    (Rev.83 REL-001 fix), so it surfaces here as the same
+    "benchmark_fetch_failed" reason as a clean HTTP failure -- still an
+    explicit, truthful, PERSISTED "unavailable" state, never a silent
+    no-op, just no longer a separately-distinguishable reason for this
+    specific case (see _classify_lane_regime's own docstring)."""
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_market_open()
@@ -1019,7 +1024,7 @@ async def test_regime_benchmark_malformed_data_falls_back_to_unavailable_with_di
     scan_row = await repositories.scan_runs.get(summary.scan_run_id)
     scan_run = hydrate("scan_runs", scan_row["payload"])
     assert scan_run.regime == "unavailable"
-    assert scan_run.regime_reason == "benchmark_data_invalid"
+    assert scan_run.regime_reason == "benchmark_fetch_failed"
     assert scan_run.regime_position_multiplier == REGIME_UNAVAILABLE_MULTIPLIER
 
 

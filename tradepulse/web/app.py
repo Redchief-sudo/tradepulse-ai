@@ -33,6 +33,7 @@ from tradepulse.config import Settings
 from tradepulse.models import asset_key_from_broker_symbol
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.persistence.codec import encode_payload
+from tradepulse.provenance import get_provenance
 from tradepulse.providers import AlpacaMarketDataProvider, resolve_market_data_capabilities
 from tradepulse.risk import build_portfolio_snapshot, load_session
 from tradepulse.session_commands import build_broker, run_reset_integrity, run_reset_risk, run_start, run_stop
@@ -80,6 +81,14 @@ class ResetIntegrityRequest(BaseModel):
 def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
     app = FastAPI(title="TradePulse Dashboard")
     app.state.tp = state
+
+    # ---- Ownership/build provenance ---------------------------------------
+    # Pure metadata, never consulted by any trading/risk/session decision --
+    # needs no repositories, broker, or session state. See tradepulse/provenance.py.
+
+    @app.get("/api/provenance")
+    async def get_provenance_route(request: Request) -> Response:
+        return _json(get_provenance())
 
     # ---- Session control -------------------------------------------------
 

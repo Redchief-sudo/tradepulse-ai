@@ -163,14 +163,16 @@ async def _fetch_atr(market_data: AlpacaMarketDataProvider, asset: AssetIdentity
     except ProviderError:
         return None
     except (ValueError, InvalidOperation):
-        # A malformed numeric field in Alpaca's raw bar response (bare
-        # Decimal(str(value)) in broker/alpaca_client.py::get_bars) or a
-        # semantically invalid bar (Candle.__post_init__, e.g. high < low)
-        # -- both raised from inside fetch_candles itself, neither a
-        # ProviderError. Same exception surface _classify_lane_regime
-        # already guards against; degrading to "skip this cycle's trailing
-        # update" here matters more, since _supervised_lane never restarts
-        # a lane after an unhandled exception.
+        # Defense-in-depth, not the primary guard anymore: fetch_candles
+        # itself now normalizes a malformed numeric bar field or a
+        # semantically invalid bar (e.g. high < low) into ProviderDataFailure
+        # (a ProviderError), so the except ProviderError clause above should
+        # already catch this in practice. Kept as a second layer -- same
+        # redundant-guard precedent as _classify_lane_regime's own bare
+        # `except Exception` around classify_regime -- since _supervised_lane
+        # never restarts a lane after an unhandled exception, this one
+        # matters enough not to depend solely on the provider boundary
+        # staying correct forever.
         return None
     value = atr([float(c.high) for c in candles], [float(c.low) for c in candles], [float(c.close) for c in candles])
     return Decimal(str(value)) if value is not None else None

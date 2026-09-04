@@ -83,6 +83,7 @@ from tradepulse.persistence import (
     release_lock,
     run_with_lock_renewal,
 )
+from tradepulse.provenance import Provenance, get_provenance
 from tradepulse.providers import (
     AIProvider,
     AlpacaMarketDataProvider,
@@ -830,6 +831,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--port", type=int, default=8000, help="port to bind the dashboard on 127.0.0.1 (default: 8000)")
     run_parser.add_argument("--no-browser", action="store_true", help="don't automatically open the dashboard in a browser")
+    subparsers.add_parser(
+        "provenance",
+        help="print TradePulse ownership/build-provenance metadata (creator, copyright, version, git commit, "
+        "build fingerprint) and exit -- needs no broker/AI credentials or active trading session",
+    )
+    manifest_parser = subparsers.add_parser(
+        "release-manifest", help="write release_manifest.json (provenance metadata for one release/build) and exit"
+    )
+    manifest_parser.add_argument("--out", type=Path, default=Path("release_manifest.json"), help="output path (default: ./release_manifest.json)")
+    manifest_parser.add_argument(
+        "--archive", type=Path, default=None,
+        help="optional path to a packaged release archive -- if given, its SHA-256 is included in the manifest",
+    )
     return parser
 
 
@@ -855,8 +869,61 @@ def _load_dotenv(path: Path = Path(".env")) -> None:
             environ.setdefault(key, value.strip().strip('"').strip("'"))
 
 
+def _print_provenance(provenance: Provenance) -> None:
+    print(provenance.product_name)
+    print(f"Creator: {provenance.creator_name}")
+    print(f"Copyright Owner: {provenance.copyright_owner}")
+    print(f"Company: {provenance.company_name}")
+    print(f"Copyright: © {provenance.copyright_years} {provenance.copyright_owner}")
+    print(f"Version: {provenance.software_version}")
+    print(f"Commit: {provenance.git_commit}")
+    print(f"Provenance Version: {provenance.provenance_version}")
+    print(f"Build Fingerprint: {provenance.build_fingerprint}")
+
+
+def _write_release_manifest(out: Path, archive: Path | None) -> None:
+    """A named, generate-on-demand mechanism (not auto-run on every build) --
+    matches item 8's own instruction not to auto-commit generated manifests.
+    Never writes machine-specific paths; `archive` (if given) is hashed but
+    never has its own path embedded in the manifest content."""
+    import hashlib as _hashlib
+    import json as _json
+
+    provenance = get_provenance()
+    manifest: dict[str, Any] = {
+        "product_name": provenance.product_name,
+        "creator_name": provenance.creator_name,
+        "copyright_owner": provenance.copyright_owner,
+        "company_name": provenance.company_name,
+        "copyright_years": provenance.copyright_years,
+        "software_version": provenance.software_version,
+        "git_commit": provenance.git_commit,
+        "build_timestamp": provenance.build_timestamp,
+        "provenance_version": provenance.provenance_version,
+        "build_fingerprint": provenance.build_fingerprint,
+        "archive_sha256": None,
+    }
+    if archive is not None:
+        digest = _hashlib.sha256()
+        with archive.open("rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                digest.update(chunk)
+        manifest["archive_sha256"] = digest.hexdigest()
+    out.write_text(_json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {out}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    # Provenance/release-manifest are pure ownership/build metadata -- no
+    # broker/AI credentials, database, or trading session required, so they
+    # bypass Settings.from_env() entirely rather than depend on it succeeding.
+    if args.command == "provenance":
+        _print_provenance(get_provenance())
+        return 0
+    if args.command == "release-manifest":
+        _write_release_manifest(args.out, args.archive)
+        return 0
     _load_dotenv()
     try:
         settings = Settings.from_env()

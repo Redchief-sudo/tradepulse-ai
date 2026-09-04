@@ -14,6 +14,15 @@ class DatabaseError(RuntimeError):
     """Persistence failure that callers must classify explicitly."""
 
 
+class RepositoryPaginationError(DatabaseError):
+    """A keyset pagination cursor failed to strictly advance between pages
+    -- a bug or a (created_at, record_id) collision, either way a signal
+    that the result set may be incomplete. Raised rather than silently
+    returning a partial page: financial-critical callers (settlement,
+    pending exposure, daily trade/PnL accounting) must never mistake a
+    truncated result for the complete unresolved/in-window set."""
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS opportunities (
   record_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL

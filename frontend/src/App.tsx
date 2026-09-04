@@ -2,6 +2,7 @@ import { AccountPanel } from './components/AccountPanel'
 import { AlertsPanel } from './components/AlertsPanel'
 import { CapabilityPanel } from './components/CapabilityPanel'
 import { FillsSettlementsPanel } from './components/FillsSettlementsPanel'
+import { Footer } from './components/Footer'
 import { OpportunitiesPanel } from './components/OpportunitiesPanel'
 import { PendingOrdersPanel } from './components/PendingOrdersPanel'
 import { PnlPanel } from './components/PnlPanel'
@@ -30,6 +31,7 @@ function App() {
         <FillsSettlementsPanel />
         <AlertsPanel />
       </div>
+      <Footer />
     </div>
   )
 }
