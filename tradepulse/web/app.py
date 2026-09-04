@@ -161,11 +161,16 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
         s = _state(request)
         try:
             account = await s.broker.get_account()
+            positions = await s.broker.get_positions()
         except (AlpacaError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=503, detail=f"BROKER_UNAVAILABLE: {exc}") from exc
+        # Same broker truth as execution/gateway.py -- current market value,
+        # not stale local cost basis. Without this, holdings_value silently
+        # fell back to average_price (see risk/engine.py::build_portfolio_snapshot).
+        mark_prices = {asset_key_from_broker_symbol(p.asset_class, p.symbol): p.current_price for p in positions}
         snapshot = await build_portfolio_snapshot(
             s.repositories, cash_balance=account.cash, account_equity=account.equity,
-            broker_prev_close_equity=account.last_equity,
+            broker_prev_close_equity=account.last_equity, mark_prices=mark_prices,
         )
         return _json(snapshot)
 

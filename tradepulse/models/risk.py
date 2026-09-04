@@ -54,6 +54,13 @@ class RiskLimits:
     # correlation of daily returns at/above which a candidate is demoted below
     # non-correlated peers in this cycle's ranking -- never a hard reject.
     max_correlation_threshold: Decimal = Decimal("0.75")
+    # Crypto's own real pairwise |correlation| runs far above equity's (median
+    # ~0.67 vs ~0.20 -- see docs/exit-intelligence-portfolio-optimization-calibration.md)
+    # -- reusing max_correlation_threshold's equity-derived value would flag
+    # ordinary crypto co-movement (e.g. BTC/ETH) as "concentrated" by default.
+    # Mirrors the equity/crypto split _CALENDAR_THRESHOLDS already uses in
+    # strategy/regime.py for volatility.
+    max_correlation_threshold_crypto: Decimal = Decimal("0.80")
     # Options lane (see scanner/coordinator.py's options branch, risk/engine.py's
     # premium-based stop): stop-loss is a flat pct of entry premium, not
     # ATR-on-underlying; contract selection targets an expiry window and an
@@ -74,6 +81,7 @@ class RiskLimits:
             "atr_stop_multiplier", "min_stop_distance_pct", "max_stop_distance_pct",
             "options_premium_stop_pct", "options_target_otm_pct",
             "break_even_trigger_pct", "trailing_atr_multiplier", "max_correlation_threshold",
+            "max_correlation_threshold_crypto",
         ):
             object.__setattr__(self, name, decimal_value(getattr(self, name), name, nonnegative=True))
         for name in ("max_daily_trades", "max_open_positions", "max_simultaneous_orders"):
@@ -91,3 +99,5 @@ class RiskLimits:
             raise ValueError("options_expiry_min_days must not exceed options_expiry_max_days")
         if self.max_correlation_threshold > 1:
             raise ValueError("max_correlation_threshold must not exceed 1 (a Pearson correlation coefficient)")
+        if self.max_correlation_threshold_crypto > 1:
+            raise ValueError("max_correlation_threshold_crypto must not exceed 1 (a Pearson correlation coefficient)")

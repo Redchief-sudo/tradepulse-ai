@@ -87,6 +87,16 @@ def test_risk_limits_reject_out_of_range_confidence() -> None:
         )
 
 
+def test_risk_limits_reject_out_of_range_correlation_thresholds() -> None:
+    from dataclasses import replace
+
+    from tradepulse.config import risk_limits_for_profile
+
+    balanced = risk_limits_for_profile("balanced")
+    with pytest.raises(ValueError, match="max_correlation_threshold_crypto"):
+        replace(balanced, max_correlation_threshold_crypto=Decimal("1.5"))
+
+
 def test_portfolio_snapshot_requires_known_source() -> None:
     with pytest.raises(ValueError, match="source"):
         PortfolioSnapshot(

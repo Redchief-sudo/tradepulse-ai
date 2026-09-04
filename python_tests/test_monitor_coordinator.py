@@ -353,6 +353,57 @@ async def test_atr_fetch_failure_degrades_gracefully_break_even_still_applies(tm
 
 
 @respx.mock
+async def test_atr_fetch_degrades_gracefully_on_malformed_numeric_bar_field(tmp_path) -> None:
+    """Rev.81 Finding 4: broker/alpaca_client.py::get_bars's own raw-bar
+    parsing is bare Decimal(str(value)) -- a non-numeric field raises
+    decimal.InvalidOperation, which is NOT a ProviderError and must not
+    propagate out of _fetch_atr (cli.py::_supervised_lane never restarts a
+    lane after an unhandled exception -- this would permanently kill the
+    position monitor)."""
+    repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
+    await _seed_holding(repositories, target_price="999")
+    await _seed_lot(repositories, mfe_price="170")
+    _mock_positions(qty="10", current_price="160")
+    bars = _bars_json([150.0] * 40)
+    bars["bars"][0]["h"] = "not-a-number"
+    respx.get("https://data.alpaca.markets/v2/stocks/AAPL/bars").mock(return_value=httpx.Response(200, json=bars))
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    summary = await run_position_monitor(repositories, broker, market_data, gateway, alerts, LIMITS, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.status == "ok"
+    assert summary.positions_checked == 1
+    holding = await _get_holding(repositories)
+    assert holding.current_stop == Decimal("150")  # break-even only -- ATR trail silently skipped, not crashed
+
+
+@respx.mock
+async def test_atr_fetch_degrades_gracefully_on_semantically_invalid_bar(tmp_path) -> None:
+    """Rev.81 Finding 4: Candle.__post_init__ raises ValueError for a bar
+    where high < low -- constructed inside fetch_candles's own return
+    statement, outside any try/except there. Same must-not-propagate
+    requirement as the malformed-numeric-field case above."""
+    repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
+    await _seed_holding(repositories, target_price="999")
+    await _seed_lot(repositories, mfe_price="170")
+    _mock_positions(qty="10", current_price="160")
+    bars = _bars_json([150.0] * 40)
+    bars["bars"][0]["h"] = 100.0  # high below low -- Candle.__post_init__ rejects this
+    bars["bars"][0]["l"] = 200.0
+    respx.get("https://data.alpaca.markets/v2/stocks/AAPL/bars").mock(return_value=httpx.Response(200, json=bars))
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    summary = await run_position_monitor(repositories, broker, market_data, gateway, alerts, LIMITS, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.status == "ok"
+    assert summary.positions_checked == 1
+    holding = await _get_holding(repositories)
+    assert holding.current_stop == Decimal("150")  # break-even only -- ATR trail silently skipped, not crashed
+
+
+@respx.mock
 async def test_time_stop_fires_at_exactly_max_hold_days_not_one_day_before(tmp_path) -> None:
     repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
     await _seed_holding(repositories, stop_loss="100", target_price="999")  # comfortably un-breached

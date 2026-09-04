@@ -408,7 +408,10 @@ async def build_portfolio_snapshot(
     fill_rows = await repositories.fills.list_all(limit=1000)
     fills = [hydrate("fills", row["payload"]) for row in fill_rows]
     today = now.date()
-    trades_today = sum(1 for f in fills if f.filled_at.date() == today)
+    # Distinct trades, not fill rows -- a single order can fill in several
+    # partial broker fills (confirmed live: one order filled in 5 pieces),
+    # which must count once against max_daily_trades, not once per fill.
+    trades_today = len({f.trade_intent_id for f in fills if f.filled_at.date() == today})
 
     if broker_prev_close_equity and broker_prev_close_equity > 0 and account_equity and account_equity > 0:
         daily_pnl_pct = ((account_equity - broker_prev_close_equity) / broker_prev_close_equity) * 100

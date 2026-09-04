@@ -17,6 +17,16 @@ break_even_trigger_pct and max_hold_days remain reasoned judgment calls (no
 clean market-statistic answers "how much gain to lock in" or "how long is
 too long without a real backtest/paper-trade dataset) -- flagged for
 revisiting once Outcome Attribution has real trade outcomes.
+
+max_correlation_threshold_crypto (Rev.81 corrective round) is anchored to
+crypto's own real pairwise |correlation| distribution (10 pairs, 5 symbols
+-- small sample, explicitly weaker confidence than the equity thresholds
+above), not equity's percentile posture reused verbatim: crypto's median is
+~0.67, well above every equity-derived threshold except aggressive's, so a
+single global threshold was flagging ordinary crypto co-movement (e.g.
+BTC/ETH) as concentrated by default. See
+docs/exit-intelligence-portfolio-optimization-calibration.md's Finding 2
+addendum.
 """
 
 from __future__ import annotations
@@ -40,6 +50,7 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         # ~p95 of real equity pairwise |correlation| across the default
         # universe -- see docs/exit-intelligence-portfolio-optimization-calibration.md
         max_correlation_threshold=Decimal("0.75"),
+        max_correlation_threshold_crypto=Decimal("0.85"),
     ),
     "balanced": RiskLimits(
         profile_id="balanced",
@@ -54,6 +65,7 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         break_even_trigger_pct=Decimal("4"), trailing_atr_multiplier=Decimal("2.5"), max_hold_days=15,
         # ~p90 -- catches JPM/BAC-level (0.82) sector concentration
         max_correlation_threshold=Decimal("0.65"),
+        max_correlation_threshold_crypto=Decimal("0.80"),
     ),
     "conservative": RiskLimits(
         profile_id="conservative",
@@ -68,6 +80,7 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         break_even_trigger_pct=Decimal("2.5"), trailing_atr_multiplier=Decimal("2.0"), max_hold_days=30,
         # ~p85 -- catches AAPL/MSFT-level (0.55) relatedness, most cautious
         max_correlation_threshold=Decimal("0.55"),
+        max_correlation_threshold_crypto=Decimal("0.75"),
     ),
     "micro": RiskLimits(
         profile_id="micro",
@@ -82,6 +95,7 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         break_even_trigger_pct=Decimal("3"), trailing_atr_multiplier=Decimal("2.5"), max_hold_days=12,
         # same posture as balanced -- ~p90
         max_correlation_threshold=Decimal("0.65"),
+        max_correlation_threshold_crypto=Decimal("0.80"),
     ),
 }
 

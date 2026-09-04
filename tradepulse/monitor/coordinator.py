@@ -156,9 +156,21 @@ async def _fetch_atr(market_data: AlpacaMarketDataProvider, asset: AssetIdentity
     for the rest of the run. Degrading to "skip the trailing update this
     cycle, keep whatever stop is already in force" is the only acceptable
     failure mode here."""
+    from decimal import InvalidOperation
+
     try:
         candles = await market_data.fetch_candles(asset, lookback_days=30)
     except ProviderError:
+        return None
+    except (ValueError, InvalidOperation):
+        # A malformed numeric field in Alpaca's raw bar response (bare
+        # Decimal(str(value)) in broker/alpaca_client.py::get_bars) or a
+        # semantically invalid bar (Candle.__post_init__, e.g. high < low)
+        # -- both raised from inside fetch_candles itself, neither a
+        # ProviderError. Same exception surface _classify_lane_regime
+        # already guards against; degrading to "skip this cycle's trailing
+        # update" here matters more, since _supervised_lane never restarts
+        # a lane after an unhandled exception.
         return None
     value = atr([float(c.high) for c in candles], [float(c.low) for c in candles], [float(c.close) for c in candles])
     return Decimal(str(value)) if value is not None else None

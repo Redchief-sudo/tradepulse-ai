@@ -292,9 +292,17 @@ async def _correlation_adjusted_rank(
     pass 1); candidate-vs-holdings needs one new fetch per DISTINCT held
     asset not already among this cycle's candidates -- a data-fetch failure
     for one holding degrades to "no correlation signal for that holding,"
-    never crashes the cycle."""
+    never crashes the cycle.
+
+    Correlation is only ever computed WITHIN an asset class (equity vs
+    equity, crypto vs crypto) -- pearson_correlation tail-aligns purely by
+    array position with no date awareness, and crypto trades 365 days/yr
+    against equity's ~252, so "same index" across the two calendars never
+    means "same calendar date." Comparing them would be economically
+    meaningless, not just imprecise. The threshold itself is also
+    asset-class-specific (see RiskLimits.max_correlation_threshold_crypto)."""
     candidate_keys = {asset_identity_key(sc.asset) for sc in ranked}
-    selected_closes: dict[str, list[Decimal]] = {}
+    selected_closes: dict[str, tuple[AssetClass, list[Decimal]]] = {}
     holdings_rows = await repositories.holdings.list_all(limit=1000)
     for row in holdings_rows:
         held_asset = hydrate("holdings", row["payload"]).asset
@@ -303,7 +311,7 @@ async def _correlation_adjusted_rank(
             continue  # already have this cycle's own candle fetch for it, via a candidate sharing the same asset
         try:
             candles = await market_data.fetch_candles(held_asset)
-            selected_closes[key] = [c.close for c in candles]
+            selected_closes[key] = (held_asset.asset_class, [c.close for c in candles])
         except ProviderError:
             continue  # no correlation signal available for this holding this cycle -- degrade gracefully, don't block ranking
 
@@ -311,19 +319,24 @@ async def _correlation_adjusted_rank(
     penalized: list[_ScoredCandidate] = []
     for sc in ranked:
         own_closes = [float(c.close) for c in sc.candles]
+        threshold = (
+            risk_limits.max_correlation_threshold_crypto
+            if sc.asset.asset_class == AssetClass.CRYPTO
+            else risk_limits.max_correlation_threshold
+        )
         correlations = (
-            abs(v) for other in selected_closes.values()
-            if (v := pearson_correlation(own_closes, [float(c) for c in other])) is not None
+            abs(v) for other_class, other_closes in selected_closes.values() if other_class == sc.asset.asset_class
+            if (v := pearson_correlation(own_closes, [float(c) for c in other_closes])) is not None
         )
         max_corr = max(correlations, default=None)
         max_corr_decimal = Decimal(str(round(max_corr, 6))) if max_corr is not None else None
-        penalize = max_corr is not None and max_corr >= risk_limits.max_correlation_threshold
+        penalize = max_corr is not None and max_corr >= threshold
         sc = replace(sc, max_correlation=max_corr_decimal, correlation_penalty_applied=penalize)
         if penalize:
             penalized.append(sc)
         else:
             prioritized.append(sc)
-            selected_closes[asset_identity_key(sc.asset)] = [c.close for c in sc.candles]
+            selected_closes[asset_identity_key(sc.asset)] = (sc.asset.asset_class, [c.close for c in sc.candles])
     return prioritized + penalized
 
 

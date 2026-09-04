@@ -389,6 +389,10 @@ async def test_get_risk_exposure_uses_live_account_and_local_holdings(tmp_path) 
     _mock_account(cash="50000", equity="100000")
     holding = Holding(asset=_aapl(), quantity=Decimal("10"), average_price=Decimal("150"), updated_at=NOW, sector="Tech")
     await state.repositories.holdings.create_once(asset_identity_key(_aapl()), holding)
+    _mock_positions({
+        "symbol": "AAPL", "asset_class": "us_equity", "qty": "10", "avg_entry_price": "150",
+        "market_value": "1500", "current_price": "150", "unrealized_pl": "0",
+    })
 
     response = await client.get("/api/risk-exposure")
     await client.aclose()
@@ -398,3 +402,27 @@ async def test_get_risk_exposure_uses_live_account_and_local_holdings(tmp_path) 
     body = response.json()
     assert body["total_equity"] == "100000"
     assert Decimal(body["holdings_value"]) == Decimal("1500")
+
+
+@respx.mock
+async def test_get_risk_exposure_uses_live_mark_price_not_cost_basis(tmp_path) -> None:
+    """Rev.81 Finding 5: this route omitted mark_prices, silently falling
+    back to the Holding's own cost-basis average_price -- the dashboard
+    number went stale the moment price moved. Must reflect the broker's
+    current_price instead."""
+    client, state = await _client_for(tmp_path)
+    _mock_account(cash="50000", equity="100000")
+    holding = Holding(asset=_aapl(), quantity=Decimal("10"), average_price=Decimal("150"), updated_at=NOW, sector="Tech")
+    await state.repositories.holdings.create_once(asset_identity_key(_aapl()), holding)
+    _mock_positions({
+        "symbol": "AAPL", "asset_class": "us_equity", "qty": "10", "avg_entry_price": "150",
+        "market_value": "2000", "current_price": "200", "unrealized_pl": "500",
+    })
+
+    response = await client.get("/api/risk-exposure")
+    await client.aclose()
+    await state.broker.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert Decimal(body["holdings_value"]) == Decimal("2000")  # 10 * 200 (live mark), not 10 * 150 (cost basis)

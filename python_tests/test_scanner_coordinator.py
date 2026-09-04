@@ -1905,6 +1905,56 @@ async def test_candidate_correlated_with_existing_holding_is_demoted(tmp_path) -
 
 
 @respx.mock
+async def test_candidate_not_demoted_by_correlation_with_a_different_asset_class_holding(tmp_path) -> None:
+    """Rev.81 Finding 2a: pearson_correlation tail-aligns purely by array
+    position with no date awareness -- crypto trades 365 days/yr against
+    equity's ~252, so comparing an equity candidate's closes against a
+    crypto holding's closes is economically meaningless even when the raw
+    numbers happen to line up. _correlation_adjusted_rank must only compare
+    within the same asset class -- an AAPL candidate must NOT be demoted by
+    a highly "correlated" (by raw array position only) BTC/USD holding."""
+    from tradepulse.strategy.correlation import pearson_correlation
+
+    duplicate_closes = [c * 2.0 for c in _BULLISH_CLOSES]
+    corr = pearson_correlation(_BULLISH_CLOSES, duplicate_closes)
+    assert corr is not None and corr > Decimal("0.99")  # would demote if asset class were ignored
+
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    held_asset = AssetIdentity("BTC/USD", AssetClass.CRYPTO, "alpaca:BTC/USD")
+    # Small notional (0.01 * 60000 = 600) -- deliberately kept well under
+    # max_total_exposure_pct so risk evaluation isn't what blocks the order;
+    # this test is about correlation-demotion, not exposure sizing.
+    holding = Holding(asset=held_asset, quantity=Decimal("0.01"), average_price=Decimal("60000"), updated_at=NOW)
+    await repositories.holdings.create_once(asset_identity_key(held_asset), holding)
+    _mock_crypto_bars(duplicate_closes)  # the crypto holding's own candle history
+
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Momentum."}])
+        )
+    )
+    _mock_account(cash="50000")
+    _mock_positions()
+    _mock_quote_for("AAPL")
+    _mock_bars_for("AAPL", _BULLISH_CLOSES)
+    _mock_spy_bars()
+    order_route = _mock_dynamic_full_fill()
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert summary.status == ScanRunStatus.COMPLETED
+    assert order_route.call_count == 1
+    opp_rows = await repositories.opportunities.list_all()
+    opportunity = hydrate("opportunities", opp_rows[0]["payload"])
+    assert opportunity.metadata["correlation_penalty_applied"] is False
+    assert opportunity.metadata["max_correlation"] is None  # no same-asset-class comparison existed this cycle
+
+
+@respx.mock
 async def test_holding_candle_fetch_failure_degrades_gracefully(tmp_path) -> None:
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))

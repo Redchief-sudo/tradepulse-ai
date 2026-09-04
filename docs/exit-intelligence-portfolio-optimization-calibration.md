@@ -149,6 +149,41 @@ it's a risk-tolerance decision, not an empirical property of price
 series), matching the original scoping discussion. Kept unchanged
 (aggressive 6 / balanced 4 / conservative 2.5 / micro 3 pct).
 
+## Rev.81 addendum -- crypto correlation threshold and ATR-quality thresholds
+
+Two follow-ups from the Rev.81 audit, using data already gathered above (no
+new fetch needed):
+
+**`max_correlation_threshold_crypto` (Finding 2b, previously flagged but not
+acted on).** Every profile's equity-derived threshold except aggressive's
+sat below crypto's own median |correlation| (0.668), so ordinary
+BTC/ETH-level co-movement was being flagged as concentrated by default.
+Added a second `RiskLimits` field, anchored to crypto's own distribution
+(still only 10 pairs -- weaker confidence than the equity values, same
+caveat as `max_hold_days`): aggressive 0.85, balanced 0.80, conservative
+0.75, micro 0.80. `_correlation_adjusted_rank` (scanner/coordinator.py) now
+also restricts correlation comparisons to same-asset-class pairs only --
+previously a crypto holding's closes could be Pearson-correlated against an
+equity candidate's, which is meaningless given the two calendars don't
+share a trading-day count (crypto 365/yr vs equity ~252/yr), so "same
+array index" never means "same calendar date."
+
+**ATR-quality thresholds (`strategy/factors.py::_ATR_QUALITY_THRESHOLDS`,
+Finding 1a).** Previously an unvalidated placeholder. Recalibrated from the
+same rolling-ATR% distribution above: equity tight=1.2%/wide=4.0% (~p25/p95),
+crypto tight=4.5%/wide=11.0% (~p25/p90). The old crypto tight_pct (2.5%) sat
+below crypto's own p10 (3.61%), so almost no real crypto bar could ever
+score full quality credit -- silently flooring `risk_quality_score` for
+crypto candidates.
+
+**Not addressed**: `_REGIME_WEIGHT_PROFILES`
+(`config/strategy_weights.py`, Finding 1b) -- these allocate relative
+weight across qualitative factors per regime, not a raw-price statistic;
+no market data answers "how much weight should momentum carry in a bull
+regime." Needs backtesting or real Outcome Attribution data, neither of
+which exists yet. Remains a clearly-labeled placeholder, not silently
+dropped from consideration.
+
 ## Summary of changes made
 
 - `max_correlation_threshold`: adjusted per the table in Finding 2 (all

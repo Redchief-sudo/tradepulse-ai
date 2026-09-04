@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from tradepulse.models import Candle
-from tradepulse.strategy.factors import compute_real_factors
+from tradepulse.strategy.factors import _ATR_QUALITY_THRESHOLDS, compute_real_factors
 
 
 def _candles(closes: list[float], volumes: list[float] | None = None) -> list[Candle]:
@@ -90,6 +90,19 @@ def test_risk_quality_score_is_high_for_tight_range_low_for_choppy_range() -> No
     assert tight.risk_quality_score > Decimal("70")
     assert choppy.risk_quality_score < Decimal("30")
     assert tight.risk_quality_score > choppy.risk_quality_score
+
+
+def test_atr_quality_thresholds_are_empirically_calibrated_not_the_old_placeholder() -> None:
+    """Rev.81 Finding 1a: the prior placeholder's crypto tight_pct (2.5)
+    sat BELOW crypto's own real p10 ATR% (3.61 -- see
+    docs/exit-intelligence-portfolio-optimization-calibration.md), meaning
+    almost no real crypto bar could ever score full risk_quality credit.
+    Locks in the recalibrated values so a future edit can't silently
+    regress back to an unvalidated guess."""
+    assert _ATR_QUALITY_THRESHOLDS["equity"].tight_pct == Decimal("1.2")
+    assert _ATR_QUALITY_THRESHOLDS["equity"].wide_pct == Decimal("4.0")
+    assert _ATR_QUALITY_THRESHOLDS["crypto"].tight_pct == Decimal("4.5")
+    assert _ATR_QUALITY_THRESHOLDS["crypto"].wide_pct == Decimal("11.0")
 
 
 def test_relative_strength_score_is_none_without_benchmark_closes() -> None:

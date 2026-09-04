@@ -7,6 +7,7 @@ from tradepulse.models import (
     AssetClass,
     AssetIdentity,
     ExecutionMode,
+    Fill,
     Holding,
     PortfolioSnapshot,
     Side,
@@ -499,6 +500,48 @@ async def test_build_portfolio_snapshot_does_not_count_risk_approved_as_outstand
     snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
 
     assert snapshot.outstanding_orders == 0
+
+
+async def _seed_fill(repositories: PersistenceRepositories, *, fill_id: str, trade_intent_id: str, quantity: Decimal, filled_at: datetime) -> None:
+    fill = Fill(
+        fill_id, trade_intent_id, f"order-{fill_id}", _aapl(), Side.BUY, ExecutionMode.PAPER,
+        quantity, Decimal("100"), Decimal("0"), Decimal("0"), filled_at,
+    )
+    await repositories.fills.create_once(fill_id, fill, unique_value=None)
+
+
+async def test_trades_today_counts_distinct_trades_not_fill_rows(tmp_path) -> None:
+    """Rev.81 Finding 3: one order that fills in several partial broker
+    fills (confirmed live -- one real order filled in 5 pieces) must count
+    ONCE against max_daily_trades, not once per Fill row."""
+    repositories = await _repositories(tmp_path)
+    for i, qty in enumerate(["7", "3", "2", "1", "0.195"]):
+        await _seed_fill(repositories, fill_id=f"fill-{i}", trade_intent_id="ti-same-order", quantity=Decimal(qty), filled_at=NOW)
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
+
+    assert snapshot.trades_today == 1
+
+
+async def test_trades_today_counts_each_distinct_trade_intent(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await _seed_fill(repositories, fill_id="fill-1", trade_intent_id="ti-a", quantity=Decimal("5"), filled_at=NOW)
+    await _seed_fill(repositories, fill_id="fill-2", trade_intent_id="ti-b", quantity=Decimal("5"), filled_at=NOW)
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
+
+    assert snapshot.trades_today == 2
+
+
+async def test_trades_today_excludes_fills_from_a_prior_day(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    yesterday = NOW.replace(day=NOW.day - 1)
+    await _seed_fill(repositories, fill_id="fill-1", trade_intent_id="ti-old", quantity=Decimal("5"), filled_at=yesterday)
+    await _seed_fill(repositories, fill_id="fill-2", trade_intent_id="ti-new", quantity=Decimal("5"), filled_at=NOW)
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
+
+    assert snapshot.trades_today == 1
 
 
 async def test_pending_risk_approved_intent_reserves_capacity_for_the_next_snapshot(tmp_path) -> None:

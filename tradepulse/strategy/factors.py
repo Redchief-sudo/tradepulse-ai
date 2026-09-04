@@ -19,13 +19,22 @@ from .regime import Calendar
 
 MIN_CANDLES = 30
 
-# ATR%-quality thresholds -- PLACEHOLDER, NOT YET CALIBRATED against real
-# data. Illustrative only, loosely extrapolated from regime.py's own
-# equity->crypto volatility-threshold ratio. Needs a real calibration pass
-# (same discipline as docs/regime-classifier-phase1-calibration.md) once
-# there is outcome-attribution data to calibrate against -- shipping a
-# clearly-labeled guess now beats blocking this phase on calibrating
-# against nothing.
+# ATR%-quality thresholds -- empirically grounded (Rev.81 corrective round)
+# against a genuinely rolling ATR(14)-as-%-of-price distribution (60-bar
+# trailing window, resampled every 5 bars, real Alpaca history: 10,115
+# equity / 1,931 crypto observations across the default universe -- the
+# same data pull used to validate RiskLimits.trailing_atr_multiplier, see
+# docs/exit-intelligence-portfolio-optimization-calibration.md):
+#
+#            p10   p25   median  p75   p90   p95
+# Equity     0.80  1.21  1.69    2.32  3.17  4.03
+# Crypto     3.61  4.62  6.06    8.34  10.98 13.26
+#
+# tight_pct ~= p25 (a range this controlled genuinely deserves full quality
+# credit), wide_pct ~= p90-95 (only the choppiest tail scores zero) for each
+# calendar. The prior placeholder's crypto tight_pct=2.5 sat BELOW crypto's
+# own p10 (3.61) -- meaning almost no real crypto bar could ever score
+# quality=100, silently flooring risk_quality_score for crypto candidates.
 @dataclass(frozen=True, slots=True)
 class _AtrQualityThresholds:
     tight_pct: Decimal  # ATR% at/below which range is "tight/controlled" -> quality 100
@@ -33,8 +42,8 @@ class _AtrQualityThresholds:
 
 
 _ATR_QUALITY_THRESHOLDS: dict[Calendar, _AtrQualityThresholds] = {
-    "equity": _AtrQualityThresholds(tight_pct=Decimal("1.0"), wide_pct=Decimal("5.0")),
-    "crypto": _AtrQualityThresholds(tight_pct=Decimal("2.5"), wide_pct=Decimal("8.0")),
+    "equity": _AtrQualityThresholds(tight_pct=Decimal("1.2"), wide_pct=Decimal("4.0")),
+    "crypto": _AtrQualityThresholds(tight_pct=Decimal("4.5"), wide_pct=Decimal("11.0")),
 }
 
 
