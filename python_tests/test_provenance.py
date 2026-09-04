@@ -26,6 +26,11 @@ def test_changing_git_commit_changes_the_fingerprint(tmp_path, monkeypatch) -> N
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    # This throwaway repo exists only to produce a real commit hash for the
+    # test -- disabling signing here is scoped to this disposable directory
+    # via local git config, never the developer's own tracked repository or
+    # real commits.
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=tmp_path, check=True)
     (tmp_path / "f.txt").write_text("x")
     subprocess.run(["git", "add", "f.txt"], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "one"], cwd=tmp_path, check=True)
