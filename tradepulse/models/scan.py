@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
+from typing import Any, Mapping
 
-from .base import require_aware, require_text
+from .base import immutable_metadata, require_aware, require_text
 from .enums import AssetClass, ScanRunStatus, ScanTrigger
 
 
@@ -82,3 +83,32 @@ class ScanRun:
             raise ValueError("terminal scan run requires completed_at")
         if self.status == ScanRunStatus.FAILED and not self.error:
             raise ValueError("failed scan run requires error")
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedCandidate:
+    """One row per candidate filtered out of a scan cycle (see
+    scanner/coordinator.py::_reject) -- durable counterpart to what was
+    previously only a stdout log line, so rejections can be reviewed after
+    the fact instead of disappearing with the process's own output."""
+
+    rejection_id: str
+    scan_run_id: str
+    scan_generation: str
+    symbol: str
+    asset_class: AssetClass
+    reason: str
+    occurred_at: datetime
+    # Whatever _reject's own **context carried for this rejection (e.g.
+    # confidence/min_confidence, ai_recommendation/deterministic_signal/
+    # composite_score, error) -- free-form by design, since each of the ~19
+    # reason codes carries different diagnostic fields.
+    context: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.asset_class, AssetClass):
+            raise TypeError("asset_class must be AssetClass")
+        for name in ("rejection_id", "scan_run_id", "scan_generation", "symbol", "reason"):
+            object.__setattr__(self, name, require_text(getattr(self, name), name))
+        object.__setattr__(self, "occurred_at", require_aware(self.occurred_at, "occurred_at"))
+        object.__setattr__(self, "context", immutable_metadata(self.context))

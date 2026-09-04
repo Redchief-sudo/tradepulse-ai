@@ -15,7 +15,7 @@ TABLES = {
     "opportunities", "trade_intents", "orders", "fills", "settlements", "holdings",
     "position_lots", "cash_ledger", "pnl_records", "reconciliation_records",
     "trading_sessions", "audit_events", "scan_runs", "equity_snapshots", "ai_responses",
-    "trade_attributions",
+    "trade_attributions", "rejected_candidates",
 }
 STATUS_TABLES = {"trade_intents", "orders", "settlements", "trading_sessions", "scan_runs"}
 UNIQUE_FIELDS = {
@@ -289,6 +289,7 @@ class PersistenceRepositories:
     equity_snapshots: RecordRepository
     ai_responses: RecordRepository
     trade_attributions: RecordRepository
+    rejected_candidates: RecordRepository
 
     @classmethod
     def create(cls, database: AsyncSQLiteDatabase) -> PersistenceRepositories:

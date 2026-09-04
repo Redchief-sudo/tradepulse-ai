@@ -249,6 +249,7 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
     _recent_route("reconciliation_records", "/api/reconciliation")
     _recent_route("audit_events", "/api/audit-events")
     _recent_route("scan_runs", "/api/scan-runs")
+    _recent_route("rejected_candidates", "/api/rejected-candidates")
 
     @app.get("/api/ai-responses/{request_id}")
     async def get_ai_response(request_id: str, request: Request) -> Response:

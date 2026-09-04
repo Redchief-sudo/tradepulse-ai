@@ -19,6 +19,7 @@ from tradepulse.models import (
     PositionLot,
     ReconciliationOutcome,
     ReconciliationRecord,
+    RejectedCandidate,
     ScanRun,
     ScanRunStatus,
     ScanTrigger,
@@ -186,6 +187,14 @@ def test_audit_event_roundtrips() -> None:
         correlation_id="corr-1", entity_type="trading_session", entity_id="session-1", details={"pct": "-1.2"},
     )
     assert roundtrip("audit_events", original) == original
+
+
+def test_rejected_candidate_roundtrips() -> None:
+    original = RejectedCandidate(
+        "rej-1", "scan-1", "gen-1", "AAPL", AssetClass.EQUITY, "CONFIDENCE_BELOW_MIN", NOW,
+        context={"confidence": 78.0, "min_confidence": "80"},
+    )
+    assert roundtrip("rejected_candidates", original) == original
 
 
 def test_scan_run_roundtrips() -> None:

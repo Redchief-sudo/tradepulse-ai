@@ -9,6 +9,7 @@ from tradepulse.models import (
     PortfolioSnapshot,
     ReconciliationOutcome,
     ReconciliationRecord,
+    RejectedCandidate,
     RiskLimits,
     ScanRun,
     ScanRunStatus,
@@ -95,6 +96,28 @@ def test_risk_limits_reject_out_of_range_correlation_thresholds() -> None:
     balanced = risk_limits_for_profile("balanced")
     with pytest.raises(ValueError, match="max_correlation_threshold_crypto"):
         replace(balanced, max_correlation_threshold_crypto=Decimal("1.5"))
+
+
+def test_rejected_candidate_rejects_non_asset_class_asset_class() -> None:
+    with pytest.raises(TypeError, match="asset_class"):
+        RejectedCandidate(
+            "rej-1", "scan-1", "gen-1", "AAPL", "equity",  # type: ignore[arg-type]
+            "CONFIDENCE_BELOW_MIN", NOW,
+        )
+
+
+def test_rejected_candidate_requires_non_empty_symbol_and_reason() -> None:
+    with pytest.raises(ValueError, match="symbol"):
+        RejectedCandidate("rej-1", "scan-1", "gen-1", "", AssetClass.EQUITY, "CONFIDENCE_BELOW_MIN", NOW)
+    with pytest.raises(ValueError, match="reason"):
+        RejectedCandidate("rej-1", "scan-1", "gen-1", "AAPL", AssetClass.EQUITY, "", NOW)
+
+
+def test_rejected_candidate_context_defaults_empty_and_is_immutable() -> None:
+    rejection = RejectedCandidate("rej-1", "scan-1", "gen-1", "AAPL", AssetClass.EQUITY, "CONFIDENCE_BELOW_MIN", NOW)
+    assert rejection.context == {}
+    with pytest.raises(TypeError):
+        rejection.context["x"] = "1"  # type: ignore[index]
 
 
 def test_portfolio_snapshot_requires_known_source() -> None:

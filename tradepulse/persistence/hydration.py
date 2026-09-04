@@ -36,6 +36,7 @@ from tradepulse.models import (
     PositionLot,
     ReconciliationOutcome,
     ReconciliationRecord,
+    RejectedCandidate,
     ScanRun,
     ScanRunStatus,
     ScanTrigger,
@@ -357,6 +358,19 @@ def decode_scan_run(d: Mapping[str, Any]) -> ScanRun:
     )
 
 
+def decode_rejected_candidate(d: Mapping[str, Any]) -> RejectedCandidate:
+    return RejectedCandidate(
+        rejection_id=d["rejection_id"],
+        scan_run_id=d["scan_run_id"],
+        scan_generation=d["scan_generation"],
+        symbol=d["symbol"],
+        asset_class=AssetClass(d["asset_class"]),
+        reason=d["reason"],
+        occurred_at=_datetime(d["occurred_at"]),
+        context=d.get("context") or {},
+    )
+
+
 def decode_equity_snapshot(d: Mapping[str, Any]) -> PortfolioSnapshot:
     return PortfolioSnapshot(
         snapshot_id=d["snapshot_id"],
@@ -401,3 +415,4 @@ register("scan_runs", decode_scan_run)
 register("equity_snapshots", decode_equity_snapshot)
 register("ai_responses", decode_ai_response)
 register("trade_attributions", decode_trade_attribution)
+register("rejected_candidates", decode_rejected_candidate)

@@ -48,6 +48,7 @@ from tradepulse.models import (
     AssetIdentity,
     Candle,
     Opportunity,
+    RejectedCandidate,
     RiskLimits,
     ScanRun,
     ScanRunStatus,
@@ -494,17 +495,28 @@ async def run_scan_cycle(
     )
     await repositories.scan_runs.create_once(scan_run_id, scan_run, status=scan_run.status.value)
 
-    def _reject(symbol: str, reason: str, **context: Any) -> None:
-        """Every candidate-filtering `continue` below logs through here
+    async def _reject(symbol: str, reason: str, **context: Any) -> None:
+        """Every candidate-filtering `continue` below routes through here
         first -- without this, a scan that approves zero candidates gives
         no clue which gate(s) it lost to. Relies on JsonFormatter forwarding
         every `extra=` field automatically (config/logging.py). A closure
         (not the former module-level function) so every rejection carries
-        this cycle's lane without threading it through every call site."""
+        this cycle's lane without threading it through every call site.
+
+        Also persists a RejectedCandidate row (durable counterpart to the
+        log line, which only lives in whatever's currently capturing this
+        process's stdout) so rejections can be reviewed after the fact --
+        `context` is the exact same free-form diagnostic payload the log
+        line already carries, just not lost the moment the process ends."""
         logger.info(
             "candidate_rejected",
             extra={"event": "candidate_rejected", "symbol": symbol, "reason": reason, "asset_class": asset_class.value, **context},
         )
+        rejection = RejectedCandidate(
+            rejection_id=str(uuid4()), scan_run_id=scan_run_id, scan_generation=scan_generation,
+            symbol=symbol, asset_class=asset_class, reason=reason, occurred_at=clock(), context=context,
+        )
+        await repositories.rejected_candidates.create_once(rejection.rejection_id, rejection)
 
     async def _finish(status: ScanRunStatus, **fields: Any) -> None:
         finished = replace(scan_run, status=status, completed_at=clock(), **fields)
@@ -587,13 +599,13 @@ async def run_scan_cycle(
     scored: list[_ScoredCandidate] = []
     for candidate in candidates:
         if lease_lost is not None and lease_lost.is_set():
-            _reject(candidate.symbol, "COMMAND_LEASE_LOST")
+            await _reject(candidate.symbol, "COMMAND_LEASE_LOST")
             continue  # scan's own command lease may no longer be exclusive -- stop starting new work
         if candidate.recommendation not in _ACTIONABLE_RECOMMENDATIONS:
-            _reject(candidate.symbol, "NOT_ACTIONABLE_RECOMMENDATION", recommendation=candidate.recommendation)
+            await _reject(candidate.symbol, "NOT_ACTIONABLE_RECOMMENDATION", recommendation=candidate.recommendation)
             continue
         if candidate.confidence < risk_limits.min_confidence:
-            _reject(candidate.symbol, "CONFIDENCE_BELOW_MIN", confidence=candidate.confidence, min_confidence=str(risk_limits.min_confidence))
+            await _reject(candidate.symbol, "CONFIDENCE_BELOW_MIN", confidence=candidate.confidence, min_confidence=str(risk_limits.min_confidence))
             continue
         if regime_label == "liquidity_crisis":
             # Signal-layer suppression -- explicit block, not a raised
@@ -604,7 +616,7 @@ async def run_scan_cycle(
             # backstop even if this gate were ever bypassed or
             # misconfigured. Placed before any candle/quote fetch to avoid
             # wasted I/O during a crisis regime.
-            _reject(candidate.symbol, "LIQUIDITY_CRISIS_NEW_ENTRIES_SUPPRESSED", regime=regime_label)
+            await _reject(candidate.symbol, "LIQUIDITY_CRISIS_NEW_ENTRIES_SUPPRESSED", regime=regime_label)
             continue
         # For the OPTIONS lane, `asset` is only ever the UNDERLYING's plain
         # equity identity -- the AI proposes a directional view on the
@@ -618,36 +630,36 @@ async def run_scan_cycle(
         asset = _asset_from_candidate(candidate)
         if asset_class == AssetClass.OPTION:
             if asset.asset_class != AssetClass.EQUITY:
-                _reject(candidate.symbol, "OUTSIDE_SCAN_LANE")
+                await _reject(candidate.symbol, "OUTSIDE_SCAN_LANE")
                 continue
             if asset.symbol not in universe.options_underlyings:
-                _reject(candidate.symbol, "OUTSIDE_EXECUTABLE_UNIVERSE")
+                await _reject(candidate.symbol, "OUTSIDE_EXECUTABLE_UNIVERSE")
                 continue
         else:
             if not is_executable(asset, universe):
-                _reject(candidate.symbol, "OUTSIDE_EXECUTABLE_UNIVERSE")
+                await _reject(candidate.symbol, "OUTSIDE_EXECUTABLE_UNIVERSE")
                 continue
             if asset.asset_class != asset_class:
                 # Defense in depth -- the prompt only ever offers this
                 # lane's symbols, but AI output is an untrusted hint (same
                 # principle as OUTSIDE_EXECUTABLE_UNIVERSE above), so
                 # nothing actually forces it to honor that.
-                _reject(candidate.symbol, "OUTSIDE_SCAN_LANE")
+                await _reject(candidate.symbol, "OUTSIDE_SCAN_LANE")
                 continue
 
         try:
             candles = await market_data.fetch_candles(asset)
         except ProviderError as exc:
-            _reject(candidate.symbol, "CANDLE_FETCH_FAILED", error=str(exc))
+            await _reject(candidate.symbol, "CANDLE_FETCH_FAILED", error=str(exc))
             continue  # insufficient candle history or a data-fetch failure -- fail closed, same as every other provider boundary here
         scores = compute_real_factors(candles, calendar=_BENCHMARK_CALENDAR[asset_class], benchmark_closes=lane_regime.benchmark_closes)
         if scores is None:
-            _reject(candidate.symbol, "INSUFFICIENT_FACTOR_DATA")
+            await _reject(candidate.symbol, "INSUFFICIENT_FACTOR_DATA")
             continue
         composite = weighted_composite(scores, effective_weights)
         deterministic_signal = signal_from_composite(composite)
         if deterministic_signal not in _DETERMINISTIC_ACTIONABLE_SIGNALS:
-            _reject(
+            await _reject(
                 candidate.symbol, "DETERMINISTIC_SIGNAL_DISAGREED", ai_recommendation=candidate.recommendation,
                 deterministic_signal=deterministic_signal, composite_score=str(composite),
             )
@@ -678,13 +690,13 @@ async def run_scan_cycle(
             # loop didn't have to guard against (pass 1 may have taken
             # several awaited fetches, or pass 2 itself may be mid-way
             # through executing earlier-ranked candidates).
-            _reject(candidate.symbol, "COMMAND_LEASE_LOST")
+            await _reject(candidate.symbol, "COMMAND_LEASE_LOST")
             continue
 
         try:
             quote = await market_data.fetch_quote(asset)
         except ProviderError as exc:
-            _reject(candidate.symbol, "QUOTE_FETCH_FAILED", error=str(exc))
+            await _reject(candidate.symbol, "QUOTE_FETCH_FAILED", error=str(exc))
             continue  # one bad quote must not abort the rest of the scan
 
         # trade_asset/trade_quote are what actually gets sized, stopped, and
@@ -698,14 +710,14 @@ async def run_scan_cycle(
                     asset.symbol, risk_limits.options_expiry_min_days, risk_limits.options_expiry_max_days, now.date(),
                 )
             except ProviderError as exc:
-                _reject(candidate.symbol, "OPTION_CHAIN_FETCH_FAILED", error=str(exc))
+                await _reject(candidate.symbol, "OPTION_CHAIN_FETCH_FAILED", error=str(exc))
                 continue
             contract = select_contract(
                 "call", quote.price, chain, min_dte=risk_limits.options_expiry_min_days,
                 max_dte=risk_limits.options_expiry_max_days, target_otm_pct=risk_limits.options_target_otm_pct, now=now.date(),
             )
             if contract is None:
-                _reject(candidate.symbol, "NO_ELIGIBLE_OPTION_CONTRACT")
+                await _reject(candidate.symbol, "NO_ELIGIBLE_OPTION_CONTRACT")
                 continue
             trade_asset = AssetIdentity(
                 symbol=contract.occ_symbol, asset_class=AssetClass.OPTION, native_asset_id=f"alpaca:{contract.occ_symbol}",
@@ -718,7 +730,7 @@ async def run_scan_cycle(
             try:
                 trade_quote = await market_data.fetch_quote(trade_asset)
             except ProviderError as exc:
-                _reject(candidate.symbol, "OPTION_QUOTE_FETCH_FAILED", error=str(exc))
+                await _reject(candidate.symbol, "OPTION_QUOTE_FETCH_FAILED", error=str(exc))
                 continue
         else:
             trade_asset = asset
@@ -727,20 +739,20 @@ async def run_scan_cycle(
         database = repositories.trade_intents.database
         owner_token = str(uuid4())
         if not await reserve_symbol_for_execution(database, trade_asset, owner_token):
-            _reject(candidate.symbol, "SYMBOL_EXECUTION_LOCKED")
+            await _reject(candidate.symbol, "SYMBOL_EXECUTION_LOCKED")
             continue  # another coordinator is already processing this asset -- don't race it
         try:
             if await has_in_flight_intent(repositories, trade_asset):
-                _reject(candidate.symbol, "SYMBOL_HAS_IN_FLIGHT_INTENT")
+                await _reject(candidate.symbol, "SYMBOL_HAS_IN_FLIGHT_INTENT")
                 continue  # don't fight an order already in flight on this symbol (e.g. from the position monitor)
 
             multiplier = contract_multiplier_of(trade_asset)  # 1 for equity/crypto, ~100 for an options contract
             if notional_budget <= 0 or trade_quote.price <= 0:
-                _reject(candidate.symbol, "NO_NOTIONAL_BUDGET_OR_INVALID_PRICE", notional_budget=str(notional_budget), price=str(trade_quote.price))
+                await _reject(candidate.symbol, "NO_NOTIONAL_BUDGET_OR_INVALID_PRICE", notional_budget=str(notional_budget), price=str(trade_quote.price))
                 continue
             quantity = _round_quantity(notional_budget / (trade_quote.price * multiplier), trade_asset.asset_class)
             if quantity <= 0:
-                _reject(candidate.symbol, "QUANTITY_ROUNDED_TO_ZERO", notional_budget=str(notional_budget), price=str(trade_quote.price))
+                await _reject(candidate.symbol, "QUANTITY_ROUNDED_TO_ZERO", notional_budget=str(notional_budget), price=str(trade_quote.price))
                 continue
 
             if asset_class == AssetClass.OPTION:

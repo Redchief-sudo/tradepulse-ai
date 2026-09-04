@@ -13,6 +13,7 @@ from tradepulse.models import (
     ExecutionMode,
     Holding,
     Opportunity,
+    RejectedCandidate,
     ScanRun,
     ScanRunStatus,
     ScanTrigger,
@@ -344,6 +345,27 @@ async def test_scan_runs_route_still_returns_universe_size_and_ai_response_reque
     body = response.json()
     assert body[0]["universe_size"] == 5
     assert body[0]["ai_response_request_id"] == "ai-req-1"
+
+
+@respx.mock
+async def test_get_rejected_candidates_returns_hydrated_recent_rows(tmp_path) -> None:
+    client, state = await _client_for(tmp_path)
+    rejection = RejectedCandidate(
+        "rej-1", "run-1", "gen-1", "AAPL", AssetClass.EQUITY, "CONFIDENCE_BELOW_MIN", NOW,
+        context={"confidence": 78.0, "min_confidence": "80"},
+    )
+    await state.repositories.rejected_candidates.create_once("rej-1", rejection)
+
+    response = await client.get("/api/rejected-candidates")
+    await client.aclose()
+    await state.broker.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) == 1
+    assert body[0]["symbol"] == "AAPL"
+    assert body[0]["reason"] == "CONFIDENCE_BELOW_MIN"
+    assert body[0]["context"]["min_confidence"] == "80"
 
 
 @respx.mock

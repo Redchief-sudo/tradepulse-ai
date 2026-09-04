@@ -30,7 +30,7 @@ from .portfolio import CashLedgerEntry, Holding, PnlRecord, PositionLot, fold_pr
 from .portfolio_snapshot import PortfolioSnapshot
 from .reconciliation import ReconciliationRecord
 from .risk import RiskLimits
-from .scan import ScanRun
+from .scan import RejectedCandidate, ScanRun
 from .session import TradingSession
 from .settlement import SettlementEvent
 from .strategy_model import StrategyWeights
@@ -40,7 +40,7 @@ __all__ = [
     "AIRequest", "AIResponse", "AssetClass", "AssetIdentity", "AuditEvent", "CashLedgerEntry",
     "Candle", "DomainValidationError", "ExecutionMode", "ExitReason", "Fill", "Holding", "MarketQuote", "Opportunity",
     "Order", "OrderStatus", "PnlRecord", "PortfolioSnapshot", "PositionLot",
-    "ReconciliationOutcome", "ReconciliationRecord", "RiskLimits", "ScanRun", "ScanRunStatus",
+    "ReconciliationOutcome", "ReconciliationRecord", "RejectedCandidate", "RiskLimits", "ScanRun", "ScanRunStatus",
     "ScanTrigger", "SessionState", "SettlementEvent", "SettlementStatus", "Side",
     "StrategyWeights", "TradeAttribution", "TradeIntent", "TradeIntentStatus", "TradingSession",
     "asset_identity_key", "asset_key_from_broker_symbol", "contract_multiplier_of", "fold_price_extremum", "is_continuous_market",

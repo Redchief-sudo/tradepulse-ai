@@ -408,6 +408,38 @@ async def test_candidate_outside_requested_lane_is_rejected(tmp_path, caplog) ->
     assert rejected[0].asset_class == "crypto"
 
 
+@respx.mock
+async def test_candidate_rejection_is_persisted_alongside_the_log_line(tmp_path) -> None:
+    """A rejection must survive the process, not just the log stream --
+    same scenario as test_candidate_outside_requested_lane_is_rejected,
+    but asserting the durable rejected_candidates row instead of caplog."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    _mock_crypto_bars(_BULLISH_CLOSES)
+    universe = ExecutableUniverse(equities=frozenset({"AAPL"}), crypto=frozenset({"BTC/USD"}))
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "hallucinated"}])
+        )
+    )
+    _mock_account()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, universe, limits, AssetClass.CRYPTO, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    rows = await repositories.rejected_candidates.list_all()
+    assert len(rows) == 1
+    rejection = hydrate("rejected_candidates", rows[0]["payload"])
+    assert rejection.symbol == "AAPL"
+    assert rejection.reason == "OUTSIDE_SCAN_LANE"
+    assert rejection.asset_class == AssetClass.CRYPTO
+    assert rejection.scan_run_id == summary.scan_run_id
+    assert rejection.occurred_at == NOW
+
+
 def _mock_crypto_quote(bid: str = "60000", ask: str = "60010") -> None:
     respx.get("https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes").mock(
         return_value=httpx.Response(200, json={"quotes": {"BTC/USD": {"bp": float(bid), "ap": float(ask), "t": QUOTE_TS}}})
