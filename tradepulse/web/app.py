@@ -29,7 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from tradepulse.broker import AlpacaClient, AlpacaError
-from tradepulse.config import Settings
+from tradepulse.config import Settings, risk_limits_for_profile
 from tradepulse.models import asset_key_from_broker_symbol
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.persistence.codec import encode_payload
@@ -89,6 +89,27 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
     @app.get("/api/provenance")
     async def get_provenance_route(request: Request) -> Response:
         return _json(get_provenance())
+
+    # ---- Active risk-profile limits -----------------------------------------
+    # Pure config passthrough for dashboard utilization display (e.g.
+    # holdings_value / max_total_exposure_pct) -- computes nothing, decides
+    # nothing, same shape as /api/provenance above. The actual risk DECISION
+    # authority remains solely risk/engine.py::evaluate_risk; this route
+    # exists only so the frontend isn't left guessing at a denominator it
+    # would otherwise have to duplicate/invent.
+
+    @app.get("/api/risk-limits")
+    async def get_risk_limits(request: Request) -> Response:
+        limits = risk_limits_for_profile(_state(request).settings.risk_profile)
+        return _json({
+            "profile_id": limits.profile_id,
+            "max_total_exposure_pct": limits.max_total_exposure_pct,
+            "max_sector_pct": limits.max_sector_pct,
+            "max_position_pct": limits.max_position_pct,
+            "max_daily_trades": limits.max_daily_trades,
+            "max_open_positions": limits.max_open_positions,
+            "max_drawdown_pct": limits.max_drawdown_pct,
+        })
 
     # ---- Session control -------------------------------------------------
 

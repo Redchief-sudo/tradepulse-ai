@@ -22,3 +22,9 @@ export function Panel({
     </section>
   )
 }
+
+/** Consistent "nothing to show" presentation -- replaces each panel's own ad
+ * hoc `<p className="muted">` string with a single shared convention. */
+export function EmptyState({ children }: { children: ReactNode }) {
+  return <p className="empty-state">{children}</p>
+}

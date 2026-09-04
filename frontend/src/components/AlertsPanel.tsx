@@ -1,7 +1,22 @@
 import { api } from '../api'
 import { usePolling } from '../usePolling'
 import { time } from '../format'
-import { Panel } from './Panel'
+import { Panel, EmptyState } from './Panel'
+
+type LineState = 'ok' | 'bad' | 'unknown'
+
+function SummaryLine({ label, state, detail }: { label: string; state: LineState; detail?: string }) {
+  const icon = state === 'ok' ? '✓' : state === 'bad' ? '⚠' : '?'
+  return (
+    <div className={`status-line status-line-${state}`}>
+      <span>{icon}</span>
+      <span>
+        {label}
+        {detail ? ` — ${detail}` : ''}
+      </span>
+    </div>
+  )
+}
 
 export function AlertsPanel() {
   const reconciliation = usePolling(() => api.getReconciliation(20), 30000)
@@ -10,10 +25,36 @@ export function AlertsPanel() {
   const notableReconciliation = reconciliation.data?.filter((r) => r.outcome !== 'matched') ?? []
   const notableAudit = audit.data?.filter((e) => e.severity === 'warning' || e.severity === 'error' || e.severity === 'critical') ?? []
 
+  const driftRecords = reconciliation.data?.filter((r) => r.outcome === 'drift_detected') ?? []
+  const fillDrift = driftRecords.filter((r) => r.reconciliation_type === 'fill')
+  const criticalAudit = audit.data?.filter((e) => e.severity === 'critical') ?? []
+
+  // A fetch error must render as unknown, never as a green checkmark --
+  // checked before any healthy/unhealthy line is decided.
+  const reconciliationLineState = (ok: boolean): LineState => (reconciliation.error ? 'unknown' : ok ? 'ok' : 'bad')
+  const auditLineState = (ok: boolean): LineState => (audit.error ? 'unknown' : ok ? 'ok' : 'bad')
+
   return (
     <Panel title="Reconciliation &amp; Audit Alerts" error={reconciliation.error ?? audit.error} loading={reconciliation.loading || audit.loading}>
+      <h3>System integrity</h3>
+      <SummaryLine
+        label="Position/view reconciliation"
+        state={reconciliationLineState(driftRecords.length === 0)}
+        detail={driftRecords.length > 0 ? `${driftRecords.length} drift event(s)` : undefined}
+      />
+      <SummaryLine
+        label="Fill/settlement reconciliation"
+        state={reconciliationLineState(fillDrift.length === 0)}
+        detail={fillDrift.length > 0 ? `${fillDrift.length} drift event(s)` : undefined}
+      />
+      <SummaryLine
+        label="Integrity-critical audit events"
+        state={auditLineState(criticalAudit.length === 0)}
+        detail={criticalAudit.length > 0 ? `${criticalAudit.length} critical event(s)` : undefined}
+      />
+
       <h3>Reconciliation drift/corrections</h3>
-      {notableReconciliation.length === 0 && <p className="muted">No drift or corrections in the recent window.</p>}
+      {notableReconciliation.length === 0 && <EmptyState>No drift or corrections in the recent window.</EmptyState>}
       {notableReconciliation.length > 0 && (
         <table>
           <thead>
@@ -40,7 +81,7 @@ export function AlertsPanel() {
       )}
 
       <h3>Audit events (warning+)</h3>
-      {notableAudit.length === 0 && <p className="muted">Nothing above info severity in the recent window.</p>}
+      {notableAudit.length === 0 && <EmptyState>Nothing above info severity in the recent window.</EmptyState>}
       {notableAudit.length > 0 && (
         <table>
           <thead>

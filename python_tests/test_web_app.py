@@ -372,6 +372,27 @@ async def test_get_provenance_exposes_only_approved_non_sensitive_fields(tmp_pat
 
 
 @respx.mock
+async def test_get_risk_limits_returns_the_active_profiles_limits(tmp_path) -> None:
+    """Pure config passthrough -- no repositories/broker involved, same
+    shape as the provenance route above."""
+    client, state = await _client_for(tmp_path)  # defaults to TRADEPULSE_RISK_PROFILE unset -> "balanced"
+
+    response = await client.get("/api/risk-limits")
+    await client.aclose()
+    await state.broker.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {
+        "profile_id", "max_total_exposure_pct", "max_sector_pct", "max_position_pct",
+        "max_daily_trades", "max_open_positions", "max_drawdown_pct",
+    }
+    assert body["profile_id"] == "balanced"
+    assert body["max_total_exposure_pct"] == "40"
+    assert body["max_daily_trades"] == 3
+
+
+@respx.mock
 async def test_get_rejected_candidates_returns_hydrated_recent_rows(tmp_path) -> None:
     client, state = await _client_for(tmp_path)
     rejection = RejectedCandidate(

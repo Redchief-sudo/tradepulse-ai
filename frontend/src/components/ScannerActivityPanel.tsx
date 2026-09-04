@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { usePolling } from '../usePolling'
 import { time } from '../format'
-import { Panel } from './Panel'
+import { Panel, EmptyState } from './Panel'
 import type { AiResponse, ScanRun } from '../types'
 
 const LANES: { key: string; label: string }[] = [
@@ -39,14 +39,33 @@ function useAiCandidates(requestId: string | null): AiResponse | null {
   return state.requestId === requestId ? state.response : null
 }
 
-function LaneCard({ label, run }: { label: string; run: ScanRun | undefined }) {
+// Verified against risk/session.py::execution_session_decision and
+// models/market.py::is_continuous_market -- MARKET_CLOSED exempts only
+// continuous markets, which today means crypto exclusively.
+const CONTINUOUS_LANES = new Set(['crypto'])
+
+function laneState(laneKey: string, marketClosed: boolean, run: ScanRun | undefined): { label: string; className: string } {
+  if (marketClosed && !CONTINUOUS_LANES.has(laneKey)) {
+    return { label: 'WAITING — MARKET CLOSED', className: 'status-badge status-badge-warning' }
+  }
+  if (!run) return { label: 'NO DATA YET', className: 'status-badge status-badge-neutral' }
+  if (run.status === 'running') return { label: 'ACTIVE — SCANNING', className: 'status-badge status-badge-ok' }
+  if (run.status === 'failed') return { label: 'FAILED', className: 'status-badge status-badge-danger' }
+  return { label: 'COMPLETED', className: 'status-badge status-badge-ok' }
+}
+
+function LaneCard({ laneKey, label, run, marketClosed }: { laneKey: string; label: string; run: ScanRun | undefined; marketClosed: boolean }) {
   const aiResponse = useAiCandidates(run?.ai_response_request_id ?? null)
   const feed = run?.asset_class === 'option' ? run.option_feed : run?.asset_class === 'equity' ? run.equity_feed : null
+  const state = laneState(laneKey, marketClosed, run)
 
   return (
-    <div>
-      <h3>{label}</h3>
-      {!run && <p className="muted">No scan cycle recorded yet.</p>}
+    <div className="lane-card">
+      <div className="lane-header">
+        <h3>{label}</h3>
+        <span className={state.className}>{state.label}</span>
+      </div>
+      {!run && <EmptyState>No scan cycle recorded yet.</EmptyState>}
       {run && (
         <>
           <dl className="kv">
@@ -69,13 +88,12 @@ function LaneCard({ label, run }: { label: string; run: ScanRun | undefined }) {
               {run.market_data_tier ?? '—'}
               {feed ? ` (${feed})` : ''}
             </dd>
-            <dt>Regime</dt>
-            <dd>
-              {!run.regime && '—'}
-              {run.regime === 'unavailable' && `unavailable (${run.regime_reason ?? 'unknown'})`}
-              {run.regime && run.regime !== 'unavailable' && `${run.regime} (${run.regime_position_multiplier ?? '?'}x)`}
-            </dd>
           </dl>
+          <div className={`regime-block${!run.regime || run.regime === 'unavailable' ? ' regime-block-unavailable' : ''}`}>
+            {!run.regime && 'Regime: —'}
+            {run.regime === 'unavailable' && `Regime: unavailable (${run.regime_reason ?? 'unknown'})`}
+            {run.regime && run.regime !== 'unavailable' && `Regime: ${run.regime} (${run.regime_position_multiplier ?? '?'}x)`}
+          </div>
           {run.error && <div className="panel-error">{run.error}</div>}
           {aiResponse && aiResponse.result.candidates.length > 0 && (
             <>
@@ -108,6 +126,7 @@ function LaneCard({ label, run }: { label: string; run: ScanRun | undefined }) {
 
 export function ScannerActivityPanel() {
   const { data, error, loading } = usePolling(() => api.getScanRuns(50), 20000)
+  const { data: session } = usePolling(api.getSession, 5000)
 
   const latestByLane: Record<string, ScanRun> = {}
   if (data) {
@@ -115,6 +134,8 @@ export function ScannerActivityPanel() {
       if (!(run.asset_class in latestByLane)) latestByLane[run.asset_class] = run
     }
   }
+
+  const marketClosed = session?.state === 'market_closed'
 
   return (
     <Panel title="Scanner Activity" error={error} loading={loading}>
@@ -124,7 +145,7 @@ export function ScannerActivityPanel() {
         detail). Rejection reasons are log-only in this pass, not shown here.
       </p>
       {LANES.map(({ key, label }) => (
-        <LaneCard key={key} label={label} run={latestByLane[key]} />
+        <LaneCard key={key} laneKey={key} label={label} run={latestByLane[key]} marketClosed={marketClosed} />
       ))}
     </Panel>
   )

@@ -122,6 +122,16 @@ header h1 {
   color: var(--negative);
 }
 
+.badge-warning {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.badge-neutral {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .button-row {
   display: flex;
   gap: 8px;
@@ -169,5 +179,292 @@ header h1 {
   max-width: 320px;
   white-space: normal;
   font-size: 0.75rem;
+  color: var(--muted);
+}
+
+/* ---- Header --------------------------------------------------------- */
+
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--panel-bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 14px var(--space-md);
+  margin-bottom: var(--space-md);
+}
+
+.app-header-top {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.app-header-top h1 {
+  margin: 0;
+  font-size: 1.3rem;
+  letter-spacing: 0.02em;
+}
+
+.app-header-subtitle {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.status-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 0.75rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.status-pill-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+.status-pill-positive {
+  border-color: var(--positive);
+  color: var(--positive);
+}
+
+.status-pill-negative {
+  border-color: var(--negative);
+  color: var(--negative);
+}
+
+.status-pill-warning {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.status-pill-neutral {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ---- KPI row ---------------------------------------------------------- */
+
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: var(--space-md);
+}
+
+.kpi-card {
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  min-width: 0;
+}
+
+.kpi-label {
+  font-size: 0.7rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+
+.kpi-value {
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.kpi-sub {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+/* ---- Utilization bars --------------------------------------------------- */
+
+.util-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+  font-size: 0.8rem;
+}
+
+.util-bar-label {
+  flex: 0 0 140px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.util-bar-track {
+  flex: 1;
+  height: 8px;
+  background: var(--bg);
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.util-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+}
+
+.util-bar-fill-ok {
+  background: var(--positive);
+}
+
+.util-bar-fill-warn {
+  background: var(--warning);
+}
+
+.util-bar-fill-critical {
+  background: var(--negative);
+}
+
+.util-bar-pct {
+  flex: 0 0 44px;
+  text-align: right;
+  color: var(--muted);
+}
+
+/* ---- Lane state badges (Scanner Activity) ------------------------------ */
+
+.lane-card {
+  margin-bottom: 18px;
+}
+
+.lane-card:last-child {
+  margin-bottom: 0;
+}
+
+.lane-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.lane-header h3 {
+  margin: 0;
+}
+
+.regime-block {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin-top: 8px;
+  font-size: 0.8rem;
+}
+
+.regime-block-unavailable {
+  border-color: var(--warning);
+}
+
+/* ---- Status summary lines (System Integrity) ---------------------------- */
+
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  padding: 3px 0;
+}
+
+.status-line-ok {
+  color: var(--positive);
+}
+
+.status-line-bad {
+  color: var(--negative);
+}
+
+.status-line-unknown {
+  color: var(--muted);
+}
+
+/* ---- Empty/placeholder states -------------------------------------------- */
+
+.empty-state {
+  color: var(--muted);
+  font-size: 0.85rem;
+  padding: 10px 0;
+}
+
+.placeholder-card {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: 16px;
+  color: var(--muted);
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+/* ---- Small status badges (fills/settlements/opportunities) -------------- */
+
+.status-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.status-badge-buy {
+  border-color: var(--positive);
+  color: var(--positive);
+}
+
+.status-badge-sell {
+  border-color: var(--negative);
+  color: var(--negative);
+}
+
+.status-badge-hold {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.status-badge-danger {
+  border-color: var(--negative);
+  color: var(--negative);
+}
+
+.status-badge-ok {
+  border-color: var(--positive);
+  color: var(--positive);
+}
+
+.status-badge-warning {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.status-badge-neutral {
+  border-color: var(--muted);
   color: var(--muted);
 }

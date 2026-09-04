@@ -165,6 +165,16 @@ export interface PortfolioSnapshot {
   source: string
 }
 
+export interface RiskLimits {
+  profile_id: string
+  max_total_exposure_pct: string
+  max_sector_pct: string
+  max_position_pct: string
+  max_daily_trades: number
+  max_open_positions: number
+  max_drawdown_pct: string
+}
+
 export interface ReconciliationRecord {
   record_id: string
   reconciliation_type: string

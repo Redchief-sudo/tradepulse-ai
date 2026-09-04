@@ -10,6 +10,7 @@ import type {
   PortfolioSnapshot,
   Provenance,
   ReconciliationRecord,
+  RiskLimits,
   ScanRun,
   SessionActionResult,
   SettlementEvent,
@@ -59,6 +60,7 @@ export const api = {
   getPositions: () => get<EnrichedPosition[]>('/api/positions'),
   getRiskExposure: () => get<PortfolioSnapshot>('/api/risk-exposure'),
   getPnl: () => get<PnlResponse>('/api/pnl'),
+  getRiskLimits: () => get<RiskLimits>('/api/risk-limits'),
 
   getMarketDataCapability: () => get<MarketDataCapabilityByLane>('/api/market-data-capability'),
   probeMarketDataCapability: () =>
