@@ -26,15 +26,22 @@ def default_strategy_weights(now: datetime) -> StrategyWeights:
 
 # Strategy Sophistication Phase 1 -- regime-conditioned weight profiles.
 #
-# PLACEHOLDER -- NOT YET CALIBRATED against real backtested outcomes.
-# Directionally reasoned (momentum-heavy in low_vol_bull, defensive/
-# relative-strength-heavy in high_vol_bear, mean-reversion/technical-heavy
-# in range_bound_choppy) but not validated against real trade results.
-# Revisit once outcome attribution (a later, separate phase) provides real
-# data to calibrate against -- shipping a guess that's clearly labeled as a
-# guess now beats blocking this phase on calibrating against nothing, the
-# same tradeoff regime.py's own thresholds started from before its Phase 1
-# calibration pass (see docs/regime-classifier-phase1-calibration.md).
+# NOT CURRENTLY WIRED IN. PLACEHOLDER -- NOT YET CALIBRATED against real
+# backtested outcomes. Directionally reasoned (momentum-heavy in
+# low_vol_bull, defensive/relative-strength-heavy in high_vol_bear,
+# mean-reversion/technical-heavy in range_bound_choppy) but never validated
+# against real trade results. scanner/coordinator.py originally called
+# regime_conditioned_weights() below to condition the live composite gate
+# on these profiles; reverted ahead of a 60-day prove-edge baseline
+# (Rev.84 audit) -- candidate scoring/ranking/capital allocation must not
+# depend on an unvalidated hypothesis, unlike regime.py's own sizing
+# multiplier (risk/engine.py's regime_multiplier), which IS grounded in
+# real historical market statistics (see
+# docs/regime-classifier-phase1-calibration.md) and remains active. Kept
+# here, tested, and callable for a future proper walk-forward calibration
+# pass (compare against the fixed baseline on held-out data, isolate each
+# factor's contribution) -- not deleted, just not trusted with live capital
+# yet.
 #
 # Deliberately keyed by a BARE STRING regime label, not strategy.regime.Regime
 # -- config/ must never import strategy.regime types here, mirroring the

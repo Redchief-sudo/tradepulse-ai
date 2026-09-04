@@ -234,7 +234,7 @@ def _mock_bars_for(symbol: str, closes: list[float], volumes: list[float] | None
 # high/low range -> higher ATR-based risk_quality_score) below, paired via
 # _mock_bars_for's volumes/band overrides. Never assume relative composite
 # ordering between two fixtures without checking directly.
-_STRONGER_BULLISH_CLOSES = _synthetic_closes(40, trend=0.7, amplitude=2.0, period=4.0, phase=0.5)
+_STRONGER_BULLISH_CLOSES = _synthetic_closes(40, trend=0.7, amplitude=3.5, period=4.0, phase=0.5)
 _STRONGER_BULLISH_VOLUMES = [300_000.0 + i * 50_000.0 for i in range(40)]
 _STRONGER_BULLISH_BAND = 0.0008
 
@@ -1641,7 +1641,14 @@ async def test_liquidity_crisis_regime_suppresses_all_new_entries_before_any_fet
 
 
 @respx.mock
-async def test_low_vol_bull_regime_weight_profile_recorded_on_scan_run_and_opportunity(tmp_path) -> None:
+async def test_regime_classification_no_longer_conditions_factor_weights(tmp_path) -> None:
+    """Rev.84 revert: regime classification is still computed and
+    persisted for observability (ScanRun.regime, sizing's
+    regime_multiplier), but no longer conditions factor weights --
+    candidate composite scoring must use the plain fixed baseline
+    ("v1") regardless of the classified regime, since the
+    regime-conditioned weight profiles were never validated against real
+    trade outcomes."""
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_market_open()
@@ -1666,13 +1673,13 @@ async def test_low_vol_bull_regime_weight_profile_recorded_on_scan_run_and_oppor
 
     scan_row = await repositories.scan_runs.get(summary.scan_run_id)
     scan_run = hydrate("scan_runs", scan_row["payload"])
-    assert scan_run.regime == "low_vol_bull"
-    assert scan_run.regime_weight_profile == "v1+regime:low_vol_bull"
+    assert scan_run.regime == "low_vol_bull"  # classification still runs and is still recorded
+    assert scan_run.regime_weight_profile == "v1"  # but no longer conditions weights -- plain fixed baseline, not "v1+regime:..."
 
     opp_rows = await repositories.opportunities.list_all()
     assert len(opp_rows) == 1
     opportunity = hydrate("opportunities", opp_rows[0]["payload"])
-    assert opportunity.metadata["regime_weight_profile"] == "v1+regime:low_vol_bull"
+    assert opportunity.metadata["regime_weight_profile"] == "v1"
     assert "liquidity_score" in opportunity.metadata
     assert "risk_quality_score" in opportunity.metadata
     assert opportunity.metadata["factor_breakdown"]["relative_strength"] != "unavailable"  # SPY benchmark was available this cycle

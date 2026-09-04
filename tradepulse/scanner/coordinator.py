@@ -32,7 +32,7 @@ from typing import Any
 from uuid import uuid4
 
 from tradepulse.broker import AlpacaClient
-from tradepulse.config import default_strategy_weights, regime_conditioned_weights, sector_for_symbol
+from tradepulse.config import default_strategy_weights, sector_for_symbol
 from tradepulse.execution import (
     SYMBOL_LOCK_TTL_SECONDS,
     ExecutionGateway,
@@ -553,13 +553,25 @@ async def run_scan_cycle(
         return ScanCycleSummary(scan_run_id, ScanRunStatus.FAILED, 0, 0, 0, [], error=str(exc))
 
     lane_regime: _LaneRegime = await regime_task
-    # Strategy Sophistication Phase 1 -- which strategy logic gets trusted
-    # more this cycle is conditioned on the SAME lane-wide regime already
-    # classified above, a deterministic modifier applied once per cycle
-    # (never per-candidate), fully independent of and never a bypass around
-    # risk/engine.py's own regime_multiplier sizing gate.
+    # Regime classification still feeds risk/engine.py's regime_multiplier
+    # sizing gate below (that path IS empirically calibrated -- see
+    # docs/regime-classifier-phase1-calibration.md) and is still persisted
+    # for observability (regime/regime_confidence on ScanRun/Opportunity).
+    #
+    # It no longer conditions FACTOR WEIGHTS. Strategy Sophistication Phase
+    # 1 originally wired regime_conditioned_weights() in here, but its
+    # weight vectors (config/strategy_weights.py::_REGIME_WEIGHT_PROFILES)
+    # were never validated against real trade outcomes -- unlike the sizing
+    # multiplier, there's no historical-market-statistic proxy for "is 30%
+    # momentum better than 20% in a bull regime," only a real backtest or
+    # live outcome data could answer that, and neither exists yet. Reverted
+    # to the fixed baseline composite (candidate scoring/ranking/capital
+    # allocation must not depend on an unvalidated hypothesis) ahead of a
+    # 60-day prove-edge baseline. regime_conditioned_weights() itself is
+    # kept, tested, and importable for a future calibration pass -- just not
+    # called from here until real evidence backs it.
     regime_label = str(lane_regime.snapshot.get("regime", "unavailable"))
-    effective_weights = regime_conditioned_weights(strategy_weights, regime_label, now)
+    effective_weights = strategy_weights
 
     await repositories.ai_responses.create_once(ai_response.request_id, ai_response)
 
