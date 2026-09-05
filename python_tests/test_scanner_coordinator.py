@@ -351,6 +351,40 @@ async def test_scan_run_leaves_capability_fields_none_when_omitted(tmp_path) -> 
 
 
 @respx.mock
+async def test_scan_generation_is_unique_across_lanes_starting_in_the_same_second(tmp_path) -> None:
+    """UI-094-01: scan_generation previously had only one-second resolution
+    (a bare timestamp string), so equity/crypto/options lanes starting
+    within the same second collided -- the dashboard's cross-lane funnel
+    count is keyed purely by this string, so a same-second fill from one
+    lane could inflate another lane's displayed count. All three lanes
+    scanning at the identical clock() value must now produce distinct
+    scan_generation values."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    _mock_spy_bars()
+    _mock_crypto_bars(_BULLISH_CLOSES)
+    respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(200, json=_tool_use_response([])))
+    crypto_universe = ExecutableUniverse(equities=frozenset(), crypto=frozenset({"BTC/USD"}))
+
+    equity_summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    crypto_summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, crypto_universe, limits, AssetClass.CRYPTO, clock=lambda: NOW)
+    option_summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, OPTIONS_UNIVERSE, limits, AssetClass.OPTION, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    equity_run = hydrate("scan_runs", (await repositories.scan_runs.get(equity_summary.scan_run_id))["payload"])
+    crypto_run = hydrate("scan_runs", (await repositories.scan_runs.get(crypto_summary.scan_run_id))["payload"])
+    option_run = hydrate("scan_runs", (await repositories.scan_runs.get(option_summary.scan_run_id))["payload"])
+
+    generations = {equity_run.scan_generation, crypto_run.scan_generation, option_run.scan_generation}
+    assert len(generations) == 3  # all three distinct despite the identical clock() timestamp
+    assert equity_run.scan_generation.endswith("-equity")
+    assert crypto_run.scan_generation.endswith("-crypto")
+    assert option_run.scan_generation.endswith("-option")
+
+
+@respx.mock
 async def test_crypto_lane_prompt_contains_only_crypto_symbols(tmp_path) -> None:
     repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
@@ -1335,6 +1369,34 @@ async def test_stale_running_scan_run_is_reclaimed_as_failed(tmp_path) -> None:
     stale_after = hydrate("scan_runs", stale_row["payload"])
     assert stale_after.error == "CRASHED_STALE_SCAN_RUN"
     assert stale_after.completed_at == NOW
+
+
+@respx.mock
+async def test_stale_scan_run_reclamation_survives_more_than_one_page_of_stale_rows(tmp_path) -> None:
+    """OBS-094-01: the old list_by_status(..., limit=50) ceiling meant
+    repeated crashes leaving more than 50 stale RUNNING rows would only
+    reclaim the oldest 50 per cycle, leaving newer stale rows displayed as
+    permanently RUNNING for cycles on end. 51 stale rows here -- one more
+    than the old ceiling -- must ALL be reclaimed in a single cycle."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(
+        repositories,
+        TradingSession("session", SessionState.RISK_STOPPED, False, NOW, kill_switch_reason="daily loss", kill_switch_reset_required=True),
+    )
+    for i in range(51):
+        stale = ScanRun(
+            scan_run_id=f"stale-{i}", scan_generation=f"gen-stale-{i}", trigger=ScanTrigger.SCHEDULED, asset_class=AssetClass.EQUITY,
+            status=ScanRunStatus.RUNNING, started_at=NOW - timedelta(seconds=1000), lock_owner_token="owner-1",
+        )
+        await repositories.scan_runs.create_once(f"stale-{i}", stale, status=stale.status.value)
+
+    await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, UNIVERSE, limits, AssetClass.EQUITY, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    for i in range(51):
+        row = await repositories.scan_runs.get(f"stale-{i}")
+        assert row["status"] == "failed", f"stale-{i} was not reclaimed"
 
 
 @respx.mock

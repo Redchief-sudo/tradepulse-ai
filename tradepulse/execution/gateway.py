@@ -510,14 +510,23 @@ class ExecutionGateway:
             intent.filled_quantity, intent.filled_avg_price,
         )
 
-    async def _attribute_order_fills(self, current: TradeIntent) -> AttributedFills:
+    async def _attribute_order_fills(self, current: TradeIntent, *, verify_order_filled_qty: bool = False) -> AttributedFills:
         """Thin pass-through to the shared fill_attribution module -- kept so
         existing/direct callers of this method (including tests) don't need
         to reach into fill_attribution themselves. See that module's
         docstring for why this logic is shared rather than gateway-private:
         reconciliation's late-fill recovery needs the exact same accounting
-        path, not a second way to create a Fill/SettlementEvent."""
-        return await attribute_order_fills(self._repositories, self._broker, self._alerts, current, self._clock)
+        path, not a second way to create a Fill/SettlementEvent.
+
+        verify_order_filled_qty defaults False here so direct unit-level
+        callers of this method (see test_execution_gateway.py) are
+        unaffected -- _poll_and_settle's own call site below passes True,
+        the only production path that needs FIN-094-01's order-level
+        consistency check."""
+        return await attribute_order_fills(
+            self._repositories, self._broker, self._alerts, current, self._clock,
+            verify_order_filled_qty=verify_order_filled_qty,
+        )
 
     async def _poll_and_settle(self, intent: TradeIntent) -> ExecutionResult:
         assert intent.broker_order_id is not None
@@ -536,7 +545,7 @@ class ExecutionGateway:
 
             attributed_qty = last_filled_qty
             if cumulative_filled > 0:
-                attributed = await self._attribute_order_fills(current)
+                attributed = await self._attribute_order_fills(current, verify_order_filled_qty=True)
                 attributed_qty = attributed.quantity
                 if attributed_qty > cumulative_filled:
                     # A broker-side data anomaly, not eventual-consistency

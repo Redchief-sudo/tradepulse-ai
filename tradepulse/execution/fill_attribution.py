@@ -16,8 +16,9 @@ from decimal import Decimal
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaActivity, AlpacaClient, AlpacaError
-from tradepulse.models import Fill, SettlementEvent, TradeIntent, TradeIntentStatus
-from tradepulse.persistence import PersistenceRepositories
+from tradepulse.models import Fill, SettlementEvent, SettlementStatus, TradeIntent, TradeIntentStatus
+from tradepulse.persistence import PersistenceRepositories, hydrate, list_all_by_json_field
+from tradepulse.risk import latch_financial_integrity_block
 from tradepulse.settlement import SettlementProcessor
 
 TERMINAL_STATUSES = frozenset(
@@ -107,7 +108,7 @@ def _is_valid_fill_activity(activity: AlpacaActivity, current: TradeIntent) -> b
 
 async def attribute_order_fills(
     repositories: PersistenceRepositories, broker: AlpacaClient, alerts: TelegramAlerter,
-    current: TradeIntent, clock: Callable[[], datetime],
+    current: TradeIntent, clock: Callable[[], datetime], *, verify_order_filled_qty: bool = False,
 ) -> AttributedFills:
     """Fetch this order's real FILL activities from Alpaca and create a
     local Fill/SettlementEvent for each validated one not already recorded,
@@ -118,7 +119,17 @@ async def attribute_order_fills(
     a broker-reported average price that covers more (or different) fills
     than were actually attributed. The caller can compare `.quantity`
     against /orders' cumulative filled_qty to tell whether the Activities
-    API has fully caught up."""
+    API has fully caught up.
+
+    FIN-094-01: verify_order_filled_qty=True makes this function its own
+    order-level consistency gate BEFORE any new SettlementEvent becomes
+    processable -- both existing callers already independently detect
+    attributed_qty > order.filled_qty AFTER this function returns, but by
+    then the disputed SettlementEvents already exist as PENDING, fully
+    eligible for SettlementProcessor.process_pending() to project into
+    PositionLot/Holding/TradeIntent accounting before anyone notices.
+    Default False preserves every existing caller/test that doesn't need
+    this (no broker order lookup, identical behavior to before)."""
     activities = await broker.get_activities(activity_type="FILL", since=current.created_at)
     order_activities = [a for a in activities if str(a.raw.get("order_id") or "") == current.broker_order_id]
 
@@ -135,6 +146,73 @@ async def attribute_order_fills(
             continue
         validated.append(activity)
     validated.sort(key=lambda a: (a.transaction_time, a.activity_id))
+
+    total_qty = sum((a.qty for a in validated), Decimal("0"))
+
+    # FIN-094-01: fetched AFTER activities (never accepted as a
+    # caller-supplied, pre-fetched value) -- this is what actually closes
+    # the TOCTOU race. A legitimate new fill landing between an earlier
+    # order-fetch and this activities-fetch would make total_qty look
+    # disputed against a now-stale order.filled_qty; fetching fresh here
+    # means such a fill is already reflected in BOTH reads (order status
+    # is assumed to update at least as promptly as the activities feed --
+    # the same assumption the existing, unchanged "attributed_qty <
+    # cumulative_filled" eventual-consistency-lag handling elsewhere
+    # already relies on, just in the opposite direction).
+    quantity_disputed = False
+    if verify_order_filled_qty:
+        try:
+            order = await broker.get_order(current.broker_order_id)
+            quantity_disputed = total_qty > order.filled_qty
+        except AlpacaError:
+            # Verification unavailable is NOT the same epistemic state as
+            # "checked and consistent" -- do not fabricate consistency,
+            # but also don't block accounting on one transient API
+            # failure. The caller's own independent mismatch check (using
+            # whatever order.filled_qty IT already has) remains the
+            # unchanged backstop regardless of this outcome.
+            await alerts.send(
+                "warning",
+                f"ORDER_FILL_VERIFICATION_UNAVAILABLE: could not fetch order {current.broker_order_id} for "
+                f"{current.asset.symbol} to verify attributed fill quantity ({total_qty}) against broker "
+                "truth -- proceeding as PENDING, not blocked, pending the next verification attempt.",
+                {"trade_intent_id": current.trade_intent_id, "broker_order_id": current.broker_order_id, "attributed_qty": str(total_qty)},
+            )
+
+    if quantity_disputed:
+        # Retroactively quarantine this order's ALREADY-EXISTING
+        # PENDING/RETRYABLE_FAILED SettlementEvents too -- create_once
+        # below only protects events newly created in THIS call; an event
+        # created by an earlier (pre-dispute) call would otherwise remain
+        # fully processable. claim_if_processable, not a blind .update(),
+        # so this can never race a concurrently-running
+        # SettlementProcessor.process_pending() claim on the same row --
+        # anything already PROCESSING/COMPLETED/TERMINAL_FAILED/already-
+        # INTEGRITY_BLOCKED is left untouched; unwinding an
+        # already-completed projection is reconciliation's job, not this
+        # function's.
+        existing_rows = await list_all_by_json_field(repositories.settlements, "trade_intent_id", current.trade_intent_id)
+        for row in existing_rows:
+            existing_event = hydrate("settlements", row["payload"])
+
+            def decide(current_event: SettlementEvent) -> SettlementEvent | None:
+                if current_event.status not in (SettlementStatus.PENDING, SettlementStatus.RETRYABLE_FAILED):
+                    return None
+                return replace(
+                    current_event, status=SettlementStatus.INTEGRITY_BLOCKED,
+                    error_code="INTEGRITY_VIOLATION: order fill quantity disputed", next_retry_at=None,
+                    processing_owner=None, processing_started_at=None,
+                )
+
+            await repositories.settlements.claim_if_processable(existing_event.settlement_event_id, decide)
+
+        await latch_financial_integrity_block(
+            repositories,
+            f"INTEGRITY_VIOLATION: attributed fill quantity ({total_qty}) exceeds broker order.filled_qty for "
+            f"{current.asset.symbol} order {current.broker_order_id} -- broker evidence is contradictory; "
+            "withholding settlement projection until reconciled.",
+            clock=clock,
+        )
 
     for activity in validated:
         fill = Fill(
@@ -155,16 +233,19 @@ async def attribute_order_fills(
         # UNIQUE `unique_value` constraint), so calling it every time is a
         # safe no-op once the SettlementEvent already exists, and repairs
         # the gap exactly once when it doesn't.
+        # FIN-094-01: a disputed order's newly-created events are minted
+        # directly as INTEGRITY_BLOCKED, never PENDING -- never eligible
+        # for SettlementProcessor.process_pending() until reconciled.
         event = SettlementEvent(
             settlement_event_id=fill.fill_id, fill_id=fill.fill_id, trade_intent_id=current.trade_intent_id,
             asset=current.asset, side=current.side, execution_mode=current.execution_mode,
             quantity=fill.quantity, price=fill.price, occurred_at=activity.transaction_time,
             broker_order_id=current.broker_order_id, broker_fill_id=activity.activity_id,
             client_order_id=current.client_order_id, sector=current.sector,
+            status=SettlementStatus.INTEGRITY_BLOCKED if quantity_disputed else SettlementStatus.PENDING,
         )
         await repositories.settlements.create_once(fill.fill_id, event, status=event.status.value, unique_value=fill.fill_id)
 
-    total_qty = sum((a.qty for a in validated), Decimal("0"))
     total_notional = sum((a.qty * a.price for a in validated), Decimal("0"))
     avg_price = total_notional / total_qty if total_qty > 0 else None
     return AttributedFills(quantity=total_qty, avg_price=avg_price)
@@ -183,7 +264,12 @@ async def resolve_order_from_broker(
     polling loop or timeout. Returns the attributed quantity/price."""
     if intent.broker_order_id is None:
         return AttributedFills(Decimal("0"), None)
-    attributed = await attribute_order_fills(repositories, broker, alerts, intent, clock)
+    # FIN-094-01: verifies order-level fill-quantity consistency here too,
+    # deliberately including an already-terminal intent -- a terminal
+    # local status does not prove a subsequently-surfacing broker activity
+    # is internally consistent, and late-fill recovery is exactly where
+    # skipping this would leave a disputed fill unprotected.
+    attributed = await attribute_order_fills(repositories, broker, alerts, intent, clock, verify_order_filled_qty=True)
     if intent.status in TERMINAL_STATUSES:
         return attributed  # already finalized -- the new Fill/SettlementEvent will be
         # picked up by the normal `tradepulse settle` cadence

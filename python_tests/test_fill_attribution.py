@@ -8,8 +8,13 @@ import respx
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
 from tradepulse.execution.fill_attribution import attribute_order_fills, terminal_status_for_order
-from tradepulse.models import AssetClass, AssetIdentity, ExecutionMode, Fill, Side, TradeIntent, TradeIntentStatus
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories
+from tradepulse.models import (
+    AssetClass, AssetIdentity, ExecutionMode, Fill, SessionState, Side, TradeIntent, TradeIntentStatus,
+)
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
+from tradepulse.risk import load_session
+from tradepulse.settlement import SettlementProcessor
+from tradepulse.settlement.stages import is_settlement_processable
 
 
 @pytest.mark.parametrize(
@@ -88,6 +93,17 @@ def _activity_json(activity_id: str, qty: str, price: str, order_id: str = "orde
     }
 
 
+def _mock_order(order_id: str, filled_qty: str, status: str = "partially_filled") -> None:
+    respx.get(f"https://paper-api.alpaca.markets/v2/orders/{order_id}").mock(return_value=httpx.Response(200, json={
+        "id": order_id, "status": status, "symbol": "AAPL", "side": "buy",
+        "filled_qty": filled_qty, "filled_avg_price": "150", "submitted_at": NOW.isoformat().replace("+00:00", "Z"),
+    }))
+
+
+def _mock_order_error(order_id: str) -> None:
+    respx.get(f"https://paper-api.alpaca.markets/v2/orders/{order_id}").mock(return_value=httpx.Response(500, json={"message": "internal error"}))
+
+
 @respx.mock
 async def test_a_fill_persisted_without_its_settlement_event_is_repaired_exactly_once_on_replay(tmp_path) -> None:
     """FIN-091-01 regression: simulates the crash window between the two
@@ -144,3 +160,112 @@ async def test_replaying_an_already_fully_settled_fill_does_not_duplicate_or_dis
     assert second.quantity == Decimal("10")
     assert len(await repositories.fills.list_all()) == 1
     assert len(await repositories.settlements.list_all()) == 1
+
+
+@respx.mock
+async def test_disputed_order_creates_integrity_blocked_settlement_not_pending(tmp_path) -> None:
+    """FIN-094-01: activities sum to more (10) than the broker's own fresh
+    order.filled_qty (5) -- the newly-created SettlementEvent must be
+    INTEGRITY_BLOCKED, not PENDING, so process_pending() never projects it
+    into holdings. The Fill itself is still persisted -- raw broker
+    evidence is never discarded."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    intent = _intent()
+
+    _mock_activities([_activity_json("act-1", "10", "150")])
+    _mock_order("order-1", filled_qty="5")
+    attributed = await attribute_order_fills(repositories, broker, _alerts(), intent, clock=lambda: NOW, verify_order_filled_qty=True)
+    await broker.aclose()
+
+    assert attributed.quantity == Decimal("10")
+    assert await repositories.fills.get("act-1") is not None
+    event_row = await repositories.settlements.get("act-1")
+    assert event_row["status"] == "integrity_blocked"
+    event = hydrate("settlements", event_row["payload"])
+    assert is_settlement_processable(event, NOW, stale_lease_seconds=120) is False
+
+    settlement = SettlementProcessor(repositories, _alerts(), clock=lambda: NOW)
+    await settlement.process_pending()
+    event_row_after = await repositories.settlements.get("act-1")
+    assert event_row_after["status"] == "integrity_blocked"  # untouched -- never picked up
+    assert hydrate("settlements", event_row_after["payload"]).holding_projected is False
+
+
+@respx.mock
+async def test_disputed_order_latches_financial_integrity_block(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    intent = _intent()
+
+    _mock_activities([_activity_json("act-1", "10", "150")])
+    _mock_order("order-1", filled_qty="5")
+    await attribute_order_fills(repositories, broker, _alerts(), intent, clock=lambda: NOW, verify_order_filled_qty=True)
+    await broker.aclose()
+
+    session = await load_session(repositories)
+    assert session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED
+    assert "order-1" in session.financial_integrity_reason
+
+
+@respx.mock
+async def test_disputed_order_retroactively_quarantines_an_earlier_created_pending_event(tmp_path) -> None:
+    """FIN-094-01's split-creation gap: the first call only sees activity A
+    (undisputed, creates a PENDING SettlementEvent). A second call sees
+    activity A plus a newly-posted activity B, whose COMBINED total now
+    disputes against the broker's order.filled_qty. Activity A's
+    already-existing PENDING event must be retroactively quarantined too --
+    create_once alone would leave it PENDING forever since it already
+    exists."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    intent = _intent()
+
+    _mock_activities([_activity_json("act-a", "5", "150")])
+    _mock_order("order-1", filled_qty="5")
+    first = await attribute_order_fills(repositories, broker, _alerts(), intent, clock=lambda: NOW, verify_order_filled_qty=True)
+    assert first.quantity == Decimal("5")
+    assert (await repositories.settlements.get("act-a"))["status"] == "pending"
+
+    respx.reset()
+    _mock_activities([_activity_json("act-a", "5", "150"), _activity_json("act-b", "5", "150")])
+    _mock_order("order-1", filled_qty="5")  # broker still only confirms 5 -- act-b's extra 5 is disputed
+    second = await attribute_order_fills(repositories, broker, _alerts(), intent, clock=lambda: NOW, verify_order_filled_qty=True)
+    await broker.aclose()
+
+    assert second.quantity == Decimal("10")
+    assert (await repositories.settlements.get("act-a"))["status"] == "integrity_blocked"  # retroactively quarantined
+    assert (await repositories.settlements.get("act-b"))["status"] == "integrity_blocked"  # newly created, minted blocked
+
+
+@respx.mock
+async def test_verification_unavailable_is_not_treated_as_consistent(tmp_path, caplog) -> None:
+    """FIN-094-01 refinement: a transient failure verifying order.filled_qty
+    must never be silently interpreted as "broker quantities match." The
+    SettlementEvent stays PENDING (no artificial accounting lag from one
+    failed API call) but a distinct warning-level alert proves the
+    verification attempt happened and did NOT succeed -- forensic logs
+    must never imply an unverified event was actually validated."""
+    import logging
+
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    intent = _intent()
+
+    _mock_activities([_activity_json("act-1", "10", "150")])
+    _mock_order_error("order-1")
+
+    with caplog.at_level(logging.WARNING):
+        attributed = await attribute_order_fills(repositories, broker, _alerts(), intent, clock=lambda: NOW, verify_order_filled_qty=True)
+    await broker.aclose()
+
+    assert attributed.quantity == Decimal("10")
+    assert await repositories.fills.get("act-1") is not None  # still persisted
+    event_row = await repositories.settlements.get("act-1")
+    assert event_row["status"] == "pending"  # not fabricated as disputed, not blocked either
+
+    session = await load_session(repositories)
+    assert session.state != SessionState.FINANCIAL_INTEGRITY_BLOCKED  # never latched on an unverifiable outcome
+
+    skipped = [r for r in caplog.records if getattr(r, "event", None) == "telegram_alert_skipped_no_credentials"]
+    assert any("ORDER_FILL_VERIFICATION_UNAVAILABLE" in r.alert_message for r in skipped)

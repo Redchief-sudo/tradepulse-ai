@@ -460,14 +460,24 @@ async def test_late_fill_recovered_into_already_terminal_intent(tmp_path) -> Non
     """An intent that already reached FILLED can still be missing one of its
     real fill activities (e.g. one attributed slice never made it into a
     Fill before the poll window closed). Recovery must still create the
-    missing Fill/SettlementEvent -- and must never need to re-check the
-    order's broker status to do it, proven here by never mocking get_order
-    at all (an unmocked call would fail the test)."""
+    missing Fill/SettlementEvent.
+
+    FIN-094-01 deliberately changed a prior invariant here: recovery used
+    to never re-check the order's broker status for an already-terminal
+    intent (a reasonable efficiency choice when nothing depended on it).
+    It now always verifies order-level fill-quantity consistency, even for
+    a terminal intent -- a terminal local status does not prove a
+    subsequently-surfacing broker activity is internally consistent, and
+    late-fill recovery is exactly where skipping this would leave a
+    disputed fill unprotected. get_order is now mocked (consistent:
+    filled_qty=5 matches the one recovered activity) rather than asserting
+    it's never called."""
     repositories = await _repositories(tmp_path)
     broker = _broker()
     await _seed_intent(repositories, trade_intent_id="ti-2", broker_order_id="order-2", status=TradeIntentStatus.FILLED)
     _mock_positions([])
     _mock_activities([_activity_json("activity-2", "5", "150", order_id="order-2")])
+    _mock_order("order-2", "filled", "5", "150")
 
     summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
     await broker.aclose()
@@ -475,6 +485,8 @@ async def test_late_fill_recovered_into_already_terminal_intent(tmp_path) -> Non
     assert summary.late_fills_recovered == 1
     fill_row = await repositories.fills.get("activity-2")
     assert fill_row is not None
+    settlement_row = await repositories.settlements.get("activity-2")
+    assert settlement_row["status"] == "pending"  # consistent -- never blocked
 
     intent_row = await repositories.trade_intents.get("ti-2")
     assert intent_row["status"] == "filled"  # untouched -- was already terminal

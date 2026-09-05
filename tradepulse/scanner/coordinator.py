@@ -59,7 +59,7 @@ from tradepulse.models import (
     asset_identity_key,
     contract_multiplier_of,
 )
-from tradepulse.persistence import PersistenceRepositories, hydrate, paginate_all_rows, run_with_lock_renewal
+from tradepulse.persistence import PersistenceRepositories, hydrate, list_all_by_statuses, paginate_all_rows, run_with_lock_renewal
 from tradepulse.providers import (
     AIProvider,
     AlpacaMarketDataProvider,
@@ -454,7 +454,12 @@ async def _reclaim_stale_scan_runs(repositories: PersistenceRepositories, now: d
     row as FAILED before starting a new cycle, mirroring the stale-lease
     reclaim already used for settlement (is_settlement_processable) and the
     CLI scan lock (SCAN_LOCK_TTL_SECONDS)."""
-    rows = await repositories.scan_runs.list_by_status(ScanRunStatus.RUNNING.value, limit=50)
+    # OBS-094-01: unbounded, not list_by_status(..., limit=50) -- this is
+    # audit-record cleanup only (the `locks` table, not this row, is what
+    # actually gates re-entry, see the docstring above), but a 50-row cap
+    # meant repeated crashes leaving >50 stale RUNNING rows would gradually
+    # (never fully) reclaim them across cycles rather than all at once.
+    rows = await list_all_by_statuses(repositories.scan_runs, [ScanRunStatus.RUNNING.value])
     for row in rows:
         run = hydrate("scan_runs", row["payload"])
         if (now - run.started_at).total_seconds() > STALE_SCAN_RUN_SECONDS:
@@ -482,7 +487,16 @@ async def run_scan_cycle(
     strategy_weights = strategy_weights or default_strategy_weights(now)
     await _reclaim_stale_scan_runs(repositories, now)
     scan_run_id = str(uuid4())
-    scan_generation = now.strftime("%Y%m%dT%H%M%SZ")
+    # UI-094-01: asset_class included -- the timestamp alone has only
+    # one-second resolution, so parallel equity/crypto/options lanes
+    # starting within the same second would otherwise share an identical
+    # scan_generation. The dashboard's cross-lane funnel count
+    # (frontend/src/useTradeLifecycleData.ts) is keyed purely by this
+    # string, so a collision let a same-second fill from one lane inflate
+    # another lane's displayed "Filled" count -- dashboard attribution
+    # only, no effect on actual Opportunity/TradeIntent financial identity
+    # (those are keyed by UUID, unaffected).
+    scan_generation = f"{now.strftime('%Y%m%dT%H%M%SZ')}-{asset_class.value}"
     # Computed here (before session/AI calls) purely so universe_size can be
     # stamped on the ScanRun from its very first (RUNNING) persisted row --
     # a pure function of universe/asset_class, no decision logic moved.
