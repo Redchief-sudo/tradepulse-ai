@@ -2,6 +2,7 @@ import { api } from '../api'
 import { usePolling } from '../usePolling'
 import { money, pct } from '../format'
 import { Panel, EmptyState } from './Panel'
+import { OccContractLabel } from './OccContractLabel'
 
 export function PositionsPanel() {
   const { data, error, loading } = usePolling(api.getPositions, 10000)
@@ -34,9 +35,15 @@ export function PositionsPanel() {
               const unrealizedPct = costBasis !== 0 ? (Number(row.position.unrealized_pl) / costBasis) * 100 : null
               const pnlTone = Number(row.position.unrealized_pl) >= 0 ? 'positive' : 'negative'
               return (
-                <tr key={row.position.symbol}>
-                  <td>{row.position.symbol}</td>
-                  <td>{row.position.asset_class}</td>
+                <tr key={row.position.symbol} data-asset-class={row.position.asset_class} className="asset-class-row">
+                  <td>
+                    {row.position.asset_class === 'option' ? <OccContractLabel symbol={row.position.symbol} /> : row.position.symbol}
+                  </td>
+                  <td>
+                    <span className={`status-badge status-badge-${row.position.asset_class === 'crypto' ? 'hold' : row.position.asset_class === 'option' ? 'warning' : 'ok'}`}>
+                      {row.position.asset_class}
+                    </span>
+                  </td>
                   <td className="num">{row.position.qty}</td>
                   <td className="num">{money(row.position.avg_entry_price)}</td>
                   <td className="num">{money(row.position.current_price)}</td>

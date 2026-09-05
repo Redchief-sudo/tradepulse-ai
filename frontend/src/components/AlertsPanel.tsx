@@ -2,6 +2,7 @@ import { api } from '../api'
 import { usePolling } from '../usePolling'
 import { time } from '../format'
 import { Panel, EmptyState } from './Panel'
+import type { SettlementEvent, TradeIntent } from '../types'
 
 type LineState = 'ok' | 'bad' | 'unknown'
 
@@ -18,7 +19,12 @@ function SummaryLine({ label, state, detail }: { label: string; state: LineState
   )
 }
 
-export function AlertsPanel() {
+export function AlertsPanel({
+  settlements, tradeIntents,
+}: {
+  settlements: { data: SettlementEvent[] | null; error: string | null; loading: boolean }
+  tradeIntents: { data: TradeIntent[] | null; error: string | null; loading: boolean }
+}) {
   const reconciliation = usePolling(() => api.getReconciliation(20), 30000)
   const audit = usePolling(() => api.getAuditEvents(20), 30000)
 
@@ -28,14 +34,21 @@ export function AlertsPanel() {
   const driftRecords = reconciliation.data?.filter((r) => r.outcome === 'drift_detected') ?? []
   const fillDrift = driftRecords.filter((r) => r.reconciliation_type === 'fill')
   const criticalAudit = audit.data?.filter((e) => e.severity === 'critical') ?? []
+  const unresolvedSettlementErrors = settlements.data?.filter((s) => s.error_code !== null) ?? []
+  const submissionUnknown = tradeIntents.data?.filter((i) => i.status === 'submission_unknown') ?? []
 
   // A fetch error must render as unknown, never as a green checkmark --
   // checked before any healthy/unhealthy line is decided.
   const reconciliationLineState = (ok: boolean): LineState => (reconciliation.error ? 'unknown' : ok ? 'ok' : 'bad')
   const auditLineState = (ok: boolean): LineState => (audit.error ? 'unknown' : ok ? 'ok' : 'bad')
+  const settlementLineState = (ok: boolean): LineState => (settlements.error ? 'unknown' : settlements.data === null ? 'unknown' : ok ? 'ok' : 'bad')
+  const intentLineState = (ok: boolean): LineState => (tradeIntents.error ? 'unknown' : tradeIntents.data === null ? 'unknown' : ok ? 'ok' : 'bad')
+
+  const overallError = reconciliation.error ?? audit.error ?? settlements.error ?? tradeIntents.error
+  const overallLoading = reconciliation.loading || audit.loading || settlements.loading || tradeIntents.loading
 
   return (
-    <Panel title="Reconciliation &amp; Audit Alerts" error={reconciliation.error ?? audit.error} loading={reconciliation.loading || audit.loading}>
+    <Panel title="System Integrity" error={overallError} loading={overallLoading}>
       <h3>System integrity</h3>
       <SummaryLine
         label="Position/view reconciliation"
@@ -51,6 +64,16 @@ export function AlertsPanel() {
         label="Integrity-critical audit events"
         state={auditLineState(criticalAudit.length === 0)}
         detail={criticalAudit.length > 0 ? `${criticalAudit.length} critical event(s)` : undefined}
+      />
+      <SummaryLine
+        label="Unresolved settlement errors"
+        state={settlementLineState(unresolvedSettlementErrors.length === 0)}
+        detail={unresolvedSettlementErrors.length > 0 ? `${unresolvedSettlementErrors.length} error(s)` : undefined}
+      />
+      <SummaryLine
+        label="Submission-unknown trade intents"
+        state={intentLineState(submissionUnknown.length === 0)}
+        detail={submissionUnknown.length > 0 ? `${submissionUnknown.length} unresolved` : undefined}
       />
 
       <h3>Reconciliation drift/corrections</h3>

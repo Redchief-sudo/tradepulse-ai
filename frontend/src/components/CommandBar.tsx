@@ -27,8 +27,8 @@ function sessionPillTone(state: SessionState | undefined): 'positive' | 'negativ
  * state SessionPanel already shows verbatim -- it exists here only to avoid
  * a header reading "Market Closed" in a way that implies crypto is halted
  * too, per the verified execution_session_decision/is_continuous_market
- * exemption (see ScannerActivityPanel for the authoritative per-lane
- * rendering of this same rule). */
+ * exemption (see ScannerActivityPanel/LaneCard for the authoritative
+ * per-lane rendering of this same rule). */
 function marketStateLabel(state: SessionState | undefined): { label: string; tone: 'positive' | 'negative' | 'warning' | 'neutral' } {
   if (state === 'active') return { label: 'Market Session Open', tone: 'positive' }
   if (state === 'market_closed') return { label: 'Equity/Options Closed — Crypto Active', tone: 'warning' }
@@ -45,9 +45,11 @@ function StatusPill({ label, tone }: { label: string; tone: 'positive' | 'negati
   )
 }
 
-export function Header() {
+export function CommandBar() {
   const { data: session } = usePolling(api.getSession, 5000)
   const { data: capability } = usePolling(api.getMarketDataCapability, 30000)
+  const account = usePolling(api.getAccount, 10000)
+  const { data: provenance } = usePolling(api.getProvenance, 24 * 60 * 60 * 1000)
   const [lastRefreshIso, setLastRefreshIso] = useState<string | null>(null)
 
   useEffect(() => {
@@ -65,10 +67,25 @@ export function Header() {
       ? 'no data yet'
       : tierEntries.map(([lane, run]) => `${lane}: ${run.market_data_tier ?? '—'}`).join(' · ')
 
+  // Broker connectivity has no dedicated backend endpoint -- derived here
+  // from the account poll's own existing error state (every live-broker
+  // route already surfaces a BROKER_UNAVAILABLE 503 on failure), never a
+  // new health-check request. `undefined` (still loading) reads as
+  // "Checking...", never as connected.
+  const brokerTone: 'positive' | 'negative' | 'neutral' = account.data ? 'positive' : account.error ? 'negative' : 'neutral'
+  const brokerLabel = account.data ? 'Broker Connected' : account.error ? 'Broker Unavailable' : 'Broker Checking…'
+
+  const isLive = session?.execution_mode === 'live'
+
   return (
     <header className="app-header">
       <div className="app-header-top">
         <h1>TradePulse</h1>
+        {session && (
+          <span className={`mode-badge ${isLive ? 'mode-badge-live' : 'mode-badge-paper'}`}>
+            {isLive ? 'LIVE' : 'PAPER'}
+          </span>
+        )}
         <span className="app-header-subtitle">
           Local operator view -- bound to 127.0.0.1 only. No remote access, no authentication (phase 1).
         </span>
@@ -77,8 +94,12 @@ export function Header() {
         <StatusPill label={session ? SESSION_STATE_LABEL[session.state] : 'Session Unknown'} tone={sessionTone} />
         <StatusPill label={market.label} tone={market.tone} />
         <StatusPill label={tradingTone === 'positive' ? 'Trading Active' : 'Trading Halted'} tone={session ? tradingTone : 'neutral'} />
+        <StatusPill label={brokerLabel} tone={brokerTone} />
         <StatusPill label={`Market Data: ${tierLabel}`} tone="neutral" />
         <StatusPill label={integrityTone === 'positive' ? 'Integrity OK' : 'Integrity Blocked'} tone={session ? integrityTone : 'neutral'} />
+        {provenance && (
+          <StatusPill label={`Build ${provenance.build_fingerprint.slice(0, 8)}`} tone="neutral" />
+        )}
         <StatusPill label={lastRefreshIso ? `Refreshed ${relativeAgo(lastRefreshIso)}` : 'Refreshed —'} tone="neutral" />
       </div>
     </header>

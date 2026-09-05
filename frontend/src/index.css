@@ -72,6 +72,12 @@ button.danger {
   color: var(--negative);
 }
 
+button.filter-active {
+  background: var(--accent);
+  color: #ffffff;
+  border-color: var(--accent);
+}
+
 input,
 select {
   background: var(--bg);

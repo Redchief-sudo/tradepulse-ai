@@ -3,7 +3,7 @@ import { api } from '../api'
 import { usePolling } from '../usePolling'
 import { time } from '../format'
 import { Panel, EmptyState } from './Panel'
-import type { Opportunity } from '../types'
+import type { Opportunity, RejectedCandidate } from '../types'
 
 function signalTone(signal: string | null | undefined): string {
   const s = (signal ?? '').toUpperCase()
@@ -36,6 +36,7 @@ function OpportunityRow({ opp }: { opp: Opportunity }) {
     <>
       <tr>
         <td>{opp.asset.symbol}</td>
+        <td>{opp.asset.asset_class}</td>
         <td>{opp.source}</td>
         <td>{opp.confidence ?? '—'}</td>
         <td>
@@ -56,7 +57,7 @@ function OpportunityRow({ opp }: { opp: Opportunity }) {
       </tr>
       {expanded && detailFields.length > 0 && (
         <tr>
-          <td colSpan={8}>
+          <td colSpan={9}>
             <dl className="kv">
               {detailFields.map(([key, label]) => (
                 <Fragment key={key}>
@@ -72,19 +73,70 @@ function OpportunityRow({ opp }: { opp: Opportunity }) {
   )
 }
 
-export function OpportunitiesPanel() {
-  const { data, error, loading } = usePolling(() => api.getOpportunities(30), 30000)
+function RejectedRow({ row }: { row: RejectedCandidate }) {
   return (
-    <Panel title="Recent Opportunities" error={error} loading={loading}>
+    <tr className="row-warning">
+      <td>{row.symbol}</td>
+      <td>{row.asset_class}</td>
+      <td colSpan={4}>{row.reason}</td>
+      <td>{time(row.occurred_at)}</td>
+      <td></td>
+    </tr>
+  )
+}
+
+type Filter = 'all' | 'equity' | 'crypto' | 'option' | 'approved' | 'rejected'
+
+const FILTERS: { key: Filter; label: string }[] = [
+  { key: 'all', label: 'All' },
+  { key: 'equity', label: 'Equity' },
+  { key: 'crypto', label: 'Crypto' },
+  { key: 'option', label: 'Options' },
+  { key: 'approved', label: 'Approved' },
+  { key: 'rejected', label: 'Rejected' },
+]
+
+export function OpportunitiesPanel({
+  data, error, loading,
+}: {
+  data: Opportunity[] | null
+  error: string | null
+  loading: boolean
+}) {
+  const [filter, setFilter] = useState<Filter>('all')
+  const rejected = usePolling(() => api.getRejectedCandidates(50), 30000)
+
+  const showRejected = filter === 'rejected'
+  const filteredOpportunities = (data ?? []).filter((o) => {
+    if (filter === 'all' || filter === 'approved') return true
+    if (filter === 'rejected') return false
+    return o.asset.asset_class === filter
+  })
+  const filteredRejected = rejected.data ?? [] // a single flat "Rejected" tab, matching the spec's mutually-exclusive filter list
+
+  const activeError = showRejected ? rejected.error : error
+  const activeLoading = showRejected ? rejected.loading : loading
+
+  return (
+    <Panel title="Recent Opportunities" error={activeError} loading={activeLoading}>
       <p className="muted">
-        Approved candidates only -- rejected candidates are logged but not yet persisted (see the plan's non-goals).
+        "Approved" opportunities cleared the full deterministic/risk gate chain. "Rejected" candidates come from a
+        separate, persisted rejection log (reason codes, not the same shape as an approved opportunity).
       </p>
-      {data && data.length === 0 && <EmptyState>No opportunities yet.</EmptyState>}
-      {data && data.length > 0 && (
+      <div className="button-row">
+        {FILTERS.map((f) => (
+          <button key={f.key} className={filter === f.key ? 'filter-active' : ''} onClick={() => setFilter(f.key)}>
+            {f.label}
+          </button>
+        ))}
+      </div>
+      {!showRejected && filteredOpportunities.length === 0 && <EmptyState>No opportunities yet.</EmptyState>}
+      {!showRejected && filteredOpportunities.length > 0 && (
         <table>
           <thead>
             <tr>
               <th>Symbol</th>
+              <th>Class</th>
               <th>Source</th>
               <th>Confidence</th>
               <th>AI recommendation</th>
@@ -95,8 +147,27 @@ export function OpportunitiesPanel() {
             </tr>
           </thead>
           <tbody>
-            {data.map((opp) => (
+            {filteredOpportunities.map((opp) => (
               <OpportunityRow key={opp.opportunity_id} opp={opp} />
+            ))}
+          </tbody>
+        </table>
+      )}
+      {showRejected && filteredRejected.length === 0 && <EmptyState>No rejected candidates in the recent window.</EmptyState>}
+      {showRejected && filteredRejected.length > 0 && (
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Class</th>
+              <th colSpan={4}>Reason</th>
+              <th>Occurred</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {filteredRejected.map((row) => (
+              <RejectedRow key={row.rejection_id} row={row} />
             ))}
           </tbody>
         </table>

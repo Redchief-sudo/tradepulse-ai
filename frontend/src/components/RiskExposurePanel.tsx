@@ -9,8 +9,7 @@ function utilTone(utilizationPct: number): 'ok' | 'warn' | 'critical' {
   return 'ok'
 }
 
-function UtilBar({ label, actual, limitAmount }: { label: string; actual: number; limitAmount: number }) {
-  const utilizationPct = (actual / limitAmount) * 100
+function UtilBar({ label, utilizationPct }: { label: string; utilizationPct: number }) {
   const tone = utilTone(utilizationPct)
   return (
     <div className="util-bar-row">
@@ -26,13 +25,23 @@ function UtilBar({ label, actual, limitAmount }: { label: string; actual: number
   )
 }
 
+function amountBar(key: string, label: string, actual: number, limitAmount: number) {
+  return limitAmount > 0 ? <UtilBar key={key} label={label} utilizationPct={(actual / limitAmount) * 100} /> : null
+}
+
 export function RiskExposurePanel() {
   const { data, error, loading } = usePolling(api.getRiskExposure, 15000)
   const { data: limits } = usePolling(api.getRiskLimits, 30000)
+  const { data: positions } = usePolling(api.getPositions, 10000)
 
   const totalEquity = data ? Number(data.total_equity) : 0
   const portfolioLimitAmount = limits && Number(limits.max_total_exposure_pct) > 0 ? (Number(limits.max_total_exposure_pct) / 100) * totalEquity : 0
   const sectorLimitAmount = limits && Number(limits.max_sector_pct) > 0 ? (Number(limits.max_sector_pct) / 100) * totalEquity : 0
+  const positionLimitAmount = limits && Number(limits.max_position_pct) > 0 ? (Number(limits.max_position_pct) / 100) * totalEquity : 0
+
+  const dailyPnlPct = data ? Number(data.daily_pnl_pct) : 0
+  const dailyLossLimitPct = limits ? Number(limits.max_daily_loss_pct) : 0
+  const dailyLossUtilizationPct = dailyLossLimitPct > 0 && dailyPnlPct < 0 ? (Math.abs(dailyPnlPct) / dailyLossLimitPct) * 100 : 0
 
   return (
     <Panel title="Risk Exposure" error={error} loading={loading}>
@@ -57,10 +66,18 @@ export function RiskExposurePanel() {
             <dd>{data.source}</dd>
           </dl>
 
-          {portfolioLimitAmount > 0 && (
+          {(portfolioLimitAmount > 0 || dailyLossLimitPct > 0) && (
             <>
               <h3>Utilization vs. active risk profile{limits ? ` (${limits.profile_id})` : ''}</h3>
-              <UtilBar label="Portfolio exposure" actual={Number(data.holdings_value)} limitAmount={portfolioLimitAmount} />
+              {amountBar('portfolio', 'Portfolio exposure', Number(data.holdings_value), portfolioLimitAmount)}
+              {dailyLossLimitPct > 0 && <UtilBar label="Daily loss budget" utilizationPct={dailyLossUtilizationPct} />}
+            </>
+          )}
+
+          {positions && positions.length > 0 && positionLimitAmount > 0 && (
+            <>
+              <h3>Position-cap utilization</h3>
+              {positions.map((p) => amountBar(p.position.symbol, p.position.symbol, Number(p.position.qty) * Number(p.position.current_price), positionLimitAmount))}
             </>
           )}
 
@@ -68,9 +85,7 @@ export function RiskExposurePanel() {
             <>
               <h3>Sector exposure</h3>
               {sectorLimitAmount > 0 &&
-                Object.entries(data.sector_exposure).map(([sector, value]) => (
-                  <UtilBar key={sector} label={sector} actual={Number(value)} limitAmount={sectorLimitAmount} />
-                ))}
+                Object.entries(data.sector_exposure).map(([sector, value]) => amountBar(sector, sector, Number(value), sectorLimitAmount))}
               <table>
                 <thead>
                   <tr>

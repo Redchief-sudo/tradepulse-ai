@@ -3,10 +3,16 @@ import { usePolling } from '../usePolling'
 import { money, pct } from '../format'
 
 function KpiCard({ label, value, sub, tone }: { label: string; value: string; sub?: string; tone?: 'positive' | 'negative' }) {
+  // Sign is shown as a leading glyph AND color -- never color alone, so the
+  // reading survives colorblindness/grayscale printing.
+  const glyph = tone === 'positive' ? '▲ ' : tone === 'negative' ? '▼ ' : ''
   return (
     <div className="kpi-card">
       <div className="kpi-label">{label}</div>
-      <div className={`kpi-value num${tone ? ` ${tone}` : ''}`}>{value}</div>
+      <div className={`kpi-value num${tone ? ` ${tone}` : ''}`}>
+        {glyph}
+        {value}
+      </div>
       {sub ? <div className="kpi-sub">{sub}</div> : null}
     </div>
   )
@@ -29,6 +35,7 @@ export function KpiRow() {
       <KpiCard label="Account Equity" value={account ? money(account.equity) : '—'} />
       <KpiCard label="Cash" value={account ? money(account.cash) : '—'} />
       <KpiCard label="Buying Power" value={account ? money(account.buying_power) : '—'} />
+      <KpiCard label="Holdings Value" value={riskExposure ? money(riskExposure.holdings_value) : '—'} />
       <KpiCard
         label="Daily P&L"
         value={dailyPnlPct !== null ? pct(dailyPnlPct) : '—'}

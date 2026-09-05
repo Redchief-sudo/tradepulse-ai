@@ -109,14 +109,24 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
             "max_daily_trades": limits.max_daily_trades,
             "max_open_positions": limits.max_open_positions,
             "max_drawdown_pct": limits.max_drawdown_pct,
+            "max_daily_loss_pct": limits.max_daily_loss_pct,
         })
 
     # ---- Session control -------------------------------------------------
 
     @app.get("/api/session")
     async def get_session(request: Request) -> Response:
-        session = await load_session(_state(request).repositories)
-        return _json(session)
+        s = _state(request)
+        session = await load_session(s.repositories)
+        # PAPER/LIVE is a pure config passthrough (Settings.execution_mode/
+        # live_trading_enabled) -- the dashboard needs this to render an
+        # unmistakable PAPER-vs-LIVE indicator; it does not change what
+        # session state means or how it's computed.
+        return _json({
+            **{f: getattr(session, f) for f in session.__dataclass_fields__},
+            "execution_mode": s.settings.execution_mode,
+            "live_trading_enabled": s.settings.live_trading_enabled,
+        })
 
     @app.post("/api/session/start")
     async def post_start(request: Request) -> Response:
@@ -280,6 +290,10 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
     _recent_route("audit_events", "/api/audit-events")
     _recent_route("scan_runs", "/api/scan-runs")
     _recent_route("rejected_candidates", "/api/rejected-candidates")
+    # Persisted every scan cycle (scanner/coordinator.py) as one point on the
+    # account equity curve -- already computed with, never fabricated for
+    # this route. Pure passthrough, same shape as every other _recent_route.
+    _recent_route("equity_snapshots", "/api/equity-history")
 
     @app.get("/api/ai-responses/{request_id}")
     async def get_ai_response(request_id: str, request: Request) -> Response:

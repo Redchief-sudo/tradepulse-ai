@@ -28,6 +28,8 @@ export interface Provenance {
   build_fingerprint: string
 }
 
+export type ExecutionMode = 'paper' | 'live'
+
 export interface TradingSession {
   session_id: string
   state: SessionState
@@ -38,6 +40,8 @@ export interface TradingSession {
   kill_switch_reset_required: boolean
   financial_integrity_reason: string | null
   financial_integrity_manual_reenable_required: boolean
+  execution_mode: ExecutionMode
+  live_trading_enabled: boolean
 }
 
 export interface SessionActionResult {
@@ -101,8 +105,15 @@ export interface Opportunity {
 
 export interface TradeIntent {
   trade_intent_id: string
+  // The link back to the originating Opportunity (opportunity_id), when
+  // this intent was scanner-originated. Monitor-originated exits (stop-
+  // loss/target closes) set this to a synthetic, non-opportunity value --
+  // a lifecycle join must treat "no matching Opportunity" as a normal,
+  // expected case, never an error.
+  correlation_id: string | null
   asset: AssetIdentity
   side: 'buy' | 'sell'
+  execution_mode: ExecutionMode
   strategy: string
   created_at: string
   requested_quantity: string | null
@@ -118,6 +129,7 @@ export interface Fill {
   trade_intent_id: string
   asset: AssetIdentity
   side: 'buy' | 'sell'
+  execution_mode: ExecutionMode
   quantity: string
   price: string
   fees: string
@@ -127,8 +139,10 @@ export interface Fill {
 export interface SettlementEvent {
   settlement_event_id: string
   fill_id: string
+  trade_intent_id: string
   asset: AssetIdentity
   side: 'buy' | 'sell'
+  execution_mode: ExecutionMode
   quantity: string
   price: string
   status: string
@@ -173,6 +187,7 @@ export interface RiskLimits {
   max_daily_trades: number
   max_open_positions: number
   max_drawdown_pct: string
+  max_daily_loss_pct: string
 }
 
 export interface ReconciliationRecord {
@@ -228,6 +243,17 @@ export interface ScanRun {
   regime_confidence: number | null
   regime_position_multiplier: string | null
   regime_realized_vol: string | null
+}
+
+export interface RejectedCandidate {
+  rejection_id: string
+  scan_run_id: string
+  scan_generation: string
+  symbol: string
+  asset_class: string
+  reason: string
+  occurred_at: string
+  context: Record<string, unknown>
 }
 
 export interface AiCandidate {

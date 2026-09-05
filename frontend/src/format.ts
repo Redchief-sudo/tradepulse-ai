@@ -19,6 +19,33 @@ export function time(value: string | null | undefined): string {
   return d.toLocaleString()
 }
 
+export interface OccContract {
+  root: string
+  expiry: string // YYYY-MM-DD
+  right: 'C' | 'P'
+  strike: number
+}
+
+/** Deterministic OCC option-symbol decode -- DISPLAY-ONLY. The backend's
+ * asset identity (symbol/native_asset_id, and the separately-recorded
+ * underlying_symbol/expiry/strike/option_type metadata on Opportunity/
+ * TradeIntent/Fill/SettlementEvent) remains the sole authority; this never
+ * becomes an identity/reconciliation/lifecycle-join/risk/accounting
+ * authority of its own. Returns null (never a guessed/partial contract) on
+ * anything that doesn't match the standard 21-char OCC layout -- callers
+ * must fall back to rendering the raw symbol string. */
+export function parseOccSymbol(symbol: string | null | undefined): OccContract | null {
+  if (!symbol) return null
+  const match = /^([A-Z]{1,6})\s*(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/.exec(symbol.trim())
+  if (!match) return null
+  const [, root, yy, mm, dd, right, strikeStr] = match
+  const month = Number(mm)
+  const day = Number(dd)
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null
+  const strike = Number(strikeStr) / 1000
+  return { root, expiry: `20${yy}-${mm}-${dd}`, right: right as 'C' | 'P', strike }
+}
+
 export function relativeAgo(value: string | null | undefined): string {
   if (!value) return '—'
   const d = new Date(value).getTime()

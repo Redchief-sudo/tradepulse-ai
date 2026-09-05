@@ -1,7 +1,6 @@
-import { api } from '../api'
-import { usePolling } from '../usePolling'
 import { money, time } from '../format'
 import { Panel, EmptyState } from './Panel'
+import type { Fill, SettlementEvent } from '../types'
 
 function settlementStatusTone(status: string): string {
   if (status === 'completed') return 'status-badge-ok'
@@ -14,10 +13,12 @@ function StatusBadge({ value, tone }: { value: string; tone: string }) {
   return <span className={`status-badge ${tone}`}>{value.replace(/_/g, ' ')}</span>
 }
 
-export function FillsSettlementsPanel() {
-  const fills = usePolling(() => api.getFills(20), 30000)
-  const settlements = usePolling(() => api.getSettlements(20), 30000)
-
+export function FillsSettlementsPanel({
+  fills, settlements,
+}: {
+  fills: { data: Fill[] | null; error: string | null; loading: boolean }
+  settlements: { data: SettlementEvent[] | null; error: string | null; loading: boolean }
+}) {
   return (
     <Panel title="Fills &amp; Settlement" error={fills.error ?? settlements.error} loading={fills.loading || settlements.loading}>
       <h3>Recent fills</h3>

@@ -10,6 +10,7 @@ import type {
   PortfolioSnapshot,
   Provenance,
   ReconciliationRecord,
+  RejectedCandidate,
   RiskLimits,
   ScanRun,
   SessionActionResult,
@@ -75,6 +76,8 @@ export const api = {
   getAuditEvents: (limit = 50) => get<AuditEvent[]>(`/api/audit-events?limit=${limit}`),
   getScanRuns: (limit = 20) => get<ScanRun[]>(`/api/scan-runs?limit=${limit}`),
   getAiResponse: (requestId: string) => get<AiResponse | null>(`/api/ai-responses/${requestId}`),
+  getRejectedCandidates: (limit = 50) => get<RejectedCandidate[]>(`/api/rejected-candidates?limit=${limit}`),
+  getEquityHistory: (limit = 200) => get<PortfolioSnapshot[]>(`/api/equity-history?limit=${limit}`),
 
   getProvenance: () => get<Provenance>('/api/provenance'),
 }

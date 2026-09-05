@@ -32,6 +32,11 @@ header h1 {
   margin-top: 20px;
 }
 
+.grid-full-width {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
 .panel {
   background: var(--panel-bg);
   border: 1px solid var(--border);
@@ -211,6 +216,29 @@ header h1 {
 .app-header-subtitle {
   color: var(--muted);
   font-size: 0.8rem;
+}
+
+/* PAPER vs LIVE must be unmistakable at a glance -- solid fills, not
+   outline-only pills, and never the same hue. */
+.mode-badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.mode-badge-paper {
+  background: var(--panel-bg);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+
+.mode-badge-live {
+  background: var(--negative);
+  color: #ffffff;
+  border: 1px solid var(--negative);
 }
 
 .status-pills {
@@ -467,4 +495,93 @@ header h1 {
 .status-badge-neutral {
   border-color: var(--muted);
   color: var(--muted);
+}
+
+/* ---- Scanner funnel --------------------------------------------------- */
+
+.funnel {
+  margin: 10px 0 18px;
+}
+
+.funnel-title {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.funnel-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0;
+  font-size: 0.78rem;
+}
+
+.funnel-label {
+  flex: 0 0 170px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.funnel-track {
+  flex: 1;
+  height: 10px;
+  background: var(--bg);
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.funnel-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+}
+
+.funnel-count {
+  flex: 0 0 60px;
+  text-align: right;
+  color: var(--text);
+}
+
+/* ---- Positions: subtle per-asset-class left border, alongside the badge -- never color-only */
+
+.asset-class-row[data-asset-class="equity"] {
+  border-left: 3px solid var(--positive);
+}
+
+.asset-class-row[data-asset-class="crypto"] {
+  border-left: 3px solid var(--accent);
+}
+
+.asset-class-row[data-asset-class="option"] {
+  border-left: 3px solid var(--warning);
+}
+
+/* ---- Market data capability cards -------------------------------------- */
+
+.capability-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.capability-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+
+.capability-card-lane {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  margin-bottom: 6px;
 }

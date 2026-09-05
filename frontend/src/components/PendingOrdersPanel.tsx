@@ -1,16 +1,20 @@
 import { useState } from 'react'
-import { api } from '../api'
-import { usePolling } from '../usePolling'
 import { time } from '../format'
 import { Panel } from './Panel'
+import type { TradeIntent } from '../types'
 
 const PENDING_STATUSES = ['proposed', 'risk_approved', 'submitted', 'accepted', 'partially_filled', 'submission_unknown']
 
-export function PendingOrdersPanel() {
+export function PendingOrdersPanel({
+  data, error, loading,
+}: {
+  data: TradeIntent[] | null
+  error: string | null
+  loading: boolean
+}) {
   const [status, setStatus] = useState<string>('')
-  const { data, error, loading } = usePolling(() => api.getTradeIntents(status || undefined), 10000)
 
-  const shown = status ? data : data?.filter((intent) => PENDING_STATUSES.includes(intent.status))
+  const shown = status ? data?.filter((intent) => intent.status === status) : data?.filter((intent) => PENDING_STATUSES.includes(intent.status))
 
   return (
     <Panel title="Trade Intents" error={error} loading={loading}>

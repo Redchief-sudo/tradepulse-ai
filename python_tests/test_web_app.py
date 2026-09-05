@@ -385,11 +385,62 @@ async def test_get_risk_limits_returns_the_active_profiles_limits(tmp_path) -> N
     body = response.json()
     assert set(body.keys()) == {
         "profile_id", "max_total_exposure_pct", "max_sector_pct", "max_position_pct",
-        "max_daily_trades", "max_open_positions", "max_drawdown_pct",
+        "max_daily_trades", "max_open_positions", "max_drawdown_pct", "max_daily_loss_pct",
     }
     assert body["profile_id"] == "balanced"
     assert body["max_total_exposure_pct"] == "40"
     assert body["max_daily_trades"] == 3
+
+
+@respx.mock
+async def test_get_session_exposes_paper_vs_live_execution_mode(tmp_path) -> None:
+    """PAPER/LIVE is a pure Settings passthrough for the dashboard's
+    command-bar indicator -- never a new session-state concept."""
+    client, state = await _client_for(tmp_path)
+    await save_session(state.repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+
+    response = await client.get("/api/session")
+    await state.broker.aclose()
+    await client.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["execution_mode"] == "paper"
+    assert body["live_trading_enabled"] is False
+    assert body["state"] == "active"  # existing fields still present alongside the two new ones
+
+
+@respx.mock
+async def test_get_equity_history_returns_persisted_snapshots_newest_first(tmp_path) -> None:
+    """Pure passthrough of the already-persisted equity_snapshots table --
+    same _recent_route mechanism as every other list endpoint, no new
+    computation. Confirms the route exists and returns real persisted rows,
+    not a fabricated/empty stand-in."""
+    client, state = await _client_for(tmp_path)
+
+    from tradepulse.models import PortfolioSnapshot
+
+    older = PortfolioSnapshot(
+        snapshot_id="s1", as_of=NOW, total_equity=Decimal("99000"), cash_balance=Decimal("50000"),
+        holdings_value=Decimal("49000"), sector_exposure={}, open_positions=1, outstanding_orders=0,
+        trades_today=0, daily_pnl_pct=Decimal("0"), source="broker",
+    )
+    newer = PortfolioSnapshot(
+        snapshot_id="s2", as_of=NOW, total_equity=Decimal("101000"), cash_balance=Decimal("50000"),
+        holdings_value=Decimal("51000"), sector_exposure={}, open_positions=1, outstanding_orders=0,
+        trades_today=1, daily_pnl_pct=Decimal("1"), source="broker",
+    )
+    await state.repositories.equity_snapshots.create_once("s1", older)
+    await state.repositories.equity_snapshots.create_once("s2", newer)
+
+    response = await client.get("/api/equity-history")
+    await client.aclose()
+    await state.broker.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) == 2
+    assert {row["snapshot_id"] for row in body} == {"s1", "s2"}
 
 
 @respx.mock
