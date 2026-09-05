@@ -12,6 +12,8 @@ from tradepulse.models import (
     Holding,
     PnlRecord,
     PortfolioSnapshot,
+    SettlementEvent,
+    SettlementStatus,
     Side,
     TradeIntent,
     TradeIntentStatus,
@@ -545,6 +547,122 @@ async def test_build_portfolio_snapshot_does_not_count_risk_approved_as_outstand
     snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
 
     assert snapshot.outstanding_orders == 0
+
+
+async def _seed_settlement_event(
+    repositories: PersistenceRepositories, *, settlement_event_id: str, trade_intent_id: str,
+    quantity: Decimal, price: Decimal, holding_projected: bool, sector: str = "Tech",
+    status: SettlementStatus = SettlementStatus.PENDING,
+) -> None:
+    event = SettlementEvent(
+        settlement_event_id, settlement_event_id, trade_intent_id, _aapl(), Side.BUY, ExecutionMode.PAPER,
+        quantity, price, NOW, status=status, sector=sector, holding_projected=holding_projected,
+        integrity_verified=status == SettlementStatus.COMPLETED,
+    )
+    await repositories.settlements.create_once(settlement_event_id, event, status=status.value, unique_value=settlement_event_id)
+
+
+async def test_build_portfolio_snapshot_includes_an_attributed_fill_with_no_holding_row_yet(tmp_path) -> None:
+    """RISK-091-01 -- a broker fill already durably attributed (a Fill +
+    SettlementEvent exist) but not yet holding_projected must still count as
+    exposure, even though no Holding row exists for it yet. Under the old
+    filled_quantity-based calculation this quantity was invisible to BOTH
+    the pending-notional reservation (already subtracted via
+    intent.filled_quantity) and Holdings (settlement hasn't projected it)."""
+    repositories = await _repositories(tmp_path)
+    intent = TradeIntent(
+        "ti-1", "ti-1", "ti-1", _aapl(), Side.BUY, ExecutionMode.PAPER, "test", NOW,
+        requested_quantity=Decimal("10"), reference_price=Decimal("100"), sector="Tech",
+        status=TradeIntentStatus.PARTIALLY_FILLED, filled_quantity=Decimal("4"),
+    )
+    await repositories.trade_intents.create_once(
+        "ti-1", intent, status=TradeIntentStatus.PARTIALLY_FILLED.value, unique_value="ti-1",
+    )
+    await _seed_settlement_event(
+        repositories, settlement_event_id="se-1", trade_intent_id="ti-1",
+        quantity=Decimal("4"), price=Decimal("105"), holding_projected=False,
+    )
+    # deliberately no Holding row for AAPL
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
+
+    # never-attributed remainder: (10 - 4) * 100 = 600; attributed-but-unsettled: 4 * 105 = 420
+    assert snapshot.holdings_value == Decimal("600") + Decimal("420")
+    assert snapshot.sector_exposure["Tech"] == Decimal("1020")
+
+
+async def test_build_portfolio_snapshot_does_not_double_count_when_filled_quantity_is_stale(tmp_path) -> None:
+    """RISK-091-01 companion -- intent.filled_quantity in the DB can be
+    stale-LOW relative to real attributed SettlementEvents (gateway.py's
+    _poll_and_settle only persists filled_quantity on a status transition,
+    not every poll iteration). A naive fix that adds unsettled-SettlementEvent
+    notional on top of the OLD filled_quantity-based remaining_qty would
+    double count the gap between the two; this asserts the corrected
+    ground-truth (SettlementEvent-derived) calculation does not."""
+    repositories = await _repositories(tmp_path)
+    intent = TradeIntent(
+        "ti-2", "ti-2", "ti-2", _aapl(), Side.BUY, ExecutionMode.PAPER, "test", NOW,
+        requested_quantity=Decimal("10"), reference_price=Decimal("100"), sector="Tech",
+        status=TradeIntentStatus.PARTIALLY_FILLED,
+        filled_quantity=Decimal("4"),  # stale: DB row only ever reflects the first fill batch
+    )
+    await repositories.trade_intents.create_once(
+        "ti-2", intent, status=TradeIntentStatus.PARTIALLY_FILLED.value, unique_value="ti-2",
+    )
+    # First batch: already fully settled -- Holding row exists, holding_projected=True.
+    await repositories.holdings.create_once(
+        asset_identity_key(_aapl()),
+        Holding(asset=_aapl(), quantity=Decimal("4"), average_price=Decimal("100"), updated_at=NOW, sector="Tech"),
+    )
+    await _seed_settlement_event(
+        repositories, settlement_event_id="se-2a", trade_intent_id="ti-2",
+        quantity=Decimal("4"), price=Decimal("100"), holding_projected=True, status=SettlementStatus.COMPLETED,
+    )
+    # Second batch: attributed AFTER the poll loop's last filled_quantity
+    # persist -- durably recorded, but trade_intents.filled_quantity never
+    # caught up (still says 4; real total attributed is 7).
+    await _seed_settlement_event(
+        repositories, settlement_event_id="se-2b", trade_intent_id="ti-2",
+        quantity=Decimal("3"), price=Decimal("110"), holding_projected=False,
+    )
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
+
+    # settled (Holdings): 4 * 100 = 400
+    # never-attributed remainder, ground truth total_attributed_qty=4+3=7: (10 - 7) * 100 = 300
+    # attributed-but-unsettled: 3 * 110 = 330
+    expected = Decimal("400") + Decimal("300") + Decimal("330")
+    assert snapshot.holdings_value == expected  # == 1030
+
+    # The naive fix (unsettled notional added ON TOP OF the stale
+    # filled_quantity-based remaining_qty = 10 - 4 = 6) would instead double
+    # count the second batch's 3 shares: 400 + 6*100 + 3*110 = 1330.
+    naive_buggy_value = Decimal("400") + (Decimal("10") - Decimal("4")) * Decimal("100") + Decimal("3") * Decimal("110")
+    assert snapshot.holdings_value < naive_buggy_value
+    assert naive_buggy_value == Decimal("1330")
+
+
+async def test_build_portfolio_snapshot_catches_an_unsettled_fill_on_an_already_terminal_intent(tmp_path) -> None:
+    """RISK-091-01 -- an intent that already reached a terminal status
+    (FILLED) is excluded from the pending-intent set entirely, so its
+    still-unsettled SettlementEvent must be caught by the global
+    non-COMPLETED catch-all term, not silently dropped."""
+    repositories = await _repositories(tmp_path)
+    intent = TradeIntent(
+        "ti-3", "ti-3", "ti-3", _aapl(), Side.BUY, ExecutionMode.PAPER, "test", NOW,
+        requested_quantity=Decimal("10"), status=TradeIntentStatus.FILLED, filled_quantity=Decimal("10"),
+    )
+    await repositories.trade_intents.create_once("ti-3", intent, status=TradeIntentStatus.FILLED.value, unique_value="ti-3")
+    await _seed_settlement_event(
+        repositories, settlement_event_id="se-3", trade_intent_id="ti-3",
+        quantity=Decimal("10"), price=Decimal("101"), holding_projected=False,
+    )
+    # deliberately no Holding row -- settlement hasn't projected it yet
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
+
+    assert snapshot.holdings_value == Decimal("1010")  # 10 * 101, caught by the global catch-all term
+    assert snapshot.sector_exposure["Tech"] == Decimal("1010")
 
 
 async def _seed_fill(repositories: PersistenceRepositories, *, fill_id: str, trade_intent_id: str, quantity: Decimal, filled_at: datetime) -> None:

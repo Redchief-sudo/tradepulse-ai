@@ -23,6 +23,7 @@ from tradepulse.models import (
     AssetClass,
     PortfolioSnapshot,
     RiskLimits,
+    SettlementStatus,
     Side,
     TradeIntentStatus,
     asset_identity_key,
@@ -31,6 +32,7 @@ from tradepulse.models import (
 from tradepulse.persistence import (
     PersistenceRepositories,
     hydrate,
+    list_all_by_json_field,
     list_all_by_json_time_range,
     list_all_by_statuses,
     paginate_all_rows,
@@ -401,27 +403,84 @@ async def build_portfolio_snapshot(
     ]
     intent_rows = await list_all_by_statuses(repositories.trade_intents, _pending_notional_statuses)
 
-    # Pending-intent notional reservation: capital already committed by an
-    # approved-but-not-yet-settled TradeIntent must count as exposure too,
-    # not just settled holdings -- otherwise a second, concurrent risk
-    # evaluation (a different asset-class lane, say) reads the SAME stale
-    # holdings_value in the window between "decision persisted" and "fill
-    # settled into the holdings table" and independently approves capital
-    # that's already spoken for. The RISK_APPROVED row itself IS the
-    # durable reservation -- no separate ledger needed.
+    # RISK-091-01: pending-intent notional reservation, corrected to never
+    # derive "how much of this order has the broker actually filled" from
+    # intent.filled_quantity -- execution/gateway.py::_poll_and_settle only
+    # persists filled_quantity to the trade_intents row on a status
+    # transition, not on every poll iteration, so a later partial fill in
+    # the same poll loop can be durably attributed (a real Fill +
+    # SettlementEvent already created) while filled_quantity is still
+    # stale-low in the DB. Using filled_quantity here would make
+    # remaining_qty overcount the still-open portion of the order AND,
+    # combined with the unsettled-notional term below, double-count that
+    # same fill. SettlementEvent records are the only ground truth for
+    # "attributed so far" -- they are created once per validated fill
+    # activity and never rewritten to lose history.
+    #
+    # Every unit of a pending intent's requested_quantity falls into
+    # exactly one of three buckets: never-attributed (remaining_qty below,
+    # against ground-truth total_attributed_qty), attributed-but-not-yet-
+    # settled (added once here, keyed by settlement_event_id), or
+    # attributed-and-settled (already reflected in Holdings above,
+    # untouched by either term). A terminal-status intent (e.g. already
+    # FILLED, so absent from intent_rows/_pending_notional_statuses
+    # entirely) only has the latter two buckets -- covered by the global
+    # catch-all term further below plus Holdings.
+    already_counted_settlement_ids: set[str] = set()
     for row in intent_rows:
         intent = hydrate("trade_intents", row["payload"])
-        # requested_quantity is overwritten with the RISK-APPROVED (possibly
-        # downsized) quantity once past PROPOSED -- see execution/gateway.py's
-        # replace(intent, status=RISK_APPROVED, requested_quantity=risk.approved_quantity)
-        # -- so this is already the real committed size, not the original ask.
-        remaining_qty = intent.requested_quantity - (intent.filled_quantity or Decimal("0"))
-        if remaining_qty <= 0 or intent.reference_price is None:
+        event_rows = await list_all_by_json_field(repositories.settlements, "trade_intent_id", intent.trade_intent_id)
+        events = [hydrate("settlements", r["payload"]) for r in event_rows]
+
+        total_attributed_qty = sum((e.quantity for e in events), Decimal("0"))
+        remaining_qty = intent.requested_quantity - total_attributed_qty
+        if remaining_qty > 0 and intent.reference_price is not None:
+            pending_notional = remaining_qty * intent.reference_price * contract_multiplier_of(intent.asset)
+            holdings_value += pending_notional
+            sector = intent.sector or "Other"
+            sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + pending_notional
+
+        for event in events:
+            if event.holding_projected:
+                continue
+            unsettled_notional = event.quantity * event.price * contract_multiplier_of(event.asset)
+            holdings_value += unsettled_notional
+            sector = event.sector or "Other"
+            sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + unsettled_notional
+            already_counted_settlement_ids.add(event.settlement_event_id)
+
+    # Global catch-all: every non-COMPLETED settlement (COMPLETED is the
+    # only status where holding_projected is guaranteed true, since it's
+    # only reached after all settlement stages -- including
+    # holding_projected -- succeed). This is what catches a still-unsettled
+    # fill belonging to a TERMINAL-status intent (e.g. already FILLED, so
+    # invisible to the per-intent loop above), and correctly also a
+    # permanently-stuck TERMINAL_FAILED/INTEGRITY_BLOCKED settlement --
+    # that is still real, unresolved broker exposure our own pipeline gave
+    # up projecting, and must still count.
+    #
+    # Deduplicated by settlement_event_id, not trade_intent_id: an event
+    # newly attributed for an intent already processed by the per-intent
+    # loop above would otherwise be silently invisible to both terms --
+    # exactly the class of gap this fix closes. Keying the dedup on the
+    # event's own id instead means it doesn't matter which of the two
+    # queries happens to observe a given event first; it is still counted
+    # exactly once.
+    unsettled_rows = await list_all_by_statuses(
+        repositories.settlements,
+        [
+            SettlementStatus.PENDING.value, SettlementStatus.PROCESSING.value, SettlementStatus.RETRYABLE_FAILED.value,
+            SettlementStatus.TERMINAL_FAILED.value, SettlementStatus.INTEGRITY_BLOCKED.value,
+        ],
+    )
+    for row in unsettled_rows:
+        event = hydrate("settlements", row["payload"])
+        if event.holding_projected or event.settlement_event_id in already_counted_settlement_ids:
             continue
-        pending_notional = remaining_qty * intent.reference_price * contract_multiplier_of(intent.asset)
-        holdings_value += pending_notional
-        sector = intent.sector or "Other"
-        sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + pending_notional
+        unsettled_notional = event.quantity * event.price * contract_multiplier_of(event.asset)
+        holdings_value += unsettled_notional
+        sector = event.sector or "Other"
+        sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + unsettled_notional
 
     total_equity = account_equity if account_equity and account_equity > 0 else holdings_value
 

@@ -143,16 +143,26 @@ async def attribute_order_fills(
             quantity=activity.qty, price=activity.price, fees=Decimal("0"), slippage=Decimal("0"),
             filled_at=activity.transaction_time, broker_fill_id=activity.activity_id,
         )
-        created = await repositories.fills.create_once(fill.fill_id, fill, unique_value=fill.fill_id)
-        if created:
-            event = SettlementEvent(
-                settlement_event_id=fill.fill_id, fill_id=fill.fill_id, trade_intent_id=current.trade_intent_id,
-                asset=current.asset, side=current.side, execution_mode=current.execution_mode,
-                quantity=fill.quantity, price=fill.price, occurred_at=activity.transaction_time,
-                broker_order_id=current.broker_order_id, broker_fill_id=activity.activity_id,
-                client_order_id=current.client_order_id, sector=current.sector,
-            )
-            await repositories.settlements.create_once(fill.fill_id, event, status=event.status.value, unique_value=fill.fill_id)
+        await repositories.fills.create_once(fill.fill_id, fill, unique_value=fill.fill_id)
+        # FIN-091-01: SettlementEvent creation must NOT depend on `created`
+        # from the Fill insert above -- a crash between the two writes
+        # (two separate SQLite transactions) would otherwise permanently
+        # orphan a real broker Fill with no SettlementEvent ever created
+        # for it on retry (fills.create_once returns False for an
+        # already-persisted fill_id, so the old `if created:` gate skipped
+        # this unconditionally). settlements.create_once is already
+        # idempotent on this exact fill_id (both the record_id and the
+        # UNIQUE `unique_value` constraint), so calling it every time is a
+        # safe no-op once the SettlementEvent already exists, and repairs
+        # the gap exactly once when it doesn't.
+        event = SettlementEvent(
+            settlement_event_id=fill.fill_id, fill_id=fill.fill_id, trade_intent_id=current.trade_intent_id,
+            asset=current.asset, side=current.side, execution_mode=current.execution_mode,
+            quantity=fill.quantity, price=fill.price, occurred_at=activity.transaction_time,
+            broker_order_id=current.broker_order_id, broker_fill_id=activity.activity_id,
+            client_order_id=current.client_order_id, sector=current.sector,
+        )
+        await repositories.settlements.create_once(fill.fill_id, event, status=event.status.value, unique_value=fill.fill_id)
 
     total_qty = sum((a.qty for a in validated), Decimal("0"))
     total_notional = sum((a.qty * a.price for a in validated), Decimal("0"))
