@@ -59,7 +59,7 @@ from tradepulse.models import (
     asset_identity_key,
     contract_multiplier_of,
 )
-from tradepulse.persistence import PersistenceRepositories, hydrate, run_with_lock_renewal
+from tradepulse.persistence import PersistenceRepositories, hydrate, paginate_all_rows, run_with_lock_renewal
 from tradepulse.providers import (
     AIProvider,
     AlpacaMarketDataProvider,
@@ -308,7 +308,10 @@ async def _correlation_adjusted_rank(
     asset-class-specific (see RiskLimits.max_correlation_threshold_crypto)."""
     candidate_keys = {asset_identity_key(sc.asset) for sc in ranked}
     selected_closes: dict[str, tuple[AssetClass, list[Decimal]]] = {}
-    holdings_rows = await repositories.holdings.list_all(limit=1000)
+    # FIN-090-01: unbounded, whole-table pagination -- NOT list_all(limit=1000),
+    # which would silently drop a held asset from correlation demotion once
+    # enough OTHER holdings existed first.
+    holdings_rows = await paginate_all_rows(repositories.holdings)
     for row in holdings_rows:
         held_asset = hydrate("holdings", row["payload"]).asset
         key = asset_identity_key(held_asset)

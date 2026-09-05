@@ -71,6 +71,10 @@ export interface EnrichedPosition {
   position: AlpacaPosition
   stop_loss: string | null
   target_price: string | null
+  // Already carried on the position's asset identity since trade time
+  // (only ever set for options) -- null for equity/crypto, or for any
+  // position with no matching local holding row.
+  contract_multiplier: string | null
 }
 
 export interface ScanRunCapability {

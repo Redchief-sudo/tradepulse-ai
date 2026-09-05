@@ -80,6 +80,11 @@ VALIDATION_START, VALIDATION_END = date(2025, 1, 1), date(2025, 8, 31)
 HOLDOUT_START, HOLDOUT_END = date(2025, 9, 1), date(2099, 1, 1)
 
 MIN_PROMOTION_SPEARMAN_DELTA = 0.02  # +0.02 absolute TRAIN-pool improvement required to promote a rung
+# VALIDATION's job is to CONFIRM the TRAIN-pool choice, not to re-search --
+# a materially lower bar than TRAIN's, but never negative (a rung that
+# improved on TRAIN and got WORSE on VALIDATION is not confirmed).
+MIN_VALIDATION_CONFIRMATION_DELTA = 0.0
+MIN_VALIDATION_EXPECTANCY_TRADES = 30
 STABILITY_HORIZON = 5
 
 
@@ -416,6 +421,17 @@ def evaluate_candidate(
 
 
 # ---- Promotion rule ----------------------------------------------------------
+#
+# CORRECTED (this revision): the original implementation computed
+# VALIDATION-pool metrics for every rung but never used them as a
+# promotion gate -- only TRAIN decided whether a rung was promoted. That
+# is not the approved methodology (TRAIN selects, VALIDATION independently
+# CONFIRMS before a rung is promoted, HOLDOUT is looked at exactly once at
+# the very end). Both check_promotion (Spearman-based, B1/B2/B4/B5/B6) and
+# check_promotion_by_expectancy (expectancy-based, B3/B7 -- threshold/gate
+# rungs don't change the composite's ranking, only which points are
+# labeled "enter", so Spearman can't distinguish between their candidates)
+# now require BOTH pools to agree before returning promoted=True.
 
 
 @dataclass
@@ -424,38 +440,109 @@ class PromotionResult:
     reason: str
     train_spearman_delta: float | None
     guard_failures: list[str]
+    validation_spearman_delta: float | None = None
+    validation_guard_failures: list[str] = field(default_factory=list)
+    train_expectancy_delta: float | None = None
+    validation_expectancy_delta: float | None = None
+
+
+def _guard_failures(prior_tm: dict, cand_tm: dict) -> list[str]:
+    """Pass/fail non-regression checks, never search targets --
+    "catastrophic" is defined once, applied uniformly to whichever pool's
+    trade metrics are passed in: trade count collapsing to <20% of the
+    prior rung's, a positive prior expectancy turning negative, profit
+    factor dropping below 0.5, or max drawdown more than doubling."""
+    failures: list[str] = []
+    if prior_tm["trade_count"] and cand_tm["trade_count"] < 0.2 * prior_tm["trade_count"]:
+        failures.append(f"trade_count collapsed ({prior_tm['trade_count']} -> {cand_tm['trade_count']})")
+    if prior_tm["expectancy_r"] is not None and cand_tm["expectancy_r"] is not None:
+        if prior_tm["expectancy_r"] > 0 and cand_tm["expectancy_r"] < 0:
+            failures.append(f"expectancy_r flipped positive->negative ({prior_tm['expectancy_r']:.4f} -> {cand_tm['expectancy_r']:.4f})")
+    if cand_tm["profit_factor"] is not None and cand_tm["profit_factor"] < 0.5:
+        failures.append(f"profit_factor below 0.5 ({cand_tm['profit_factor']:.2f})")
+    if prior_tm["max_drawdown_r"] is not None and cand_tm["max_drawdown_r"] is not None and prior_tm["max_drawdown_r"] > 0:
+        if cand_tm["max_drawdown_r"] > 2 * prior_tm["max_drawdown_r"]:
+            failures.append(f"max_drawdown_r more than doubled ({prior_tm['max_drawdown_r']:.2f} -> {cand_tm['max_drawdown_r']:.2f})")
+    return failures
 
 
 def check_promotion(prior: CandidateEvaluation, candidate: CandidateEvaluation) -> PromotionResult:
-    prior_sp = prior.spearman_by_pool["train"]["spearman"]
-    cand_sp = candidate.spearman_by_pool["train"]["spearman"]
-    if prior_sp is None or cand_sp is None:
+    """TRAIN selects (must clear +0.02 Spearman and pass TRAIN guards);
+    VALIDATION must then independently CONFIRM (delta >= 0.0 and pass
+    VALIDATION guards) before promotion. Failing either pool rejects the
+    rung -- VALIDATION is never used to search for a better candidate,
+    only to veto a TRAIN-selected one that doesn't hold up."""
+    train_prior_sp = prior.spearman_by_pool["train"]["spearman"]
+    train_cand_sp = candidate.spearman_by_pool["train"]["spearman"]
+    if train_prior_sp is None or train_cand_sp is None:
         return PromotionResult(False, "insufficient TRAIN-pool data to compute Spearman delta", None, [])
-    delta = cand_sp - prior_sp
+    train_delta = train_cand_sp - train_prior_sp
+    train_guard_failures = _guard_failures(prior.trade_metrics_by_pool["train"], candidate.trade_metrics_by_pool["train"])
 
-    guard_failures: list[str] = []
-    prior_tm, cand_tm = prior.trade_metrics_by_pool["train"], candidate.trade_metrics_by_pool["train"]
-    # Guards are pass/fail non-regression checks, never search targets --
-    # "catastrophic" is defined once, applied uniformly: trade count
-    # collapsing to <20% of the prior rung's, or a positive prior expectancy
-    # turning negative, or profit factor dropping below 0.5, or max
-    # drawdown more than doubling.
-    if prior_tm["trade_count"] and cand_tm["trade_count"] < 0.2 * prior_tm["trade_count"]:
-        guard_failures.append(f"trade_count collapsed ({prior_tm['trade_count']} -> {cand_tm['trade_count']})")
-    if prior_tm["expectancy_r"] is not None and cand_tm["expectancy_r"] is not None:
-        if prior_tm["expectancy_r"] > 0 and cand_tm["expectancy_r"] < 0:
-            guard_failures.append(f"expectancy_r flipped positive->negative ({prior_tm['expectancy_r']:.4f} -> {cand_tm['expectancy_r']:.4f})")
-    if cand_tm["profit_factor"] is not None and cand_tm["profit_factor"] < 0.5:
-        guard_failures.append(f"profit_factor below 0.5 ({cand_tm['profit_factor']:.2f})")
-    if prior_tm["max_drawdown_r"] is not None and cand_tm["max_drawdown_r"] is not None and prior_tm["max_drawdown_r"] > 0:
-        if cand_tm["max_drawdown_r"] > 2 * prior_tm["max_drawdown_r"]:
-            guard_failures.append(f"max_drawdown_r more than doubled ({prior_tm['max_drawdown_r']:.2f} -> {cand_tm['max_drawdown_r']:.2f})")
+    if train_delta < MIN_PROMOTION_SPEARMAN_DELTA:
+        return PromotionResult(False, f"TRAIN Spearman delta {train_delta:+.4f} below +{MIN_PROMOTION_SPEARMAN_DELTA} threshold", train_delta, train_guard_failures)
+    if train_guard_failures:
+        return PromotionResult(False, "TRAIN Spearman delta cleared but TRAIN guard(s) failed", train_delta, train_guard_failures)
 
-    if delta < MIN_PROMOTION_SPEARMAN_DELTA:
-        return PromotionResult(False, f"TRAIN Spearman delta {delta:+.4f} below +{MIN_PROMOTION_SPEARMAN_DELTA} threshold", delta, guard_failures)
-    if guard_failures:
-        return PromotionResult(False, "Spearman delta cleared but non-regression guard(s) failed", delta, guard_failures)
-    return PromotionResult(True, f"TRAIN Spearman delta {delta:+.4f} clears threshold, guards pass", delta, guard_failures)
+    val_prior_sp = prior.spearman_by_pool["validation"]["spearman"]
+    val_cand_sp = candidate.spearman_by_pool["validation"]["spearman"]
+    if val_prior_sp is None or val_cand_sp is None:
+        return PromotionResult(False, "TRAIN cleared but VALIDATION data is insufficient to confirm", train_delta, train_guard_failures, None, [])
+    val_delta = val_cand_sp - val_prior_sp
+    val_guard_failures = _guard_failures(prior.trade_metrics_by_pool["validation"], candidate.trade_metrics_by_pool["validation"])
+
+    if val_delta < MIN_VALIDATION_CONFIRMATION_DELTA:
+        return PromotionResult(False, f"TRAIN cleared but VALIDATION did not confirm (delta {val_delta:+.4f})", train_delta, train_guard_failures, val_delta, val_guard_failures)
+    if val_guard_failures:
+        return PromotionResult(False, "TRAIN cleared but VALIDATION guard(s) failed", train_delta, train_guard_failures, val_delta, val_guard_failures)
+
+    return PromotionResult(
+        True, f"TRAIN Spearman delta {train_delta:+.4f} and VALIDATION delta {val_delta:+.4f} both clear, guards pass",
+        train_delta, train_guard_failures, val_delta, val_guard_failures,
+    )
+
+
+def check_promotion_by_expectancy(prior: CandidateEvaluation, candidate: CandidateEvaluation) -> PromotionResult:
+    """Same TRAIN-selects/VALIDATION-confirms discipline as check_promotion,
+    but for rungs (B3's gate, B7's threshold) whose candidates are selected
+    by TRAIN expectancy_r rather than Spearman, since a gate/threshold
+    changes only which points are labeled "enter" -- Spearman over the full
+    score distribution is identical across every candidate in these grids
+    and cannot select between them."""
+    prior_tm_train, cand_tm_train = prior.trade_metrics_by_pool["train"], candidate.trade_metrics_by_pool["train"]
+    train_guard_failures = _guard_failures(prior_tm_train, cand_tm_train)
+    if cand_tm_train["trade_count"] < MIN_VALIDATION_EXPECTANCY_TRADES:
+        train_guard_failures.append(f"trade_count below {MIN_VALIDATION_EXPECTANCY_TRADES} ({cand_tm_train['trade_count']})")
+    if cand_tm_train["expectancy_r"] is None or prior_tm_train["expectancy_r"] is None:
+        return PromotionResult(False, "insufficient TRAIN trade data to compute expectancy delta", None, train_guard_failures)
+    train_expectancy_delta = cand_tm_train["expectancy_r"] - prior_tm_train["expectancy_r"]
+    if train_expectancy_delta < 0:
+        return PromotionResult(False, "TRAIN expectancy_r did not improve vs. the prior frozen rung", None, train_guard_failures, train_expectancy_delta=train_expectancy_delta)
+    if train_guard_failures:
+        return PromotionResult(False, "TRAIN expectancy_r improved but TRAIN guard(s) failed", None, train_guard_failures, train_expectancy_delta=train_expectancy_delta)
+
+    prior_tm_val, cand_tm_val = prior.trade_metrics_by_pool["validation"], candidate.trade_metrics_by_pool["validation"]
+    val_guard_failures = _guard_failures(prior_tm_val, cand_tm_val)
+    if cand_tm_val["trade_count"] < MIN_VALIDATION_EXPECTANCY_TRADES:
+        val_guard_failures.append(f"VALIDATION trade_count below {MIN_VALIDATION_EXPECTANCY_TRADES} ({cand_tm_val['trade_count']})")
+    if cand_tm_val["expectancy_r"] is None or prior_tm_val["expectancy_r"] is None:
+        return PromotionResult(False, "TRAIN improved but VALIDATION trade data is insufficient to confirm", None, train_guard_failures, None, val_guard_failures, train_expectancy_delta)
+    validation_expectancy_delta = cand_tm_val["expectancy_r"] - prior_tm_val["expectancy_r"]
+    if validation_expectancy_delta < MIN_VALIDATION_CONFIRMATION_DELTA:
+        return PromotionResult(
+            False, f"TRAIN improved but VALIDATION expectancy did not confirm (delta {validation_expectancy_delta:+.4f})",
+            None, train_guard_failures, None, val_guard_failures, train_expectancy_delta, validation_expectancy_delta,
+        )
+    if val_guard_failures:
+        return PromotionResult(
+            False, "TRAIN improved and VALIDATION expectancy confirmed, but VALIDATION guard(s) failed",
+            None, train_guard_failures, None, val_guard_failures, train_expectancy_delta, validation_expectancy_delta,
+        )
+    return PromotionResult(
+        True,
+        f"TRAIN expectancy delta {train_expectancy_delta:+.4f}, VALIDATION expectancy delta {validation_expectancy_delta:+.4f}, both confirmed, guards pass",
+        None, train_guard_failures, None, val_guard_failures, train_expectancy_delta, validation_expectancy_delta,
+    )
 
 
 # ---- Ladder orchestration ----------------------------------------------------
@@ -535,6 +622,10 @@ def main() -> None:
             "promotion": (None if promotion is None else {
                 "promoted": promotion.promoted, "reason": promotion.reason,
                 "train_spearman_delta": promotion.train_spearman_delta, "guard_failures": promotion.guard_failures,
+                "validation_spearman_delta": promotion.validation_spearman_delta,
+                "validation_guard_failures": promotion.validation_guard_failures,
+                "train_expectancy_delta": promotion.train_expectancy_delta,
+                "validation_expectancy_delta": promotion.validation_expectancy_delta,
             }),
             "note": note,
         }
@@ -593,8 +684,8 @@ def main() -> None:
         best_spec, best_eval = max(
             b3_candidates, key=lambda pair: (pair[1].trade_metrics_by_pool["train"]["expectancy_r"] or float("-inf")),
         )
-        promo_b3 = check_promotion(frozen_eval, best_eval)
-        record_rung("B3", best_spec, best_eval, promo_b3, f"best of 6 bounded gate candidates by TRAIN expectancy_r, selected {best_spec.label}")
+        promo_b3 = check_promotion_by_expectancy(frozen_eval, best_eval)
+        record_rung("B3", best_spec, best_eval, promo_b3, f"best of 6 bounded gate candidates by TRAIN expectancy_r, VALIDATION-confirmed, selected {best_spec.label}")
         if promo_b3.promoted:
             frozen_spec, frozen_eval = best_spec, best_eval
         else:
@@ -680,35 +771,65 @@ def main() -> None:
     best_spec, best_eval = max(
         b7_candidates, key=lambda pair: (pair[1].trade_metrics_by_pool["train"]["expectancy_r"] or float("-inf")),
     )
-    prior_tm = frozen_eval.trade_metrics_by_pool["train"]
-    cand_tm = best_eval.trade_metrics_by_pool["train"]
-    b7_guard_failures = []
-    if cand_tm["trade_count"] < 30:
-        b7_guard_failures.append(f"trade_count below 30 ({cand_tm['trade_count']})")
-    if cand_tm["expectancy_r"] is None or (prior_tm["expectancy_r"] is not None and cand_tm["expectancy_r"] < prior_tm["expectancy_r"]):
-        b7_promoted = False
-        b7_reason = "TRAIN expectancy_r did not improve vs the frozen (65) threshold"
-    elif b7_guard_failures:
-        b7_promoted = False
-        b7_reason = "TRAIN expectancy_r improved but guard(s) failed"
-    else:
-        b7_promoted = True
-        b7_reason = f"TRAIN expectancy_r improved ({prior_tm['expectancy_r']} -> {cand_tm['expectancy_r']}), guards pass"
-    promo_b7 = PromotionResult(b7_promoted, b7_reason, None, b7_guard_failures)
-    record_rung("B7", best_spec, best_eval, promo_b7, f"best of 6-point threshold grid by TRAIN expectancy_r (not Spearman -- see code comment), selected threshold={best_spec.buy_threshold}")
+    promo_b7 = check_promotion_by_expectancy(frozen_eval, best_eval)
+    record_rung("B7", best_spec, best_eval, promo_b7, f"best of 6-point threshold grid by TRAIN expectancy_r (not Spearman -- see code comment), VALIDATION-confirmed, selected threshold={best_spec.buy_threshold}")
     if promo_b7.promoted:
         frozen_spec, frozen_eval = best_spec, best_eval
 
     # ---- Final: single holdout look, frozen candidate vs. B0 --------------
-    print("Final step -- evaluating frozen candidate and B0 on the HOLDOUT pool, exactly once...")
-    frozen_holdout = evaluate_candidate(frozen_spec, samples_by_symbol, momentum_series_by_symbol, pools=("holdout",))
-    b0_holdout = evaluate_candidate(spec_b0, samples_by_symbol, momentum_series_by_symbol, pools=("holdout",))
+    # SAFEGUARD: HOLDOUT was already viewed by a prior run of this script.
+    # That view must never be used to tune anything, so before touching
+    # HOLDOUT again this compares the corrected methodology's frozen_spec
+    # against the ALREADY-RECORDED frozen_spec on disk. Identical -> reuse
+    # the prior HOLDOUT numbers verbatim (HOLDOUT is not re-evaluated at
+    # all). Different -> STOP; this is a new calibration generation and
+    # HOLDOUT is not evaluated for it here -- that needs a genuinely
+    # untouched, later holdout period, not this one.
+    frozen_spec_dict = _spec_to_dict(frozen_spec)
+    prior_final: dict | None = None
+    if RESULTS_PATH.exists():
+        try:
+            prior_final = json.loads(RESULTS_PATH.read_text(encoding="utf-8")).get("final")
+        except (json.JSONDecodeError, OSError):
+            prior_final = None
+    candidate_unchanged = prior_final is not None and prior_final.get("frozen_spec") == frozen_spec_dict
 
-    frozen_sp = frozen_holdout.spearman_by_pool["holdout"]["spearman"]
-    b0_sp = b0_holdout.spearman_by_pool["holdout"]["spearman"]
-    frozen_tm = frozen_holdout.trade_metrics_by_pool["holdout"]
-    b0_tm = b0_holdout.trade_metrics_by_pool["holdout"]
-    frozen_ind = frozen_holdout.independence_by_pool["holdout"]
+    if prior_final is None:
+        print("Final step -- no prior run found; evaluating frozen candidate and B0 on HOLDOUT for the first time...")
+        frozen_holdout = evaluate_candidate(frozen_spec, samples_by_symbol, momentum_series_by_symbol, pools=("holdout",))
+        b0_holdout = evaluate_candidate(spec_b0, samples_by_symbol, momentum_series_by_symbol, pools=("holdout",))
+        frozen_sp = frozen_holdout.spearman_by_pool["holdout"]["spearman"]
+        b0_sp = b0_holdout.spearman_by_pool["holdout"]["spearman"]
+        frozen_tm = frozen_holdout.trade_metrics_by_pool["holdout"]
+        b0_tm = b0_holdout.trade_metrics_by_pool["holdout"]
+        frozen_ind = frozen_holdout.independence_by_pool["holdout"]
+        b0_ind = b0_holdout.independence_by_pool["holdout"]
+    elif candidate_unchanged:
+        print("Final step -- corrected methodology selected the IDENTICAL frozen candidate as the prior (already-viewed) run.")
+        print("Reusing the prior run's recorded HOLDOUT numbers verbatim -- HOLDOUT is not re-evaluated.")
+        frozen_sp = prior_final["frozen_holdout"]["spearman"]
+        b0_sp = prior_final["b0_holdout"]["spearman"]
+        frozen_tm = prior_final["frozen_holdout"]["trade_metrics"]
+        b0_tm = prior_final["b0_holdout"]["trade_metrics"]
+        frozen_ind = prior_final["frozen_holdout"]["independence"]
+        b0_ind = prior_final["b0_holdout"]["independence"]
+    else:
+        print("Final step -- STOPPING. Corrected methodology selected a DIFFERENT frozen candidate than the prior run.")
+        print(f"  prior:     {prior_final.get('frozen_spec')}")
+        print(f"  corrected: {frozen_spec_dict}")
+        print("HOLDOUT was already viewed for the prior candidate and will NOT be evaluated for this new one.")
+        result["final"] = {
+            "frozen_spec": frozen_spec_dict,
+            "prior_frozen_spec": prior_final.get("frozen_spec"),
+            "recommendation": "NEW CALIBRATION GENERATION REQUIRED -- corrected methodology selected a different "
+                               "candidate than the already-holdout-viewed prior run; HOLDOUT was not evaluated for "
+                               "this candidate and must not be until a genuinely untouched future holdout exists.",
+        }
+        RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        RESULTS_PATH.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+        print(f"Wrote calibration-ladder results to {RESULTS_PATH}")
+        print(f"RECOMMENDATION: {result['final']['recommendation']}")
+        return
 
     promotion_standard = {
         "1_materially_improved_ordering": (frozen_sp is not None and b0_sp is not None and (frozen_sp - b0_sp) >= MIN_PROMOTION_SPEARMAN_DELTA),
@@ -721,9 +842,24 @@ def main() -> None:
             frozen_tm["max_drawdown_r"] is not None and b0_tm["max_drawdown_r"] is not None
             and frozen_tm["max_drawdown_r"] <= 1.5 * b0_tm["max_drawdown_r"]
         ),
+        # CORRECTED: the original check only tested "does a promotion dict
+        # exist" (always true, even for a rejected rung). It now checks
+        # that every rung which WAS promoted actually carries recorded
+        # VALIDATION-confirmation evidence -- structurally guaranteed to be
+        # present whenever promoted=True by the corrected check_promotion/
+        # check_promotion_by_expectancy above, so this is now a real proof,
+        # not a vacuous one. A rejected or skipped rung is vacuously fine
+        # (nothing was promoted for it to need confirming).
         "4_stability_across_folds": all(
-            result["rungs"].get(r, {}).get("promotion", {}) is not None for r in ("B1", "B2", "B4", "B5", "B6")
-        ),  # every promoted rung already passed independent TRAIN+VALIDATION checks -- see per-rung records
+            (lambda rung: (
+                rung.get("skipped")
+                or rung.get("promotion") is None
+                or not rung["promotion"]["promoted"]
+                or rung["promotion"].get("validation_spearman_delta") is not None
+                or rung["promotion"].get("validation_expectancy_delta") is not None
+            ))(result["rungs"].get(r, {}))
+            for r in ("B1", "B2", "B3", "B4", "B5", "B6", "B7")
+        ),
         "5_broad_symbol_participation": (frozen_ind["unique_symbols"] is not None and frozen_ind["unique_symbols"] >= 10 and (frozen_ind["max_symbol_share"] or 1.0) <= 0.3),
         "6_no_dependence_on_one_regime_or_short_period": None,  # descriptive only -- see report (holdout is a single, short, most-recent window by construction)
         "7_robustness_to_neighboring_parameters": True,  # see B6/B7 full grids recorded above -- not a single point estimate
@@ -731,11 +867,10 @@ def main() -> None:
     }
     passes_all = all(v is True for k, v in promotion_standard.items() if v is not None and k not in ("6_no_dependence_on_one_regime_or_short_period",))
 
-    frozen_spec_dict = _spec_to_dict(frozen_spec)
     result["final"] = {
         "frozen_spec": frozen_spec_dict,
         "frozen_holdout": {"spearman": frozen_sp, "trade_metrics": frozen_tm, "independence": frozen_ind},
-        "b0_holdout": {"spearman": b0_sp, "trade_metrics": b0_tm, "independence": b0_holdout.independence_by_pool["holdout"]},
+        "b0_holdout": {"spearman": b0_sp, "trade_metrics": b0_tm, "independence": b0_ind},
         "promotion_standard": promotion_standard,
         "recommendation": "FROZEN_CANDIDATE_PASSES" if passes_all else "NO ENTRY-COMPOSITE CALIBRATION READY FOR PRODUCTION",
     }

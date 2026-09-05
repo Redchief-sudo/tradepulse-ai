@@ -192,6 +192,52 @@ async def test_get_positions_cross_references_local_holding_stop_loss(tmp_path) 
 
 
 @respx.mock
+async def test_get_positions_exposes_the_option_contract_multiplier_already_on_the_holdings_asset(tmp_path) -> None:
+    """contract_multiplier is already carried on Holding.asset.metadata
+    since trade time (scanner/coordinator.py's option-contract resolution)
+    -- this only surfaces it, never re-derives it, so the dashboard can
+    compute a truthful options notional without inventing contract
+    economics of its own."""
+    client, state = await _client_for(tmp_path)
+    option_asset = AssetIdentity(
+        "AAPL240119C00150000", AssetClass.OPTION, "alpaca:AAPL240119C00150000",
+        metadata={"underlying_symbol": "AAPL", "expiry": "2024-01-19", "strike": "150", "option_type": "call", "contract_multiplier": "100"},
+    )
+    holding = Holding(asset=option_asset, quantity=Decimal("2"), average_price=Decimal("3"), updated_at=NOW)
+    await state.repositories.holdings.create_once(asset_identity_key(option_asset), holding)
+    _mock_positions({
+        "symbol": "AAPL240119C00150000", "asset_class": "us_option", "qty": "2", "avg_entry_price": "3",
+        "market_value": "600", "current_price": "3", "unrealized_pl": "0",
+    })
+
+    response = await client.get("/api/positions")
+    await client.aclose()
+    await state.broker.aclose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body[0]["contract_multiplier"] == "100"
+
+
+@respx.mock
+async def test_get_positions_contract_multiplier_is_null_without_a_local_holding_row(tmp_path) -> None:
+    """No fabricated multiplier when there's no local holding to source it
+    from (e.g. a position predating this dashboard field, or an equity
+    position that never has one)."""
+    client, state = await _client_for(tmp_path)
+    _mock_positions({
+        "symbol": "AAPL", "asset_class": "us_equity", "qty": "10", "avg_entry_price": "150",
+        "market_value": "1550", "current_price": "155", "unrealized_pl": "50",
+    })
+
+    response = await client.get("/api/positions")
+    await client.aclose()
+    await state.broker.aclose()
+
+    assert response.json()[0]["contract_multiplier"] is None
+
+
+@respx.mock
 async def test_market_data_capability_reads_from_scan_runs_not_live_probe(tmp_path) -> None:
     """No Alpaca options-chain/quote route is mocked at all -- if this route
     tried to probe live, respx would fail the request. It must only ever

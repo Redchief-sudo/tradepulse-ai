@@ -43,7 +43,6 @@ class Settings:
     max_retry_attempts: int
     alpaca_api_key: str | None
     alpaca_api_secret: str | None
-    alpaca_base_url: str
     finnhub_api_key: str | None
     coingecko_api_key: str | None
     coinmarketcap_api_key: str | None
@@ -96,7 +95,6 @@ class Settings:
             max_retry_attempts=_int(values, "MAX_RETRY_ATTEMPTS", 3, 1),
             alpaca_api_key=alpaca_key,
             alpaca_api_secret=alpaca_secret,
-            alpaca_base_url=values.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),
             finnhub_api_key=values.get("FINNHUB_API_KEY") or None,
             coingecko_api_key=values.get("COINGECKO_API_KEY") or None,
             coinmarketcap_api_key=values.get("COINMARKETCAP_API_KEY") or None,

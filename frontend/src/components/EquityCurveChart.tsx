@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { AreaSeries, createChart, type IChartApi } from 'lightweight-charts'
+import { AreaSeries, createChart, type IChartApi, type UTCTimestamp } from 'lightweight-charts'
 import { api } from '../api'
 import { usePolling } from '../usePolling'
 import { money } from '../format'
@@ -7,16 +7,31 @@ import { Panel, EmptyState } from './Panel'
 
 const MIN_POINTS_FOR_A_MEANINGFUL_CHART = 3
 
+/** TradePulse persists an equity snapshot every scan cycle -- an intraday
+ * series, often several observations per calendar day. A date-only time
+ * key (slice(0, 10)) would collapse same-day snapshots onto one point and
+ * violate lightweight-charts' strictly-ascending/unique time requirement;
+ * this uses the full timestamp (seconds since epoch) so every persisted
+ * snapshot gets its own point, deduplicating only the rare case of two
+ * snapshots landing on the exact same second (keeping the later one). */
+export function toChartPoints(data: { as_of: string; total_equity: string }[]): { time: UTCTimestamp; value: number }[] {
+  const sorted = [...data].sort((a, b) => (a.as_of < b.as_of ? -1 : 1))
+  const byTimestamp = new Map<number, number>()
+  for (const snapshot of sorted) {
+    const seconds = Math.floor(new Date(snapshot.as_of).getTime() / 1000)
+    byTimestamp.set(seconds, Number(snapshot.total_equity))
+  }
+  return [...byTimestamp.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([time, value]) => ({ time: time as UTCTimestamp, value }))
+}
+
 export function EquityCurveChart() {
   const { data, error, loading } = usePolling(() => api.getEquityHistory(200), 60000)
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
 
-  const points = data
-    ? [...data]
-        .sort((a, b) => (a.as_of < b.as_of ? -1 : 1))
-        .map((snapshot) => ({ time: snapshot.as_of.slice(0, 10), value: Number(snapshot.total_equity) }))
-    : []
+  const points = data ? toChartPoints(data) : []
   const hasEnoughHistory = points.length >= MIN_POINTS_FOR_A_MEANINGFUL_CHART
 
   useEffect(() => {
@@ -25,7 +40,7 @@ export function EquityCurveChart() {
       height: 220,
       layout: { background: { color: 'transparent' }, textColor: '#8b93a7' },
       grid: { vertLines: { color: '#262b38' }, horzLines: { color: '#262b38' } },
-      timeScale: { borderColor: '#262b38' },
+      timeScale: { borderColor: '#262b38', timeVisible: true, secondsVisible: false },
       rightPriceScale: { borderColor: '#262b38' },
     })
     const series = chart.addSeries(AreaSeries, {

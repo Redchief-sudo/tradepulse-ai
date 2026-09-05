@@ -51,7 +51,13 @@ from tradepulse.models import (
     contract_multiplier_of,
     fold_price_extremum,
 )
-from tradepulse.persistence import PersistenceRepositories, hydrate, list_all_by_statuses
+from tradepulse.persistence import (
+    PersistenceRepositories,
+    hydrate,
+    list_all_by_asset,
+    list_all_by_json_field,
+    list_all_by_statuses,
+)
 from tradepulse.risk import latch_financial_integrity_block
 
 from .lots import IntegrityViolationError, plan_signed_lot_fill
@@ -66,9 +72,13 @@ logger = logging.getLogger(__name__)
 
 
 async def _project_lot(repositories: PersistenceRepositories, event: SettlementEvent) -> Mapping[str, Any]:
-    lot_rows = await repositories.position_lots.list_all(limit=10000)
-    lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
-    symbol_lots = [lot for lot in lots if asset_identity_key(lot.asset) == asset_identity_key(event.asset)]
+    # FIN-090-01: asset-scoped, unbounded pagination -- NOT list_all(limit=N),
+    # which is oldest-first and would silently drop this asset's lots once
+    # enough OTHER-asset lots exist first. Any lot status (including
+    # already-closed) must be visible here for closure.get(event.fill_id)
+    # replay-protection below.
+    lot_rows = await list_all_by_asset(repositories.position_lots, event.asset)
+    symbol_lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
     plan = plan_signed_lot_fill(symbol_lots, event)
 
     for closure in plan.closures:
@@ -170,12 +180,11 @@ async def _project_attribution(repositories: PersistenceRepositories, event: Set
     already reflects this event's own closures. One attribution record per
     (lot, closing event) pair -- a single closing fill can FIFO-close more
     than one older lot at once."""
-    lot_rows = await repositories.position_lots.list_all(limit=10000)
+    # FIN-090-01: asset-scoped, unbounded pagination -- any lot status,
+    # since a lot must be visible here as soon as it's closed by this event.
+    lot_rows = await list_all_by_asset(repositories.position_lots, event.asset)
     lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
-    closed_lots = [
-        lot for lot in lots
-        if asset_identity_key(lot.asset) == asset_identity_key(event.asset) and event.fill_id in lot.closures
-    ]
+    closed_lots = [lot for lot in lots if event.fill_id in lot.closures]
     if not closed_lots:
         return None  # a pure opening fill -- nothing has round-tripped yet
 
@@ -272,12 +281,12 @@ async def _entry_protective_levels(
 
 
 async def _project_holding(repositories: PersistenceRepositories, event: SettlementEvent) -> None:
-    lot_rows = await repositories.position_lots.list_all(limit=10000)
+    # FIN-090-01: asset-scoped, unbounded pagination, then Python-side
+    # Decimal-based lot.status filter (never a SQL numeric cast) -- see
+    # persistence/repositories.py::paginate_all_rows's docstring for why.
+    lot_rows = await list_all_by_asset(repositories.position_lots, event.asset)
     lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
-    open_lots = [
-        lot for lot in lots
-        if asset_identity_key(lot.asset) == asset_identity_key(event.asset) and lot.status in ("open", "partially_closed")
-    ]
+    open_lots = [lot for lot in lots if lot.status in ("open", "partially_closed")]
 
     record_id = _holding_record_id(event.asset)
     existing_row = await repositories.holdings.get(record_id)
@@ -324,10 +333,11 @@ async def _project_trade(repositories: PersistenceRepositories, event: Settlemen
         return None
     intent = hydrate("trade_intents", intent_row["payload"])
 
-    fill_rows = await repositories.fills.list_all(limit=10000)
-    fills = [
-        hydrate("fills", row["payload"]) for row in fill_rows if row["payload"]["trade_intent_id"] == event.trade_intent_id
-    ]
+    # FIN-090-01: scoped to this trade_intent_id, unbounded -- NOT
+    # list_all(limit=N), which would silently drop this intent's own fills
+    # once enough OTHER intents' fills exist first.
+    fill_rows = await list_all_by_json_field(repositories.fills, "trade_intent_id", event.trade_intent_id)
+    fills = [hydrate("fills", row["payload"]) for row in fill_rows]
     cumulative_qty = sum((f.quantity for f in fills), Decimal("0"))
     total_notional = sum((f.quantity * f.price for f in fills), Decimal("0"))
     avg_price = total_notional / cumulative_qty if cumulative_qty > 0 else None
@@ -342,11 +352,9 @@ async def _project_trade(repositories: PersistenceRepositories, event: Settlemen
     # stage checkpoint, instead of double-counting on resume. (Fixes a
     # confirmed defect: the previous `intent.realized_pnl + event.realized_pnl`
     # form double-counted exactly that crash window.)
-    settlement_rows = await repositories.settlements.list_all(limit=10000)
-    own_events = [
-        hydrate("settlements", row["payload"]) for row in settlement_rows
-        if row["payload"]["trade_intent_id"] == event.trade_intent_id
-    ]
+    # FIN-090-01: scoped to this trade_intent_id, unbounded.
+    settlement_rows = await list_all_by_json_field(repositories.settlements, "trade_intent_id", event.trade_intent_id)
+    own_events = [hydrate("settlements", row["payload"]) for row in settlement_rows]
     total_realized_pnl = sum((e.realized_pnl or Decimal("0") for e in own_events), Decimal("0"))
 
     patch: dict[str, Any] = {
@@ -360,12 +368,13 @@ async def _project_trade(repositories: PersistenceRepositories, event: Settlemen
 async def _verify_integrity(repositories: PersistenceRepositories, event: SettlementEvent) -> None:
     errors: list[str] = []
 
-    lot_rows = await repositories.position_lots.list_all(limit=10000)
+    # FIN-090-01: asset-scoped, unbounded pagination, then Python-side
+    # Decimal-based lot.status filter -- an incomplete lot fetch here would
+    # produce a false-negative HOLDING_LOT_MISMATCH (the exact failure mode
+    # this whole fix is about).
+    lot_rows = await list_all_by_asset(repositories.position_lots, event.asset)
     lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
-    open_lots = [
-        lot for lot in lots
-        if asset_identity_key(lot.asset) == asset_identity_key(event.asset) and lot.status in ("open", "partially_closed")
-    ]
+    open_lots = [lot for lot in lots if lot.status in ("open", "partially_closed")]
     lot_qty = sum((lot.signed_quantity for lot in open_lots), Decimal("0"))
 
     holding_row = await repositories.holdings.get(_holding_record_id(event.asset))
@@ -375,12 +384,14 @@ async def _verify_integrity(repositories: PersistenceRepositories, event: Settle
         errors.append(f"HOLDING_LOT_MISMATCH: holding {holding_qty}, lots {lot_qty} for {event.asset.symbol}")
 
     if event.broker_fill_id:
-        settlement_rows = await repositories.settlements.list_all(limit=10000)
+        # FIN-090-01: scoped to this broker_fill_id (the actual matching
+        # key), not a scan of every COMPLETED settlement ever -- narrow
+        # AND complete, rather than trading one for the other.
+        settlement_rows = await list_all_by_json_field(repositories.settlements, "broker_fill_id", event.broker_fill_id)
         duplicates = [
             row
             for row in settlement_rows
-            if row["payload"].get("broker_fill_id") == event.broker_fill_id
-            and row["payload"]["settlement_event_id"] != event.settlement_event_id
+            if row["payload"]["settlement_event_id"] != event.settlement_event_id
             and row.get("status") == SettlementStatus.COMPLETED.value
         ]
         if duplicates:

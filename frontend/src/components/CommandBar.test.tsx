@@ -66,4 +66,32 @@ describe('CommandBar', () => {
 
     await waitFor(() => expect(screen.getByText(/Broker Unavailable/)).toBeInTheDocument())
   })
+
+  it('never keeps showing Broker Connected once a later poll fails, even though stale account data is intentionally retained', async () => {
+    // usePolling deliberately keeps the last-good `data` on a failed
+    // refresh -- CommandBar must still prioritize the MOST RECENT poll's
+    // `error` over that stale `data` when deciding connectivity, not read
+    // `data` first and never notice the newest request actually failed.
+    vi.useFakeTimers()
+    try {
+      vi.mocked(api.getSession).mockResolvedValue(session())
+      vi.mocked(api.getMarketDataCapability).mockResolvedValue({})
+      vi.mocked(api.getProvenance).mockResolvedValue({
+        product_name: 'x', creator_name: 'x', copyright_owner: 'x', company_name: 'x', copyright_years: 'x',
+        software_version: '1', git_commit: 'abc', build_timestamp: 'x', provenance_version: '1', build_fingerprint: 'abcdef1234567890',
+      })
+      vi.mocked(api.getAccount)
+        .mockResolvedValueOnce({ equity: '100000', last_equity: '99000', cash: '50000', buying_power: '100000', portfolio_value: '100000' })
+        .mockRejectedValueOnce(new Error('BROKER_UNAVAILABLE: timeout'))
+
+      render(<CommandBar />)
+      await vi.waitFor(() => expect(screen.getByText(/Broker Connected/)).toBeInTheDocument())
+
+      await vi.advanceTimersByTimeAsync(10000) // the account poll's own interval
+      await vi.waitFor(() => expect(screen.getByText(/Broker Unavailable/)).toBeInTheDocument())
+      expect(screen.queryByText(/Broker Connected/)).not.toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

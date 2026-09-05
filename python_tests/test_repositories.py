@@ -19,7 +19,14 @@ from tradepulse.models import (
     TradeIntentStatus,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, RepositoryPaginationError, hydrate
-from tradepulse.persistence.repositories import _paginate_all, list_all_by_json_time_range, list_all_by_statuses
+from tradepulse.persistence.repositories import (
+    _paginate_all,
+    list_all_by_asset,
+    list_all_by_json_field,
+    list_all_by_json_time_range,
+    list_all_by_statuses,
+    paginate_all_rows,
+)
 
 
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
@@ -383,3 +390,126 @@ async def test_list_by_json_time_range_rejects_a_malformed_field_name(tmp_path) 
     repositories = await _repositories(tmp_path)
     with pytest.raises(ValueError, match="invalid JSON field name"):
         await repositories.fills.list_by_json_time_range("filled_at'; --", NOW, NOW + timedelta(hours=1))
+
+
+# ---- list_by_asset / list_all_by_asset (FIN-090-01) -----------------------------------------------
+
+
+def _other_asset() -> AssetIdentity:
+    return AssetIdentity("BTC/USD", AssetClass.CRYPTO, "alpaca:BTC/USD")
+
+
+async def test_list_by_asset_matches_only_the_given_asset_regardless_of_status(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await repositories.position_lots.create_once("lot-open", _lot("lot-open", asset=_asset()), unique_value="fill-lot-open")
+    await repositories.position_lots.create_once(
+        "lot-closed", _lot("lot-closed", asset=_asset(), remaining_quantity=Decimal("0")), unique_value="fill-lot-closed",
+    )
+    await repositories.position_lots.create_once("lot-other", _lot("lot-other", asset=_other_asset()), unique_value="fill-lot-other")
+
+    rows = await repositories.position_lots.list_by_asset(_asset())
+
+    assert {row["record_id"] for row in rows} == {"lot-open", "lot-closed"}  # both statuses, never the other asset
+
+
+async def test_list_by_asset_matches_full_identity_not_just_symbol(tmp_path) -> None:
+    """A ticker-shaped symbol can be shared by economically distinct
+    instruments (see asset_identity_key's own docstring) -- a different
+    venue must not match."""
+    repositories = await _repositories(tmp_path)
+    await repositories.position_lots.create_once("lot-1", _lot("lot-1", asset=_asset()), unique_value="fill-1")
+    other_venue = AssetIdentity("AAPL", AssetClass.EQUITY, "otherbroker:AAPL", venue="other-venue")
+
+    rows = await repositories.position_lots.list_by_asset(other_venue)
+
+    assert rows == []
+
+
+async def test_list_all_by_asset_fetches_a_set_spanning_several_batches(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await asyncio.gather(*(
+        repositories.position_lots.create_once(f"lot-{i}", _lot(f"lot-{i}", asset=_asset()), unique_value=f"fill-{i}")
+        for i in range(25)
+    ))
+
+    rows = await list_all_by_asset(repositories.position_lots, _asset(), batch_size=4)
+
+    assert {row["record_id"] for row in rows} == {f"lot-{i}" for i in range(25)}
+
+
+# ---- list_by_json_field / list_all_by_json_field (FIN-090-01) -------------------------------------
+
+
+async def test_list_by_json_field_matches_only_the_exact_value(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await repositories.fills.create_once("fill-match-1", _fill("fill-match-1", NOW), unique_value=None)
+    await repositories.fills.create_once("fill-match-2", _fill("fill-match-2", NOW + timedelta(minutes=1)), unique_value=None)
+    other = Fill("fill-other", "ti-2", "order-2", _asset(), Side.BUY, ExecutionMode.PAPER, Decimal("1"), Decimal("100"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-other", other, unique_value=None)
+
+    rows = await repositories.fills.list_by_json_field("trade_intent_id", "ti-1")
+
+    assert {row["record_id"] for row in rows} == {"fill-match-1", "fill-match-2"}
+
+
+async def test_list_all_by_json_field_fetches_a_set_spanning_several_batches(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await asyncio.gather(*(
+        repositories.fills.create_once(f"fill-{i}", _fill(f"fill-{i}", NOW + timedelta(minutes=i)), unique_value=None)
+        for i in range(25)
+    ))
+
+    rows = await list_all_by_json_field(repositories.fills, "trade_intent_id", "ti-1", batch_size=4)
+
+    assert {row["record_id"] for row in rows} == {f"fill-{i}" for i in range(25)}
+
+
+async def test_list_by_json_field_rejects_a_malformed_field_name(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    with pytest.raises(ValueError, match="invalid JSON field name"):
+        await repositories.fills.list_by_json_field("trade_intent_id'; --", "ti-1")
+
+
+# ---- list_page / paginate_all_rows (FIN-090-01) ---------------------------------------------------
+
+
+async def test_list_page_returns_every_row_with_no_filter(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    for i in range(3):
+        await repositories.holdings.create_once(f"holding-{i}", Holding(_asset(), Decimal(i + 1), Decimal("150"), NOW))
+
+    rows = await repositories.holdings.list_page(limit=500)
+
+    assert {row["record_id"] for row in rows} == {"holding-0", "holding-1", "holding-2"}
+
+
+async def test_list_page_cursor_pages_without_skip_or_repeat(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    for i in range(10):
+        await repositories.holdings.create_once(f"holding-{i}", Holding(_asset(), Decimal(i + 1), Decimal("150"), NOW))
+
+    seen: list[str] = []
+    after = None
+    while True:
+        page = await repositories.holdings.list_page(limit=3, after=after)
+        if not page:
+            break
+        seen.extend(row["record_id"] for row in page)
+        after = (page[-1]["created_at"], page[-1]["record_id"])
+
+    assert seen == [f"holding-{i}" for i in range(10)]
+
+
+async def test_paginate_all_rows_fetches_the_whole_table_spanning_several_batches(tmp_path) -> None:
+    """Direct proof of the FIN-090-01 fix's core claim: a table much
+    larger than one batch is returned completely, not truncated the way
+    the old list_all(limit=N) ceiling would have."""
+    repositories = await _repositories(tmp_path)
+    await asyncio.gather(*(
+        repositories.holdings.create_once(f"holding-{i}", Holding(AssetIdentity(f"SYM{i}", AssetClass.EQUITY, f"alpaca:SYM{i}"), Decimal("1"), Decimal("150"), NOW))
+        for i in range(25)
+    ))
+
+    rows = await paginate_all_rows(repositories.holdings, batch_size=4)
+
+    assert {row["record_id"] for row in rows} == {f"holding-{i}" for i in range(25)}

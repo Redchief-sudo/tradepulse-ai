@@ -28,7 +28,13 @@ from tradepulse.models import (
     asset_identity_key,
     contract_multiplier_of,
 )
-from tradepulse.persistence import PersistenceRepositories, hydrate, list_all_by_json_time_range, list_all_by_statuses
+from tradepulse.persistence import (
+    PersistenceRepositories,
+    hydrate,
+    list_all_by_json_time_range,
+    list_all_by_statuses,
+    paginate_all_rows,
+)
 
 # Risk-day boundary for trades_today/daily_realized (resolves the previous
 # UTC-calendar-day simplification): a single NY-midnight-to-NY-midnight
@@ -366,7 +372,13 @@ async def build_portfolio_snapshot(
     now = now or datetime.now(UTC)
     mark_prices = mark_prices or {}
 
-    holding_rows = await repositories.holdings.list_all()
+    # FIN-090-01: unbounded, whole-table pagination -- NOT list_all(),
+    # which defaults to limit=1000 (oldest-first) and would silently
+    # understate holdings_value/sector_exposure -- and therefore make
+    # max_total_exposure_pct/max_sector_pct limit checks more PERMISSIVE,
+    # not less -- once enough holdings existed first. See the sibling
+    # trade_intents pull below for the same fix already applied earlier.
+    holding_rows = await paginate_all_rows(repositories.holdings)
     holdings = [hydrate("holdings", row["payload"]) for row in holding_rows]
 
     holdings_value = Decimal("0")

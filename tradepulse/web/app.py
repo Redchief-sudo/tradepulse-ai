@@ -193,6 +193,14 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
                 "position": position,
                 "stop_loss": holding.stop_loss if holding is not None else None,
                 "target_price": holding.target_price if holding is not None else None,
+                # Already carried on the same AssetIdentity since trade time
+                # (scanner/coordinator.py's option-contract resolution) --
+                # exposed here only so the dashboard can compute a truthful
+                # options notional (qty * price * multiplier) without
+                # re-deriving contract economics of its own.
+                "contract_multiplier": (
+                    holding.asset.metadata.get("contract_multiplier") if holding is not None else None
+                ),
             })
         return _json(enriched)
 

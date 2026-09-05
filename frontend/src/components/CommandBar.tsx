@@ -70,10 +70,14 @@ export function CommandBar() {
   // Broker connectivity has no dedicated backend endpoint -- derived here
   // from the account poll's own existing error state (every live-broker
   // route already surfaces a BROKER_UNAVAILABLE 503 on failure), never a
-  // new health-check request. `undefined` (still loading) reads as
-  // "Checking...", never as connected.
-  const brokerTone: 'positive' | 'negative' | 'neutral' = account.data ? 'positive' : account.error ? 'negative' : 'neutral'
-  const brokerLabel = account.data ? 'Broker Connected' : account.error ? 'Broker Unavailable' : 'Broker Checking…'
+  // new health-check request. The MOST RECENT poll's error must win even
+  // when usePolling is (correctly, for its own purpose) still showing
+  // stale last-good `data` alongside it -- checking `error` first is what
+  // prevents "Broker Connected" from surviving past a real, current
+  // failure. `undefined` on both (still loading) reads as "Checking...",
+  // never as connected.
+  const brokerTone: 'positive' | 'negative' | 'neutral' = account.error ? 'negative' : account.data ? 'positive' : 'neutral'
+  const brokerLabel = account.error ? 'Broker Unavailable' : account.data ? 'Broker Connected' : 'Broker Checking…'
 
   const isLive = session?.execution_mode === 'live'
 

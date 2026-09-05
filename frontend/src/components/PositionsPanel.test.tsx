@@ -12,7 +12,7 @@ function position(overrides: Partial<EnrichedPosition['position']> = {}): Enrich
       symbol: 'AAPL', asset_class: 'equity', qty: '10', avg_entry_price: '100', market_value: '1050',
       current_price: '105', unrealized_pl: '50', ...overrides,
     },
-    stop_loss: null, target_price: null,
+    stop_loss: null, target_price: null, contract_multiplier: null,
   }
 }
 

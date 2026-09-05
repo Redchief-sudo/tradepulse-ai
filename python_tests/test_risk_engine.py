@@ -460,6 +460,30 @@ async def test_build_portfolio_snapshot_falls_back_to_cost_basis_when_asset_has_
     assert snapshot.holdings_value == Decimal("1000")  # 10 * 100 cost basis -- AAPL has no entry in mark_prices
 
 
+async def test_build_portfolio_snapshot_includes_a_holding_beyond_one_page_of_others(tmp_path) -> None:
+    """FIN-090-01 Tier 2 -- the most important single regression in this
+    fix: the old list_all() default (limit=1000, oldest-first) would
+    silently drop a holding once enough OTHER holdings existed first,
+    UNDERSTATING holdings_value/sector_exposure and therefore making
+    max_total_exposure_pct/max_sector_pct limit checks MORE PERMISSIVE
+    than they should be -- the exact wrong direction for a risk control."""
+    repositories = await _repositories(tmp_path)
+
+    async def _noise(i: int) -> None:
+        noise_asset = AssetIdentity(f"NOISE{i}", AssetClass.EQUITY, f"alpaca:NOISE{i}")
+        holding = Holding(asset=noise_asset, quantity=Decimal("1"), average_price=Decimal("10"), updated_at=NOW, sector="Noise")
+        await repositories.holdings.create_once(asset_identity_key(noise_asset), holding)
+
+    await asyncio.gather(*(_noise(i) for i in range(501)))  # more than one default page (500)
+    holding = Holding(asset=_aapl(), quantity=Decimal("10"), average_price=Decimal("100"), updated_at=NOW, sector="Tech")
+    await repositories.holdings.create_once(asset_identity_key(_aapl()), holding)
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
+
+    assert snapshot.holdings_value == Decimal("1000") + Decimal("501") * Decimal("10")  # AAPL's 1000 must be included, not silently dropped
+    assert snapshot.sector_exposure["Tech"] == Decimal("1000")  # AAPL's own sector exposure specifically must be present
+
+
 async def test_build_portfolio_snapshot_defaults_to_cost_basis_when_mark_prices_omitted(tmp_path) -> None:
     repositories = await _repositories(tmp_path)
     holding = Holding(asset=_aapl(), quantity=Decimal("10"), average_price=Decimal("100"), updated_at=NOW)

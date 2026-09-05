@@ -776,3 +776,35 @@ async def test_monitor_stops_starting_new_work_when_lease_already_lost(tmp_path)
 
     assert summary.exits_triggered == 0
     assert order_route.call_count == 0
+
+
+@respx.mock
+async def test_open_lot_mfe_still_updates_behind_more_than_one_page_of_other_assets_lots(tmp_path) -> None:
+    """FIN-090-01 Tier 2 regression: the old list_all(limit=N) ceiling on
+    the monitor's whole-table open-lot pre-fetch would silently drop this
+    asset's own open lot once enough OTHER-asset lots existed first,
+    leaving it invisible to protective-stop tracking entirely."""
+    repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
+
+    async def _noise_lot(i: int) -> None:
+        noise_asset = AssetIdentity(f"NOISE{i}", AssetClass.EQUITY, f"alpaca:NOISE{i}")
+        lot = PositionLot(
+            lot_id=f"noise-lot-{i}", originating_fill_id=f"noise-fill-{i}", asset=noise_asset,
+            position_side="long", opened_quantity=Decimal("1"), remaining_quantity=Decimal("1"),
+            acquisition_price=Decimal("10"), opened_at=NOW,
+        )
+        await repositories.position_lots.create_once(f"noise-lot-{i}", lot, unique_value=f"noise-fill-{i}")
+
+    await asyncio.gather(*(_noise_lot(i) for i in range(501)))  # more than one default page (500)
+    await _seed_holding(repositories)
+    await _seed_lot(repositories)  # no mfe/mae yet
+    _mock_positions(qty="10", current_price="155")
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    summary = await run_position_monitor(repositories, broker, market_data, gateway, alerts, LIMITS, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.exits_triggered == 0
+    lot = await _get_lot(repositories, "lot-1")
+    assert lot.mfe_price == Decimal("155")  # proves the real lot was found and updated, not silently skipped
+    assert lot.mae_price == Decimal("155")

@@ -22,8 +22,9 @@ TOOL_DIR = Path(__file__).resolve().parent.parent / "tools" / "historical_data"
 sys.path.insert(0, str(TOOL_DIR))
 
 from entry_calibration_ladder import (  # noqa: E402
-    CandidateSpec, RawSample, TRAIN_END, TRAIN_START, VALIDATION_END, VALIDATION_START, HOLDOUT_END, HOLDOUT_START,
-    _risk_value, _technical_value, evaluate_candidate, pool_for_date, score_sample, trailing_percentile_momentum,
+    CandidateEvaluation, CandidateSpec, RawSample, TRAIN_END, TRAIN_START, VALIDATION_END, VALIDATION_START,
+    HOLDOUT_END, HOLDOUT_START, _risk_value, _spec_to_dict, _technical_value, check_promotion,
+    check_promotion_by_expectancy, evaluate_candidate, pool_for_date, score_sample, trailing_percentile_momentum,
 )
 
 
@@ -217,3 +218,96 @@ def test_evaluate_candidate_default_pools_exclude_holdout() -> None:
     default_pools = sig.parameters["pools"].default
     assert "holdout" not in default_pools
     assert default_pools == ("train", "validation")
+
+
+# ---- Promotion rule: VALIDATION must independently confirm, not just TRAIN -------------------------
+
+
+def _tm(trade_count: int = 100, expectancy_r: float | None = 0.05, profit_factor: float | None = 1.2, max_drawdown_r: float | None = 10.0) -> dict:
+    return {"trade_count": trade_count, "hit_rate": 0.5, "expectancy_r": expectancy_r, "profit_factor": profit_factor, "max_drawdown_r": max_drawdown_r}
+
+
+def _eval(train_sp: float | None, val_sp: float | None, train_tm: dict | None = None, val_tm: dict | None = None) -> CandidateEvaluation:
+    return CandidateEvaluation(
+        label="x",
+        spearman_by_pool={"train": {"n": 100, "spearman": train_sp}, "validation": {"n": 50, "spearman": val_sp}},
+        trade_metrics_by_pool={"train": train_tm or _tm(), "validation": val_tm or _tm()},
+        independence_by_pool={"train": {}, "validation": {}},
+    )
+
+
+def test_check_promotion_requires_both_train_and_validation_to_improve() -> None:
+    prior = _eval(train_sp=-0.10, val_sp=-0.10)
+    candidate = _eval(train_sp=-0.06, val_sp=-0.05)  # both improve (deltas +0.04, +0.05)
+    result = check_promotion(prior, candidate)
+    assert result.promoted is True
+    assert result.validation_spearman_delta == pytest.approx(0.05)
+
+
+def test_check_promotion_rejects_when_validation_contradicts_train() -> None:
+    """The core defect this test guards against: TRAIN alone cleared the
+    bar in the original (uncorrected) implementation, but VALIDATION
+    actually got WORSE -- this must now block promotion, not just get
+    silently recorded alongside an approval."""
+    prior = _eval(train_sp=-0.10, val_sp=-0.05)
+    candidate = _eval(train_sp=-0.06, val_sp=-0.09)  # TRAIN delta +0.04 (clears), VALIDATION delta -0.04 (contradicts)
+    result = check_promotion(prior, candidate)
+    assert result.promoted is False
+    assert "VALIDATION" in result.reason
+    assert result.validation_spearman_delta == pytest.approx(-0.04)
+
+
+def test_check_promotion_rejects_when_train_delta_alone_is_insufficient() -> None:
+    prior = _eval(train_sp=-0.10, val_sp=-0.10)
+    candidate = _eval(train_sp=-0.09, val_sp=-0.05)  # TRAIN delta only +0.01, below the +0.02 bar
+    result = check_promotion(prior, candidate)
+    assert result.promoted is False
+    assert result.validation_spearman_delta is None  # never even reaches the VALIDATION check
+
+
+def test_check_promotion_rejects_on_a_train_guard_failure_even_if_validation_would_confirm() -> None:
+    prior = _eval(train_sp=-0.10, val_sp=-0.10, train_tm=_tm(expectancy_r=0.05), val_tm=_tm(expectancy_r=0.05))
+    candidate = _eval(train_sp=-0.06, val_sp=-0.05, train_tm=_tm(expectancy_r=-0.05), val_tm=_tm(expectancy_r=0.10))
+    result = check_promotion(prior, candidate)
+    assert result.promoted is False
+    assert any("expectancy_r flipped" in f for f in result.guard_failures)
+
+
+def test_check_promotion_by_expectancy_requires_validation_confirmation_too() -> None:
+    prior = _eval(train_sp=None, val_sp=None, train_tm=_tm(expectancy_r=0.05), val_tm=_tm(expectancy_r=0.05))
+    candidate_confirmed = _eval(train_sp=None, val_sp=None, train_tm=_tm(expectancy_r=0.10), val_tm=_tm(expectancy_r=0.08))
+    result = check_promotion_by_expectancy(prior, candidate_confirmed)
+    assert result.promoted is True
+    assert result.validation_expectancy_delta == pytest.approx(0.03)
+
+
+def test_check_promotion_by_expectancy_rejects_when_validation_regresses() -> None:
+    """Mirrors the real Rev.89 B7 defect: TRAIN expectancy improved
+    (0.084 -> 0.117 in the actual run) but that alone must not be enough
+    to promote -- VALIDATION expectancy must not have gotten worse."""
+    prior = _eval(train_sp=None, val_sp=None, train_tm=_tm(expectancy_r=0.05), val_tm=_tm(expectancy_r=0.05))
+    candidate_unconfirmed = _eval(train_sp=None, val_sp=None, train_tm=_tm(expectancy_r=0.10), val_tm=_tm(expectancy_r=0.01))
+    result = check_promotion_by_expectancy(prior, candidate_unconfirmed)
+    assert result.promoted is False
+    assert "VALIDATION" in result.reason
+
+
+def test_check_promotion_by_expectancy_rejects_below_minimum_validation_trade_count() -> None:
+    prior = _eval(train_sp=None, val_sp=None, train_tm=_tm(expectancy_r=0.05, trade_count=100), val_tm=_tm(expectancy_r=0.05, trade_count=100))
+    thin_validation = _eval(train_sp=None, val_sp=None, train_tm=_tm(expectancy_r=0.10, trade_count=100), val_tm=_tm(expectancy_r=0.10, trade_count=5))
+    result = check_promotion_by_expectancy(prior, thin_validation)
+    assert result.promoted is False
+    assert any("trade_count" in f for f in result.validation_guard_failures)
+
+
+def test_spec_to_dict_is_stable_for_identical_specs_and_differs_for_different_ones() -> None:
+    """The holdout-reuse safeguard in main() compares two _spec_to_dict
+    results for equality to decide whether HOLDOUT may be safely reused
+    without re-touching it -- this must reliably distinguish an unchanged
+    candidate from a genuinely different one."""
+    spec_a = CandidateSpec(label="B7_50", technical_weight=100.0, momentum_weight=0.0, buy_threshold=50.0)
+    spec_a_again = CandidateSpec(label="B7_50", technical_weight=100.0, momentum_weight=0.0, buy_threshold=50.0)
+    spec_b = replace(spec_a, buy_threshold=65.0)
+
+    assert _spec_to_dict(spec_a) == _spec_to_dict(spec_a_again)
+    assert _spec_to_dict(spec_a) != _spec_to_dict(spec_b)

@@ -416,6 +416,109 @@ class RecordRepository:
 
         return await self.database.run(select)
 
+    async def list_by_asset(
+        self, asset: Any, limit: int = 500, *, after: tuple[str, str] | None = None,
+    ) -> list[Mapping[str, Any]]:
+        """Every row (ANY status/lot-state) matching one canonical asset
+        identity -- same json_extract filter shape as
+        exists_with_status_and_asset above, keyset-paginated via
+        (created_at, record_id) exactly like list_by_json_time_range. Used
+        for position_lots reads that must see closed lots too (replay
+        protection, integrity checks) -- narrower than a whole-table
+        pull, and unlike a status/time filter, correct regardless of how
+        old or how far in the past the relevant lot was opened."""
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+
+        venue = (asset.venue or "default").lower()
+        where = (
+            "json_extract(payload, '$.asset.asset_class') = ? "
+            "AND LOWER(COALESCE(json_extract(payload, '$.asset.venue'), 'default')) = ? "
+            "AND json_extract(payload, '$.asset.native_asset_id') = ?"
+        )
+        params: list[Any] = [asset.asset_class.value, venue, asset.native_asset_id]
+        if after is not None:
+            where += " AND (created_at, record_id) > (?, ?)"
+            params.extend(after)
+        params.append(limit)
+
+        def select(connection: sqlite3.Connection) -> list[Mapping[str, Any]]:
+            rows = connection.execute(
+                f"SELECT * FROM {self.table} WHERE {where} ORDER BY created_at ASC, record_id ASC LIMIT ?", params,
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                item["payload"] = decode_payload(item["payload"])
+                result.append(item)
+            return result
+
+        return await self.database.run(select)
+
+    async def list_by_json_field(
+        self, field: str, value: Any, limit: int = 500, *, after: tuple[str, str] | None = None,
+    ) -> list[Mapping[str, Any]]:
+        """Every row where a validated top-level JSON field equals `value`
+        -- the equality analog of list_by_json_time_range (same guard,
+        same keyset pagination). Used to scope a read to one financial
+        identity (a trade_intent_id, a broker_fill_id, a broker_order_id)
+        instead of pulling the whole table and filtering in Python."""
+        _validate_json_field_name(field)
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+
+        where = f"json_extract(payload, '$.{field}') = ?"
+        params: list[Any] = [value]
+        if after is not None:
+            where += " AND (created_at, record_id) > (?, ?)"
+            params.extend(after)
+        params.append(limit)
+
+        def select(connection: sqlite3.Connection) -> list[Mapping[str, Any]]:
+            rows = connection.execute(
+                f"SELECT * FROM {self.table} WHERE {where} ORDER BY created_at ASC, record_id ASC LIMIT ?", params,
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                item["payload"] = decode_payload(item["payload"])
+                result.append(item)
+            return result
+
+        return await self.database.run(select)
+
+    async def list_page(self, limit: int = 500, *, after: tuple[str, str] | None = None) -> list[Mapping[str, Any]]:
+        """One page of the ENTIRE table, no filter at all -- keyset-
+        paginated via (created_at, record_id), same contract as
+        list_by_json_time_range/list_by_asset/list_by_json_field. Only for
+        tables with no filterable dimension for the caller's actual need
+        (e.g. holdings, where every row must be compared against every
+        other simultaneously) -- see paginate_all_rows for the no-ceiling
+        wrapper. Deliberately distinct from the existing (bounded, ceiling-
+        capped) list_all -- this is never a truncating read."""
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+
+        where = ""
+        params: list[Any] = []
+        if after is not None:
+            where = "WHERE (created_at, record_id) > (?, ?) "
+            params.extend(after)
+        params.append(limit)
+
+        def select(connection: sqlite3.Connection) -> list[Mapping[str, Any]]:
+            rows = connection.execute(
+                f"SELECT * FROM {self.table} {where}ORDER BY created_at ASC, record_id ASC LIMIT ?", params,
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                item["payload"] = decode_payload(item["payload"])
+                result.append(item)
+            return result
+
+        return await self.database.run(select)
+
 
 async def _paginate_all(
     fetch_page: Callable[[tuple[str, str] | None, int], Awaitable[list[Mapping[str, Any]]]],
@@ -459,6 +562,30 @@ async def list_all_by_json_time_range(
     return await _paginate_all(
         lambda after, limit: repo.list_by_json_time_range(field, start, end, limit=limit, after=after), batch_size=batch_size,
     )
+
+
+async def list_all_by_asset(repo: RecordRepository, asset: Any, *, batch_size: int = 500) -> list[Mapping[str, Any]]:
+    """No-ceiling caller-facing wrapper around list_by_asset -- every row
+    (any status) for one canonical asset identity, regardless of table size."""
+    return await _paginate_all(lambda after, limit: repo.list_by_asset(asset, limit=limit, after=after), batch_size=batch_size)
+
+
+async def list_all_by_json_field(
+    repo: RecordRepository, field: str, value: Any, *, batch_size: int = 500,
+) -> list[Mapping[str, Any]]:
+    """No-ceiling caller-facing wrapper around list_by_json_field -- every
+    row matching one financial identity value, regardless of table size."""
+    return await _paginate_all(lambda after, limit: repo.list_by_json_field(field, value, limit=limit, after=after), batch_size=batch_size)
+
+
+async def paginate_all_rows(repo: RecordRepository, *, batch_size: int = 500) -> list[Mapping[str, Any]]:
+    """No-ceiling caller-facing wrapper around list_page -- the ENTIRE
+    table, unfiltered, regardless of size. Only for tables with no
+    filterable dimension for the caller's actual need (holdings; and
+    position_lots' whole-table open-lot prefetches, where open/closed is
+    determined afterward via the payload's own Decimal-based lot.status
+    property in Python, never a SQL-side floating-point filter)."""
+    return await _paginate_all(lambda after, limit: repo.list_page(limit=limit, after=after), batch_size=batch_size)
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,4 +1,5 @@
-from datetime import UTC, datetime
+import asyncio
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -580,3 +581,115 @@ async def test_unrecognized_broker_position_asset_class_reports_degraded(tmp_pat
 
     assert summary.status == "degraded"
     assert "BROKER_ASSET_CLASS_UNKNOWN" in summary.error
+
+
+# ---- FIN-090-01 Tier 2: financial-behavior regressions, not just pagination proofs -----------------
+
+
+@respx.mock
+async def test_ambiguous_broker_order_id_is_surfaced_never_silently_resolved(tmp_path) -> None:
+    """FIN-090-01 refinement #2: two local TradeIntents sharing the same
+    broker_order_id (should not happen, but no DB-level uniqueness
+    constraint proves it can't) must never be resolved by picking either
+    one at random -- it must be recorded as drift, alerted, and latch
+    financial integrity, with late-fill recovery skipped entirely."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    await _seed_intent(repositories, trade_intent_id="ti-dup-a", broker_order_id="order-shared", status=TradeIntentStatus.ACCEPTED)
+    await _seed_intent(repositories, trade_intent_id="ti-dup-b", broker_order_id="order-shared", status=TradeIntentStatus.ACCEPTED)
+    _mock_positions([])
+    _mock_activities([_activity_json("activity-ambiguous", "5", "150", order_id="order-shared")])
+
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.late_fills_recovered == 0  # never recovered into either candidate
+    assert summary.missed_fills_detected == 1  # counted as the same "financial truth uncertain" bucket
+
+    fill_row = await repositories.fills.get("activity-ambiguous")
+    assert fill_row is None  # nothing fabricated
+
+    records = await repositories.reconciliation_records.list_all()
+    payloads = [hydrate("reconciliation_records", r["payload"]) for r in records]
+    fill_records = [p for p in payloads if p.reconciliation_type == "fill"]
+    assert len(fill_records) == 1
+    assert fill_records[0].outcome == ReconciliationOutcome.DRIFT_DETECTED
+    assert set(fill_records[0].actual["matching_trade_intent_ids"]) == {"ti-dup-a", "ti-dup-b"}
+
+    session = await load_session(repositories)
+    assert session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED
+
+
+@respx.mock
+async def test_position_reconciliation_survives_more_than_one_page_of_other_assets_lots_and_holdings(tmp_path) -> None:
+    """FIN-090-01 Tier 2: the old list_all(limit=N) ceiling on the
+    whole-table lots/holdings pre-fetch would silently drop this asset's
+    own lot/holding once enough OTHER-asset rows existed first, producing
+    a FALSE accounting-drift alert for a position that's actually fine."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+
+    # Each noise asset's lot/holding/broker-position all agree (qty=1) --
+    # deliberately NOT accounting drift, so the only way this test can fail
+    # is the real AAPL position being lost behind the noise, not a flaw in
+    # the noise data's own (correct) reconciliation.
+    noise_positions = []
+    for i in range(501):  # more than one default page (500)
+        noise_asset = AssetIdentity(f"NOISE{i}", AssetClass.EQUITY, f"alpaca:NOISE{i}")
+        lot = PositionLot(
+            lot_id=f"noise-lot-{i}", originating_fill_id=f"noise-fill-{i}", asset=noise_asset,
+            position_side="long", opened_quantity=Decimal("1"), remaining_quantity=Decimal("1"),
+            acquisition_price=Decimal("10"), opened_at=NOW,
+        )
+        await repositories.position_lots.create_once(f"noise-lot-{i}", lot, unique_value=f"noise-fill-{i}")
+        await repositories.holdings.create_once(asset_identity_key(noise_asset), Holding(asset=noise_asset, quantity=Decimal("1"), average_price=Decimal("10"), updated_at=NOW))
+        noise_positions.append({
+            "symbol": f"NOISE{i}", "asset_class": "us_equity", "qty": "1", "avg_entry_price": "10",
+            "market_value": "0", "current_price": "10", "unrealized_pl": "0",
+        })
+
+    await _seed_lot(repositories, lot_id="lot-1", fill_id="fill-1", quantity="10", price="150")
+    await _seed_holding(repositories, quantity="10")
+    _mock_positions([_position_json("10"), *noise_positions])
+    _mock_activities([])
+
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.status == "ok"
+    assert summary.accounting_drift_detected == 0  # the real position's lot/holding were found, not falsely flagged as drift
+
+    records = await repositories.reconciliation_records.list_all()
+    payloads = [hydrate("reconciliation_records", r["payload"]) for r in records]
+    aapl_records = [p for p in payloads if p.subject_id == "AAPL"]
+    assert len(aapl_records) == 1
+    assert aapl_records[0].outcome == ReconciliationOutcome.MATCHED
+
+
+@respx.mock
+async def test_fill_reconciliation_survives_more_than_one_page_of_fills_outside_the_match_window(tmp_path) -> None:
+    """FIN-090-01 Tier 2: the fills read is now scoped by a time window,
+    not list_all(limit=N) -- proves a genuine in-window fill is still
+    found and matched behind a large number of OUT-of-window noise fills."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+
+    async def _noise(i: int) -> None:
+        # Each seeded 1 day apart, all well outside the reconciliation
+        # window (default lookback=1 day, +/- the 300s match window).
+        await _seed_fill(repositories, fill_id=f"noise-fill-{i}", quantity="1", price="10", filled_at=NOW - timedelta(days=10 + i))
+
+    await asyncio.gather(*(_noise(i) for i in range(501)))
+    await _seed_fill(repositories, fill_id="fill-1", quantity="10", price="150", filled_at=NOW, broker_fill_id="activity-1")
+    _mock_positions([])
+    _mock_activities([_activity_json("activity-1", "10", "150")])
+
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.missed_fills_detected == 0  # the real fill was found, not hidden behind 501 out-of-window noise rows
+    records = await repositories.reconciliation_records.list_all()
+    payloads = [hydrate("reconciliation_records", r["payload"]) for r in records]
+    fill_records = [p for p in payloads if p.reconciliation_type == "fill"]
+    assert len(fill_records) == 1
+    assert fill_records[0].outcome == ReconciliationOutcome.MATCHED

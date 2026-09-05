@@ -45,7 +45,7 @@ from tradepulse.models import (
     asset_key_from_broker_symbol,
     fold_price_extremum,
 )
-from tradepulse.persistence import PersistenceRepositories, hydrate, run_with_lock_renewal
+from tradepulse.persistence import PersistenceRepositories, hydrate, paginate_all_rows, run_with_lock_renewal
 from tradepulse.providers import AlpacaMarketDataProvider, ProviderError
 from tradepulse.strategy import atr
 
@@ -264,7 +264,13 @@ async def run_position_monitor(
     # have more than one open lot (a scale-in); every open lot for a symbol
     # sees the SAME broker-observed price this cycle, just folds it against
     # its own individually-tracked extremes.
-    lot_rows = await repositories.position_lots.list_all(limit=10000)
+    # FIN-090-01: unbounded, whole-table pagination -- NOT list_all(limit=N),
+    # which is oldest-first and would silently drop a newer open lot once
+    # enough OTHER (any-asset) lots existed first, hiding it from
+    # protective-stop monitoring. Open/closed is determined below via the
+    # payload's own Decimal-based lot.status property, never a SQL-side
+    # numeric filter.
+    lot_rows = await paginate_all_rows(repositories.position_lots)
     open_lots_by_asset: dict[str, list[PositionLot]] = {}
     for row in lot_rows:
         lot = hydrate("position_lots", row["payload"])

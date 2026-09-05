@@ -52,11 +52,17 @@ from tradepulse.models import (
     Holding,
     ReconciliationOutcome,
     ReconciliationRecord,
-    TradeIntent,
     asset_identity_key,
     asset_key_from_broker_symbol,
 )
-from tradepulse.persistence import PersistenceRepositories, hydrate
+from tradepulse.persistence import (
+    PersistenceRepositories,
+    hydrate,
+    list_all_by_asset,
+    list_all_by_json_field,
+    list_all_by_json_time_range,
+    paginate_all_rows,
+)
 from tradepulse.risk import latch_financial_integrity_block
 from tradepulse.settlement import SettlementProcessor
 
@@ -93,10 +99,10 @@ async def _rebuild_holding_from_lots(
     caller doesn't have, and this codebase's convention is a small local
     duplicate over reaching into another module's private internals, same
     as execution/gateway.py's own `symbol.upper()` holding-key convention)."""
-    lot_rows = await repositories.position_lots.list_all(limit=10000)
+    # FIN-090-01: asset-scoped, unbounded pagination -- NOT list_all(limit=N).
+    lot_rows = await list_all_by_asset(repositories.position_lots, asset)
     lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
-    target_key = asset_identity_key(asset)
-    open_lots = [lot for lot in lots if asset_identity_key(lot.asset) == target_key and lot.status in _OPEN_LOT_STATUSES]
+    open_lots = [lot for lot in lots if lot.status in _OPEN_LOT_STATUSES]
     if not open_lots:
         return None
 
@@ -128,7 +134,10 @@ async def _reconcile_positions(
     broker_positions = await broker.get_positions()
     broker_by_asset_key = {asset_key_from_broker_symbol(p.asset_class, p.symbol): p for p in broker_positions}
 
-    lot_rows = await repositories.position_lots.list_all(limit=10000)
+    # FIN-090-01: unbounded, whole-table pagination -- cross-asset by
+    # design (every held asset compared at once). Open/closed determined
+    # below via the payload's own Decimal-based lot.status property.
+    lot_rows = await paginate_all_rows(repositories.position_lots)
     all_lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
     open_lots_by_asset_key: dict[str, Decimal] = {}
     asset_by_key: dict[str, AssetIdentity] = {}
@@ -139,7 +148,9 @@ async def _reconcile_positions(
         open_lots_by_asset_key[key] = open_lots_by_asset_key.get(key, Decimal("0")) + lot.signed_quantity
         asset_by_key.setdefault(key, lot.asset)
 
-    holding_rows = await repositories.holdings.list_all(limit=10000)
+    # FIN-090-01: unbounded, whole-table pagination -- no filterable
+    # dimension for "every currently-held asset."
+    holding_rows = await paginate_all_rows(repositories.holdings)
     holdings_by_asset_key = {row["record_id"]: hydrate("holdings", row["payload"]) for row in holding_rows}
     for key, holding in holdings_by_asset_key.items():
         asset_by_key.setdefault(key, holding.asset)
@@ -270,15 +281,15 @@ async def _reconcile_fills(
     lease_lost: asyncio.Event | None = None,
 ) -> tuple[int, int, int]:
     activities = await broker.get_activities(activity_type="FILL", since=now - lookback)
-    fill_rows = await repositories.fills.list_all(limit=10000)
+    # FIN-090-01: scoped to the actual match window (_find_heuristic_match
+    # never matches beyond +/-_FILL_MATCH_WINDOW_SECONDS of an activity's
+    # transaction_time, and activities themselves are already bounded to
+    # [now-lookback, now]) -- NOT list_all(limit=N), which would silently
+    # drop this window's own fills once enough OTHER (older or newer)
+    # fills existed first.
+    match_window = timedelta(seconds=_FILL_MATCH_WINDOW_SECONDS)
+    fill_rows = await list_all_by_json_time_range(repositories.fills, "filled_at", now - lookback - match_window, now + match_window)
     local_fills = [hydrate("fills", row["payload"]) for row in fill_rows]
-
-    intent_rows = await repositories.trade_intents.list_all(limit=10000)
-    intents_by_order_id: dict[str, TradeIntent] = {}
-    for row in intent_rows:
-        intent = hydrate("trade_intents", row["payload"])
-        if intent.broker_order_id:
-            intents_by_order_id[intent.broker_order_id] = intent
 
     fills_checked = 0
     missed_fills = 0
@@ -304,7 +315,41 @@ async def _reconcile_fills(
             continue
 
         order_id = str(activity.raw.get("order_id") or "")
-        candidate_intent = intents_by_order_id.get(order_id) if order_id else None
+        candidate_intent = None
+        if order_id:
+            # FIN-090-01 refinement: a per-activity point lookup (scoped
+            # to this order_id), not a whole-table prefetch -- and
+            # deliberately NOT limit=1, since no DB-level uniqueness
+            # constraint on broker_order_id was found. 0 matches = no
+            # candidate (existing unmatched path, unchanged); exactly 1 =
+            # the existing recovery path, unchanged; MORE THAN 1 is a
+            # genuine financial-integrity ambiguity -- which local
+            # TradeIntent this fill actually belongs to is unknown -- and
+            # must be surfaced, never silently resolved by picking one.
+            matching_rows = await list_all_by_json_field(repositories.trade_intents, "broker_order_id", order_id)
+            candidate_intents = [hydrate("trade_intents", row["payload"]) for row in matching_rows]
+            if len(candidate_intents) > 1:
+                missed_fills += 1  # same "local financial truth uncertain" bucket reset-integrity's gate already checks
+                await _record(
+                    repositories, reconciliation_type="fill", subject_id=activity.activity_id, outcome=ReconciliationOutcome.DRIFT_DETECTED,
+                    expected={}, actual={
+                        "activity_id": activity.activity_id, "order_id": order_id,
+                        "matching_trade_intent_ids": [i.trade_intent_id for i in candidate_intents],
+                    },
+                    occurred_at=now,
+                )
+                await alerts.send(
+                    "critical",
+                    f"Reconciliation: AMBIGUOUS BROKER_ORDER_ID -- {order_id} matches {len(candidate_intents)} local "
+                    f"TradeIntents for activity {activity.activity_id} ({activity.symbol}); late-fill recovery skipped, "
+                    "human investigation required.",
+                    {"activity_id": activity.activity_id, "order_id": order_id, "match_count": len(candidate_intents)},
+                )
+                await latch_financial_integrity_block(
+                    repositories, f"Ambiguous broker_order_id {order_id} matches multiple local TradeIntents", clock=lambda: now,
+                )
+                continue
+            candidate_intent = candidate_intents[0] if candidate_intents else None
         if candidate_intent is not None:
             await resolve_order_from_broker(repositories, broker, settlement, alerts, candidate_intent, lambda: now)
             recovered_row = await repositories.fills.get(activity.activity_id)

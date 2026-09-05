@@ -2,6 +2,21 @@ import { api } from '../api'
 import { usePolling } from '../usePolling'
 import { money, pct } from '../format'
 import { Panel } from './Panel'
+import type { EnrichedPosition } from '../types'
+
+/** Economic-unit notional for the position-cap utilization bar --
+ * abs(quantity) so a short position shows its real exposure magnitude
+ * instead of clamping to 0% (a negative qty * price is negative, and the
+ * bar's own display clamp would otherwise silently hide it), times the
+ * option contract_multiplier when the backend provides one (already
+ * carried on the position's asset identity since trade time -- never
+ * re-derived or guessed here; equity/crypto have no multiplier and default
+ * to 1). This is a display-only economic-unit correction, not a new risk
+ * authority -- the real risk engine's own multiplier handling is untouched. */
+function positionNotional(p: EnrichedPosition): number {
+  const multiplier = p.contract_multiplier !== null ? Number(p.contract_multiplier) : 1
+  return Math.abs(Number(p.position.qty)) * Number(p.position.current_price) * multiplier
+}
 
 function utilTone(utilizationPct: number): 'ok' | 'warn' | 'critical' {
   if (utilizationPct > 90) return 'critical'
@@ -77,7 +92,7 @@ export function RiskExposurePanel() {
           {positions && positions.length > 0 && positionLimitAmount > 0 && (
             <>
               <h3>Position-cap utilization</h3>
-              {positions.map((p) => amountBar(p.position.symbol, p.position.symbol, Number(p.position.qty) * Number(p.position.current_price), positionLimitAmount))}
+              {positions.map((p) => amountBar(p.position.symbol, p.position.symbol, positionNotional(p), positionLimitAmount))}
             </>
           )}
 

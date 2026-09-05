@@ -840,3 +840,138 @@ async def test_process_pending_still_sees_a_new_pending_event_behind_a_large_com
     assert summary.completed == 1  # the new event was found and processed, not hidden behind 1100 older rows
     event_row = await repositories.settlements.get("se-1")
     assert event_row["status"] == SettlementStatus.COMPLETED.value
+
+
+# ---- FIN-090-01 Tier 2: financial-behavior regressions, not just pagination proofs -----------------
+# The point is not "pagination returns every row" (that's proven at the
+# repository level in test_repositories.py) -- it's that the SPECIFIC
+# financial calculations this bug could have corrupted (lot lookup,
+# filled-quantity/realized-pnl recomputation, duplicate-fill detection)
+# are proven correct once the relevant record sits behind a page's worth
+# of unrelated noise, which the old list_all(limit=N) ceiling would have
+# silently dropped once enough noise existed.
+
+
+async def _seed_noise_lots(repositories: PersistenceRepositories, count: int) -> None:
+    """`count` position_lots rows for OTHER assets -- inserted first, so
+    they occupy earlier (created_at, record_id) pages than whatever is
+    seeded afterward for the asset actually under test."""
+    async def _one(i: int) -> None:
+        noise_asset = AssetIdentity(f"NOISE{i}", AssetClass.EQUITY, f"alpaca:NOISE{i}")
+        lot = PositionLot(
+            lot_id=f"noise-lot-{i}", originating_fill_id=f"noise-fill-{i}", asset=noise_asset,
+            position_side="long", opened_quantity=Decimal("1"), remaining_quantity=Decimal("1"),
+            acquisition_price=Decimal("10"), opened_at=NOW,
+        )
+        await repositories.position_lots.create_once(f"noise-lot-{i}", lot, unique_value=f"noise-fill-{i}")
+
+    await asyncio.gather(*(_one(i) for i in range(count)))
+
+
+async def test_sell_still_closes_the_correct_lot_behind_more_than_one_page_of_other_assets_lots(tmp_path) -> None:
+    """Direct regression for FIN-090-01 in _project_lot/_project_holding/
+    _verify_integrity: with the old list_all(limit=N) ceiling, once enough
+    OTHER-asset lots existed first, this asset's own open lot would fall
+    off the oldest-N-rows window and silently look like "no open lot for
+    this asset" -- the SELL would then be misprojected instead of closing
+    the real position."""
+    repositories = await _repositories(tmp_path)
+    await _seed_noise_lots(repositories, 501)  # more than one default page (500) of OTHER assets' lots
+    await _seed_buy(repositories)
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending()
+
+    holding_row = await repositories.holdings.get(asset_identity_key(asset()))
+    assert holding_row is not None
+    assert hydrate("holdings", holding_row["payload"]).quantity == Decimal("10")
+
+    sell_intent = TradeIntent(
+        "ti-2", "idem-2", "corr-2", asset(), Side.SELL, ExecutionMode.PAPER, "manual", NOW,
+        requested_quantity=Decimal("10"),
+    )
+    await repositories.trade_intents.create_once("ti-2", sell_intent, status=sell_intent.status.value, unique_value=sell_intent.idempotency_key)
+    sell_fill = Fill("fill-2", "ti-2", "order-2", asset(), Side.SELL, ExecutionMode.PAPER, Decimal("10"), Decimal("165"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-2", sell_fill, unique_value=None)
+    sell_event = SettlementEvent("se-2", "fill-2", "ti-2", asset(), Side.SELL, ExecutionMode.PAPER, Decimal("10"), Decimal("165"), NOW)
+    await repositories.settlements.create_once("se-2", sell_event, status=sell_event.status.value, unique_value="fill-2")
+
+    summary = await processor.process_pending()
+
+    assert summary.completed == 1
+    assert summary.ok  # no INTEGRITY_VIOLATION -- the real lot was found, matched, and closed correctly
+    holding_row = await repositories.holdings.get(asset_identity_key(asset()))
+    assert holding_row is None  # fully closed -- proves the SELL matched the real BUY lot, not a phantom new short
+
+    lot_rows = await repositories.position_lots.list_by_asset(asset())
+    assert len(lot_rows) == 1
+    lot = hydrate("position_lots", lot_rows[0]["payload"])
+    assert lot.status == "closed"
+    assert lot.realized_pnl == Decimal("150")  # (165-150)*10 -- the correct BUY lot's price, not a fabricated one
+
+
+async def test_project_trade_recomputation_survives_more_than_one_page_of_other_intents_fills(tmp_path) -> None:
+    """Direct regression for FIN-090-01 in _project_trade: with the old
+    ceiling, once enough OTHER trade_intents' fills existed first, THIS
+    intent's own (possibly multi-fill) history could fall outside the
+    oldest-N-rows window and understate filled_quantity/realized_pnl."""
+    repositories = await _repositories(tmp_path)
+
+    async def _noise_fill(i: int) -> None:
+        fill = Fill(f"noise-fill-{i}", f"noise-ti-{i}", f"noise-order-{i}", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("1"), Decimal("100"), Decimal("0"), Decimal("0"), NOW)
+        await repositories.fills.create_once(f"noise-fill-{i}", fill, unique_value=None)
+
+    await asyncio.gather(*(_noise_fill(i) for i in range(501)))
+    await _seed_buy(repositories, fill_id="fill-1", quantity="6", price="150")
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending()
+
+    # A second, partial fill on the SAME trade intent -- _project_trade must
+    # recompute filled_quantity/avg_price from BOTH fills, not just whichever
+    # one a truncated read happened to still see.
+    second_fill = Fill("fill-1b", "ti-1", "order-1", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("4"), Decimal("160"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-1b", second_fill, unique_value=None)
+    second_event = SettlementEvent("se-1b", "fill-1b", "ti-1", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("4"), Decimal("160"), NOW)
+    await repositories.settlements.create_once("se-1b", second_event, status=second_event.status.value, unique_value="fill-1b")
+
+    summary = await processor.process_pending()
+    assert summary.completed == 1
+
+    intent_row = await repositories.trade_intents.get("ti-1")
+    intent = hydrate("trade_intents", intent_row["payload"])
+    assert intent.filled_quantity == Decimal("10")  # 6 + 4, both fills seen
+    assert intent.filled_avg_price == (Decimal("6") * Decimal("150") + Decimal("4") * Decimal("160")) / Decimal("10")
+
+
+async def test_duplicate_broker_fill_detection_survives_more_than_one_page_of_other_broker_fill_ids(tmp_path) -> None:
+    """Direct regression for the refined _verify_integrity duplicate check
+    (FIN-090-01 refinement #1): scoped to broker_fill_id, but must still
+    find a genuine duplicate behind a page's worth of unrelated ones."""
+    repositories = await _repositories(tmp_path)
+
+    async def _noise_settlement(i: int) -> None:
+        event = SettlementEvent(f"noise-se-{i}", f"noise-fill-{i}", f"noise-ti-{i}", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("1"), Decimal("100"), NOW)
+        completed = replace(event, status=SettlementStatus.COMPLETED, integrity_verified=True, broker_fill_id=f"broker-noise-{i}")
+        await repositories.settlements.create_once(f"noise-se-{i}", completed, status=completed.status.value, unique_value=f"noise-fill-{i}")
+
+    await asyncio.gather(*(_noise_settlement(i) for i in range(501)))
+
+    shared_broker_fill_id = "broker-shared-1"
+    first = SettlementEvent("se-dup-1", "fill-dup-1", "ti-dup-1", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("1"), Decimal("100"), NOW, broker_fill_id=shared_broker_fill_id)
+    first_completed = replace(first, status=SettlementStatus.COMPLETED, integrity_verified=True)
+    await repositories.settlements.create_once("se-dup-1", first_completed, status=first_completed.status.value, unique_value="fill-dup-1")
+
+    # A second event sharing the SAME broker_fill_id as an already-COMPLETED one --
+    # exactly the DUPLICATE_BROKER_FILL condition _verify_integrity must catch.
+    intent = TradeIntent("ti-dup-2", "idem-dup-2", "corr-dup-2", asset(), Side.BUY, ExecutionMode.PAPER, "manual", NOW, requested_quantity=Decimal("1"))
+    await repositories.trade_intents.create_once("ti-dup-2", intent, status=intent.status.value, unique_value=intent.idempotency_key)
+    fill = Fill("fill-dup-2", "ti-dup-2", "order-dup-2", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("1"), Decimal("100"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-dup-2", fill, unique_value=None)
+    second = SettlementEvent("se-dup-2", "fill-dup-2", "ti-dup-2", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("1"), Decimal("100"), NOW, broker_fill_id=shared_broker_fill_id)
+    await repositories.settlements.create_once("se-dup-2", second, status=second.status.value, unique_value="fill-dup-2")
+
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    summary = await processor.process_pending()
+
+    assert summary.integrity_blocked == 1  # the duplicate WAS detected, not silently missed behind the noise
+    event_row = await repositories.settlements.get("se-dup-2")
+    assert event_row["status"] == SettlementStatus.INTEGRITY_BLOCKED.value
