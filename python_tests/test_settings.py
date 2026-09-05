@@ -45,6 +45,16 @@ def test_unknown_risk_profile_fails_configuration() -> None:
         Settings.from_env({"TRADEPULSE_RISK_PROFILE": "yolo"})
 
 
+def test_blank_risk_profile_fails_configuration() -> None:
+    """A present-but-empty-string TRADEPULSE_RISK_PROFILE is a distinct
+    case from the var being absent entirely (which defaults to "balanced",
+    see test_defaults_use_balanced_risk_profile_and_anthropic_haiku) -- it
+    must fail closed the same as any other unrecognized value, never
+    silently fall through to a default profile."""
+    with pytest.raises(SettingsError, match="TRADEPULSE_RISK_PROFILE"):
+        Settings.from_env({"TRADEPULSE_RISK_PROFILE": ""})
+
+
 def test_risk_profile_and_anthropic_overrides_are_honored() -> None:
     settings = Settings.from_env({
         "TRADEPULSE_RISK_PROFILE": "conservative",

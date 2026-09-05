@@ -14,6 +14,17 @@ const MIN_POINTS_FOR_A_MEANINGFUL_CHART = 3
  * this uses the full timestamp (seconds since epoch) so every persisted
  * snapshot gets its own point, deduplicating only the rare case of two
  * snapshots landing on the exact same second (keeping the later one). */
+/** UI-092-01: the chart-recreation effect below must refire whenever the
+ * TIME axis changes, not just when values do -- a rolling-window history
+ * (oldest point drops, a new one is appended, length stays constant) can
+ * have an unchanged value sequence (e.g. equity flat across the window
+ * boundary) while every point's timestamp has shifted. Keying the
+ * dependency on value alone would leave the chart showing a stale time
+ * axis in that case. */
+export function chartRefreshKey(points: { time: UTCTimestamp; value: number }[]): string {
+  return points.map((p) => `${p.time}:${p.value}`).join(',')
+}
+
 export function toChartPoints(data: { as_of: string; total_equity: string }[]): { time: UTCTimestamp; value: number }[] {
   const sorted = [...data].sort((a, b) => (a.as_of < b.as_of ? -1 : 1))
   const byTimestamp = new Map<number, number>()
@@ -62,7 +73,7 @@ export function EquityCurveChart() {
       chartRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasEnoughHistory, points.length, points.map((p) => p.value).join(',')])
+  }, [hasEnoughHistory, points.length, chartRefreshKey(points)])
 
   const latest = data && data.length > 0 ? [...data].sort((a, b) => (a.as_of < b.as_of ? 1 : -1))[0] : null
 

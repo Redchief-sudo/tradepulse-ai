@@ -35,6 +35,8 @@ from decimal import Decimal
 
 from tradepulse.models import RiskLimits
 
+from .settings import SettingsError
+
 RISK_PROFILES: dict[str, RiskLimits] = {
     "aggressive": RiskLimits(
         profile_id="aggressive",
@@ -101,4 +103,12 @@ RISK_PROFILES: dict[str, RiskLimits] = {
 
 
 def risk_limits_for_profile(profile_id: str) -> RiskLimits:
-    return RISK_PROFILES.get(profile_id, RISK_PROFILES["balanced"])
+    """Every production caller passes an already-validated Settings.risk_profile
+    (Settings.from_env() rejects anything outside RISK_PROFILE_IDS before
+    construction completes), so this should never see an unrecognized value
+    in practice -- but it must still fail closed rather than silently
+    substitute a different profile's limits for whatever was actually
+    requested."""
+    if profile_id not in RISK_PROFILES:
+        raise SettingsError(f"unknown risk profile: {profile_id!r}")
+    return RISK_PROFILES[profile_id]
