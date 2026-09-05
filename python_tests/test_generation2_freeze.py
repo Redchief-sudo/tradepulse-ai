@@ -32,6 +32,20 @@ def test_missing_manifest_fails_closed_rather_than_guessing_a_boundary(monkeypat
         generation2_freeze.freeze_date()
 
 
+def test_malformed_manifest_json_fails_closed_as_generation2_freeze_error(monkeypatch, tmp_path) -> None:
+    """Malformed JSON must still fail closed (never guess/default a
+    boundary), but normalized to the module's own Generation2FreezeError
+    rather than a raw JSONDecodeError leaking out -- with the original
+    exception preserved via `raise ... from exc` for diagnosis."""
+    manifest_path = tmp_path / "generation_2_freeze_manifest.json"
+    manifest_path.write_text("{not valid json!!", encoding="utf-8")
+    monkeypatch.setattr(generation2_freeze, "MANIFEST_PATH", manifest_path)
+
+    with pytest.raises(generation2_freeze.Generation2FreezeError, match="malformed") as exc_info:
+        generation2_freeze.freeze_date()
+    assert isinstance(exc_info.value.__cause__, json.JSONDecodeError)
+
+
 def test_a_bar_dated_exactly_on_the_freeze_date_is_not_eligible(monkeypatch, tmp_path) -> None:
     """The boundary is exclusive -- freeze_date itself is the last
     contaminated day, never the first reserve day."""

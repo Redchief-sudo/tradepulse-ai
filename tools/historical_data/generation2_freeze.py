@@ -36,7 +36,14 @@ def _load_manifest() -> dict:
             f"{MANIFEST_PATH} does not exist -- run create_generation2_freeze_manifest.py first. "
             "No Generation-2 tooling may guess or hardcode a freeze boundary."
         )
-    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    try:
+        return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise Generation2FreezeError(
+            f"{MANIFEST_PATH} is malformed (not valid JSON) -- refusing to guess a freeze boundary from a "
+            "corrupt manifest. It must be regenerated deliberately with create_generation2_freeze_manifest.py; "
+            "this is never done automatically."
+        ) from exc
 
 
 def freeze_date() -> date:
