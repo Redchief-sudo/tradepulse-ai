@@ -47,7 +47,21 @@ def _load_manifest() -> dict:
 
 
 def freeze_date() -> date:
-    return date.fromisoformat(_load_manifest()["freeze_date"])
+    manifest = _load_manifest()
+    try:
+        return date.fromisoformat(manifest["freeze_date"])
+    except KeyError as exc:
+        raise Generation2FreezeError(
+            f"{MANIFEST_PATH} is missing the required 'freeze_date' field -- refusing to guess a freeze "
+            "boundary from an incomplete manifest. It must be regenerated deliberately with "
+            "create_generation2_freeze_manifest.py; this is never done automatically."
+        ) from exc
+    except ValueError as exc:
+        raise Generation2FreezeError(
+            f"{MANIFEST_PATH}'s 'freeze_date' field is not a valid ISO date -- refusing to guess a freeze "
+            "boundary from a corrupt manifest. It must be regenerated deliberately with "
+            "create_generation2_freeze_manifest.py; this is never done automatically."
+        ) from exc
 
 
 def is_generation2_reserve_eligible(market_date: str) -> bool:
