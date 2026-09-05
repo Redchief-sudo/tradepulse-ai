@@ -1,0 +1,222 @@
+{
+  "calibration_generation": 2,
+  "contamination_basis": "Rev.86-89 calibration/forensic tooling and reports have already used or explicitly reported on every date in the currently-available historical range for both equity and crypto -- see docs/generation-2-calibration-freeze.md for the full lineage audit. calibrate_exit_params.py's walk-forward folds score all history up to each fold's train_end as a 'train' window; diagnose_signal_sparsity.py and entry_composite_audit.py iterate the entire cached range with no date filter; the regime-classifier Phase 1 report individually names and tabulates specific historical periods spanning the full cached range, including its earliest dates.",
+  "created_at": "2026-09-05T21:19:14.718898+00:00",
+  "created_from_commit": "3164d812e967e403595580030884b93a158aaf95",
+  "eligibility_rule": "bar_market_date > 2026-09-04",
+  "freeze_date": "2026-09-04",
+  "historical_data_through_freeze": "contaminated_for_model_selection",
+  "integrity_sha256": "04290a57d5ed23de428fed13af1668cdd0183291e77c34a68b5dc4b3c2224e26",
+  "manifest_version": 1,
+  "per_symbol_last_contaminated_date": {
+    "crypto:BCH/USD": {
+      "asset_class": "crypto",
+      "first_bar_date": "2021-01-01",
+      "last_bar_date": "2026-09-04"
+    },
+    "crypto:BTC/USD": {
+      "asset_class": "crypto",
+      "first_bar_date": "2021-01-01",
+      "last_bar_date": "2026-09-04"
+    },
+    "crypto:ETH/USD": {
+      "asset_class": "crypto",
+      "first_bar_date": "2021-01-01",
+      "last_bar_date": "2026-09-04"
+    },
+    "crypto:LTC/USD": {
+      "asset_class": "crypto",
+      "first_bar_date": "2021-01-01",
+      "last_bar_date": "2026-09-04"
+    },
+    "crypto:SOL/USD": {
+      "asset_class": "crypto",
+      "first_bar_date": "2021-01-01",
+      "last_bar_date": "2026-09-04"
+    },
+    "equity:AAPL": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:AMZN": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:BAC": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:BND": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:DIA": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:GLD": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:GOOGL": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:HD": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:IEF": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:IWM": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:JNJ": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:JPM": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:KO": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:MA": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:META": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:MSFT": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:NVDA": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:PG": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:QQQ": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:SHY": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:SLV": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:SPY": {
+      "asset_class": "equity",
+      "first_bar_date": "2018-11-01",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:TLT": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:TSLA": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:UNH": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:V": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:VOO": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:VTI": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:WMT": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:XLE": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:XLF": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:XLI": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:XLK": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:XLU": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    },
+    "equity:XLV": {
+      "asset_class": "equity",
+      "first_bar_date": "2020-07-27",
+      "last_bar_date": "2026-09-03"
+    }
+  },
+  "purpose": "untouched_generation_2_holdout_reserve",
+  "rules": [
+    "Every historical bar with market date <= freeze_date is contaminated for future model-selection/holdout purposes.",
+    "Only bars whose actual market date is strictly greater than freeze_date may enter the Generation-2 untouched reserve.",
+    "Refetching an older bar after the freeze date does NOT make it eligible -- eligibility is decided by the bar's own market date, never by fetch/file timestamp.",
+    "The reserve may be accumulated (fetched and cached) but must NOT be loaded into calibration-selection, threshold-search, weight-search, diagnostics, or reports until the Generation-2 candidate is completely frozen.",
+    "This manifest never decides which model wins -- it only proves what data was eligible before Generation-2 calibration starts."
+  ],
+  "source": "alpaca_iex_equity_and_alpaca_crypto"
+}
