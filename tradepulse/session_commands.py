@@ -22,7 +22,7 @@ from tradepulse.broker import AlpacaClient, AlpacaError
 from tradepulse.config import Settings, SettingsError, risk_limits_for_profile
 from tradepulse.execution import ExecutionGateway
 from tradepulse.models import AuditEvent, ExecutionMode, SessionState, TradingSession
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, paginate_all_rows
 from tradepulse.providers import AlpacaMarketDataProvider
 from tradepulse.reconciliation import run_reconciliation
 from tradepulse.risk import SESSION_RECORD_ID, load_session, transition_session
@@ -265,6 +265,31 @@ async def run_reset_integrity(settings: Settings, *, force: bool) -> int:
                 },
             )
             return 1
+        # FIN-095-02: a clean POSITION-level reconciliation is not evidence
+        # that a specific order-level fill-quantity dispute was ever
+        # actually explained -- positions can balance while the underlying
+        # anomaly (e.g. a phantom/erroneous Activities entry with no real
+        # extra broker holding behind it) stays factually unresolved.
+        # run_reconciliation's own _reverify_pending_holds step already
+        # tries to resolve any verification_pending hold via a real broker
+        # re-check as part of THIS pass -- so any hold still present here
+        # (of EITHER type) represents something that reconciliation itself
+        # could not resolve, and the non-force path must refuse rather
+        # than silently clear it just because aggregates happen to look
+        # right. Only --force (already explicitly logged as an unverified
+        # critical action) may clear a hold that reconciliation alone
+        # didn't actually resolve.
+        remaining_holds = await paginate_all_rows(repositories.integrity_holds)
+        if remaining_holds:
+            logger.error(
+                "reset_integrity_refused_active_integrity_holds",
+                extra={
+                    "event": "reset_integrity_refused_active_integrity_holds",
+                    "remaining_holds": len(remaining_holds),
+                    "broker_order_ids": [row["record_id"] for row in remaining_holds],
+                },
+            )
+            return 1
         reconciliation_details = {
             "reconciliation_status": summary.status,
             "positions_checked": str(summary.positions_checked),
@@ -299,7 +324,26 @@ async def run_reset_integrity(settings: Settings, *, force: bool) -> int:
             )
         return new_session, event
 
-    result = await transition_session(repositories, decide)
+    # FIN-095-02: clearing integrity_holds and transitioning the session
+    # out of FINANCIAL_INTEGRITY_BLOCKED must be ONE atomic transaction,
+    # not merely ordered operations -- if the session-state write failed
+    # AFTER holds were already deleted (as separate, already-committed
+    # operations), the settlement's atomic guard would see no hold for a
+    # still-genuinely-disputed order even though the session still
+    # (correctly) reports blocked. clear_integrity_holds=True folds the
+    # hold deletion into transition_session's own single BEGIN IMMEDIATE
+    # transaction alongside the session/audit-event write -- either both
+    # happen or neither does; a failure anywhere in that transaction rolls
+    # BOTH back, so this must fail closed (return 1, session untouched)
+    # rather than let the exception propagate uncaught.
+    try:
+        result = await transition_session(repositories, decide, clear_integrity_holds=True)
+    except Exception as exc:  # noqa: BLE001 - must refuse the reset, never crash past a rolled-back transaction
+        logger.error(
+            "reset_integrity_failed_clearing_holds",
+            extra={"event": "reset_integrity_failed_clearing_holds", "error": str(exc)},
+        )
+        return 1
     if result is None:
         logger.info("reset_integrity_noop_state_changed_concurrently", extra={"event": "reset_integrity_noop_state_changed_concurrently"})
         return 0

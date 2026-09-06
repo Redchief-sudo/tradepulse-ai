@@ -16,7 +16,7 @@ from decimal import Decimal
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaActivity, AlpacaClient, AlpacaError
-from tradepulse.models import Fill, SettlementEvent, SettlementStatus, TradeIntent, TradeIntentStatus
+from tradepulse.models import Fill, IntegrityHold, IntegrityHoldType, SettlementEvent, SettlementStatus, TradeIntent, TradeIntentStatus
 from tradepulse.persistence import PersistenceRepositories, hydrate, list_all_by_json_field
 from tradepulse.risk import latch_financial_integrity_block
 from tradepulse.settlement import SettlementProcessor
@@ -149,8 +149,8 @@ async def attribute_order_fills(
 
     total_qty = sum((a.qty for a in validated), Decimal("0"))
 
-    # FIN-094-01: fetched AFTER activities (never accepted as a
-    # caller-supplied, pre-fetched value) -- this is what actually closes
+    # FIN-094-01/095-01/095-02: fetched AFTER activities (never accepted as
+    # a caller-supplied, pre-fetched value) -- this is what actually closes
     # the TOCTOU race. A legitimate new fill landing between an earlier
     # order-fetch and this activities-fetch would make total_qty look
     # disputed against a now-stale order.filled_qty; fetching fresh here
@@ -159,25 +159,66 @@ async def attribute_order_fills(
     # the same assumption the existing, unchanged "attributed_qty <
     # cumulative_filled" eventual-consistency-lag handling elsewhere
     # already relies on, just in the opposite direction).
+    #
+    # This function creates NEITHER a processable SettlementEvent NOR a
+    # withheld one on verification failure -- both were tried and proven
+    # wrong across three design-review rounds. Instead, ground truth is
+    # split into two independent, always-honest signals: the SettlementEvent
+    # is ALWAYS created as PENDING regardless of verification outcome (so
+    # RISK-091-01's exposure accounting, which reads exclusively from
+    # SettlementEvent rows, never loses visibility into a real fill), while
+    # a separate, persisted per-order `integrity_holds` row is what
+    # actually blocks settlement's PositionLot/Holding/TradeIntent
+    # projection -- checked atomically, in the SAME SQLite transaction as
+    # each guarded write, by persistence/repositories.py::_check_integrity_hold.
     quantity_disputed = False
     if verify_order_filled_qty:
         try:
             order = await broker.get_order(current.broker_order_id)
             quantity_disputed = total_qty > order.filled_qty
+            if not quantity_disputed:
+                # Verification succeeded and confirmed consistency -- clear
+                # any earlier verification_pending hold for this order (a
+                # prior call's transient failure has now resolved). Never
+                # touches an existing fill_quantity_disputed hold: that one
+                # is permanent, cleared only by the operator-driven
+                # reset-integrity flow, never automatically by a later
+                # successful check.
+                existing_hold_row = await repositories.integrity_holds.get(current.broker_order_id)
+                if existing_hold_row is not None and existing_hold_row["status"] == IntegrityHoldType.VERIFICATION_PENDING.value:
+                    await repositories.integrity_holds.delete(current.broker_order_id)
         except AlpacaError:
             # Verification unavailable is NOT the same epistemic state as
-            # "checked and consistent" -- do not fabricate consistency,
-            # but also don't block accounting on one transient API
-            # failure. The caller's own independent mismatch check (using
-            # whatever order.filled_qty IT already has) remains the
-            # unchanged backstop regardless of this outcome.
+            # "checked and consistent" -- do not fabricate consistency, but
+            # also don't globally halt trading over one transient API
+            # failure. A verification_pending hold (below) is what
+            # protects settlement projection for THIS order specifically;
+            # everything else keeps running normally.
             await alerts.send(
                 "warning",
                 f"ORDER_FILL_VERIFICATION_UNAVAILABLE: could not fetch order {current.broker_order_id} for "
                 f"{current.asset.symbol} to verify attributed fill quantity ({total_qty}) against broker "
-                "truth -- proceeding as PENDING, not blocked, pending the next verification attempt.",
+                "truth -- Fill/SettlementEvent still recorded as PENDING, but settlement projection is held "
+                "for this order until a later verification succeeds.",
                 {"trade_intent_id": current.trade_intent_id, "broker_order_id": current.broker_order_id, "attributed_qty": str(total_qty)},
             )
+            existing_hold_row = await repositories.integrity_holds.get(current.broker_order_id)
+            if existing_hold_row is None:
+                pending_hold = IntegrityHold(
+                    broker_order_id=current.broker_order_id, trade_intent_id=current.trade_intent_id,
+                    hold_type=IntegrityHoldType.VERIFICATION_PENDING,
+                    reason=f"Could not verify order-level fill-quantity consistency for {current.asset.symbol} "
+                    f"order {current.broker_order_id} (attributed quantity so far: {total_qty}).",
+                    created_at=clock(),
+                )
+                await repositories.integrity_holds.create_once(
+                    current.broker_order_id, pending_hold, status=pending_hold.hold_type.value,
+                )
+            # else: a hold (of either type) already exists -- never
+            # downgrade a proven dispute, and an existing verification_pending
+            # hold's own attempt_count/next_retry_at are advanced only by
+            # reconciliation's dedicated re-verification step, not by this
+            # live-path failure.
 
     if quantity_disputed:
         # Retroactively quarantine this order's ALREADY-EXISTING
@@ -206,13 +247,32 @@ async def attribute_order_fills(
 
             await repositories.settlements.claim_if_processable(existing_event.settlement_event_id, decide)
 
-        await latch_financial_integrity_block(
-            repositories,
+        # Create or upgrade the persistent per-order hold to the permanent,
+        # non-auto-clearable disputed type -- this is the atomic-guard
+        # authority checked by settlement's guarded writes, in addition to
+        # (not instead of) the retroactive quarantine above, which only
+        # covers events already existing at this exact moment.
+        disputed_reason = (
             f"INTEGRITY_VIOLATION: attributed fill quantity ({total_qty}) exceeds broker order.filled_qty for "
             f"{current.asset.symbol} order {current.broker_order_id} -- broker evidence is contradictory; "
-            "withholding settlement projection until reconciled.",
-            clock=clock,
+            "withholding settlement projection until reconciled."
         )
+        disputed_hold = IntegrityHold(
+            broker_order_id=current.broker_order_id, trade_intent_id=current.trade_intent_id,
+            hold_type=IntegrityHoldType.FILL_QUANTITY_DISPUTED, reason=disputed_reason, created_at=clock(),
+        )
+        created = await repositories.integrity_holds.create_once(
+            current.broker_order_id, disputed_hold, status=disputed_hold.hold_type.value,
+        )
+        if not created:
+            # A hold already existed (verification_pending from an earlier
+            # call, or already disputed) -- upgrade it in place. Never
+            # downgrades: this branch only ever sets fill_quantity_disputed.
+            await repositories.integrity_holds.update(
+                current.broker_order_id, disputed_hold, status=disputed_hold.hold_type.value,
+            )
+
+        await latch_financial_integrity_block(repositories, disputed_reason, clock=clock)
 
     for activity in validated:
         fill = Fill(
@@ -233,16 +293,17 @@ async def attribute_order_fills(
         # UNIQUE `unique_value` constraint), so calling it every time is a
         # safe no-op once the SettlementEvent already exists, and repairs
         # the gap exactly once when it doesn't.
-        # FIN-094-01: a disputed order's newly-created events are minted
-        # directly as INTEGRITY_BLOCKED, never PENDING -- never eligible
-        # for SettlementProcessor.process_pending() until reconciled.
+        # FIN-095-01/02: ALWAYS created as PENDING, regardless of dispute
+        # or verification-unavailable outcome -- the integrity_holds row
+        # (above) is what blocks settlement's actual projection, atomically,
+        # not this event's own status. Keeping this PENDING is what keeps
+        # RISK-091-01's exposure accounting (SettlementEvent-only) honest.
         event = SettlementEvent(
             settlement_event_id=fill.fill_id, fill_id=fill.fill_id, trade_intent_id=current.trade_intent_id,
             asset=current.asset, side=current.side, execution_mode=current.execution_mode,
             quantity=fill.quantity, price=fill.price, occurred_at=activity.transaction_time,
             broker_order_id=current.broker_order_id, broker_fill_id=activity.activity_id,
             client_order_id=current.client_order_id, sector=current.sector,
-            status=SettlementStatus.INTEGRITY_BLOCKED if quantity_disputed else SettlementStatus.PENDING,
         )
         await repositories.settlements.create_once(fill.fill_id, event, status=event.status.value, unique_value=fill.fill_id)
 

@@ -9,6 +9,8 @@ from tradepulse.models import (
     AssetIdentity,
     ExecutionMode,
     Fill,
+    IntegrityHold,
+    IntegrityHoldType,
     MarketQuote,
     Opportunity,
     PositionLot,
@@ -20,7 +22,7 @@ from tradepulse.models import (
     asset_identity_key,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
-from tradepulse.risk import load_session
+from tradepulse.risk import latch_financial_integrity_block, load_session
 from tradepulse.settlement import SettlementProcessor
 
 
@@ -975,3 +977,323 @@ async def test_duplicate_broker_fill_detection_survives_more_than_one_page_of_ot
     assert summary.integrity_blocked == 1  # the duplicate WAS detected, not silently missed behind the noise
     event_row = await repositories.settlements.get("se-dup-2")
     assert event_row["status"] == SettlementStatus.INTEGRITY_BLOCKED.value
+
+
+async def test_active_hold_overrides_a_settlement_events_own_retry_eligibility(tmp_path) -> None:
+    """FIN-095-02 acceptance requirement: an event's own RETRYABLE_FAILED
+    retry-eligibility timer becoming due must NEVER override an active
+    per-order integrity hold -- the hold remains the sole authority over
+    whether a stage's financial write may proceed, checked atomically at
+    write-time regardless of what state the SettlementEvent itself claims
+    to be in or how long it has been waiting to retry."""
+    repositories = await _repositories(tmp_path)
+    intent = TradeIntent(
+        "ti-hold-1", "idem-hold-1", "corr-hold-1", asset(), Side.BUY, ExecutionMode.PAPER, "manual", NOW,
+        requested_quantity=Decimal("10"), broker_order_id="order-hold-1",
+    )
+    await repositories.trade_intents.create_once("ti-hold-1", intent, status=intent.status.value, unique_value=intent.idempotency_key)
+    fill = Fill("fill-hold-1", "ti-hold-1", "order-hold-1", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-hold-1", fill, unique_value=None)
+    # Already-due for retry -- next_retry_at is well in the past, so
+    # is_settlement_processable would ordinarily select this for another
+    # attempt right now.
+    event = SettlementEvent(
+        "se-hold-1", "fill-hold-1", "ti-hold-1", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), NOW,
+        broker_order_id="order-hold-1", status=SettlementStatus.RETRYABLE_FAILED,
+        next_retry_at=NOW - timedelta(seconds=1), attempt_count=1,
+    )
+    await repositories.settlements.create_once("se-hold-1", event, status=event.status.value, unique_value="fill-hold-1")
+
+    hold = IntegrityHold(
+        broker_order_id="order-hold-1", trade_intent_id="ti-hold-1", hold_type=IntegrityHoldType.FILL_QUANTITY_DISPUTED,
+        reason="INTEGRITY_VIOLATION: disputed", created_at=NOW,
+    )
+    await repositories.integrity_holds.create_once("order-hold-1", hold, status=hold.hold_type.value)
+
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    summary = await processor.process_pending()
+
+    assert summary.integrity_blocked == 1
+    assert summary.completed == 0
+    event_row = await repositories.settlements.get("se-hold-1")
+    assert event_row["status"] == SettlementStatus.INTEGRITY_BLOCKED.value
+    assert hydrate("settlements", event_row["payload"]).lot_projected is False
+    assert await repositories.position_lots.list_all() == []  # zero financial mutation, despite the retry timer being due
+
+
+async def test_unrelated_order_settles_normally_while_another_order_is_held(tmp_path) -> None:
+    """FIN-095-02 case H: order A's active hold must not affect order B's
+    settlement at all -- the guard is scoped strictly by broker_order_id."""
+    repositories = await _repositories(tmp_path)
+
+    held_intent = TradeIntent(
+        "ti-held", "idem-held", "corr-held", asset(), Side.BUY, ExecutionMode.PAPER, "manual", NOW,
+        requested_quantity=Decimal("10"), broker_order_id="order-held",
+    )
+    await repositories.trade_intents.create_once("ti-held", held_intent, status=held_intent.status.value, unique_value=held_intent.idempotency_key)
+    held_fill = Fill("fill-held", "ti-held", "order-held", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-held", held_fill, unique_value=None)
+    held_event = SettlementEvent(
+        "se-held", "fill-held", "ti-held", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), NOW,
+        broker_order_id="order-held",
+    )
+    await repositories.settlements.create_once("se-held", held_event, status=held_event.status.value, unique_value="fill-held")
+    hold = IntegrityHold(
+        broker_order_id="order-held", trade_intent_id="ti-held", hold_type=IntegrityHoldType.FILL_QUANTITY_DISPUTED,
+        reason="INTEGRITY_VIOLATION: disputed", created_at=NOW,
+    )
+    await repositories.integrity_holds.create_once("order-held", hold, status=hold.hold_type.value)
+
+    unrelated_asset = AssetIdentity("MSFT", AssetClass.EQUITY, "alpaca:MSFT")
+    normal_intent = TradeIntent(
+        "ti-normal", "idem-normal", "corr-normal", unrelated_asset, Side.BUY, ExecutionMode.PAPER, "manual", NOW,
+        requested_quantity=Decimal("5"), broker_order_id="order-normal",
+    )
+    await repositories.trade_intents.create_once("ti-normal", normal_intent, status=normal_intent.status.value, unique_value=normal_intent.idempotency_key)
+    normal_fill = Fill("fill-normal", "ti-normal", "order-normal", unrelated_asset, Side.BUY, ExecutionMode.PAPER, Decimal("5"), Decimal("300"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-normal", normal_fill, unique_value=None)
+    normal_event = SettlementEvent(
+        "se-normal", "fill-normal", "ti-normal", unrelated_asset, Side.BUY, ExecutionMode.PAPER, Decimal("5"), Decimal("300"), NOW,
+        broker_order_id="order-normal",
+    )
+    await repositories.settlements.create_once("se-normal", normal_event, status=normal_event.status.value, unique_value="fill-normal")
+
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    summary = await processor.process_pending()
+
+    assert summary.integrity_blocked == 1
+    assert summary.completed == 1
+    assert (await repositories.settlements.get("se-held"))["status"] == SettlementStatus.INTEGRITY_BLOCKED.value
+    assert (await repositories.settlements.get("se-normal"))["status"] == SettlementStatus.COMPLETED.value
+
+    held_lots = [
+        hydrate("position_lots", r["payload"]) for r in await repositories.position_lots.list_all()
+        if hydrate("position_lots", r["payload"]).asset.symbol == "AAPL"
+    ]
+    assert held_lots == []  # order-held's lot never materialized
+    normal_lots = [
+        hydrate("position_lots", r["payload"]) for r in await repositories.position_lots.list_all()
+        if hydrate("position_lots", r["payload"]).asset.symbol == "MSFT"
+    ]
+    assert len(normal_lots) == 1  # order-normal settled completely normally
+
+
+async def test_case_e_settlement_transaction_wins_first_then_a_later_hold_blocks_the_next_write(tmp_path) -> None:
+    """FIN-095-02 case E: a guarded write that commits BEFORE a dispute
+    hold exists must complete normally -- that mutation legitimately
+    happened before the dispute was established. A SUBSEQUENT fill on the
+    SAME order, once a hold now exists, must be blocked. The first,
+    already-completed settlement must remain untouched throughout."""
+    repositories = await _repositories(tmp_path)
+    intent = TradeIntent(
+        "ti-e", "idem-e", "corr-e", asset(), Side.BUY, ExecutionMode.PAPER, "manual", NOW,
+        requested_quantity=Decimal("10"), broker_order_id="order-e",
+    )
+    await repositories.trade_intents.create_once("ti-e", intent, status=intent.status.value, unique_value=intent.idempotency_key)
+    fill_1 = Fill("fill-e-1", "ti-e", "order-e", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-e-1", fill_1, unique_value=None)
+    event_1 = SettlementEvent("se-e-1", "fill-e-1", "ti-e", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), NOW, broker_order_id="order-e")
+    await repositories.settlements.create_once("se-e-1", event_1, status=event_1.status.value, unique_value="fill-e-1")
+
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    first_summary = await processor.process_pending()
+    assert first_summary.completed == 1  # settlement won the race -- no hold existed yet
+    assert len(await repositories.position_lots.list_all()) == 1
+
+    # Now a dispute is discovered (e.g. a later, contradictory activity on
+    # the same order) -- the hold is created AFTER the first fill already
+    # settled.
+    hold = IntegrityHold(
+        broker_order_id="order-e", trade_intent_id="ti-e", hold_type=IntegrityHoldType.FILL_QUANTITY_DISPUTED,
+        reason="INTEGRITY_VIOLATION: disputed", created_at=NOW,
+    )
+    await repositories.integrity_holds.create_once("order-e", hold, status=hold.hold_type.value)
+
+    # A second fill on the SAME order, still PENDING -- must now be blocked.
+    fill_2 = Fill("fill-e-2", "ti-e", "order-e", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("5"), Decimal("151"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-e-2", fill_2, unique_value=None)
+    event_2 = SettlementEvent("se-e-2", "fill-e-2", "ti-e", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("5"), Decimal("151"), NOW, broker_order_id="order-e")
+    await repositories.settlements.create_once("se-e-2", event_2, status=event_2.status.value, unique_value="fill-e-2")
+
+    second_summary = await processor.process_pending()
+    assert second_summary.integrity_blocked == 1
+    assert (await repositories.settlements.get("se-e-2"))["status"] == SettlementStatus.INTEGRITY_BLOCKED.value
+
+    # The FIRST fill's already-completed projection is untouched.
+    assert (await repositories.settlements.get("se-e-1"))["status"] == SettlementStatus.COMPLETED.value
+    lots_after = [hydrate("position_lots", r["payload"]) for r in await repositories.position_lots.list_all()]
+    assert len(lots_after) == 1
+    assert lots_after[0].remaining_quantity == Decimal("10")  # unchanged by the second (blocked) fill
+
+
+async def test_case_f_dispute_transaction_wins_first_zero_financial_mutation(tmp_path) -> None:
+    """FIN-095-02 case F: the hold is persisted BEFORE any settlement
+    attempt for that order -- the guarded write's own SELECT sees it and
+    raises before performing any mutation at all."""
+    repositories = await _repositories(tmp_path)
+    intent = TradeIntent(
+        "ti-f", "idem-f", "corr-f", asset(), Side.BUY, ExecutionMode.PAPER, "manual", NOW,
+        requested_quantity=Decimal("10"), broker_order_id="order-f",
+    )
+    await repositories.trade_intents.create_once("ti-f", intent, status=intent.status.value, unique_value=intent.idempotency_key)
+    fill = Fill("fill-f", "ti-f", "order-f", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-f", fill, unique_value=None)
+    event = SettlementEvent("se-f", "fill-f", "ti-f", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), NOW, broker_order_id="order-f")
+    await repositories.settlements.create_once("se-f", event, status=event.status.value, unique_value="fill-f")
+
+    hold = IntegrityHold(
+        broker_order_id="order-f", trade_intent_id="ti-f", hold_type=IntegrityHoldType.FILL_QUANTITY_DISPUTED,
+        reason="INTEGRITY_VIOLATION: disputed", created_at=NOW,
+    )
+    await repositories.integrity_holds.create_once("order-f", hold, status=hold.hold_type.value)
+
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    summary = await processor.process_pending()
+
+    assert summary.integrity_blocked == 1
+    assert summary.completed == 0
+    assert (await repositories.settlements.get("se-f"))["status"] == SettlementStatus.INTEGRITY_BLOCKED.value
+    assert await repositories.position_lots.list_all() == []
+    assert await repositories.holdings.get(asset_identity_key(asset())) is None
+
+
+async def test_case_g_dispute_discovered_after_completion_never_rewrites_the_completed_event(tmp_path) -> None:
+    """FIN-095-02 case G: a dispute discovered AFTER a settlement already
+    reached COMPLETED must not rewrite or reopen it -- is_settlement_processable
+    never re-selects a COMPLETED row, so the guard never even runs for it
+    again. The hold/latch still get created (for whatever caused the
+    dispute), but no automatic rollback of the already-completed
+    projection is attempted -- reconciliation remains responsible for
+    that."""
+    repositories = await _repositories(tmp_path)
+    await _seed_buy(repositories)
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    await processor.process_pending()
+    completed_row_before = await repositories.settlements.get("se-1")
+    assert completed_row_before["status"] == SettlementStatus.COMPLETED.value
+    lot_before = hydrate("position_lots", (await repositories.position_lots.list_all())[0]["payload"])
+
+    # A dispute is discovered for this SAME order, after se-1 already
+    # completed (e.g. a later activity contradicts order.filled_qty).
+    hold = IntegrityHold(
+        broker_order_id="order-1", trade_intent_id="ti-1", hold_type=IntegrityHoldType.FILL_QUANTITY_DISPUTED,
+        reason="INTEGRITY_VIOLATION: disputed", created_at=NOW,
+    )
+    await repositories.integrity_holds.create_once("order-1", hold, status=hold.hold_type.value)
+    await latch_financial_integrity_block(repositories, "INTEGRITY_VIOLATION: disputed", clock=lambda: NOW)
+
+    # Re-running process_pending must be a total no-op for se-1 -- COMPLETED
+    # is never re-selected.
+    summary = await processor.process_pending()
+    assert summary.processed == 0
+
+    completed_row_after = await repositories.settlements.get("se-1")
+    assert completed_row_after["status"] == SettlementStatus.COMPLETED.value  # unchanged, never reopened
+    assert completed_row_after["payload"] == completed_row_before["payload"]  # byte-for-byte identical, no rewrite
+    lot_after = hydrate("position_lots", (await repositories.position_lots.list_all())[0]["payload"])
+    assert lot_after == lot_before  # no automatic rollback attempted
+
+    session = await load_session(repositories)
+    assert session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED  # the hold/latch DID get created
+    assert (await repositories.integrity_holds.get("order-1"))["status"] == "fill_quantity_disputed"
+
+
+async def test_case_i_verification_pending_hold_survives_a_restart_and_still_blocks(tmp_path) -> None:
+    """FIN-095-02 case I: a hold must survive a real process restart (a
+    genuinely new AsyncSQLiteDatabase/PersistenceRepositories object graph
+    against the same file, not merely re-reading through the same
+    in-memory repository object) and still block a guarded write
+    afterward."""
+    from tradepulse.persistence import AsyncSQLiteDatabase as _Database
+
+    db_path = f"{tmp_path}/restart_test.db"
+    first_db = _Database(f"sqlite:///{db_path}")
+    await first_db.initialize()
+    first_repositories = PersistenceRepositories.create(first_db)
+
+    intent = TradeIntent(
+        "ti-i", "idem-i", "corr-i", asset(), Side.BUY, ExecutionMode.PAPER, "manual", NOW,
+        requested_quantity=Decimal("10"), broker_order_id="order-i",
+    )
+    await first_repositories.trade_intents.create_once("ti-i", intent, status=intent.status.value, unique_value=intent.idempotency_key)
+    fill = Fill("fill-i", "ti-i", "order-i", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), Decimal("0"), Decimal("0"), NOW)
+    await first_repositories.fills.create_once("fill-i", fill, unique_value=None)
+    event = SettlementEvent("se-i", "fill-i", "ti-i", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), NOW, broker_order_id="order-i")
+    await first_repositories.settlements.create_once("se-i", event, status=event.status.value, unique_value="fill-i")
+    hold = IntegrityHold(
+        broker_order_id="order-i", trade_intent_id="ti-i", hold_type=IntegrityHoldType.VERIFICATION_PENDING,
+        reason="verification unavailable", created_at=NOW,
+    )
+    await first_repositories.integrity_holds.create_once("order-i", hold, status=hold.hold_type.value)
+    # first_db/first_repositories deliberately never referenced again below --
+    # AsyncSQLiteDatabase.run() already opens/closes a fresh connection per
+    # call, so there is no persistent connection to explicitly close; a
+    # brand new object graph against the same file is what "restart" means
+    # here, and is exactly what the code below constructs.
+
+    second_db = _Database(f"sqlite:///{db_path}")
+    await second_db.initialize()
+    second_repositories = PersistenceRepositories.create(second_db)
+
+    restored_hold_row = await second_repositories.integrity_holds.get("order-i")
+    assert restored_hold_row is not None
+    assert restored_hold_row["status"] == "verification_pending"
+
+    processor = SettlementProcessor(second_repositories, _no_op_alerter(), clock=lambda: NOW)
+    summary = await processor.process_pending()
+
+    # verification_pending (unlike fill_quantity_disputed) classifies as an
+    # ordinary RETRYABLE_FAILED -- no global latch over one unresolved
+    # verification -- but it still blocks the guarded write with zero
+    # financial mutation, which is the actual property this case proves.
+    assert summary.retryable_failed == 1
+    assert summary.integrity_blocked == 0
+    assert (await second_repositories.settlements.get("se-i"))["status"] == SettlementStatus.RETRYABLE_FAILED.value
+    assert await second_repositories.position_lots.list_all() == []
+
+
+async def test_verification_pending_settlement_event_recovers_once_the_hold_clears_mid_retry(tmp_path) -> None:
+    """The lifecycle the design depends on: a PENDING event blocked by a
+    verification_pending hold becomes RETRYABLE_FAILED (not stranded). Once
+    the hold is cleared (e.g. by reconciliation's re-verification step
+    succeeding before the SettlementEvent's own retry attempts are
+    exhausted), the SAME event must complete successfully on a later
+    retry -- proving the two independent retry timers (the hold's own
+    backoff, and the SettlementEvent's own RETRYABLE_FAILED backoff) don't
+    leave the event permanently stuck relative to each other."""
+    repositories = await _repositories(tmp_path)
+    intent = TradeIntent(
+        "ti-recover", "idem-recover", "corr-recover", asset(), Side.BUY, ExecutionMode.PAPER, "manual", NOW,
+        requested_quantity=Decimal("10"), broker_order_id="order-recover",
+    )
+    await repositories.trade_intents.create_once("ti-recover", intent, status=intent.status.value, unique_value=intent.idempotency_key)
+    fill = Fill("fill-recover", "ti-recover", "order-recover", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("fill-recover", fill, unique_value=None)
+    event = SettlementEvent(
+        "se-recover", "fill-recover", "ti-recover", asset(), Side.BUY, ExecutionMode.PAPER, Decimal("10"), Decimal("150"), NOW,
+        broker_order_id="order-recover",
+    )
+    await repositories.settlements.create_once("se-recover", event, status=event.status.value, unique_value="fill-recover")
+    hold = IntegrityHold(
+        broker_order_id="order-recover", trade_intent_id="ti-recover", hold_type=IntegrityHoldType.VERIFICATION_PENDING,
+        reason="verification unavailable", created_at=NOW,
+    )
+    await repositories.integrity_holds.create_once("order-recover", hold, status=hold.hold_type.value)
+
+    processor = SettlementProcessor(repositories, _no_op_alerter(), clock=lambda: NOW)
+    first_summary = await processor.process_pending()
+    assert first_summary.retryable_failed == 1
+    assert (await repositories.settlements.get("se-recover"))["status"] == SettlementStatus.RETRYABLE_FAILED.value
+    assert await repositories.position_lots.list_all() == []
+
+    # Verification later succeeds (simulating reconciliation's re-verification
+    # step resolving it) -- the hold is cleared, well before the
+    # SettlementEvent's own MAX_SETTLEMENT_ATTEMPTS is reached.
+    await repositories.integrity_holds.delete("order-recover")
+
+    second_summary = await processor.process_pending(force_retry=True)  # bypasses the backoff wait, same as this file's other retry tests
+    assert second_summary.completed == 1
+    event_row = await repositories.settlements.get("se-recover")
+    assert event_row["status"] == SettlementStatus.COMPLETED.value
+    assert hydrate("settlements", event_row["payload"]).integrity_verified is True
+    assert len(await repositories.position_lots.list_all()) == 1

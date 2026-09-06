@@ -40,6 +40,22 @@ class SettlementStatus(StrEnum):
     INTEGRITY_BLOCKED = "integrity_blocked"
 
 
+class IntegrityHoldType(StrEnum):
+    """FIN-095-02: an order-level hold blocking settlement's guarded writes
+    (position_lots/holdings/trade_intents) for one broker_order_id.
+    VERIFICATION_PENDING is temporary -- created when order-level
+    fill-quantity consistency could not be checked (a transient broker API
+    failure), cleared automatically once a later verification attempt
+    succeeds. FILL_QUANTITY_DISPUTED is permanent -- created when a
+    dispute is PROVEN (Activities/`/orders` genuinely disagree) -- never
+    auto-downgraded or auto-cleared; only the operator-driven
+    reset-integrity flow (after its own clean-reconciliation gate) may
+    clear it."""
+
+    VERIFICATION_PENDING = "verification_pending"
+    FILL_QUANTITY_DISPUTED = "fill_quantity_disputed"
+
+
 class TradeIntentStatus(StrEnum):
     PROPOSED = "proposed"
     RISK_APPROVED = "risk_approved"

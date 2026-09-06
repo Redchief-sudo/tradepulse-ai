@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
@@ -50,6 +50,7 @@ from tradepulse.models import (
     AssetIdentity,
     Fill,
     Holding,
+    IntegrityHoldType,
     ReconciliationOutcome,
     ReconciliationRecord,
     asset_identity_key,
@@ -61,10 +62,12 @@ from tradepulse.persistence import (
     list_all_by_asset,
     list_all_by_json_field,
     list_all_by_json_time_range,
+    list_all_by_statuses,
     paginate_all_rows,
 )
 from tradepulse.risk import latch_financial_integrity_block
 from tradepulse.settlement import SettlementProcessor
+from tradepulse.settlement.stages import retry_delay_seconds
 
 from ..execution.fill_attribution import resolve_order_from_broker
 
@@ -83,6 +86,7 @@ class ReconciliationSummary:
     fills_checked: int = 0
     missed_fills_detected: int = 0
     late_fills_recovered: int = 0
+    verification_holds_reverified: int = 0
     error: str | None = None
 
 
@@ -405,6 +409,60 @@ async def _reconcile_fills(
     return fills_checked, missed_fills, late_fills_recovered
 
 
+async def _reverify_pending_holds(
+    repositories: PersistenceRepositories, broker: AlpacaClient, settlement: SettlementProcessor,
+    alerts: TelegramAlerter, now: datetime, lease_lost: asyncio.Event | None = None,
+) -> int:
+    """FIN-095-01's actual retry mechanism for a verification_pending hold.
+    Neither the gateway's poll loop (a single-tick-terminal order gets no
+    "next tick") nor _reconcile_fills's activity-driven matching (which
+    skips an activity forever once its Fill exists, _find_exact_id_match
+    above) guarantees a later re-verification attempt -- this is scoped by
+    the HOLD itself, independent of whether the order's activities already
+    have local Fill matches. Backoff (mirroring settlement's own
+    retry_delay_seconds, attempt_count/next_retry_at on the hold itself)
+    avoids re-hitting a persistently-unavailable broker every
+    reconciliation cycle."""
+    hold_rows = await list_all_by_statuses(repositories.integrity_holds, [IntegrityHoldType.VERIFICATION_PENDING.value])
+    reverified = 0
+    for row in hold_rows:
+        if lease_lost is not None and lease_lost.is_set():
+            continue
+        hold = hydrate("integrity_holds", row["payload"])
+        if hold.next_retry_at is not None and hold.next_retry_at > now:
+            continue
+        intent_row = await repositories.trade_intents.get(hold.trade_intent_id)
+        if intent_row is None:
+            continue
+        intent = hydrate("trade_intents", intent_row["payload"])
+        # resolve_order_from_broker already calls attribute_order_fills
+        # with verify_order_filled_qty=True internally -- this IS the
+        # re-verification attempt, bypassing _reconcile_fills's
+        # activity-matching entirely. Idempotent/safe regardless of the
+        # intent's current status (documented behavior, unchanged).
+        await resolve_order_from_broker(repositories, broker, settlement, alerts, intent, lambda: now)
+        reverified += 1
+
+        still_pending_row = await repositories.integrity_holds.get(hold.broker_order_id)
+        if still_pending_row is not None and still_pending_row["status"] == IntegrityHoldType.VERIFICATION_PENDING.value:
+            # Still unresolved -- another failed verification attempt (or
+            # a genuinely still-inconclusive one). Advance backoff so the
+            # NEXT reconciliation cycle doesn't immediately re-hit a
+            # persistently-unavailable broker.
+            still_pending = hydrate("integrity_holds", still_pending_row["payload"])
+            next_attempt = still_pending.attempt_count + 1
+            updated = replace(
+                still_pending, attempt_count=next_attempt,
+                next_retry_at=now + timedelta(seconds=retry_delay_seconds(next_attempt)),
+            )
+            await repositories.integrity_holds.update(hold.broker_order_id, updated, status=updated.hold_type.value)
+        # else: cleared (resolved consistent) or upgraded to
+        # fill_quantity_disputed -- either way, resolve_order_from_broker's
+        # own call into attribute_order_fills already handled it; nothing
+        # further to do here.
+    return reverified
+
+
 async def run_reconciliation(
     repositories: PersistenceRepositories,
     broker: AlpacaClient,
@@ -435,7 +493,17 @@ async def run_reconciliation(
             error=f"BROKER_ACTIVITIES_UNAVAILABLE: {exc}",
         )
 
+    try:
+        verification_holds_reverified = await _reverify_pending_holds(repositories, broker, settlement, alerts, now, lease_lost)
+    except Exception as exc:  # noqa: BLE001 - a broker outage here must fail this pass cleanly, not crash the caller
+        await alerts.send("critical", f"Reconciliation degraded -- verification-hold re-check unavailable: {exc}", {})
+        return ReconciliationSummary(
+            "degraded", positions_checked, view_drift_corrected, accounting_drift_detected,
+            fills_checked, missed_fills_detected, late_fills_recovered,
+            error=f"BROKER_VERIFICATION_UNAVAILABLE: {exc}",
+        )
+
     return ReconciliationSummary(
         "ok", positions_checked, view_drift_corrected, accounting_drift_detected,
-        fills_checked, missed_fills_detected, late_fills_recovered,
+        fills_checked, missed_fills_detected, late_fills_recovered, verification_holds_reverified,
     )

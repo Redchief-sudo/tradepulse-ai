@@ -56,6 +56,7 @@ async def save_session(repositories: PersistenceRepositories, session: TradingSe
 async def transition_session(
     repositories: PersistenceRepositories,
     decide: Callable[[TradingSession], tuple[TradingSession, AuditEvent] | None],
+    *, clear_integrity_holds: bool = False,
 ) -> TradingSession | None:
     """Atomically re-read the singleton TradingSession row, call
     decide(current) for a final go/no-go against the FRESH state (not
@@ -70,6 +71,17 @@ async def transition_session(
     session, or None if decide refused (state changed concurrently, or
     nothing to do) -- in which case nothing is written, including no audit
     event for a no-op.
+
+    clear_integrity_holds=True (FIN-095-02's reset-integrity flow) folds
+    deleting every integrity_holds row into this SAME transaction, only
+    when decide actually commits a new session -- never as a separate,
+    independently-committed step. Ordering-then-hoping-nothing-fails-in-
+    between was the actual gap: a session-state write failing AFTER holds
+    were already deleted (as two separate operations) would leave the
+    session correctly still FINANCIAL_INTEGRITY_BLOCKED while the
+    settlement guard's only evidence of a still-genuinely-disputed order
+    was already gone. One transaction means either both happen or neither
+    does.
 
     Any async precondition (a live broker health check, a live
     reconciliation pass) must happen BEFORE calling this -- the transaction
@@ -90,6 +102,10 @@ async def transition_session(
             return None
         new_session, event = decision
         now = utc_now()
+        if clear_integrity_holds:
+            hold_ids = [r["record_id"] for r in connection.execute("SELECT record_id FROM integrity_holds").fetchall()]
+            for hold_id in hold_ids:
+                connection.execute("DELETE FROM integrity_holds WHERE record_id=?", (hold_id,))
         if row is None:
             connection.execute(
                 "INSERT INTO trading_sessions (record_id, status, payload, created_at, updated_at) VALUES (?,?,?,?,?)",

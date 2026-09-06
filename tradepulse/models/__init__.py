@@ -5,6 +5,7 @@ from .base import DomainValidationError
 from .enums import (
     AssetClass,
     ExecutionMode,
+    IntegrityHoldType,
     OrderStatus,
     ReconciliationOutcome,
     ScanRunStatus,
@@ -32,13 +33,14 @@ from .reconciliation import ReconciliationRecord
 from .risk import RiskLimits
 from .scan import RejectedCandidate, ScanRun
 from .session import TradingSession
-from .settlement import SettlementEvent
+from .settlement import IntegrityHold, SettlementEvent
 from .strategy_model import StrategyWeights
 from .trade_intent import TradeIntent
 
 __all__ = [
     "AIRequest", "AIResponse", "AssetClass", "AssetIdentity", "AuditEvent", "CashLedgerEntry",
-    "Candle", "DomainValidationError", "ExecutionMode", "ExitReason", "Fill", "Holding", "MarketQuote", "Opportunity",
+    "Candle", "DomainValidationError", "ExecutionMode", "ExitReason", "Fill", "Holding", "IntegrityHold",
+    "IntegrityHoldType", "MarketQuote", "Opportunity",
     "Order", "OrderStatus", "PnlRecord", "PortfolioSnapshot", "PositionLot",
     "ReconciliationOutcome", "ReconciliationRecord", "RejectedCandidate", "RiskLimits", "ScanRun", "ScanRunStatus",
     "ScanTrigger", "SessionState", "SettlementEvent", "SettlementStatus", "Side",

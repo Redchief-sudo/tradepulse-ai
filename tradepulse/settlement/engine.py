@@ -98,7 +98,9 @@ async def _project_lot(repositories: PersistenceRepositories, event: SettlementE
                 realized_pnl=current.realized_pnl + closure.pnl,
                 mfe_price=mfe, mae_price=mae,
             )
-        await repositories.position_lots.mutate(closure.lot.lot_id, _decide)
+        await repositories.position_lots.mutate(
+            closure.lot.lot_id, _decide, guard_table="integrity_holds", guard_key=event.broker_order_id,
+        )
 
     if plan.opening_quantity > 0:
         new_lot = PositionLot(
@@ -117,7 +119,10 @@ async def _project_lot(repositories: PersistenceRepositories, event: SettlementE
         # constraint) -- a resumed/retried run silently no-ops here instead
         # of needing the source's manual "does a lot for this event+direction
         # already exist" pre-check.
-        await repositories.position_lots.create_once(new_lot.lot_id, new_lot, unique_value=event.fill_id)
+        await repositories.position_lots.create_once(
+            new_lot.lot_id, new_lot, unique_value=event.fill_id,
+            guard_table="integrity_holds", guard_key=event.broker_order_id,
+        )
 
     return {"realized_pnl": plan.realized_pnl}
 
@@ -293,7 +298,7 @@ async def _project_holding(repositories: PersistenceRepositories, event: Settlem
 
     if not open_lots:
         if existing_row is not None:
-            await repositories.holdings.delete(record_id)
+            await repositories.holdings.delete(record_id, guard_table="integrity_holds", guard_key=event.broker_order_id)
         return None
 
     total_signed = sum((lot.signed_quantity for lot in open_lots), Decimal("0"))
@@ -321,9 +326,10 @@ async def _project_holding(repositories: PersistenceRepositories, event: Settlem
         # pre-ratchet value, silently reverting a just-advanced ratchet.
         def _decide(current: Holding) -> Holding:
             return replace(holding, current_stop=current.current_stop)
-        await repositories.holdings.mutate(record_id, _decide)
+        await repositories.holdings.mutate(record_id, _decide, guard_table="integrity_holds", guard_key=event.broker_order_id)
     else:
-        await repositories.holdings.create_once(record_id, holding)  # current_stop defaults None -- no ratchet history yet
+        # current_stop defaults None -- no ratchet history yet
+        await repositories.holdings.create_once(record_id, holding, guard_table="integrity_holds", guard_key=event.broker_order_id)
     return None
 
 
@@ -361,11 +367,24 @@ async def _project_trade(repositories: PersistenceRepositories, event: Settlemen
         "filled_quantity": cumulative_qty, "filled_avg_price": avg_price, "realized_pnl": total_realized_pnl,
     }
     updated_intent = replace(intent, **patch)
-    await repositories.trade_intents.update(event.trade_intent_id, updated_intent, status=updated_intent.status.value)
+    await repositories.trade_intents.update(
+        event.trade_intent_id, updated_intent, status=updated_intent.status.value,
+        guard_table="integrity_holds", guard_key=event.broker_order_id,
+    )
     return None
 
 
 async def _verify_integrity(repositories: PersistenceRepositories, event: SettlementEvent) -> None:
+    # FIN-095-02: cheap, explicit belt-and-suspenders check -- the actual
+    # atomicity guarantee already comes from the guard on each earlier
+    # stage's own financial write (position_lots/holdings/trade_intents),
+    # not from this read-only check; this is a final confirming gate, not
+    # the load-bearing mechanism.
+    hold_row = await repositories.integrity_holds.get(event.broker_order_id)
+    if hold_row is not None:
+        prefix = "INTEGRITY_VIOLATION" if hold_row["status"] == "fill_quantity_disputed" else "VERIFICATION_PENDING"
+        raise IntegrityViolationError(f"{prefix}: order-level integrity hold ({hold_row['status']}) active for {event.broker_order_id}")
+
     errors: list[str] = []
 
     # FIN-090-01: asset-scoped, unbounded pagination, then Python-side

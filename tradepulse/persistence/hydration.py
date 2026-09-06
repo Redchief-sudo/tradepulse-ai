@@ -27,6 +27,8 @@ from tradepulse.models import (
     ExecutionMode,
     Fill,
     Holding,
+    IntegrityHold,
+    IntegrityHoldType,
     MarketQuote,
     Opportunity,
     Order,
@@ -211,6 +213,18 @@ def decode_settlement(d: Mapping[str, Any]) -> SettlementEvent:
         next_retry_at=_datetime_or_none(d.get("next_retry_at")),
         processing_owner=d.get("processing_owner"),
         processing_started_at=_datetime_or_none(d.get("processing_started_at")),
+    )
+
+
+def decode_integrity_hold(d: Mapping[str, Any]) -> IntegrityHold:
+    return IntegrityHold(
+        broker_order_id=d["broker_order_id"],
+        trade_intent_id=d["trade_intent_id"],
+        hold_type=IntegrityHoldType(d["hold_type"]),
+        reason=d["reason"],
+        created_at=_datetime(d["created_at"]),
+        attempt_count=d.get("attempt_count", 0),
+        next_retry_at=_datetime_or_none(d.get("next_retry_at")),
     )
 
 
@@ -416,3 +430,4 @@ register("equity_snapshots", decode_equity_snapshot)
 register("ai_responses", decode_ai_response)
 register("trade_attributions", decode_trade_attribution)
 register("rejected_candidates", decode_rejected_candidate)
+register("integrity_holds", decode_integrity_hold)

@@ -163,12 +163,18 @@ async def test_replaying_an_already_fully_settled_fill_does_not_duplicate_or_dis
 
 
 @respx.mock
-async def test_disputed_order_creates_integrity_blocked_settlement_not_pending(tmp_path) -> None:
-    """FIN-094-01: activities sum to more (10) than the broker's own fresh
-    order.filled_qty (5) -- the newly-created SettlementEvent must be
-    INTEGRITY_BLOCKED, not PENDING, so process_pending() never projects it
-    into holdings. The Fill itself is still persisted -- raw broker
-    evidence is never discarded."""
+async def test_disputed_order_creates_hold_that_blocks_settlement_projection(tmp_path) -> None:
+    """FIN-095-02: activities sum to more (10) than the broker's own fresh
+    order.filled_qty (5) -- a persistent fill_quantity_disputed hold is
+    created for the order, and the SettlementEvent is still created as
+    PENDING (RISK-091-01's exposure accounting reads exclusively from
+    SettlementEvent rows, so it must stay visible). process_pending() WILL
+    attempt this event (PENDING is unconditionally processable) but the
+    atomic guard on its first financial write (position_lots) raises
+    before any mutation, so it ends up INTEGRITY_BLOCKED with zero
+    PositionLot/Holding ever created -- not born blocked, but never
+    allowed to complete. The Fill itself is persisted throughout -- raw
+    broker evidence is never discarded."""
     repositories = await _repositories(tmp_path)
     broker = _broker()
     intent = _intent()
@@ -181,15 +187,18 @@ async def test_disputed_order_creates_integrity_blocked_settlement_not_pending(t
     assert attributed.quantity == Decimal("10")
     assert await repositories.fills.get("act-1") is not None
     event_row = await repositories.settlements.get("act-1")
-    assert event_row["status"] == "integrity_blocked"
-    event = hydrate("settlements", event_row["payload"])
-    assert is_settlement_processable(event, NOW, stale_lease_seconds=120) is False
+    assert event_row["status"] == "pending"  # visible to RISK-091-01, not withheld
+    hold_row = await repositories.integrity_holds.get("order-1")
+    assert hold_row["status"] == "fill_quantity_disputed"
 
     settlement = SettlementProcessor(repositories, _alerts(), clock=lambda: NOW)
     await settlement.process_pending()
     event_row_after = await repositories.settlements.get("act-1")
-    assert event_row_after["status"] == "integrity_blocked"  # untouched -- never picked up
-    assert hydrate("settlements", event_row_after["payload"]).holding_projected is False
+    assert event_row_after["status"] == "integrity_blocked"  # blocked mid-attempt by the atomic guard
+    event_after = hydrate("settlements", event_row_after["payload"])
+    assert event_after.lot_projected is False  # the guard raised before any stage completed
+    assert event_after.holding_projected is False
+    assert await repositories.position_lots.list_all() == []  # zero financial mutation reached the DB
 
 
 @respx.mock
@@ -214,9 +223,15 @@ async def test_disputed_order_retroactively_quarantines_an_earlier_created_pendi
     (undisputed, creates a PENDING SettlementEvent). A second call sees
     activity A plus a newly-posted activity B, whose COMBINED total now
     disputes against the broker's order.filled_qty. Activity A's
-    already-existing PENDING event must be retroactively quarantined too --
-    create_once alone would leave it PENDING forever since it already
-    exists."""
+    already-existing PENDING event must be retroactively quarantined
+    (claim_if_processable, immediate) -- create_once alone would leave it
+    PENDING forever since it already exists. Activity B (newly created in
+    the SAME disputed call) is minted PENDING too (FIN-095-01/02: never
+    withheld, never minted blocked directly) -- its protection comes from
+    the persistent order-level hold instead, proven here by running
+    process_pending() and confirming BOTH events end up blocked with zero
+    financial mutation, via two different mechanisms converging on the
+    same outcome."""
     repositories = await _repositories(tmp_path)
     broker = _broker()
     intent = _intent()
@@ -234,8 +249,14 @@ async def test_disputed_order_retroactively_quarantines_an_earlier_created_pendi
     await broker.aclose()
 
     assert second.quantity == Decimal("10")
-    assert (await repositories.settlements.get("act-a"))["status"] == "integrity_blocked"  # retroactively quarantined
-    assert (await repositories.settlements.get("act-b"))["status"] == "integrity_blocked"  # newly created, minted blocked
+    assert (await repositories.settlements.get("act-a"))["status"] == "integrity_blocked"  # retroactively quarantined, immediate
+    assert (await repositories.settlements.get("act-b"))["status"] == "pending"  # newly created, minted PENDING (not withheld, not blocked)
+    assert (await repositories.integrity_holds.get("order-1"))["status"] == "fill_quantity_disputed"
+
+    settlement = SettlementProcessor(repositories, _alerts(), clock=lambda: NOW)
+    await settlement.process_pending()
+    assert (await repositories.settlements.get("act-b"))["status"] == "integrity_blocked"  # now blocked via the atomic guard
+    assert await repositories.position_lots.list_all() == []  # zero financial mutation for either activity
 
 
 @respx.mock
@@ -267,5 +288,66 @@ async def test_verification_unavailable_is_not_treated_as_consistent(tmp_path, c
     session = await load_session(repositories)
     assert session.state != SessionState.FINANCIAL_INTEGRITY_BLOCKED  # never latched on an unverifiable outcome
 
+    hold_row = await repositories.integrity_holds.get("order-1")
+    assert hold_row["status"] == "verification_pending"  # settlement projection held for this order, not the session globally
+
     skipped = [r for r in caplog.records if getattr(r, "event", None) == "telegram_alert_skipped_no_credentials"]
     assert any("ORDER_FILL_VERIFICATION_UNAVAILABLE" in r.alert_message for r in skipped)
+
+
+@respx.mock
+async def test_verification_pending_hold_is_cleared_by_a_later_successful_consistent_check(tmp_path) -> None:
+    """The temporary hold must actually resolve once verification later
+    succeeds and confirms consistency -- otherwise the order would stay
+    blocked forever despite never actually being disputed."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    intent = _intent()
+
+    _mock_activities([_activity_json("act-1", "10", "150")])
+    _mock_order_error("order-1")
+    await attribute_order_fills(repositories, broker, _alerts(), intent, clock=lambda: NOW, verify_order_filled_qty=True)
+    await broker.aclose()
+    assert (await repositories.integrity_holds.get("order-1"))["status"] == "verification_pending"
+
+    respx.reset()
+    broker2 = _broker()
+    _mock_activities([_activity_json("act-1", "10", "150")])
+    _mock_order("order-1", filled_qty="10")  # now confirms consistent
+    await attribute_order_fills(repositories, broker2, _alerts(), intent, clock=lambda: NOW, verify_order_filled_qty=True)
+    await broker2.aclose()
+
+    assert await repositories.integrity_holds.get("order-1") is None  # hold cleared
+
+    settlement = SettlementProcessor(repositories, _alerts(), clock=lambda: NOW)
+    summary = await settlement.process_pending()
+    assert summary.completed == 1
+    assert (await repositories.settlements.get("act-1"))["status"] == "completed"
+
+
+@respx.mock
+async def test_fill_quantity_disputed_hold_is_never_auto_cleared_by_a_later_successful_check(tmp_path) -> None:
+    """Monotonicity: once a dispute is proven, no later successful
+    verification (even one confirming consistency for whatever new
+    activities exist at that point) may silently downgrade or clear the
+    permanent hold -- only the operator-driven reset-integrity flow may."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    intent = _intent()
+
+    _mock_activities([_activity_json("act-1", "10", "150")])
+    _mock_order("order-1", filled_qty="5")  # disputed: 10 attributed vs 5 confirmed
+    await attribute_order_fills(repositories, broker, _alerts(), intent, clock=lambda: NOW, verify_order_filled_qty=True)
+    await broker.aclose()
+    assert (await repositories.integrity_holds.get("order-1"))["status"] == "fill_quantity_disputed"
+
+    respx.reset()
+    broker2 = _broker()
+    _mock_activities([_activity_json("act-1", "10", "150")])
+    _mock_order("order-1", filled_qty="10")  # a LATER check now finds it consistent
+    await attribute_order_fills(repositories, broker2, _alerts(), intent, clock=lambda: NOW, verify_order_filled_qty=True)
+    await broker2.aclose()
+
+    hold_row = await repositories.integrity_holds.get("order-1")
+    assert hold_row is not None
+    assert hold_row["status"] == "fill_quantity_disputed"  # still disputed -- never auto-cleared

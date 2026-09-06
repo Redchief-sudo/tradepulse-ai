@@ -29,9 +29,9 @@ TABLES = {
     "opportunities", "trade_intents", "orders", "fills", "settlements", "holdings",
     "position_lots", "cash_ledger", "pnl_records", "reconciliation_records",
     "trading_sessions", "audit_events", "scan_runs", "equity_snapshots", "ai_responses",
-    "trade_attributions", "rejected_candidates",
+    "trade_attributions", "rejected_candidates", "integrity_holds",
 }
-STATUS_TABLES = {"trade_intents", "orders", "settlements", "trading_sessions", "scan_runs"}
+STATUS_TABLES = {"trade_intents", "orders", "settlements", "trading_sessions", "scan_runs", "integrity_holds"}
 UNIQUE_FIELDS = {
     "trade_intents": "idempotency_key",
     "orders": "idempotency_key",
@@ -42,8 +42,45 @@ UNIQUE_FIELDS = {
 }
 
 
+class RepositoryIntegrityHoldError(RuntimeError):
+    """Raised by a guarded write (see `guard_table`/`guard_key` on
+    `mutate`/`create_once`/`update`) when an order-level integrity hold is
+    active for the guarded key -- deliberately NOT `settlement.lots.
+    IntegrityViolationError` (avoiding a persistence->settlement import),
+    since settlement's own classify_settlement_failure (settlement/stages.py)
+    classifies purely by the exception's string message, never its Python
+    type -- a message starting "INTEGRITY_VIOLATION" or "VERIFICATION_PENDING"
+    is classified identically regardless of which exception class carries
+    it."""
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _check_integrity_hold(connection: sqlite3.Connection, guard_table: str | None, guard_key: str | None) -> None:
+    """Shared by mutate/create_once/update's optional guard_table/guard_key
+    kwargs -- checked as the FIRST statement inside the SAME op(connection)
+    closure as the caller's own read/write, so this SELECT and that write
+    are the same BEGIN IMMEDIATE transaction. That is what makes the check
+    atomic with the write: SQLite serializes all writers against the whole
+    database file, so there is no interleaving where a hold is created
+    between this SELECT and the caller's own write committing -- either
+    the write's transaction commits entirely first (hold appears after,
+    accepted as history), or the hold's transaction commits entirely first
+    (this SELECT sees it, raises, zero mutation). See
+    settlement/stages.py::classify_settlement_failure -- classifies purely
+    by the exception's string message, so RepositoryIntegrityHoldError
+    (not settlement.lots.IntegrityViolationError, avoiding a
+    persistence->settlement import) is classified identically."""
+    if guard_table is None:
+        return
+    if guard_table not in TABLES:
+        raise ValueError(f"invalid guard_table: {guard_table!r}")
+    row = connection.execute(f"SELECT status FROM {guard_table} WHERE record_id=?", (guard_key,)).fetchone()
+    if row is not None:
+        prefix = "INTEGRITY_VIOLATION" if row["status"] == "fill_quantity_disputed" else "VERIFICATION_PENDING"
+        raise RepositoryIntegrityHoldError(f"{prefix}: order-level integrity hold ({row['status']}) active for {guard_key}")
 
 
 class RecordRepository:
@@ -60,6 +97,8 @@ class RecordRepository:
         *,
         status: str | None = None,
         unique_value: str | None = None,
+        guard_table: str | None = None,
+        guard_key: str | None = None,
     ) -> bool:
         if not record_id:
             raise ValueError("record_id is required")
@@ -86,6 +125,7 @@ class RecordRepository:
         sql = f"INSERT OR IGNORE INTO {self.table} ({','.join(columns)}) VALUES ({placeholders})"
 
         def insert(connection: sqlite3.Connection) -> bool:
+            _check_integrity_hold(connection, guard_table, guard_key)
             cursor = connection.execute(sql, values)
             return cursor.rowcount == 1
 
@@ -117,7 +157,10 @@ class RecordRepository:
 
         return await self.database.run(select)
 
-    async def update(self, record_id: str, payload: Any, *, status: str | None = None) -> bool:
+    async def update(
+        self, record_id: str, payload: Any, *, status: str | None = None,
+        guard_table: str | None = None, guard_key: str | None = None,
+    ) -> bool:
         now = utc_now()
         if self.table in STATUS_TABLES:
             if status is None:
@@ -131,20 +174,21 @@ class RecordRepository:
             raise ValueError(f"immutable repository cannot update: {self.table}")
 
         def execute(connection: sqlite3.Connection) -> bool:
+            _check_integrity_hold(connection, guard_table, guard_key)
             return connection.execute(sql, values).rowcount == 1
 
         return await self.database.run(execute, write=True)
 
-    async def delete(self, record_id: str) -> bool:
-        """Hard delete, restricted to `holdings` -- a current-state
-        materialized view where a fully-closed position must not linger as a
-        stale row. Every other table is append-only audit trail (fills,
-        settlements, audit_events, etc.), matching the source system's own
-        practice."""
-        if self.table != "holdings":
-            raise ValueError(f"delete is not permitted on {self.table} -- only holdings is a current-state view; all other tables are append-only audit trail")
+    async def delete(self, record_id: str, *, guard_table: str | None = None, guard_key: str | None = None) -> bool:
+        """Hard delete, restricted to `holdings`/`integrity_holds` -- both
+        current-state views where a resolved row must not linger, unlike
+        every other table (append-only audit trail: fills, settlements,
+        audit_events, etc., matching the source system's own practice)."""
+        if self.table not in {"holdings", "integrity_holds"}:
+            raise ValueError(f"delete is not permitted on {self.table} -- only holdings/integrity_holds are current-state views; all other tables are append-only audit trail")
 
         def execute(connection: sqlite3.Connection) -> bool:
+            _check_integrity_hold(connection, guard_table, guard_key)
             return connection.execute(f"DELETE FROM {self.table} WHERE record_id=?", (record_id,)).rowcount == 1
 
         return await self.database.run(execute, write=True)
@@ -189,7 +233,10 @@ class RecordRepository:
 
         return await self.database.run(op, write=True)
 
-    async def mutate(self, record_id: str, decide: Callable[[Any], Any | None]) -> Any | None:
+    async def mutate(
+        self, record_id: str, decide: Callable[[Any], Any | None],
+        *, guard_table: str | None = None, guard_key: str | None = None,
+    ) -> Any | None:
         """Atomic read-hydrate-decide-write for holdings/position_lots -- the
         non-status sibling of claim_if_processable, needed once a table has
         more than one concurrent writer (Outcome Attribution: both
@@ -203,11 +250,15 @@ class RecordRepository:
         STATUS_TABLES. `decide` returns a new value to persist, or None to
         leave the row unchanged (not found, or the caller determines no
         update is needed -- e.g. the observed extremum didn't move, or the
-        row's state no longer qualifies by the time the transaction runs)."""
+        row's state no longer qualifies by the time the transaction runs).
+        guard_table/guard_key: see _check_integrity_hold -- raises before
+        the read even happens if a hold is active, atomically with this
+        same transaction."""
         if self.table not in {"holdings", "position_lots"}:
             raise ValueError(f"mutate requires an updatable current-state table: {self.table}")
 
         def op(connection: sqlite3.Connection) -> Any | None:
+            _check_integrity_hold(connection, guard_table, guard_key)
             row = connection.execute(f"SELECT * FROM {self.table} WHERE record_id=?", (record_id,)).fetchone()
             if row is None:
                 return None
@@ -607,6 +658,7 @@ class PersistenceRepositories:
     ai_responses: RecordRepository
     trade_attributions: RecordRepository
     rejected_candidates: RecordRepository
+    integrity_holds: RecordRepository
 
     @classmethod
     def create(cls, database: AsyncSQLiteDatabase) -> PersistenceRepositories:

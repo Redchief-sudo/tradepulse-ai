@@ -85,6 +85,10 @@ CREATE TABLE IF NOT EXISTS locks (
   lock_key TEXT PRIMARY KEY, owner_token TEXT NOT NULL,
   acquired_at TEXT NOT NULL, expires_at TEXT NOT NULL, command TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS integrity_holds (
+  record_id TEXT PRIMARY KEY, status TEXT NOT NULL, payload TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_settlements_status ON settlements(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_trade_intents_status ON trade_intents(status, created_at);
