@@ -305,10 +305,22 @@ async def test_equity_snapshots_max_by_json_field_uses_expression_index(tmp_path
 
 async def test_initialize_backfills_all_ten_indexes_on_an_already_existing_database(tmp_path) -> None:
     """Proves migration, not just fresh-database creation: a database built
-    with an OLDER schema (tables present, none of the Rev.94/95 indexes)
-    receives every one of them the next time `initialize()` runs -- exactly
-    the path a real deployed `tradepulse.db` takes on its next startup."""
+    with an OLDER schema (tables present, none of the Rev.94/95 indexes),
+    already holding real rows, receives every new index the next time
+    `initialize()` runs -- exactly the path a real deployed `tradepulse.db`
+    takes on its next startup. Proves all six things a schema migration
+    must prove, not just that the index NAMES appear in sqlite_master:
+    (1) the database file is not recreated -- proven by the seeded rows
+    surviving, since executescript(SCHEMA) contains no DROP/DELETE and
+    initialize() opens the SAME file, never a fresh one; (2) existing rows
+    are byte-for-byte unchanged; (3)+(4) all ten indexes are installed,
+    via sqlite_master; (5) PRAGMA integrity_check stays ok; (6) a real
+    production query against THIS SAME upgraded database actually gets
+    served by the new index, not just that an index with the right name
+    exists unused."""
     import sqlite3
+
+    from tradepulse.persistence.codec import encode_payload
 
     db_path = tmp_path / "pre_existing.db"
     pre_existing_schema = """
@@ -344,7 +356,38 @@ async def test_initialize_backfills_all_ten_indexes_on_an_already_existing_datab
     connection = sqlite3.connect(db_path)
     try:
         connection.executescript(pre_existing_schema)
+        # Real rows, real payload shape (via the app's own model classes +
+        # encode_payload, never hand-typed JSON) -- an upgrade test that
+        # migrates an empty database proves nothing about existing data
+        # surviving.
+        seeded_lot = PositionLot(
+            lot_id="lot-seed", originating_fill_id="fill-seed", asset=_asset(0),
+            position_side="long", opened_quantity=Decimal("10"), remaining_quantity=Decimal("10"),
+            acquisition_price=Decimal("150"), opened_at=NOW,
+        )
+        connection.execute(
+            "INSERT INTO position_lots (record_id, originating_fill_id, payload, created_at, updated_at) VALUES (?,?,?,?,?)",
+            ("lot-seed", "fill-seed", encode_payload(seeded_lot), NOW.isoformat(), NOW.isoformat()),
+        )
+        seeded_fill = _fill(0)
+        connection.execute(
+            "INSERT INTO fills (record_id, broker_fill_id, payload, created_at) VALUES (?,?,?,?)",
+            (seeded_fill.fill_id, seeded_fill.broker_fill_id, encode_payload(seeded_fill), NOW.isoformat()),
+        )
+        seeded_intent = TradeIntent(
+            "ti-seed", "idem-seed", "corr-seed", _asset(0), Side.BUY, ExecutionMode.PAPER, "manual", NOW,
+            requested_quantity=Decimal("10"), broker_order_id="order-seed",
+        )
+        connection.execute(
+            "INSERT INTO trade_intents (record_id, idempotency_key, status, payload, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+            ("ti-seed", "idem-seed", seeded_intent.status.value, encode_payload(seeded_intent), NOW.isoformat(), NOW.isoformat()),
+        )
         connection.commit()
+        rows_before = {
+            "position_lots": connection.execute("SELECT record_id, payload FROM position_lots").fetchall(),
+            "fills": connection.execute("SELECT record_id, payload FROM fills").fetchall(),
+            "trade_intents": connection.execute("SELECT record_id, payload FROM trade_intents").fetchall(),
+        }
     finally:
         connection.close()
 
@@ -369,8 +412,30 @@ async def test_initialize_backfills_all_ten_indexes_on_an_already_existing_datab
     try:
         existing_after = {row[0] for row in after.execute("SELECT name FROM sqlite_master WHERE type='index'")}
         integrity = after.execute("PRAGMA integrity_check").fetchone()[0]
+        rows_after = {
+            "position_lots": after.execute("SELECT record_id, payload FROM position_lots").fetchall(),
+            "fills": after.execute("SELECT record_id, payload FROM fills").fetchall(),
+            "trade_intents": after.execute("SELECT record_id, payload FROM trade_intents").fetchall(),
+        }
     finally:
         after.close()
 
     assert expected_indexes <= existing_after, expected_indexes - existing_after
     assert integrity == "ok"
+    # (2) existing rows survive byte-for-byte -- if initialize() had ever
+    # recreated the file instead of migrating it in place, this seeded data
+    # would be gone.
+    assert rows_after == rows_before
+
+    # (6) a real production query against THIS upgraded database -- not a
+    # freshly-created one -- actually gets served by the new index.
+    repositories = PersistenceRepositories.create(database)
+    sql, detail = await _capture_plan(
+        repositories, lambda: repositories.position_lots.list_by_asset(_asset(0), limit=10),
+    )
+    assert any("USING INDEX idx_position_lots_asset" in line for line in detail), (sql, detail)
+
+    sql, detail = await _capture_plan(
+        repositories, lambda: repositories.fills.list_by_json_field("trade_intent_id", "ti-0", limit=10),
+    )
+    assert any("USING INDEX idx_fills_trade_intent_id" in line for line in detail), (sql, detail)
