@@ -93,6 +93,32 @@ CREATE INDEX IF NOT EXISTS idx_settlements_status ON settlements(status, created
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_trade_intents_status ON trade_intents(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_equity_snapshots_created ON equity_snapshots(created_at);
+
+-- Rev.94/95 performance hardening: closes the full-scan-plus-sort plans a
+-- read-only EXPLAIN QUERY PLAN audit found on every JSON-identity/whole-
+-- table-pagination query family below (see docs/persistence-index-
+-- performance-audit.md). `CREATE INDEX IF NOT EXISTS` makes this a no-op
+-- migration on a database that already has these -- and, since
+-- AsyncSQLiteDatabase.initialize() runs this whole script unconditionally
+-- on every startup (not just first-time setup), an existing database
+-- backfills the missing indexes the next time the app starts, without a
+-- separate migration step. Ordered by the audit's priority: proven-HIGH
+-- findings on financial-authority/genuinely-growing tables first.
+CREATE INDEX IF NOT EXISTS idx_position_lots_asset ON position_lots(
+  json_extract(payload,'$.asset.asset_class'),
+  LOWER(COALESCE(json_extract(payload,'$.asset.venue'),'default')),
+  json_extract(payload,'$.asset.native_asset_id'),
+  created_at, record_id
+);
+CREATE INDEX IF NOT EXISTS idx_position_lots_created ON position_lots(created_at, record_id);
+CREATE INDEX IF NOT EXISTS idx_fills_trade_intent_id ON fills(json_extract(payload,'$.trade_intent_id'), created_at, record_id);
+CREATE INDEX IF NOT EXISTS idx_settlements_trade_intent_id ON settlements(json_extract(payload,'$.trade_intent_id'), created_at, record_id);
+CREATE INDEX IF NOT EXISTS idx_settlements_broker_fill_id ON settlements(json_extract(payload,'$.broker_fill_id'), created_at, record_id);
+CREATE INDEX IF NOT EXISTS idx_trade_intents_broker_order_id ON trade_intents(json_extract(payload,'$.broker_order_id'), created_at, record_id);
+CREATE INDEX IF NOT EXISTS idx_fills_filled_at ON fills(json_extract(payload,'$.filled_at'), created_at, record_id);
+CREATE INDEX IF NOT EXISTS idx_equity_total_equity_real ON equity_snapshots(CAST(json_extract(payload,'$.total_equity') AS REAL));
+CREATE INDEX IF NOT EXISTS idx_scan_runs_status ON scan_runs(status, created_at, record_id);
+CREATE INDEX IF NOT EXISTS idx_integrity_holds_status ON integrity_holds(status, created_at, record_id);
 """
 
 
