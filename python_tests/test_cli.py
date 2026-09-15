@@ -501,16 +501,22 @@ async def test_resolve_risk_profile_id_maps_equity_through_the_ladder_when_enabl
     assert broker.call_count == 1
 
 
-async def test_resolve_risk_profile_id_fails_closed_to_configured_profile_on_broker_error(caplog) -> None:
+async def test_resolve_risk_profile_id_fails_closed_to_most_conservative_tier_on_broker_error(caplog) -> None:
+    """Rev.98 correction: the fail-closed target under auto mode must be the
+    ladder's own most conservative tier, NEVER the arbitrary static
+    TRADEPULSE_RISK_PROFILE setting -- that setting could be "aggressive"
+    from before auto mode was ever enabled, and falling back to it would let
+    a broker outage silently produce a MORE permissive risk posture than
+    intended (flagged by external Rev.97 audit)."""
     settings = Settings.from_env({
-        "TRADEPULSE_RISK_PROFILE": "balanced", "TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY": "true",
+        "TRADEPULSE_RISK_PROFILE": "aggressive", "TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY": "true",
     })
     broker = _StubAccountBroker(error=httpx.ConnectError("boom"))
 
     with caplog.at_level("WARNING"):
         resolved = await _resolve_risk_profile_id(settings, broker)
 
-    assert resolved == "balanced"  # never guesses, never crashes the calling lane
+    assert resolved == "conservative"  # never the configured "aggressive" -- never guesses, never crashes the lane
     failures = [r for r in caplog.records if getattr(r, "event", None) == "auto_risk_profile_equity_fetch_failed"]
     assert len(failures) == 1
 

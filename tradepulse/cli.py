@@ -71,7 +71,14 @@ import httpx
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient, AlpacaError
-from tradepulse.config import Settings, SettingsError, default_strategy_weights, profile_id_for_equity, risk_limits_for_profile
+from tradepulse.config import (
+    EQUITY_PROFILE_LADDER_TOP_PROFILE_ID,
+    Settings,
+    SettingsError,
+    default_strategy_weights,
+    profile_id_for_equity,
+    risk_limits_for_profile,
+)
 from tradepulse.config.logging import configure_logging
 from tradepulse.execution import ExecutionGateway
 from tradepulse.models import AssetClass, AuditEvent, SessionState
@@ -226,9 +233,17 @@ async def _resolve_risk_profile_id(settings: Settings, broker: AlpacaClient) -> 
     config.profile_id_for_equity's fixed, deterministic ladder. Deliberately
     NOT an AI/LLM judgment call, matching this codebase's standing principle
     that the AI proposes trade candidates only and never sets risk
-    parameters (see scanner/coordinator.py's own module docstring). Fails
-    closed to the configured static profile on any broker/network trouble --
-    never guesses, never crashes the calling lane."""
+    parameters (see scanner/coordinator.py's own module docstring).
+
+    On broker/network trouble while auto mode is ON, fails closed to
+    EQUITY_PROFILE_LADDER_TOP_PROFILE_ID (the ladder's own most conservative
+    tier) -- deliberately NOT settings.risk_profile. The static setting is
+    only ever the pre-auto-mode default and carries no guarantee of being
+    the conservative choice (an operator could have it set to "aggressive"
+    from before auto mode was ever enabled); falling back to it would let a
+    broker outage -- missing financial truth -- silently produce a MORE
+    permissive risk posture than intended, exactly backwards for a
+    fail-closed guard. Never guesses, never crashes the calling lane."""
     if not settings.auto_risk_profile_by_equity:
         return settings.risk_profile
     try:
@@ -238,10 +253,10 @@ async def _resolve_risk_profile_id(settings: Settings, broker: AlpacaClient) -> 
             "auto_risk_profile_equity_fetch_failed",
             extra={
                 "event": "auto_risk_profile_equity_fetch_failed", "error": str(exc),
-                "fallback_profile": settings.risk_profile,
+                "fallback_profile": EQUITY_PROFILE_LADDER_TOP_PROFILE_ID,
             },
         )
-        return settings.risk_profile
+        return EQUITY_PROFILE_LADDER_TOP_PROFILE_ID
     resolved = profile_id_for_equity(account.equity)
     if resolved != settings.risk_profile:
         logger.info(
