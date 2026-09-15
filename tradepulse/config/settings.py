@@ -57,6 +57,7 @@ class Settings:
     telegram_bot_token: str | None
     telegram_chat_id: str | None
     risk_profile: str
+    auto_risk_profile_by_equity: bool
     equity_universe_path: str | None
     crypto_universe_path: str | None
     options_universe_path: str | None
@@ -78,6 +79,7 @@ class Settings:
         risk_profile = values.get("TRADEPULSE_RISK_PROFILE", "balanced").strip().lower()
         if risk_profile not in RISK_PROFILE_IDS:
             raise SettingsError(f"TRADEPULSE_RISK_PROFILE must be one of {sorted(RISK_PROFILE_IDS)}")
+        auto_risk_profile_by_equity = _bool(values, "TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY", False)
         ai_provider = values.get("TRADEPULSE_AI_PROVIDER", "anthropic").strip().lower()
         if ai_provider not in AI_PROVIDER_IDS:
             raise SettingsError(f"TRADEPULSE_AI_PROVIDER must be one of {sorted(AI_PROVIDER_IDS)}")
@@ -109,6 +111,7 @@ class Settings:
             telegram_bot_token=values.get("TELEGRAM_BOT_TOKEN") or None,
             telegram_chat_id=values.get("TELEGRAM_CHAT_ID") or None,
             risk_profile=risk_profile,
+            auto_risk_profile_by_equity=auto_risk_profile_by_equity,
             equity_universe_path=values.get("TRADEPULSE_EQUITY_UNIVERSE_PATH") or None,
             crypto_universe_path=values.get("TRADEPULSE_CRYPTO_UNIVERSE_PATH") or None,
             options_universe_path=values.get("TRADEPULSE_OPTIONS_UNIVERSE_PATH") or None,

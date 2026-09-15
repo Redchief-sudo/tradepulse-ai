@@ -332,10 +332,11 @@ async def test_trailing_stop_uses_most_favorable_lot_mfe_across_multi_lot_positi
 async def test_atr_fetch_failure_degrades_gracefully_break_even_still_applies(tmp_path) -> None:
     """A transient market-data hiccup must never crash the monitor cycle --
     see monitor/coordinator.py::_fetch_atr's own docstring: an unguarded
-    failure here would permanently end the monitor lane
-    (cli.py::_supervised_lane never restarts). Break-even (which needs no
-    candle fetch at all) still applies even when the ATR trail can't be
-    computed."""
+    failure here would cost real position-protection latency (cli.py::
+    _supervised_lane restarts a crashed lane, but only after a backoff
+    delay -- degrading gracefully at the source is still strictly better
+    than relying on that recovery). Break-even (which needs no candle fetch
+    at all) still applies even when the ATR trail can't be computed."""
     repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
     await _seed_holding(repositories, target_price="999")
     await _seed_lot(repositories, mfe_price="170")
@@ -357,9 +358,9 @@ async def test_atr_fetch_degrades_gracefully_on_malformed_numeric_bar_field(tmp_
     """Rev.81 Finding 4: broker/alpaca_client.py::get_bars's own raw-bar
     parsing is bare Decimal(str(value)) -- a non-numeric field raises
     decimal.InvalidOperation, which is NOT a ProviderError and must not
-    propagate out of _fetch_atr (cli.py::_supervised_lane never restarts a
-    lane after an unhandled exception -- this would permanently kill the
-    position monitor)."""
+    propagate out of _fetch_atr (cli.py::_supervised_lane restarts a crashed
+    lane, but only after a backoff delay -- this would still cost real
+    position-protection latency in the meantime)."""
     repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
     await _seed_holding(repositories, target_price="999")
     await _seed_lot(repositories, mfe_price="170")

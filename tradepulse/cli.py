@@ -71,7 +71,7 @@ import httpx
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient, AlpacaError
-from tradepulse.config import Settings, SettingsError, default_strategy_weights, risk_limits_for_profile
+from tradepulse.config import Settings, SettingsError, default_strategy_weights, profile_id_for_equity, risk_limits_for_profile
 from tradepulse.config.logging import configure_logging
 from tradepulse.execution import ExecutionGateway
 from tradepulse.models import AssetClass, AuditEvent, SessionState
@@ -141,6 +141,13 @@ SETTLE_INTERVAL_SECONDS = 60
 MARKET_CLOCK_RETRY_SECONDS = 30
 BROWSER_OPEN_MAX_WAIT_SECONDS = 5.0
 BROWSER_OPEN_POLL_SECONDS = 0.2
+# A lane that dies from an unhandled exception restarts rather than staying
+# dead for the rest of the process's life (see _supervised_lane) -- capped
+# exponential backoff so a persistent failure (e.g. a struggling external
+# API) is retried forever without ever turning into a tight crash loop that
+# hammers it.
+LANE_RESTART_INITIAL_BACKOFF_SECONDS = 5
+LANE_RESTART_MAX_BACKOFF_SECONDS = 300
 
 
 def scan_lock_key(asset_class: AssetClass) -> str:
@@ -211,6 +218,42 @@ def _lease_lost_signal(
     return lease_lost, on_lease_lost
 
 
+async def _resolve_risk_profile_id(settings: Settings, broker: AlpacaClient) -> str:
+    """TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY, opt-in and off by default. Off
+    -- a pure, zero-cost passthrough to the configured static profile, no
+    broker call at all (existing behavior is byte-for-byte unchanged). On --
+    looks up TODAY's actual account equity and maps it through
+    config.profile_id_for_equity's fixed, deterministic ladder. Deliberately
+    NOT an AI/LLM judgment call, matching this codebase's standing principle
+    that the AI proposes trade candidates only and never sets risk
+    parameters (see scanner/coordinator.py's own module docstring). Fails
+    closed to the configured static profile on any broker/network trouble --
+    never guesses, never crashes the calling lane."""
+    if not settings.auto_risk_profile_by_equity:
+        return settings.risk_profile
+    try:
+        account = await broker.get_account()
+    except (AlpacaError, httpx.HTTPError) as exc:
+        logger.warning(
+            "auto_risk_profile_equity_fetch_failed",
+            extra={
+                "event": "auto_risk_profile_equity_fetch_failed", "error": str(exc),
+                "fallback_profile": settings.risk_profile,
+            },
+        )
+        return settings.risk_profile
+    resolved = profile_id_for_equity(account.equity)
+    if resolved != settings.risk_profile:
+        logger.info(
+            "auto_risk_profile_resolved",
+            extra={
+                "event": "auto_risk_profile_resolved", "equity": str(account.equity),
+                "resolved_profile": resolved, "configured_profile": settings.risk_profile,
+            },
+        )
+    return resolved
+
+
 async def _run_scan_leg(
     database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, ai_provider: AIProvider,
     market_data: AlpacaMarketDataProvider, broker: AlpacaClient, gateway: ExecutionGateway,
@@ -224,7 +267,7 @@ async def _run_scan_leg(
         return None
     try:
         universe = load_executable_universe(settings)
-        risk_limits = risk_limits_for_profile(settings.risk_profile)
+        risk_limits = risk_limits_for_profile(await _resolve_risk_profile_id(settings, broker))
         strategy_weights = default_strategy_weights(datetime.now(UTC))
         lease_lost, on_lease_lost = _lease_lost_signal(alerts, lock_key, owner_token)
         return await run_with_lock_renewal(
@@ -249,7 +292,7 @@ async def _run_monitor_leg(
         return None
     try:
         lease_lost, on_lease_lost = _lease_lost_signal(alerts, MONITOR_LOCK_KEY, owner_token)
-        risk_limits = risk_limits_for_profile(settings.risk_profile)
+        risk_limits = risk_limits_for_profile(await _resolve_risk_profile_id(settings, broker))
         return await run_with_lock_renewal(
             database, MONITOR_LOCK_KEY, owner_token, MONITOR_LOCK_TTL_SECONDS,
             run_position_monitor(repositories, broker, market_data, gateway, alerts, risk_limits, lease_lost=lease_lost),
@@ -573,31 +616,62 @@ async def _periodic_loop(
             waited += 1
 
 
+def _describe_exception(exc: BaseException) -> str:
+    """`str(exc)` alone goes silently empty for exceptions raised with no
+    message argument -- notably network-timeout types (bare
+    `asyncio.TimeoutError()`/httpx timeout subclasses), which is exactly the
+    class of failure a lane is most likely to hit. Falling back to the
+    exception's own type name keeps every failure diagnosable from the
+    persisted audit event/log line alone, never an empty string."""
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+
+
 async def _supervised_lane(
-    name: str, loop_coro: Awaitable[None], repositories: PersistenceRepositories, alerts: TelegramAlerter,
+    name: str, loop_coro_factory: Callable[[], Awaitable[None]], repositories: PersistenceRepositories,
+    alerts: TelegramAlerter, shutdown: asyncio.Event, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> None:
     """A lane dying must never (a) silently vanish with no trace, (b) take
-    down its siblings, or (c) leave the session looking healthy/ACTIVE while
-    nothing is actually scanning. Deliberately NOT RISK_STOPPED/
-    FINANCIAL_INTEGRITY_BLOCKED -- real domain states with their own specific
-    meanings this must not borrow. The persisted, typed AuditEvent below is
-    already queryable and dashboard-visible today via the existing
-    AlertsPanel (polls audit_events, highlights severity="critical") -- zero
-    new dashboard code required."""
-    try:
-        await loop_coro
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001 -- a lane dying unhandled IS the critical condition to report; must never crash the whole supervisor or vanish silently
-        message = f"TRADING_SUPERVISOR_LANE_FAILED: {name} stopped scheduling after an unhandled error: {exc}"
-        logger.error("trading_supervisor_lane_failed", extra={"event": "trading_supervisor_lane_failed", "lane": name, "error": str(exc)})
-        await alerts.send("critical", message, {"lane": name})
-        event = AuditEvent(
-            event_id=str(uuid4()), event_type="trading_supervisor_lane_failed", severity="critical",
-            message=message, occurred_at=datetime.now(UTC), entity_type="trading_supervisor", entity_id=name,
-            details={"lane": name, "error": str(exc)},
-        )
-        await repositories.audit_events.create_once(event.event_id, event)
+    down its siblings, (c) leave the session looking healthy/ACTIVE while
+    nothing is actually scanning, or (d) stay permanently dead after one
+    transient failure until an operator notices and bounces the whole
+    process. Deliberately NOT RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED --
+    real domain states with their own specific meanings this must not
+    borrow. The persisted, typed AuditEvent below is already queryable and
+    dashboard-visible today via the existing AlertsPanel (polls
+    audit_events, highlights severity="critical") -- zero new dashboard code
+    required.
+
+    Restarts with capped exponential backoff (LANE_RESTART_*_BACKOFF_SECONDS)
+    rather than giving up after the first failure -- every failure is still
+    logged/alerted/audited, not just the first, so a persistently-failing
+    lane stays fully visible even though it keeps retrying. `loop_coro_factory`
+    is a zero-arg callable (not an already-built coroutine) specifically so a
+    fresh one can be constructed for each restart attempt -- a coroutine
+    object can only ever be awaited once."""
+    backoff = LANE_RESTART_INITIAL_BACKOFF_SECONDS
+    while not shutdown.is_set():
+        try:
+            await loop_coro_factory()
+            return  # the factory's own loop only ever returns at shutdown, never as a failure
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- a lane dying unhandled IS the critical condition to report; must never crash the whole supervisor or vanish silently
+            detail = _describe_exception(exc)
+            message = f"TRADING_SUPERVISOR_LANE_FAILED: {name} restarting in {backoff}s after an unhandled error ({detail})"
+            logger.error("trading_supervisor_lane_failed", extra={"event": "trading_supervisor_lane_failed", "lane": name, "error": detail})
+            await alerts.send("critical", message, {"lane": name})
+            event = AuditEvent(
+                event_id=str(uuid4()), event_type="trading_supervisor_lane_failed", severity="critical",
+                message=message, occurred_at=datetime.now(UTC), entity_type="trading_supervisor", entity_id=name,
+                details={"lane": name, "error": detail},
+            )
+            await repositories.audit_events.create_once(event.event_id, event)
+
+        waited = 0.0
+        while waited < backoff and not shutdown.is_set():
+            await sleep(1)
+            waited += 1
+        backoff = min(backoff * 2, LANE_RESTART_MAX_BACKOFF_SECONDS)
 
 
 async def _run_trading_supervisor(
@@ -610,38 +684,43 @@ async def _run_trading_supervisor(
     option, monitor, settle) -- genuine concurrency, never a shared serial
     loop, so a slow equity AI call can never delay a simultaneously-due
     crypto/option cycle or the position monitor. Each lane is wrapped in
-    _supervised_lane so one lane's crash never affects its siblings.
-    asyncio.gather only returns once every lane's task has ended (i.e. at
-    shutdown, since _supervised_lane catches each lane's own exceptions
-    rather than letting them propagate) -- this still correctly waits for
-    any lane's in-flight cycle to finish before returning, upholding "never
-    cancel in-flight work" at the whole-supervisor level too."""
-    lanes: dict[str, Awaitable[None]] = {
-        "equity": _periodic_loop(
+    _supervised_lane so one lane's crash never affects its siblings, and is
+    restarted (capped backoff) rather than left dead. asyncio.gather only
+    returns once every lane's task has ended (i.e. at shutdown, since
+    _supervised_lane catches and retries each lane's own exceptions rather
+    than letting them propagate) -- this still correctly waits for any
+    lane's in-flight cycle to finish before returning, upholding "never
+    cancel in-flight work" at the whole-supervisor level too.
+
+    Each lane is a zero-arg FACTORY (not an already-built coroutine) --
+    _supervised_lane calls it again on every restart attempt, and a
+    coroutine object can only ever be awaited once."""
+    lanes: dict[str, Callable[[], Awaitable[None]]] = {
+        "equity": lambda: _periodic_loop(
             lambda: _scan_action(
                 AssetClass.EQUITY, EQUITY_SCAN_INTERVAL_SECONDS, database, repositories, ai_provider, market_data,
                 broker, gateway, settings, alerts, capabilities,
             ),
             shutdown, sleep,
         ),
-        "crypto": _periodic_loop(
+        "crypto": lambda: _periodic_loop(
             lambda: _scan_action(
                 AssetClass.CRYPTO, CRYPTO_SCAN_INTERVAL_SECONDS, database, repositories, ai_provider, market_data,
                 broker, gateway, settings, alerts, capabilities,
             ),
             shutdown, sleep,
         ),
-        "option": _periodic_loop(
+        "option": lambda: _periodic_loop(
             lambda: _scan_action(
                 AssetClass.OPTION, OPTION_SCAN_INTERVAL_SECONDS, database, repositories, ai_provider, market_data,
                 broker, gateway, settings, alerts, capabilities,
             ),
             shutdown, sleep,
         ),
-        "monitor": _periodic_loop(lambda: _monitor_action(database, repositories, broker, market_data, gateway, alerts, settings), shutdown, sleep),
-        "settle": _periodic_loop(lambda: _settle_action(database, repositories, settlement, alerts), shutdown, sleep),
+        "monitor": lambda: _periodic_loop(lambda: _monitor_action(database, repositories, broker, market_data, gateway, alerts, settings), shutdown, sleep),
+        "settle": lambda: _periodic_loop(lambda: _settle_action(database, repositories, settlement, alerts), shutdown, sleep),
     }
-    await asyncio.gather(*(_supervised_lane(name, coro, repositories, alerts) for name, coro in lanes.items()))
+    await asyncio.gather(*(_supervised_lane(name, factory, repositories, alerts, shutdown, sleep) for name, factory in lanes.items()))
 
 
 def _build_dashboard_server(state: Any, port: int, log_level: str) -> Any:

@@ -112,3 +112,36 @@ def risk_limits_for_profile(profile_id: str) -> RiskLimits:
     if profile_id not in RISK_PROFILES:
         raise SettingsError(f"unknown risk profile: {profile_id!r}")
     return RISK_PROFILES[profile_id]
+
+
+# Equity-based auto-profile ladder (TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY,
+# opt-in, default off -- see Settings). A deterministic, auditable lookup on
+# account equity ONLY -- never AI/LLM-decided, matching this codebase's
+# standing principle that risk sizing/profile selection is never delegated
+# to a non-deterministic, unauditable AI call (the AI's role stays strictly
+# discovery-only: proposing candidates, never setting risk parameters).
+# Composes with, and is independent of, the existing market-regime sizing
+# multiplier (risk/engine.py's regime_multiplier) -- that still scales
+# position size within whichever profile this ladder selects.
+#
+# Threshold picks are directionally reasoned from each profile's own
+# designed position sizing (micro's 20% max-position suits a small account
+# where 20% is still a modest dollar amount; conservative's 5% suits a large
+# one where 5% is already substantial) -- not empirically calibrated against
+# real outcome data. Revisit with real data the same way every other
+# judgment-call threshold in this codebase has been (see docs/).
+EQUITY_PROFILE_LADDER: tuple[tuple[Decimal, str], ...] = (
+    (Decimal("10000"), "micro"),
+    (Decimal("50000"), "aggressive"),
+    (Decimal("250000"), "balanced"),
+)
+EQUITY_PROFILE_LADDER_TOP_PROFILE_ID = "conservative"  # at or above the top threshold
+
+
+def profile_id_for_equity(equity: Decimal) -> str:
+    """Pure lookup, no I/O -- the equity value itself is the caller's
+    responsibility to fetch fresh (see cli.py's per-cycle resolution)."""
+    for threshold, profile_id in EQUITY_PROFILE_LADDER:
+        if equity < threshold:
+            return profile_id
+    return EQUITY_PROFILE_LADDER_TOP_PROFILE_ID

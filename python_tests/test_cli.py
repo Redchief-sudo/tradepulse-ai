@@ -11,7 +11,7 @@ import pytest
 import respx
 
 from tradepulse.alerts import TelegramAlerter
-from tradepulse.broker import AlpacaClock, AlpacaError
+from tradepulse.broker import AlpacaAccount, AlpacaClock, AlpacaError
 from tradepulse.cli import (
     CRYPTO_SCAN_INTERVAL_SECONDS,
     EQUITY_SCAN_INTERVAL_SECONDS,
@@ -29,6 +29,7 @@ from tradepulse.cli import (
     _load_dotenv,
     _periodic_loop,
     _require_credentials,
+    _resolve_risk_profile_id,
     _run_application,
     _run_monitor,
     _run_reconcile,
@@ -459,6 +460,61 @@ class _StubClockBroker:
         return AlpacaClock(is_open=bool(self._is_open), next_open=None, next_close=None, timestamp=None)
 
 
+class _StubAccountBroker:
+    """Duck-typed broker.get_account() stub for _resolve_risk_profile_id
+    tests -- returns a fixed equity or raises, no real HTTP."""
+
+    def __init__(self, *, equity: Decimal | None = None, error: Exception | None = None) -> None:
+        self._equity = equity
+        self._error = error
+        self.call_count = 0
+
+    async def get_account(self) -> AlpacaAccount:
+        self.call_count += 1
+        if self._error is not None:
+            raise self._error
+        return AlpacaAccount(equity=self._equity, last_equity=self._equity, cash=self._equity, buying_power=self._equity, portfolio_value=self._equity)
+
+
+async def test_resolve_risk_profile_id_passthrough_when_auto_disabled() -> None:
+    """Off by default -- must be a zero-cost passthrough, no broker call at
+    all, so existing deployments that never opt in see zero behavior change
+    and zero extra API load."""
+    settings = Settings.from_env({"TRADEPULSE_RISK_PROFILE": "conservative"})
+    broker = _StubAccountBroker(equity=Decimal("5000"))  # would resolve to "micro" if ever consulted
+
+    resolved = await _resolve_risk_profile_id(settings, broker)
+
+    assert resolved == "conservative"
+    assert broker.call_count == 0
+
+
+async def test_resolve_risk_profile_id_maps_equity_through_the_ladder_when_enabled() -> None:
+    settings = Settings.from_env({
+        "TRADEPULSE_RISK_PROFILE": "balanced", "TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY": "true",
+    })
+    broker = _StubAccountBroker(equity=Decimal("5000"))
+
+    resolved = await _resolve_risk_profile_id(settings, broker)
+
+    assert resolved == "micro"
+    assert broker.call_count == 1
+
+
+async def test_resolve_risk_profile_id_fails_closed_to_configured_profile_on_broker_error(caplog) -> None:
+    settings = Settings.from_env({
+        "TRADEPULSE_RISK_PROFILE": "balanced", "TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY": "true",
+    })
+    broker = _StubAccountBroker(error=httpx.ConnectError("boom"))
+
+    with caplog.at_level("WARNING"):
+        resolved = await _resolve_risk_profile_id(settings, broker)
+
+    assert resolved == "balanced"  # never guesses, never crashes the calling lane
+    failures = [r for r in caplog.records if getattr(r, "event", None) == "auto_risk_profile_equity_fetch_failed"]
+    assert len(failures) == 1
+
+
 async def _wait_until(predicate: Callable[[], bool], timeout: float = 2.0, interval: float = 0.01) -> None:
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
@@ -617,7 +673,7 @@ async def test_supervised_lane_reraises_cancellation() -> None:
         raise asyncio.CancelledError()
 
     with pytest.raises(asyncio.CancelledError):
-        await _supervised_lane("monitor", _cancel(), None, TelegramAlerter(None, None))
+        await _supervised_lane("monitor", _cancel, None, TelegramAlerter(None, None), asyncio.Event())
 
 
 async def test_supervised_lane_persists_critical_audit_event_and_sends_alert_on_unhandled_exception(tmp_path, caplog) -> None:
@@ -626,12 +682,21 @@ async def test_supervised_lane_persists_critical_audit_event_and_sends_alert_on_
     await database.initialize()
     repositories = PersistenceRepositories.create(database)
     alerts = TelegramAlerter(None, None)
+    shutdown = asyncio.Event()
+    failed_once = asyncio.Event()
 
     async def _boom() -> None:
+        failed_once.set()
         raise RuntimeError("simulated lane crash")
 
+    async def fake_sleep(seconds: float) -> None:
+        await asyncio.sleep(0)
+
     with caplog.at_level("WARNING"):
-        await _supervised_lane("equity", _boom(), repositories, alerts)  # must not raise
+        task = asyncio.create_task(_supervised_lane("equity", _boom, repositories, alerts, shutdown, sleep=fake_sleep))
+        await asyncio.wait_for(failed_once.wait(), timeout=1.0)
+        shutdown.set()  # stop it after exactly one failure so this test stays deterministic
+        await asyncio.wait_for(task, timeout=1.0)  # must not raise
 
     rows = await repositories.audit_events.list_all()
     events = [hydrate("audit_events", row["payload"]) for row in rows]
@@ -642,6 +707,44 @@ async def test_supervised_lane_persists_critical_audit_event_and_sends_alert_on_
     assert failures[0].entity_id == "equity"
     skipped = [r for r in caplog.records if getattr(r, "event", None) == "telegram_alert_skipped_no_credentials"]
     assert len(skipped) == 1  # alerts.send was actually invoked
+
+
+async def test_supervised_lane_restarts_after_failure_and_resumes_normal_operation(tmp_path) -> None:
+    """The core new behavior: a lane that fails must self-heal (retry with
+    backoff), never stay dead for the rest of the process's life -- and
+    every attempt, including the ones that eventually succeed, must still be
+    genuinely retried (a fresh coroutine per attempt, not the same
+    already-exhausted one)."""
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    alerts = TelegramAlerter(None, None)
+    shutdown = asyncio.Event()
+    recovered = asyncio.Event()
+    attempts = 0
+
+    async def _flaky_then_recovers() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise RuntimeError(f"simulated transient failure #{attempts}")
+        recovered.set()
+        await shutdown.wait()  # stay "running" (like a real periodic loop would) until shutdown
+
+    async def fake_sleep(seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    task = asyncio.create_task(_supervised_lane("equity", _flaky_then_recovers, repositories, alerts, shutdown, sleep=fake_sleep))
+    await asyncio.wait_for(recovered.wait(), timeout=1.0)
+    shutdown.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert attempts == 3  # two failures, then the attempt that actually recovered
+    rows = await repositories.audit_events.list_all()
+    events = [hydrate("audit_events", row["payload"]) for row in rows]
+    failures = [e for e in events if e.event_type == "trading_supervisor_lane_failed"]
+    assert len(failures) == 2  # every failed attempt recorded, not just the first
 
 
 async def test_run_settle_leg_skipped_when_lock_held(tmp_path) -> None:
@@ -782,8 +885,11 @@ async def test_run_trading_supervisor_settlement_fires_independently(tmp_path, m
 
 
 async def test_run_trading_supervisor_lane_failure_is_isolated_and_recorded(tmp_path, monkeypatch) -> None:
-    """A crashed lane must never take its siblings down with it, and must
-    never be misreported via RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED."""
+    """A crashed lane must never take its siblings down with it, must never
+    be misreported via RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED, and must
+    self-heal (restart) rather than stay dead for the rest of the process's
+    life -- equity here fails twice, then recovers and resumes contributing
+    like any other lane."""
     database_url = f"sqlite:///{tmp_path}/test.db"
     database = AsyncSQLiteDatabase(database_url)
     await database.initialize()
@@ -793,10 +899,14 @@ async def test_run_trading_supervisor_lane_failure_is_isolated_and_recorded(tmp_
     settlement = SettlementProcessor(repositories, alerts)
 
     other_activity: set[str] = set()
+    equity_attempts = 0
 
     async def _stub_scan_cycle(repositories, ai_provider, market_data, broker, gateway, universe, risk_limits, asset_class, **kwargs):
+        nonlocal equity_attempts
         if asset_class == AssetClass.EQUITY:
-            raise RuntimeError("simulated equity lane crash")
+            equity_attempts += 1
+            if equity_attempts <= 2:
+                raise RuntimeError(f"simulated equity lane crash #{equity_attempts}")
         other_activity.add(asset_class.value)
 
     monkeypatch.setattr("tradepulse.cli.run_scan_cycle", _stub_scan_cycle)
@@ -825,18 +935,22 @@ async def test_run_trading_supervisor_lane_failure_is_isolated_and_recorded(tmp_
             sleep=fake_sleep,
         )
     )
-    await _wait_until(lambda: {"crypto", "option", "monitor", "settle"} <= other_activity, timeout=2.0)
+    # "equity" only ever lands in other_activity once the lane has actually
+    # recovered -- proving the restart, not just the isolation, worked.
+    await _wait_until(lambda: {"equity", "crypto", "option", "monitor", "settle"} <= other_activity, timeout=2.0)
     shutdown.set()
     await asyncio.wait_for(task, timeout=2.0)
 
-    assert "equity" not in other_activity  # the crashed lane never got to append anything
+    # >= 3, not == -- once recovered, the lane's own periodic_loop may complete
+    # further successful cycles (fake_sleep makes its interval wait near-instant)
+    # before shutdown is observed; only the two failures are deterministic.
+    assert equity_attempts >= 3
 
     rows = await repositories.audit_events.list_all()
     events = [hydrate("audit_events", row["payload"]) for row in rows]
     failures = [e for e in events if e.event_type == "trading_supervisor_lane_failed"]
-    assert len(failures) == 1
-    assert failures[0].entity_id == "equity"
-    assert failures[0].severity == "critical"
+    assert len(failures) == 2  # exactly the two failed attempts -- never re-raised after recovery
+    assert all(f.entity_id == "equity" and f.severity == "critical" for f in failures)
 
 
 def _stub_build_dashboard_server(state: Any, port: int, log_level: str) -> Any:
