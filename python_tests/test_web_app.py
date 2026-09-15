@@ -457,6 +457,28 @@ async def test_get_session_exposes_paper_vs_live_execution_mode(tmp_path) -> Non
 
 
 @respx.mock
+async def test_get_session_exposes_process_run_time_stable_across_requests(tmp_path) -> None:
+    """`process_started_at` is when this backend PROCESS came up -- fixed at
+    `build_app_state`, never re-derived per-request and never the same
+    concept as the domain session's own `updated_at`. Proven by: (1) it
+    differs from a session `updated_at` that is deliberately far in the
+    past, and (2) two separate requests against the same running app see
+    the identical value."""
+    client, state = await _client_for(tmp_path)
+    await save_session(state.repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+
+    first = await client.get("/api/session")
+    second = await client.get("/api/session")
+    await state.broker.aclose()
+    await client.aclose()
+
+    assert first.status_code == 200 and second.status_code == 200
+    first_started = first.json()["process_started_at"]
+    assert first_started == second.json()["process_started_at"]
+    assert first_started != NOW.isoformat()
+
+
+@respx.mock
 async def test_get_equity_history_returns_persisted_snapshots_newest_first(tmp_path) -> None:
     """Pure passthrough of the already-persisted equity_snapshots table --
     same _recent_route mechanism as every other list endpoint, no new

@@ -42,6 +42,7 @@ export interface TradingSession {
   financial_integrity_manual_reenable_required: boolean
   execution_mode: ExecutionMode
   live_trading_enabled: boolean
+  process_started_at: string
 }
 
 export interface SessionActionResult {

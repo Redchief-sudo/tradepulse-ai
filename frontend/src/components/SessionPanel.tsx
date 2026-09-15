@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { api, ApiError } from '../api'
 import { usePolling } from '../usePolling'
-import { time } from '../format'
+import { time, duration } from '../format'
 import { Panel } from './Panel'
 import type { SessionState } from '../types'
 
@@ -49,6 +49,8 @@ export function SessionPanel() {
           <dl className="kv">
             <dt>Trading active</dt>
             <dd>{session.trading_active ? 'Yes' : 'No'}</dd>
+            <dt>Run time</dt>
+            <dd>{duration(session.process_started_at)}</dd>
             <dt>Updated</dt>
             <dd>{time(session.updated_at)}</dd>
             {session.kill_switch_reason && (

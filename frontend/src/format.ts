@@ -46,6 +46,26 @@ export function parseOccSymbol(symbol: string | null | undefined): OccContract |
   return { root, expiry: `20${yy}-${mm}-${dd}`, right: right as 'C' | 'P', strike }
 }
 
+/** Elapsed wall-clock duration since `value`, formatted as "1d 2h 3m" (drops
+ * leading zero units, e.g. "5m" once under an hour). Used for the dashboard's
+ * process run-time display -- purely cosmetic, never a domain duration. */
+export function duration(value: string | null | undefined): string {
+  if (!value) return '—'
+  const started = new Date(value).getTime()
+  if (Number.isNaN(started)) return value
+  const seconds = Math.max(0, Math.floor((Date.now() - started) / 1000))
+  const days = Math.floor(seconds / 86400)
+  const hours = Math.floor((seconds % 86400) / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  const secs = seconds % 60
+  const parts: string[] = []
+  if (days > 0) parts.push(`${days}d`)
+  if (days > 0 || hours > 0) parts.push(`${hours}h`)
+  if (days === 0 && (hours > 0 || minutes > 0)) parts.push(`${minutes}m`)
+  if (days === 0 && hours === 0) parts.push(`${secs}s`)
+  return parts.join(' ')
+}
+
 export function relativeAgo(value: string | null | undefined): string {
   if (!value) return '—'
   const d = new Date(value).getTime()

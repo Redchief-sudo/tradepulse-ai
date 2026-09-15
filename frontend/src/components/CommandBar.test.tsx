@@ -18,7 +18,7 @@ function session(overrides: Partial<TradingSession> = {}): TradingSession {
     session_id: 's', state: 'active', trading_active: true, updated_at: '2026-01-01T00:00:00Z',
     kill_switch_reason: null, kill_switch_at: null, kill_switch_reset_required: false,
     financial_integrity_reason: null, financial_integrity_manual_reenable_required: false,
-    execution_mode: 'paper', live_trading_enabled: false,
+    execution_mode: 'paper', live_trading_enabled: false, process_started_at: '2026-01-01T00:00:00Z',
     ...overrides,
   }
 }

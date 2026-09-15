@@ -16,7 +16,8 @@ would be unauthenticated start/stop/reset-risk/reset-integrity authority.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,12 @@ class AppState:
     broker: AlpacaClient
     market_data: AlpacaMarketDataProvider
     account_cache: tuple[float, Any] | None = None
+    # Wall-clock time this process came up -- pure display metadata (dashboard
+    # "run time" indicator), never consulted by any trading/risk/session
+    # decision. Deliberately process-local, not persisted: it answers "how
+    # long has THIS backend process been up", not a domain concept like a
+    # trading session's lifetime.
+    process_started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 async def build_app_state(settings: Settings) -> AppState:
@@ -126,6 +133,7 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
             **{f: getattr(session, f) for f in session.__dataclass_fields__},
             "execution_mode": s.settings.execution_mode,
             "live_trading_enabled": s.settings.live_trading_enabled,
+            "process_started_at": s.process_started_at,
         })
 
     @app.post("/api/session/start")
