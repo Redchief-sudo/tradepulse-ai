@@ -86,7 +86,8 @@ def _milestone_evidence(
 ) -> MilestoneResult:
     """Walks the SAME bar range the baseline actually held the position for
     (entry_index+1 .. baseline's own exit bar, or to the end of history if
-    censored) and checks whether that day's HIGH ever touched
+    censored), excluding a stop-exit bar because stop precedes target when
+    intrabar ordering is unknown, and checks whether that day's HIGH ever touched
     entry + target_r*risk -- the upside-symmetric counterpart of
     simulate_exit's own low-touches-stop convention. Never looks past the
     baseline's own exit: this answers "did price reach this milestone
@@ -100,6 +101,8 @@ def _milestone_evidence(
         return MilestoneResult(False, None, None)
     target_price = entry.entry_price + risk * target_r
     end_index = date_to_index[baseline.exit_date] if baseline.exit_date is not None else len(bars) - 1
+    if baseline.exit_reason == "stop":
+        end_index -= 1
     for i in range(entry.entry_index + 1, end_index + 1):
         if Decimal(bars[i]["high"]) >= target_price:
             return MilestoneResult(True, i - entry.entry_index, baseline.r_multiple)

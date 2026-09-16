@@ -9,7 +9,7 @@ Three questions were posed before any target-sizing method should be picked: how
 ## Methodology
 
 - Reuses `simulate_trades.py`'s entry generation directly (same fixed-baseline composite, same ATR stop, same no-lookahead machinery) -- no new entries, no new data fetch.
-- **Milestone evidence** (§1/§2): for every entry, the current policy's own exit (`simulate_exit`) is computed once, then the bar range up to that exit is checked for whether that day's HIGH ever touched `entry + R*risk`, for R in {1, 1.5, 2, 2.5, 3} -- the upside-symmetric counterpart of `simulate_exit`'s own low-touches-stop convention. Never looks past the baseline's own exit date.
+- **Milestone evidence** (§1/§2): for every entry, the current policy's own exit (`simulate_exit`) is computed once, then the bar range up to that exit is checked for whether that day's HIGH ever touched `entry + R*risk`, for R in {1, 1.5, 2, 2.5, 3} -- the upside-symmetric counterpart of `simulate_exit`'s own low-touches-stop convention. Never looks past the baseline's own exit date. Excludes the stop-exit bar: daily OHLC cannot establish target-before-stop ordering, so stop takes precedence. Time-stop bars remain included because the simulator checks the target before the close-based time exit.
 - **Policy comparison** (§3): `simulate_exit_with_target` is a field-for-field mirror of `simulate_exit` with exactly one addition -- a full exit the first day price's HIGH touches the target. Evaluated on `calibrate_exit_params.FOLDS` (the same four walk-forward folds already approved for exit-parameter calibration) and the same frozen friction scenarios, for R in {1.5, 2, 2.5, 3}, against the `baseline_trailing_only` policy (today's actual behavior).
 - New code: `tools/historical_data/target_price_evidence.py`. Results: `data/calibration/target_price_evidence.json`.
 
@@ -18,12 +18,12 @@ Three questions were posed before any target-sizing method should be picked: how
 | R | Equity reached (n=6,499) | Equity avg give-back when reached | Crypto reached (n=81) | Crypto avg give-back when reached |
 |---|---:|---:|---:|---:|
 | 1.0 | 33.1% | -0.06R | 29.6% | -0.08R |
-| 1.5 | 17.0% | -0.09R | 23.5% | +0.15R |
-| 2.0 | 7.6% | -0.12R | 22.2% | +0.58R |
-| 2.5 | 4.2% | +0.01R | 21.0% | +1.11R |
-| 3.0 | 1.9% | +0.28R | 13.6% | +2.00R |
+| 1.5 | 17.0% | -0.10R | 23.5% | +0.15R |
+| 2.0 | 7.6% | -0.12R | 14.8% | -0.00R |
+| 2.5 | 4.2% | +0.01R | 13.6% | +0.49R |
+| 3.0 | 1.9% | +0.28R | 4.9% | +0.95R |
 
-Negative give-back means the current policy's *actual* exit r-multiple was, on average, **better** than the milestone it passed through -- i.e. letting it ride paid off. For equity, that holds up through roughly 2R: the trailing/break-even policy is already capturing more than a fixed exit at 1-2R would have, on average. Beyond 2.5-3R, give-back turns positive -- the rare biggest equity winners do surrender some profit before the trailing stop finally closes them. For crypto, give-back turns positive much earlier (already at 1.5R) and grows fast -- consistent with crypto's wider ATR trail (`trailing_atr_multiplier`) giving back more before it catches a sharp reversal, though the sample here (81 entries total, single digits to low 30s per fold) is thin.
+Negative give-back means the current policy's *actual* exit r-multiple was, on average, **better** than the milestone it passed through -- i.e. letting it ride paid off. For equity, that holds up through roughly 2R: the trailing/break-even policy is already capturing more than a fixed exit at 1-2R would have, on average. Beyond 2.5-3R, give-back turns positive -- the rare biggest equity winners do surrender some profit before the trailing stop finally closes them. For crypto, average give-back is positive at 1.5R, approximately zero at 2R, and positive at 2.5-3R. The sample here (81 entries total, single digits to low 30s per fold) is thin; only four entries reached 3R under the conservative ordering policy.
 
 ## §3: does a hard target beat the current policy? (walk-forward, base friction)
 
