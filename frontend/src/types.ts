@@ -70,7 +70,9 @@ export interface AlpacaPosition {
 
 export interface EnrichedPosition {
   position: AlpacaPosition
-  stop_loss: string | null
+  unrealized_pct?: string | null
+  initial_stop: string | null
+  active_stop: string | null
   target_price: string | null
   // Already carried on the position's asset identity since trade time
   // (only ever set for options) -- null for equity/crypto, or for any
@@ -176,6 +178,9 @@ export interface PortfolioSnapshot {
   total_equity: string
   cash_balance: string
   holdings_value: string
+  holdings_cost_basis?: string | null
+  equity_reconciliation_status?: string | null
+  valuation_errors?: string[]
   sector_exposure: Record<string, string>
   open_positions: number
   outstanding_orders: number

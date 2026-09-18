@@ -12,11 +12,23 @@ function position(overrides: Partial<EnrichedPosition['position']> = {}): Enrich
       symbol: 'AAPL', asset_class: 'equity', qty: '10', avg_entry_price: '100', market_value: '1050',
       current_price: '105', unrealized_pl: '50', ...overrides,
     },
-    stop_loss: null, target_price: null, contract_multiplier: null,
+    initial_stop: null, active_stop: null, target_price: null, contract_multiplier: null,
   }
 }
 
 describe('PositionsPanel', () => {
+  it('renders the precise active stop rounded only for display and uses broker market value', async () => {
+    const row = position({ qty: '2', current_price: '3', market_value: '600' })
+    row.initial_stop = '305.96'
+    row.active_stop = '319.4384280853317375'
+    vi.mocked(api.getPositions).mockResolvedValue([row])
+    render(<PositionsPanel />)
+    await waitFor(() => expect(screen.getByText('$319.44')).toBeInTheDocument())
+    expect(screen.queryByText('$305.96')).not.toBeInTheDocument()
+    expect(screen.getByText('$600.00')).toBeInTheDocument()
+    expect(row.active_stop).toBe('319.4384280853317375')
+  })
+
   it('colors a positive unrealized P&L distinctly from a negative one', async () => {
     vi.mocked(api.getPositions).mockResolvedValue([
       position({ symbol: 'WINNER', unrealized_pl: '50' }),

@@ -398,6 +398,13 @@ def decode_equity_snapshot(d: Mapping[str, Any]) -> PortfolioSnapshot:
         trades_today=d["trades_today"],
         daily_pnl_pct=_decimal(d["daily_pnl_pct"]),
         source=d["source"],
+        valuation_version=d.get("valuation_version", 1),
+        holdings_cost_basis=_decimal_or_none(d.get("holdings_cost_basis")),
+        sector_cost_basis={k: _decimal(v) for k, v in d.get("sector_cost_basis", {}).items()},
+        broker_equity_components={k: _decimal(v) for k, v in d.get("broker_equity_components", {}).items()},
+        equity_reconciliation_status=d.get("equity_reconciliation_status"),
+        equity_reconciliation_difference=_decimal_or_none(d.get("equity_reconciliation_difference")),
+        valuation_errors=tuple(d.get("valuation_errors", ())),
     )
 
 

@@ -146,9 +146,10 @@ async def _reconcile_positions(
     open_lots_by_asset_key: dict[str, Decimal] = {}
     asset_by_key: dict[str, AssetIdentity] = {}
     for lot in all_lots:
+        key = asset_identity_key(lot.asset)
+        asset_by_key.setdefault(key, lot.asset)
         if lot.status not in _OPEN_LOT_STATUSES:
             continue
-        key = asset_identity_key(lot.asset)
         open_lots_by_asset_key[key] = open_lots_by_asset_key.get(key, Decimal("0")) + lot.signed_quantity
         asset_by_key.setdefault(key, lot.asset)
 
@@ -175,7 +176,7 @@ async def _reconcile_positions(
             return asset_by_key[key].symbol
         return holdings_by_asset_key[key].asset.symbol
 
-    asset_keys = set(broker_by_asset_key) | set(open_lots_by_asset_key) | set(holdings_by_asset_key)
+    asset_keys = set(broker_by_asset_key) | set(asset_by_key) | set(holdings_by_asset_key)
 
     positions_checked = 0
     view_drift_corrected = 0
@@ -193,7 +194,7 @@ async def _reconcile_positions(
 
         if broker_qty == lots_qty == holding_qty:
             await _record(
-                repositories, reconciliation_type="position", subject_id=display_symbol, outcome=ReconciliationOutcome.MATCHED,
+                repositories, reconciliation_type="position", subject_id=key, outcome=ReconciliationOutcome.MATCHED,
                 expected={"broker_qty": str(broker_qty)}, actual={"lots_qty": str(lots_qty), "holding_qty": str(holding_qty)},
                 occurred_at=now,
             )
@@ -203,7 +204,7 @@ async def _reconcile_positions(
             # VIEW_DRIFT: the accounting (lots) already agrees with Alpaca --
             # only the materialized Holding is stale. Safe to rebuild it.
             await _record(
-                repositories, reconciliation_type="position_view", subject_id=display_symbol, outcome=ReconciliationOutcome.DRIFT_DETECTED,
+                repositories, reconciliation_type="position_view", subject_id=key, outcome=ReconciliationOutcome.DRIFT_DETECTED,
                 expected={"holding_qty": str(holding_qty)}, actual={"broker_qty": str(broker_qty), "lots_qty": str(lots_qty)},
                 occurred_at=now,
             )
@@ -226,7 +227,7 @@ async def _reconcile_positions(
 
             view_drift_corrected += 1
             await _record(
-                repositories, reconciliation_type="position_view", subject_id=display_symbol, outcome=ReconciliationOutcome.CORRECTED,
+                repositories, reconciliation_type="position_view", subject_id=key, outcome=ReconciliationOutcome.CORRECTED,
                 expected={"holding_qty": str(holding_qty)}, actual={"broker_qty": str(broker_qty)}, occurred_at=now,
                 corrective_action="rebuilt local Holding from position_lots to match Alpaca",
             )
@@ -235,7 +236,7 @@ async def _reconcile_positions(
             # Not auto-corrected -- the Holding is left untouched.
             accounting_drift_detected += 1
             await _record(
-                repositories, reconciliation_type="position_accounting", subject_id=display_symbol, outcome=ReconciliationOutcome.DRIFT_DETECTED,
+                repositories, reconciliation_type="position_accounting", subject_id=key, outcome=ReconciliationOutcome.DRIFT_DETECTED,
                 expected={"lots_qty": str(lots_qty)}, actual={"broker_qty": str(broker_qty), "holding_qty": str(holding_qty)},
                 occurred_at=now,
             )

@@ -197,11 +197,15 @@ class AlpacaClient:
             raise_alpaca_error(response, "getAccount")
         data = response.json()
         return AlpacaAccount(
-            equity=_decimal(data.get("equity", "0")),
-            last_equity=_decimal(data.get("last_equity", "0")),
-            cash=_decimal(data.get("cash", "0")),
+            equity=_decimal(data["equity"]),
+            last_equity=_decimal(data["last_equity"]),
+            cash=_decimal(data["cash"]),
             buying_power=_decimal(data.get("buying_power", "0")),
             portfolio_value=_decimal(data.get("portfolio_value", "0")),
+            equity_components={name: _decimal(data[name]) for name in (
+                "long_market_value", "short_market_value", "accrued_fees", "memoposts",
+                "pending_transfer_in", "pending_transfer_out", "intraday_adjustments", "pending_reg_taf_fees",
+            ) if name in data and data[name] is not None},
         )
 
     async def get_positions(self) -> list[AlpacaPosition]:
@@ -237,7 +241,8 @@ class AlpacaClient:
                     asset_class=asset_class,
                     qty=_decimal(row.get("qty", "0")),
                     avg_entry_price=_decimal(row.get("avg_entry_price", "0")),
-                    market_value=_decimal(row.get("market_value", "0")),
+                    market_value=_decimal(row["market_value"]),
+                    cost_basis=_decimal_or_none(row.get("cost_basis")),
                     current_price=_decimal(row.get("current_price", "0")),
                     unrealized_pl=_decimal(row.get("unrealized_pl", "0")),
                 )

@@ -135,6 +135,25 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
         if key not in latest or timestamp(row["occurred_at"]) >= timestamp(latest[key]["occurred_at"]):
             latest[key] = row
     reconciliation_issues = sum(row["outcome"] not in {"matched", "corrected"} for row in latest.values())
+    # Equity receipts cannot validate position accounting. Every traded identity
+    # needs a broker comparison at or after its latest fill, including closed lots.
+    from tradepulse.models import asset_identity_key
+    from tradepulse.persistence import hydrate
+    latest_fill_by_asset = {}
+    for fill in fills.values():
+        key = asset_identity_key(hydrate("fills", fill).asset)
+        at = timestamp(fill["filled_at"])
+        if key not in latest_fill_by_asset or at > latest_fill_by_asset[key]:
+            latest_fill_by_asset[key] = at
+    unreconciled_assets = set()
+    for key, at in latest_fill_by_asset.items():
+        receipt = latest.get(("position", key))
+        if receipt is None or timestamp(receipt["occurred_at"]) < at:
+            problems.append("position_reconciliation_missing_or_stale")
+            unreconciled_assets.add(key)
+        elif receipt["outcome"] not in {"matched", "corrected"}:
+            unreconciled_assets.add(key)
+
     integrity_issues = len(rows["integrity_holds"]) + sum(
         row.get("state") == "financial_integrity_blocked" or row.get("financial_integrity_manual_reenable_required") is True
         for row in rows["trading_sessions"]
@@ -163,6 +182,8 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     else:
         cost_rate = None
     for intent_id, lots in sorted(groups.items()):
+        if any(asset_identity_key(hydrate("fills", fills[lot["originating_fill_id"]]).asset) in unreconciled_assets for lot in lots):
+            continue  # unresolved positions never contribute eligible round trips or net results
         intent = intents.get(intent_id)
         if intent is None:
             problems.append("missing_opening_intent")

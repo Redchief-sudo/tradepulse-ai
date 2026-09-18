@@ -169,7 +169,7 @@ def passing_rows(count=200, wins=120):
         {"snapshot_id": "first", "as_of": START.isoformat(), "source": "broker", "total_equity": "10000"},
         {"snapshot_id": "last", "as_of": NOW.isoformat(), "source": "broker", "total_equity": "10160"},
     ]
-    rows["reconciliation_records"] = [{"record_id": "r", "reconciliation_type": "position_accounting", "subject_id": "X",
+    rows["reconciliation_records"] = [{"record_id": "r", "reconciliation_type": "position_accounting", "subject_id": "equity:default:alpaca:X",
                                        "outcome": "matched", "occurred_at": NOW.isoformat()}]
     # Full persisted contracts for the database-backed seal test.
     for row in rows["settlements"]:

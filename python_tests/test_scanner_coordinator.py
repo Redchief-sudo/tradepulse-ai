@@ -49,6 +49,7 @@ async def _setup(tmp_path, *, risk_limits: RiskLimits | None = None):
 
 
 def _mock_account(cash: str = "50000", equity: str = "100000") -> None:
+    _mock_positions()  # each scan now observes broker positions for its persisted valuation
     respx.get("https://paper-api.alpaca.markets/v2/account").mock(
         return_value=httpx.Response(200, json={"equity": equity, "last_equity": "99500", "cash": cash, "buying_power": equity, "portfolio_value": equity})
     )

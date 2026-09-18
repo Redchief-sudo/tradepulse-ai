@@ -18,10 +18,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
-
-from decimal import Decimal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -36,8 +35,9 @@ from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories,
 from tradepulse.persistence.codec import encode_payload
 from tradepulse.provenance import get_provenance
 from tradepulse.providers import AlpacaMarketDataProvider, resolve_market_data_capabilities
-from tradepulse.risk import build_portfolio_snapshot, load_session
+from tradepulse.risk import load_session
 from tradepulse.session_commands import build_broker, run_reset_integrity, run_reset_risk, run_start, run_stop
+from tradepulse.valuation import marked_snapshot
 
 _CONFIRMATION_PHRASE = "RESET_FINANCIAL_INTEGRITY"
 _ACCOUNT_CACHE_SECONDS = 5
@@ -196,10 +196,17 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
         enriched = []
         for position in positions:
             holding_row = await s.repositories.holdings.get(asset_key_from_broker_symbol(position.asset_class, position.symbol))
-            holding = hydrate("holdings", holding_row["payload"]) if holding_row is not None else None
+            try:
+                holding = hydrate("holdings", holding_row["payload"]) if holding_row is not None else None
+            except (ValueError, TypeError, KeyError, ArithmeticError) as exc:
+                raise HTTPException(status_code=503, detail=f"POSITION_DATA_INVALID: {position.symbol}") from exc
             enriched.append({
                 "position": position,
-                "stop_loss": holding.stop_loss if holding is not None else None,
+                "unrealized_pct": (position.unrealized_pl / abs(position.cost_basis) * 100) if position.cost_basis else None,
+                "initial_stop": holding.stop_loss if holding is not None else None,
+                "active_stop": (
+                    holding.current_stop if holding.current_stop is not None else holding.stop_loss
+                ) if holding is not None else None,
                 "target_price": holding.target_price if holding is not None else None,
                 # Already carried on the same AssetIdentity since trade time
                 # (scanner/coordinator.py's option-contract resolution) --
@@ -220,14 +227,10 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
             positions = await s.broker.get_positions()
         except (AlpacaError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=503, detail=f"BROKER_UNAVAILABLE: {exc}") from exc
-        # Same broker truth as execution/gateway.py -- current market value,
-        # not stale local cost basis. Without this, holdings_value silently
-        # fell back to average_price (see risk/engine.py::build_portfolio_snapshot).
-        mark_prices = {asset_key_from_broker_symbol(p.asset_class, p.symbol): p.current_price for p in positions}
-        snapshot = await build_portfolio_snapshot(
-            s.repositories, cash_balance=account.cash, account_equity=account.equity,
-            broker_prev_close_equity=account.last_equity, mark_prices=mark_prices,
-        )
+        try:
+            snapshot = await marked_snapshot(s.repositories, account, positions)
+        except (ValueError, TypeError, KeyError, ArithmeticError) as exc:
+            raise HTTPException(status_code=503, detail="POSITION_VALUATION_INVALID") from exc
         return _json(snapshot)
 
     @app.get("/api/pnl")

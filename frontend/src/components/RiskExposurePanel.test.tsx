@@ -24,7 +24,7 @@ function position(overrides: Partial<EnrichedPosition['position']> = {}, contrac
       symbol: 'AAPL', asset_class: 'equity', qty: '10', avg_entry_price: '100', market_value: '1000',
       current_price: '100', unrealized_pl: '0', ...overrides,
     },
-    stop_loss: null, target_price: null, contract_multiplier,
+    initial_stop: null, active_stop: null, target_price: null, contract_multiplier,
   }
 }
 

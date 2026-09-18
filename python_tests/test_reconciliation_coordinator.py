@@ -673,7 +673,7 @@ async def test_position_reconciliation_survives_more_than_one_page_of_other_asse
 
     records = await repositories.reconciliation_records.list_all()
     payloads = [hydrate("reconciliation_records", r["payload"]) for r in records]
-    aapl_records = [p for p in payloads if p.subject_id == "AAPL"]
+    aapl_records = [p for p in payloads if p.subject_id == asset_identity_key(_aapl())]
     assert len(aapl_records) == 1
     assert aapl_records[0].outcome == ReconciliationOutcome.MATCHED
 

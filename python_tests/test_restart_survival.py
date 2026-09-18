@@ -77,7 +77,7 @@ async def _fresh_gateway(db_url: str):
 
 def _mock_account(cash: str = "50000", equity: str = "100000") -> None:
     respx.get("https://paper-api.alpaca.markets/v2/account").mock(
-        return_value=httpx.Response(200, json={"equity": equity, "last_equity": "99500", "cash": cash, "buying_power": equity, "portfolio_value": equity})
+        return_value=httpx.Response(200, json={"equity": equity, "last_equity": "99500", "cash": cash, "buying_power": equity, "portfolio_value": equity, "long_market_value": str(Decimal(equity)-Decimal(cash)), "short_market_value": "0"})
     )
 
 
@@ -325,7 +325,7 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
     db_url = f"sqlite:///{tmp_path}/test.db"
     universe = ExecutableUniverse(equities=frozenset({"AAPL"}), crypto=frozenset())
 
-    _mock_account()
+    _mock_account(cash="100000")
     _mock_positions()  # no position yet -- Process A's buy is opening a fresh one
     _mock_quote()
     _mock_market_open()
@@ -440,14 +440,13 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
     assert reconcile_summary.accounting_drift_detected == 0
     assert reconcile_summary.missed_fills_detected == 0
 
-    # No position record at all: with the position fully closed everywhere
-    # (broker, lots, and holding all show zero exposure), there's nothing to
-    # reconcile for that symbol -- only the two fill matches are expected.
+    # Closed lots require an explicit broker-zero comparison. The scan valuation,
+    # two fills, and canonical closed-position receipt all survive restart.
     records = await repositories_c.reconciliation_records.list_all()
     payloads = [hydrate("reconciliation_records", r["payload"]) for r in records]
-    assert len(payloads) == 2
+    assert len(payloads) == 4
     assert all(p.outcome == ReconciliationOutcome.MATCHED for p in payloads)
-    assert all(p.reconciliation_type == "fill" for p in payloads)
+    assert sorted(p.reconciliation_type for p in payloads) == ["equity", "fill", "fill", "position"]
 
 
 @respx.mock

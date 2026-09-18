@@ -30,13 +30,30 @@ class PortfolioSnapshot:
     trades_today: int
     daily_pnl_pct: Decimal
     source: SnapshotSource
+    valuation_version: int = 1
+    holdings_cost_basis: Decimal | None = None
+    sector_cost_basis: Mapping[str, Decimal] = field(default_factory=dict)
+    broker_equity_components: Mapping[str, Decimal] = field(default_factory=dict)
+    equity_reconciliation_status: str | None = None
+    equity_reconciliation_difference: Decimal | None = None
+    valuation_errors: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "snapshot_id", require_text(self.snapshot_id, "snapshot_id"))
         object.__setattr__(self, "as_of", require_aware(self.as_of, "as_of"))
         object.__setattr__(self, "total_equity", decimal_value(self.total_equity, "total_equity", nonnegative=True))
-        object.__setattr__(self, "cash_balance", decimal_value(self.cash_balance, "cash_balance", nonnegative=True))
-        object.__setattr__(self, "holdings_value", decimal_value(self.holdings_value, "holdings_value", nonnegative=True))
+        if self.valuation_version not in (1, 2):
+            raise ValueError("unknown snapshot valuation version")
+        object.__setattr__(self, "cash_balance", decimal_value(self.cash_balance, "cash_balance", nonnegative=self.valuation_version == 1))
+        object.__setattr__(self, "holdings_value", decimal_value(self.holdings_value, "holdings_value", nonnegative=self.valuation_version == 1))
+        for name in ("holdings_cost_basis", "equity_reconciliation_difference"):
+            if getattr(self, name) is not None:
+                object.__setattr__(self, name, decimal_value(getattr(self, name), name))
+        for name in ("sector_cost_basis", "broker_equity_components"):
+            object.__setattr__(self, name, immutable_metadata({k: decimal_value(v, k) for k, v in getattr(self, name).items()}))
+        if self.valuation_version == 2 and (self.equity_reconciliation_status not in ("matched", "failed") or (self.equity_reconciliation_status == "matched" and self.holdings_cost_basis is None)):
+            raise ValueError("marked snapshots require cost basis and explicit reconciliation status")
+        object.__setattr__(self, "valuation_errors", tuple(self.valuation_errors))
         object.__setattr__(self, "sector_exposure", immutable_metadata(self.sector_exposure))
         for name in ("open_positions", "outstanding_orders", "trades_today"):
             if getattr(self, name) < 0:

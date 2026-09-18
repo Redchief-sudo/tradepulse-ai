@@ -27,12 +27,8 @@ export function PositionsPanel() {
           </thead>
           <tbody>
             {data.map((row) => {
-              const qty = Number(row.position.qty)
-              const avgEntry = Number(row.position.avg_entry_price)
-              const current = Number(row.position.current_price)
-              const marketValue = qty * current
-              const costBasis = qty * avgEntry
-              const unrealizedPct = costBasis !== 0 ? (Number(row.position.unrealized_pl) / costBasis) * 100 : null
+              const marketValue = row.position.market_value
+              const unrealizedPct = row.unrealized_pct == null ? null : Number(row.unrealized_pct)
               const pnlTone = Number(row.position.unrealized_pl) >= 0 ? 'positive' : 'negative'
               return (
                 <tr key={row.position.symbol} data-asset-class={row.position.asset_class} className="asset-class-row">
@@ -52,7 +48,7 @@ export function PositionsPanel() {
                   <td className={`num ${unrealizedPct !== null ? (unrealizedPct >= 0 ? 'positive' : 'negative') : ''}`}>
                     {unrealizedPct !== null ? pct(unrealizedPct) : '—'}
                   </td>
-                  <td className="num">{money(row.stop_loss)}</td>
+                  <td className="num">{money(row.active_stop)}</td>
                   <td className="num">{money(row.target_price)}</td>
                 </tr>
               )

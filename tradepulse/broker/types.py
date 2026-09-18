@@ -29,6 +29,7 @@ class AlpacaAccount:
     cash: Decimal
     buying_power: Decimal
     portfolio_value: Decimal
+    equity_components: Mapping[str, Decimal] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +41,7 @@ class AlpacaPosition:
     market_value: Decimal
     current_price: Decimal
     unrealized_pl: Decimal
+    cost_basis: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)

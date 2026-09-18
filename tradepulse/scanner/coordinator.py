@@ -59,7 +59,13 @@ from tradepulse.models import (
     asset_identity_key,
     contract_multiplier_of,
 )
-from tradepulse.persistence import PersistenceRepositories, hydrate, list_all_by_statuses, paginate_all_rows, run_with_lock_renewal
+from tradepulse.persistence import (
+    PersistenceRepositories,
+    hydrate,
+    list_all_by_statuses,
+    paginate_all_rows,
+    run_with_lock_renewal,
+)
 from tradepulse.providers import (
     AIProvider,
     AlpacaMarketDataProvider,
@@ -70,7 +76,7 @@ from tradepulse.providers import (
     ProviderHttpFailure,
     build_scan_request,
 )
-from tradepulse.risk import build_portfolio_snapshot, load_session, sync_market_session
+from tradepulse.risk import load_session, sync_market_session
 from tradepulse.strategy import (
     Calendar,
     ExecutableUniverse,
@@ -86,6 +92,7 @@ from tradepulse.strategy import (
     signal_from_composite,
     weighted_composite,
 )
+from tradepulse.valuation import marked_snapshot, record_valuation
 
 logger = logging.getLogger(__name__)
 
@@ -605,11 +612,14 @@ async def run_scan_cycle(
     # check_max_drawdown() has to search for a historical peak. Without this,
     # equity_snapshots stays permanently empty and drawdown protection can
     # never trip (drawdown against an empty history is always 0%).
-    equity_snapshot = await build_portfolio_snapshot(
-        repositories, cash_balance=account.cash, account_equity=account.equity,
-        broker_prev_close_equity=account.last_equity, now=now,
-    )
-    await repositories.equity_snapshots.create_once(equity_snapshot.snapshot_id, equity_snapshot)
+    try:
+        positions = await broker.get_positions()
+        equity_snapshot = await marked_snapshot(repositories, account, positions, now=now)
+        await record_valuation(repositories, equity_snapshot)
+        await repositories.equity_snapshots.create_once(equity_snapshot.snapshot_id, equity_snapshot)
+    except Exception as exc:  # noqa: BLE001 - valuation failure must not kill the scan worker
+        await _finish(ScanRunStatus.FAILED, candidates_discovered=len(candidates), error=f"VALUATION_UNAVAILABLE: {exc}")
+        return ScanCycleSummary(scan_run_id, ScanRunStatus.FAILED, len(candidates), 0, 0, [], error=f"VALUATION_UNAVAILABLE: {exc}")
 
     notional_budget = (risk_limits.max_position_pct / 100) * account.equity
 

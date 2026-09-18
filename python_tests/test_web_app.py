@@ -188,7 +188,8 @@ async def test_get_positions_cross_references_local_holding_stop_loss(tmp_path) 
     body = response.json()
     assert len(body) == 1
     assert body[0]["position"]["symbol"] == "AAPL"
-    assert body[0]["stop_loss"] == "140"
+    assert body[0]["initial_stop"] == "140"
+    assert body[0]["active_stop"] == "140"
 
 
 @respx.mock
@@ -612,3 +613,42 @@ async def test_get_risk_exposure_uses_live_mark_price_not_cost_basis(tmp_path) -
     assert response.status_code == 200
     body = response.json()
     assert Decimal(body["holdings_value"]) == Decimal("2000")  # 10 * 200 (live mark), not 10 * 150 (cost basis)
+
+
+@respx.mock
+async def test_active_stop_preserves_original_and_exact_precision(tmp_path) -> None:
+    client, state = await _client_for(tmp_path)
+    holding = Holding(asset=_aapl(), quantity=Decimal('50.303'), average_price=Decimal('317.104097'),
+                      updated_at=NOW, stop_loss=Decimal('305.96'), current_stop=Decimal('319.4384280853317375'))
+    key = asset_identity_key(_aapl())
+    await state.repositories.holdings.create_once(key, holding)
+    _mock_positions({'symbol': 'AAPL', 'asset_class': 'us_equity', 'qty': '50.303',
+                     'avg_entry_price': '317.104097', 'market_value': '16919.96308',
+                     'cost_basis': '15951.28742', 'current_price': '336.36', 'unrealized_pl': '968.67566'})
+    before = await state.repositories.holdings.get(key)
+    response = await client.get('/api/positions')
+    assert response.status_code == 200
+    row = response.json()[0]
+    assert row['initial_stop'] == '305.96'
+    assert row['active_stop'] == '319.4384280853317375'
+    assert await state.repositories.holdings.get(key) == before
+    await client.aclose()
+    await state.broker.aclose()
+
+
+@respx.mock
+async def test_malformed_active_stop_is_visible_error(tmp_path) -> None:
+    client, state = await _client_for(tmp_path)
+    holding = Holding(asset=_aapl(), quantity=Decimal(10), average_price=Decimal(150), updated_at=NOW, stop_loss=Decimal(140))
+    key = asset_identity_key(_aapl())
+    await state.repositories.holdings.create_once(key, holding)
+    payload = dict((await state.repositories.holdings.get(key))['payload'])
+    payload['current_stop'] = 'not-a-decimal'
+    await state.repositories.holdings.update(key, payload)
+    _mock_positions({'symbol': 'AAPL', 'asset_class': 'us_equity', 'qty': '10', 'avg_entry_price': '150',
+                     'market_value': '1550', 'current_price': '155', 'unrealized_pl': '50'})
+    response = await client.get('/api/positions')
+    assert response.status_code == 503
+    assert response.json()['detail'] == 'POSITION_DATA_INVALID: AAPL'
+    await client.aclose()
+    await state.broker.aclose()

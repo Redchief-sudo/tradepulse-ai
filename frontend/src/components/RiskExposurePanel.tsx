@@ -62,6 +62,7 @@ export function RiskExposurePanel() {
     <Panel title="Risk Exposure" error={error} loading={loading}>
       {data && (
         <>
+          {data.equity_reconciliation_status === 'failed' && <p role="alert">Valuation reconciliation failed: {data.valuation_errors?.join(', ')}</p>}
           <dl className="kv">
             <dt>Total equity</dt>
             <dd>{money(data.total_equity)}</dd>
