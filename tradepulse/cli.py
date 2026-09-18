@@ -785,7 +785,7 @@ async def _open_browser_when_ready(
         logger.warning("run_browser_open_failed", extra={"event": "run_browser_open_failed", "error": str(exc)})
 
 
-async def _run_application(settings: Settings, port: int, open_browser: bool) -> int:
+async def _run_application(settings: Settings, port: int, open_browser: bool, *, verification: Any | None = None) -> int:
     """`tradepulse run`: the normal one-command interactive startup -- opens
     the local dashboard, activates the trading session, and keeps the
     equity/crypto/option scan lanes, position monitor, and settlement
@@ -817,6 +817,7 @@ async def _run_application(settings: Settings, port: int, open_browser: bool) ->
         server = _build_dashboard_server(dashboard_state, port, settings.log_level)
 
         shutdown = asyncio.Event()
+        verification_task = asyncio.create_task(verification.watch(shutdown)) if verification is not None else None
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, shutdown.set)
@@ -874,6 +875,8 @@ async def _run_application(settings: Settings, port: int, open_browser: bool) ->
         if trading_task is not None:
             await trading_task
         await dashboard_task
+        if verification_task is not None:
+            await verification_task
         return 0
 
     owner_token = str(uuid4())
@@ -903,7 +906,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers.add_parser("monitor", help="run one stop/target position-protection pass and exit")
     subparsers.add_parser("settle", help="drain any due settlement retries and exit")
-    subparsers.add_parser("reconcile", help="run one reconciliation pass against Alpaca's real state and exit")
+    reconcile_parser = subparsers.add_parser("reconcile", help="run one reconciliation pass against Alpaca's real state and exit")
+    reconcile_parser.add_argument("--verification-generation", help="verify the bound paper generation before and after reconciliation")
     subparsers.add_parser("start", help="activate the trading session (refuses from RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED/SYSTEM_DEGRADED/MARKET_CLOSED)")
     subparsers.add_parser("stop", help="deactivate the trading session (never downgrades an active safety block)")
     subparsers.add_parser("status", help="report the current trading session state and exit")
@@ -925,6 +929,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--port", type=int, default=8000, help="port to bind the dashboard on 127.0.0.1 (default: 8000)")
     run_parser.add_argument("--no-browser", action="store_true", help="don't automatically open the dashboard in a browser")
+    run_parser.add_argument("--verification-generation", help="require the frozen official paper-verification generation")
+    from tradepulse.verification.commands import add_parser as add_verification_parser
+    add_verification_parser(subparsers)
     subparsers.add_parser(
         "provenance",
         help="print TradePulse ownership/build-provenance metadata (creator, copyright, version, git commit, "
@@ -1026,7 +1033,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     configure_logging(settings.log_level)
 
+    from tradepulse.verification.commands import command as verification_command, permit_command, run_official
+    generation = getattr(args, "verification_generation", None)
+    if not permit_command(settings, args.command, generation):
+        return 1
+
     try:
+        if args.command == "verification":
+            return asyncio.run(verification_command(settings, args))
+        if args.command == "reconcile" and generation is not None:
+            return asyncio.run(run_official(settings, generation, lambda verification: _run_reconcile(settings)))
         if args.command == "reset-integrity":
             return asyncio.run(_run_reset_integrity(settings, force=args.force))
         if args.command == "scan":
@@ -1034,6 +1050,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "dashboard":
             return asyncio.run(_run_dashboard(settings, args.port))
         if args.command == "run":
+            if generation is not None:
+                return asyncio.run(run_official(
+                    settings, generation,
+                    lambda verification: _run_application(settings, args.port, not args.no_browser, verification=verification),
+                ))
             return asyncio.run(_run_application(settings, args.port, not args.no_browser))
         return asyncio.run(_COMMANDS[args.command](settings))
     except (SettingsError, MarketDataCapabilityError) as exc:
