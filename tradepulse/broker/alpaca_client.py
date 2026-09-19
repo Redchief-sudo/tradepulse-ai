@@ -456,6 +456,7 @@ class AlpacaClient:
     ) -> list[AlpacaActivity]:
         activities: list[AlpacaActivity] = []
         page_token: str | None = None
+        seen_tokens: set[str] = set()
         while True:
             params: dict[str, str] = {"activity_types": activity_type, "page_size": str(page_size), "direction": "asc"}
             if since is not None:
@@ -466,7 +467,8 @@ class AlpacaClient:
             if not response.is_success:
                 raise_alpaca_error(response, "getActivities")
             page = response.json()
-            page = page if isinstance(page, list) else []
+            if not isinstance(page, list):
+                raise AlpacaDataIntegrityError("activities response is not a list")
             for row in page:
                 side_raw = str(row.get("side") or "").lower()
                 side = Side.BUY if side_raw in ("buy", "buy_to_cover") else Side.SELL if side_raw in ("sell", "sell_short") else None
@@ -490,8 +492,9 @@ class AlpacaClient:
             if len(page) < page_size:
                 break
             page_token = str(page[-1].get("id") or "")
-            if not page_token:
-                break
+            if not page_token or page_token in seen_tokens:
+                raise AlpacaDataIntegrityError("activities pagination is incomplete or repeated")
+            seen_tokens.add(page_token)
         return activities
 
     def _parse_order_response(self, response: httpx.Response) -> AlpacaOrderResponse:

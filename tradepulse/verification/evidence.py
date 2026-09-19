@@ -111,6 +111,42 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
             problems.append("settlement_fill_mismatch")
     if settlements.keys() - fills.keys() or allocated.keys() - fills.keys():
         problems.append("missing_authoritative_fill")
+    fee_allocations = defaultdict(dict)
+    fee_basis = defaultdict(lambda: Decimal(0))
+    for lot in rows["position_lots"]:
+        for fee_id, quantity in lot.get("asset_fee_quantities", {}).items():
+            amount = number(quantity)
+            if amount <= 0:
+                problems.append("asset_fee_quantity_invalid")
+            fee_allocations[fee_id][lot["lot_id"]] = amount
+            fee_basis[fee_id] += amount * number(lot["acquisition_price"])
+    fee_receipts = {}
+    valid_fee_receipts = set()
+    lots_by_id = {lot["lot_id"]: lot for lot in rows["position_lots"]}
+    from tradepulse.models import asset_identity_key
+    from tradepulse.persistence import hydrate
+    from tradepulse.reconciliation.asset_fees import parse_asset_fee
+    for row in rows["reconciliation_records"]:
+        if row["reconciliation_type"] != "asset_fee" or row["record_id"] != "asset_fee:" + row["subject_id"]:
+            continue
+        try:
+            fee = parse_asset_fee(row["actual"]["activity"])
+            allocations = {key: number(value) for key, value in row["actual"]["allocations"].items()}
+            if (fee.activity_id in fee_receipts or fee.activity_id != row["subject_id"]
+                    or row["outcome"] != "corrected" or not start <= fee.occurred_at <= now
+                    or row["actual"]["asset_key"] != asset_identity_key(fee.asset)
+                    or allocations != fee_allocations[fee.activity_id]
+                    or any(asset_identity_key(hydrate("fills", fills[lots_by_id[lid]["originating_fill_id"]]).asset) != asset_identity_key(fee.asset) for lid in allocations)
+                    or sum(allocations.values(), Decimal(0)) != fee.quantity
+                    or fee_basis[fee.activity_id] != number(row["actual"]["cost_basis_debit"])):
+                problems.append("asset_fee_receipt_mismatch")
+            else:
+                valid_fee_receipts.add(fee.activity_id)
+            fee_receipts[fee.activity_id] = fee
+        except (ValueError, KeyError, TypeError, ArithmeticError):
+            problems.append("asset_fee_receipt_invalid")
+    if fee_allocations.keys() != fee_receipts.keys():
+        problems.append("asset_fee_receipt_missing")
     expected = {(lot["lot_id"], fid) for lot in rows["position_lots"] for fid in lot["closures"]}
     missing = len(expected - attrs.keys())
     duplicates = sum(max(0, len(items) - 1) for items in attrs.values())
@@ -206,7 +242,10 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
             opening = fills[lot["originating_fill_id"]]
             if not settled(settlements.get(opening["fill_id"])):
                 valid = False
-            if sum((number(q) for q in lot["closures"].values()), Decimal(0)) != number(lot["opened_quantity"]):
+            if any(fee_id not in valid_fee_receipts for fee_id in lot.get("asset_fee_quantities", {})):
+                valid = False
+            asset_fee_quantity = sum((number(q) for q in lot.get("asset_fee_quantities", {}).values()), Decimal(0))
+            if sum((number(q) for q in lot["closures"].values()), Decimal(0)) + asset_fee_quantity != number(lot["opened_quantity"]):
                 problems.append("lot_closure_quantity_mismatch")
                 valid = False
             from tradepulse.models import contract_multiplier_of
@@ -234,7 +273,7 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
             if lot_pnl != number(lot["realized_pnl"]):
                 problems.append("attribution_pnl_mismatch")
                 valid = False
-            gross += lot_pnl
+            gross += lot_pnl - asset_fee_quantity * number(lot["acquisition_price"])
         if valid:
             population.append(intent_id)
             if cost_rate is not None:

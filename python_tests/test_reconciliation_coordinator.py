@@ -309,7 +309,7 @@ async def test_two_positions_sharing_ticker_text_across_asset_classes_reconcile_
 
     records = await repositories.reconciliation_records.list_all()
     payloads = [hydrate("reconciliation_records", r["payload"]) for r in records]
-    matched = [p for p in payloads if p.outcome == ReconciliationOutcome.MATCHED]
+    matched = [p for p in payloads if p.outcome == ReconciliationOutcome.MATCHED and p.reconciliation_type.startswith("position")]
     drifted = [p for p in payloads if p.outcome == ReconciliationOutcome.DRIFT_DETECTED]
     assert len(matched) == 1  # the equity AAPL, untouched by the crypto AAPL's drift
     assert len(drifted) == 1

@@ -70,6 +70,7 @@ from tradepulse.settlement import SettlementProcessor
 from tradepulse.settlement.stages import retry_delay_seconds
 
 from ..execution.fill_attribution import resolve_order_from_broker
+from .asset_fees import reconcile_asset_fees
 
 _OPEN_LOT_STATUSES = ("open", "partially_closed")
 _FILL_MATCH_WINDOW_SECONDS = 300
@@ -475,6 +476,12 @@ async def run_reconciliation(
     lease_lost: asyncio.Event | None = None,
 ) -> ReconciliationSummary:
     now = clock()
+    try:
+        if not await reconcile_asset_fees(repositories, broker, now=now, lease_lost=lease_lost):
+            return ReconciliationSummary("degraded", error="ASSET_FEE_RECONCILIATION_FAILED")
+    except Exception as exc:  # noqa: BLE001 - preserve the caller when fee evidence cannot be persisted
+        await alerts.send("critical", f"Asset-fee reconciliation unavailable: {exc}", {})
+        return ReconciliationSummary("degraded", error=f"ASSET_FEE_RECONCILIATION_UNAVAILABLE: {exc}")
     try:
         positions_checked, view_drift_corrected, accounting_drift_detected = await _reconcile_positions(
             repositories, broker, alerts, now, lease_lost

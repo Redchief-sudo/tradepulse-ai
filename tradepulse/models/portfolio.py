@@ -79,6 +79,10 @@ class PositionLot:
     mfe_price: Decimal | None = None
     mae_price: Decimal | None = None
 
+    # Authoritative asset-fee activity ID -> units debited from this lot.
+    # These are inventory expenses, not executions or fabricated closing fills.
+    asset_fee_quantities: Mapping[str, Decimal] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         if self.position_side not in ("long", "short"):
             raise ValueError("position_side must be 'long' or 'short'")
@@ -89,6 +93,11 @@ class PositionLot:
         object.__setattr__(self, "acquisition_price", decimal_value(self.acquisition_price, "acquisition_price", positive=True))
         object.__setattr__(self, "opened_at", require_aware(self.opened_at, "opened_at"))
         object.__setattr__(self, "closures", immutable_metadata(self.closures))
+        fees = {require_text(k, "asset_fee_id"): decimal_value(v, "asset_fee_quantity", positive=True)
+                for k, v in self.asset_fee_quantities.items()}
+        object.__setattr__(self, "asset_fee_quantities", immutable_metadata(fees))
+        if fees and self.remaining_quantity + sum(self.closures.values(), Decimal(0)) + sum(fees.values(), Decimal(0)) != self.opened_quantity:
+            raise ValueError("asset fee lot quantity is not conserved")
         object.__setattr__(self, "realized_pnl", decimal_value(self.realized_pnl, "realized_pnl"))
         if self.mfe_price is not None:
             object.__setattr__(self, "mfe_price", decimal_value(self.mfe_price, "mfe_price", positive=True))

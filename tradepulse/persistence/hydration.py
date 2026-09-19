@@ -252,6 +252,7 @@ def decode_position_lot(d: Mapping[str, Any]) -> PositionLot:
         acquisition_price=_decimal(d["acquisition_price"]),
         opened_at=_datetime(d["opened_at"]),
         closures={k: _decimal(v) for k, v in (d.get("closures") or {}).items()},
+        asset_fee_quantities={k: _decimal(v) for k, v in d.get("asset_fee_quantities", {}).items()},
         realized_pnl=_decimal(d.get("realized_pnl", "0")),
         mfe_price=_decimal_or_none(d.get("mfe_price")),
         mae_price=_decimal_or_none(d.get("mae_price")),
