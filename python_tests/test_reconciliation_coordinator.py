@@ -310,7 +310,7 @@ async def test_two_positions_sharing_ticker_text_across_asset_classes_reconcile_
     records = await repositories.reconciliation_records.list_all()
     payloads = [hydrate("reconciliation_records", r["payload"]) for r in records]
     matched = [p for p in payloads if p.outcome == ReconciliationOutcome.MATCHED and p.reconciliation_type.startswith("position")]
-    drifted = [p for p in payloads if p.outcome == ReconciliationOutcome.DRIFT_DETECTED]
+    drifted = [p for p in payloads if p.outcome == ReconciliationOutcome.DRIFT_DETECTED and p.reconciliation_type.startswith("position")]
     assert len(matched) == 1  # the equity AAPL, untouched by the crypto AAPL's drift
     assert len(drifted) == 1
 
@@ -705,3 +705,34 @@ async def test_fill_reconciliation_survives_more_than_one_page_of_fills_outside_
     fill_records = [p for p in payloads if p.reconciliation_type == "fill"]
     assert len(fill_records) == 1
     assert fill_records[0].outcome == ReconciliationOutcome.MATCHED
+
+
+@respx.mock
+async def test_known_accepted_order_recovers_fill_older_than_daily_lookback(tmp_path):
+    """The V failure: an accepted order outlives the one-day fill query."""
+    from dataclasses import replace
+    from datetime import timedelta
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    await _seed_intent(repositories, trade_intent_id='old-intent', broker_order_id='old-order')
+    intent = hydrate('trade_intents', (await repositories.trade_intents.get('old-intent'))['payload'])
+    intent = replace(intent, created_at=NOW-timedelta(days=5))
+    await repositories.trade_intents.update(intent.trade_intent_id, intent, status=intent.status.value)
+    order = {**_order_json('filled', '5', '150', 'old-order'), 'client_order_id': 'old-intent'}
+    respx.get('https://paper-api.alpaca.markets/v2/orders/old-order').mock(return_value=httpx.Response(200, json=order))
+    raw = _activity_json('aged-fill', '5', '150', NOW-timedelta(days=4), order_id='old-order')
+    def activities(request):
+        after = datetime.fromisoformat(request.url.params['after']) if 'after' in request.url.params else NOW-timedelta(days=10)
+        return httpx.Response(200, json=[raw] if after < NOW-timedelta(days=4) else [])
+    respx.get('https://paper-api.alpaca.markets/v2/account/activities').mock(side_effect=activities)
+    _mock_positions([_position_json('5')])
+    summary = await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    assert summary.status == 'ok'
+    assert summary.accounting_drift_detected == 0
+    assert (await repositories.trade_intents.get('old-intent'))['status'] == 'filled'
+    assert (await repositories.holdings.get(asset_identity_key(_aapl())))['payload']['quantity'] == '5'
+    assert (await repositories.settlements.get('aged-fill'))['status'] == 'completed'
+    assert len(await repositories.fills.list_all()) == 1
+    await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    assert len(await repositories.fills.list_all()) == 1
+    await broker.aclose()

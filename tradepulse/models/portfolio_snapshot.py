@@ -37,6 +37,11 @@ class PortfolioSnapshot:
     equity_reconciliation_status: str | None = None
     equity_reconciliation_difference: Decimal | None = None
     valuation_errors: tuple[str, ...] = ()
+    position_value_observation_difference: Decimal | None = None
+    position_value_observation_status: str | None = None
+    valuation_observation_times: Mapping[str, str] = field(default_factory=dict)
+    accounting_states: Mapping[str, str] = field(default_factory=dict)
+    reconciliation_results: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "snapshot_id", require_text(self.snapshot_id, "snapshot_id"))
@@ -46,13 +51,21 @@ class PortfolioSnapshot:
             raise ValueError("unknown snapshot valuation version")
         object.__setattr__(self, "cash_balance", decimal_value(self.cash_balance, "cash_balance", nonnegative=self.valuation_version == 1))
         object.__setattr__(self, "holdings_value", decimal_value(self.holdings_value, "holdings_value", nonnegative=self.valuation_version == 1))
-        for name in ("holdings_cost_basis", "equity_reconciliation_difference"):
+        for name in ("holdings_cost_basis", "equity_reconciliation_difference", "position_value_observation_difference"):
             if getattr(self, name) is not None:
                 object.__setattr__(self, name, decimal_value(getattr(self, name), name))
         for name in ("sector_cost_basis", "broker_equity_components"):
             object.__setattr__(self, name, immutable_metadata({k: decimal_value(v, k) for k, v in getattr(self, name).items()}))
-        if self.valuation_version == 2 and (self.equity_reconciliation_status not in ("matched", "failed") or (self.equity_reconciliation_status == "matched" and self.holdings_cost_basis is None)):
-            raise ValueError("marked snapshots require cost basis and explicit reconciliation status")
+        if self.valuation_version == 2 and self.equity_reconciliation_status not in ("matched", "failed"):
+            raise ValueError("marked snapshots require explicit equity reconciliation status")
+        if self.position_value_observation_status not in (None, 'unavailable',
+                'equal_uncoordinated_observations', 'different_uncoordinated_observations'):
+            raise ValueError('unknown position observation status')
+        for value in self.valuation_observation_times.values():
+            require_aware(datetime.fromisoformat(value), 'valuation_received_at')
+        object.__setattr__(self, 'valuation_observation_times', immutable_metadata(self.valuation_observation_times))
+        object.__setattr__(self, 'accounting_states', immutable_metadata(self.accounting_states))
+        object.__setattr__(self, 'reconciliation_results', immutable_metadata(self.reconciliation_results))
         object.__setattr__(self, "valuation_errors", tuple(self.valuation_errors))
         object.__setattr__(self, "sector_exposure", immutable_metadata(self.sector_exposure))
         for name in ("open_positions", "outstanding_orders", "trades_today"):

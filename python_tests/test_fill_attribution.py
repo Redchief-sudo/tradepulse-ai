@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -86,10 +87,11 @@ def _mock_activities(activities: list[dict]) -> None:
     respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(return_value=httpx.Response(200, json=activities))
 
 
-def _activity_json(activity_id: str, qty: str, price: str, order_id: str = "order-1") -> dict:
+def _activity_json(activity_id: str, qty: str, price: str, order_id: str = "order-1", **extra) -> dict:
     return {
         "id": activity_id, "activity_type": "FILL", "symbol": "AAPL", "side": "buy",
         "qty": qty, "price": price, "transaction_time": NOW.isoformat().replace("+00:00", "Z"), "order_id": order_id,
+        **extra,
     }
 
 
@@ -160,6 +162,36 @@ async def test_replaying_an_already_fully_settled_fill_does_not_duplicate_or_dis
     assert second.quantity == Decimal("10")
     assert len(await repositories.fills.list_all()) == 1
     assert len(await repositories.settlements.list_all()) == 1
+
+
+@respx.mock
+async def test_fill_persists_observed_cost_and_execution_evidence(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    intent = replace(
+        _intent(), submitted_at=NOW, order_type="limit",
+        risk_snapshot={
+            "entry_price": "150", "reference_bid": "149.90", "reference_ask": "150.10",
+            "reference_observed_at": NOW.isoformat(),
+        },
+    )
+
+    _mock_activities([_activity_json("act-1", "10", "150.25", fee="0.37", fee_currency="USD")])
+    attributed = await attribute_order_fills(repositories, broker, _alerts(), intent, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert attributed.quantity == Decimal("10")
+    fill = hydrate("fills", (await repositories.fills.get("act-1"))["payload"])
+    assert fill.fees == Decimal("0.37")
+    assert fill.fee_currency == "USD"
+    assert fill.fee_source == "broker_activity"
+    assert fill.slippage == Decimal("0.25")
+    assert fill.reference_bid == Decimal("149.90")
+    assert fill.reference_ask == Decimal("150.10")
+    assert fill.submitted_at == NOW
+    assert fill.order_type == "limit"
+    settlement = hydrate("settlements", (await repositories.settlements.get("act-1"))["payload"])
+    assert settlement.fees == Decimal("0.37")
 
 
 @respx.mock
@@ -303,6 +335,8 @@ async def test_verification_pending_hold_is_cleared_by_a_later_successful_consis
     repositories = await _repositories(tmp_path)
     broker = _broker()
     intent = _intent()
+    await repositories.trade_intents.create_once(intent.trade_intent_id, intent,
+        status=intent.status.value, unique_value=intent.idempotency_key)
 
     _mock_activities([_activity_json("act-1", "10", "150")])
     _mock_order_error("order-1")

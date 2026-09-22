@@ -288,6 +288,8 @@ class ExecutionGateway:
                 sector=request.sector,
                 stop_loss=request.stop_loss,
                 target_price=request.target_price,
+                order_type=request.order_type,
+                signal_timestamp=request.signal_timestamp,
                 status=TradeIntentStatus.PROPOSED,
             )
             if existing is None:
@@ -300,6 +302,7 @@ class ExecutionGateway:
             snapshot = await build_portfolio_snapshot(
                 self._repositories, cash_balance=account.cash, account_equity=account.equity,
                 broker_prev_close_equity=account.last_equity, mark_prices=mark_prices, now=now,
+                broker_positions=positions_by_key,
             )
 
             max_drawdown_breached = False
@@ -348,6 +351,12 @@ class ExecutionGateway:
                 "reasons": list(risk.reasons),
                 "confidence": str(request.confidence) if request.confidence is not None else None,
                 "entry_price": str(quote.price),
+                "reference_bid": str(quote.bid),
+                "reference_ask": str(quote.ask),
+                "reference_observed_at": quote.observed_at.isoformat(),
+                "estimated_slippage_pct": str(quote.estimated_slippage_pct),
+                "order_type": request.order_type,
+                "signal_timestamp": request.signal_timestamp,
                 "stop_loss": str(request.stop_loss) if request.stop_loss is not None else None,
                 "contract_multiplier": str(risk_input.contract_multiplier),
                 "requested_quantity": str(request.requested_quantity),
@@ -440,6 +449,27 @@ class ExecutionGateway:
                 await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
                 return ExecutionResult("rejected", trade_intent_id, ["EXECUTION_RESERVATION_LOST"], Decimal("0"), None)
 
+        if request.asset.asset_class == AssetClass.CRYPTO:
+            from tradepulse.reconciliation.epochs import AccountingEpochPending, reserve_epoch
+            # Re-read immediately before submitting a protective order. An
+            # intervening fee must never leave an exit above broker inventory.
+            if protective_exit:
+                try:
+                    fresh = await self._broker.get_positions()
+                    matched = [p for p in fresh if asset_key_from_broker_symbol(p.asset_class, p.symbol)
+                               == asset_identity_key(request.asset)]
+                    if len(matched) != 1 or risk.approved_quantity > abs(matched[0].qty):
+                        return ExecutionResult("skipped", trade_intent_id, ["BROKER_EXIT_QUANTITY_CHANGED"], Decimal(0), None)
+                    held_quantity = matched[0].qty
+                except (AlpacaError, AlpacaDataIntegrityError, httpx.HTTPError) as exc:
+                    return ExecutionResult("skipped", trade_intent_id, [f"BROKER_POSITIONS_UNAVAILABLE: {exc}"], Decimal(0), None)
+            try:
+                await reserve_epoch(self._repositories, approved, held_quantity, protective=protective_exit, now=now)
+            except AccountingEpochPending as exc:
+                rejected = replace(approved, status=TradeIntentStatus.REJECTED, rejection_reason=str(exc))
+                await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
+                return ExecutionResult("rejected", trade_intent_id, [str(exc)], Decimal(0), None)
+
         order_request = AlpacaOrderRequest(
             symbol=request.asset.symbol, qty=risk.approved_quantity, side=request.side,
             order_type=request.order_type, time_in_force=default_time_in_force(request.asset.asset_class),
@@ -462,7 +492,10 @@ class ExecutionGateway:
             # from this error alone. Never assume rejection or resubmit.
             return await self._recover_unknown_submission(submitted, exc)
 
-        accepted = replace(submitted, status=TradeIntentStatus.ACCEPTED, broker_order_id=placed.broker_order_id, client_order_id=trade_intent_id)
+        accepted = replace(
+            submitted, status=TradeIntentStatus.ACCEPTED, broker_order_id=placed.broker_order_id,
+            client_order_id=trade_intent_id, submitted_at=placed.submitted_at or self._clock(),
+        )
         await self._repositories.trade_intents.update(trade_intent_id, accepted, status=accepted.status.value)
 
         return await self._poll_and_settle(accepted)

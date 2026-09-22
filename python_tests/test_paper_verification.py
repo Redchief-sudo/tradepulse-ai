@@ -145,7 +145,7 @@ COSTS = {"fee_bps": "1", "slippage_bps": "1"}
 ASSET = {"symbol": "X", "asset_class": "equity", "native_asset_id": "alpaca:X", "venue": None, "metadata": {}}
 
 
-def passing_rows(count=200, wins=120):
+def passing_rows(count=200, wins=120, *, merge_first=False, partial_first=False):
     rows = {table: [] for table in TABLES}
     for i in range(count):
         buy, sell, lot_id, intent = f"b{i}", f"s{i}", f"lot{i}", f"intent{i}"
@@ -192,7 +192,75 @@ def passing_rows(count=200, wins=120):
                     "open_positions": 0, "outstanding_orders": 0, "trades_today": 0, "daily_pnl_pct": "0"})
     for row in rows["reconciliation_records"]:
         row.update({"expected": {}, "actual": {}})
-    return rows
+    if merge_first:
+        rows['fills'][2]['trade_intent_id'] = 'intent0'
+        rows['fills'][2]['order_id'] = rows['fills'][0]['order_id']
+        rows['settlements'][2]['trade_intent_id'] = 'intent0'
+        rows['trade_attributions'][1]['opening_trade_intent_id'] = 'intent0'
+        rows['trade_intents'][0]['filled_quantity'] = '2'
+    from decimal import Decimal
+    if partial_first:
+        rows['fills'][1]['quantity'] = '0.5'
+        rows['settlements'][1]['quantity'] = '0.5'
+        rows['position_lots'][0].update(remaining_quantity='0.5', closures={'s0': '0.5'}, realized_pnl='1')
+        rows['trade_attributions'][0].update(quantity='0.5', realized_pnl='1')
+        rows['holdings'] = [{'asset': ASSET, 'quantity': '0.5', 'average_price': '100', 'updated_at': NOW.isoformat()}]
+    for fill in rows['fills']:
+        fid = fill['fill_id']
+        amount = Decimal(fill['quantity']) * Decimal(fill['price'])
+        amount = amount if fill['side'] == 'sell' else -amount
+        rows['cash_ledger'].append({'entry_id': 'fill:cash:' + fid, 'idempotency_key': 'fill:cash:' + fid,
+            'amount': str(amount), 'currency': 'USD', 'occurred_at': fill['filled_at'], 'reason': 'fixture immutable fill'})
+    for attr in rows['trade_attributions']:
+        rows['pnl_records'].append({'record_id': 'fill:pnl:' + attr['attribution_id'], 'asset': attr['asset'],
+            'realized': attr['realized_pnl'], 'unrealized': '0', 'as_of': attr['exit_at']})
+    # Build a real, verifiable population checkpoint from the fixture's fills.
+    # No eligibility flag or unverifiable epoch placeholder is used.
+    from tradepulse.persistence import hydrate
+    from tradepulse.persistence.codec import encode_payload, decode_payload
+    from tradepulse.reconciliation.fee_population import validate_fee_population
+    from tradepulse.reconciliation.epochs import finalize_population
+    from hashlib import sha256
+    by_intent = {row['trade_intent_id']: row for row in rows['trade_intents']}
+    for fill in rows['fills']:
+        if fill['trade_intent_id'] not in by_intent:
+            by_intent[fill['trade_intent_id']] = {**rows['trade_intents'][0],
+                'trade_intent_id': fill['trade_intent_id'], 'idempotency_key': fill['trade_intent_id']}
+        by_intent[fill['trade_intent_id']].update(broker_order_id=fill['order_id'], side=fill['side'])
+    rows['trade_intents'] = list(by_intent.values())
+    activities = [{'id': f['broker_fill_id'], 'activity_type': 'FILL', 'symbol': 'X',
+        'qty': f['quantity'], 'price': f['price'], 'side': f['side'], 'order_id': f['order_id'],
+        'transaction_time': f['filled_at']} for f in sorted(rows['fills'], key=lambda f: (f['filled_at'], f['fill_id']))]
+    fs = [hydrate('fills', f) for f in rows['fills']]
+    its = [hydrate('trade_intents', i) for i in rows['trade_intents']]
+    population_quantity = sum((Decimal(lot['remaining_quantity']) for lot in rows['position_lots']), Decimal(0))
+    _, proof = validate_fee_population(fs[0].asset, activities, fs, its, population_quantity)
+    population_id = 'asset_fee_population:' + sha256(encode_payload(proof).encode()).hexdigest()
+    pages = []
+    for offset in range(0, len(activities) + 1, 100):
+        page = activities[offset:offset+100]
+        request = {'page_size': '100', 'direction': 'asc'}
+        if offset:
+            request['page_token'] = activities[offset-1]['id']
+        pages.append({'request': request, 'activity_ids': [r['id'] for r in page],
+            'terminal': len(page) < 100, 'response_hash': sha256(encode_payload(page).encode()).hexdigest()})
+    pagination = {'method': 'resume_boundary_and_full_history_audit', 'complete': True, 'pages': pages,
+        'activity_ids': [r['id'] for r in activities], 'population_hash': sha256(encode_payload(activities).encode()).hexdigest()}
+    rows['reconciliation_records'].append({'record_id': population_id, 'reconciliation_type': 'accounting_population',
+        'subject_id': 'equity:default:alpaca:X', 'outcome': 'matched', 'expected': {}, 'actual': proof, 'occurred_at': NOW.isoformat()})
+    connection = sqlite3.connect(':memory:')
+    connection.row_factory = sqlite3.Row
+    connection.executescript(SCHEMA)
+    for intent in its:
+        connection.execute('INSERT INTO trade_intents(record_id,idempotency_key,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?)',
+            (intent.trade_intent_id, intent.idempotency_key, 'filled', encode_payload(intent), START.isoformat(), START.isoformat()))
+    finalize_population(connection, key='equity:default:alpaca:X', proof=proof, population_id=population_id,
+        fills=fs, fees=[], cash_plans=[], lots=[hydrate('position_lots', lot) for lot in rows['position_lots']],
+        quantity=population_quantity, activities=activities, now=NOW, pagination=pagination)
+    for table in ('accounting_epochs', 'reconciliation_records'):
+        rows[table].extend(decode_payload(row['payload']) for row in connection.execute(f'SELECT payload FROM {table} ORDER BY rowid'))
+    connection.close()
+    return decode_payload(encode_payload(rows))
 
 
 def test_all_gates_pass_from_completed_population():
@@ -241,8 +309,7 @@ def test_each_failed_gate_prevents_pass(defect):
 
 
 def test_partial_closures_and_open_lots_are_not_completed_trades():
-    rows = passing_rows()
-    rows["position_lots"][0]["remaining_quantity"] = "0.5"
+    rows = passing_rows(partial_first=True)
     result = assess(rows, START.isoformat(), NOW, COSTS)
     assert result["criteria"]["eligible_round_trips"]["actual"] == 199
     assert result["status"] != "PROVE_EDGE_PASSED"
@@ -266,8 +333,12 @@ def test_seal_preserves_snapshot_and_permits_development_only(generation):
                 values = {"record_id": f"r{i}", "payload": json.dumps(payload), "created_at": START.isoformat()}
                 for column in columns - values.keys():
                     values[column] = f"v{i}" if column in {"idempotency_key", "fill_id", "originating_fill_id", "broker_fill_id"} else "completed"
+                if table == 'cash_ledger':
+                    values.update(record_id=payload['entry_id'], idempotency_key=payload['idempotency_key'])
+                elif table == 'pnl_records':
+                    values['record_id'] = payload['record_id']
                 if "status" in columns:
-                    values["status"] = payload["status"]
+                    values["status"] = payload['fee_accounting_status'] if table == 'accounting_epochs' else payload["status"]
                 names = list(values)
                 connection.execute(f"INSERT INTO {table} ({','.join(names)}) VALUES ({','.join('?' for _ in names)})", list(values.values()))
     generation.acquire()
@@ -338,13 +409,8 @@ def test_reconciliation_has_explicit_generation_interface(generation):
 
 
 def test_partial_opening_fills_count_once_and_costs_are_not_omitted():
-    rows = passing_rows()
-    # Equal quantities group by the original opening intent even if it has
-    # two separate fills/lots: they are one completed sample, not two wins.
-    rows["fills"][2]["trade_intent_id"] = "intent0"
-    rows["settlements"][2]["trade_intent_id"] = "intent0"
-    rows["trade_attributions"][1]["opening_trade_intent_id"] = "intent0"
-    rows["trade_intents"][0]["filled_quantity"] = "2"
+    # Rebuild the checkpoint from the actual two-fill order population.
+    rows = passing_rows(merge_first=True)
     result = assess(rows, START.isoformat(), NOW, COSTS)
     assert result["criteria"]["eligible_round_trips"]["actual"] == 199
     assert result["criteria"]["net_realized_pnl"]["actual"] != "160"

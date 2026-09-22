@@ -37,6 +37,9 @@ class TradeIntent:
     sector: str | None = None
     stop_loss: Decimal | None = None
     target_price: Decimal | None = None
+    order_type: str = "market"
+    signal_timestamp: str | None = None
+    submitted_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.side, Side) or not isinstance(self.execution_mode, ExecutionMode):
@@ -47,6 +50,7 @@ class TradeIntent:
             object.__setattr__(self, name, require_text(getattr(self, name), name))
         object.__setattr__(self, "created_at", require_aware(self.created_at, "created_at"))
         object.__setattr__(self, "risk_snapshot", immutable_metadata(self.risk_snapshot))
+        object.__setattr__(self, "order_type", require_text(self.order_type, "order_type"))
         if self.requested_quantity is None and self.requested_notional is None:
             raise ValueError("requested_quantity or requested_notional is required")
         if self.requested_quantity is not None:
@@ -70,3 +74,5 @@ class TradeIntent:
             object.__setattr__(self, "stop_loss", decimal_value(self.stop_loss, "stop_loss", positive=True))
         if self.target_price is not None:
             object.__setattr__(self, "target_price", decimal_value(self.target_price, "target_price", positive=True))
+        if self.submitted_at is not None:
+            object.__setattr__(self, "submitted_at", require_aware(self.submitted_at, "submitted_at"))

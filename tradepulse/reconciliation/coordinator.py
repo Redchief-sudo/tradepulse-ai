@@ -47,6 +47,7 @@ from uuid import uuid4
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaActivity, AlpacaClient
 from tradepulse.models import (
+    AssetClass,
     AssetIdentity,
     Fill,
     Holding,
@@ -247,9 +248,14 @@ async def _reconcile_positions(
                 f"position (broker={broker_qty}, lots={lots_qty}). NOT auto-corrected -- investigate missing/duplicate fills.",
                 {"symbol": display_symbol, "broker_qty": str(broker_qty), "lots_qty": str(lots_qty)},
             )
-            await latch_financial_integrity_block(
-                repositories, f"Accounting drift detected for {display_symbol}: broker={broker_qty}, lots={lots_qty}", clock=lambda: now
-            )
+            if asset_by_key[key].asset_class == AssetClass.CRYPTO:
+                from .epochs import block_asset
+                await block_asset(repositories, asset_by_key[key],
+                                  f"POSITION_QUANTITY_MISMATCH: broker={broker_qty}, lots={lots_qty}", now=now)
+            else:
+                await latch_financial_integrity_block(
+                    repositories, f"Accounting drift detected for {display_symbol}: broker={broker_qty}, lots={lots_qty}", clock=lambda: now
+                )
 
     return positions_checked, view_drift_corrected, accounting_drift_detected
 
@@ -465,6 +471,49 @@ async def _reverify_pending_holds(
     return reverified
 
 
+async def _recover_inflight_orders(repositories, broker, settlement, alerts, now, lease_lost=None):
+    """Known unresolved orders do not expire out of the activity lookback.
+
+    Fetch by the persisted broker ID, then use the sole fill/settlement path.
+    Neither absence from current positions nor an old local status is a fill.
+    """
+    from hashlib import sha256
+
+    from tradepulse.persistence.codec import encode_payload
+
+    from .asset_fees import _record_feed_transition
+    rows = await list_all_by_statuses(repositories.trade_intents,
+                                     ['submitted', 'accepted', 'partially_filled', 'submission_unknown'])
+    for row in rows:
+        if lease_lost is not None and lease_lost.is_set():
+            return
+        intent = hydrate('trade_intents', row['payload'])
+        if not intent.broker_order_id:
+            continue
+        try:
+            owners = await list_all_by_json_field(repositories.trade_intents, 'broker_order_id', intent.broker_order_id)
+            if len(owners) != 1:
+                raise ValueError('AMBIGUOUS_BROKER_ORDER_ID')
+            order = await broker.get_order(intent.broker_order_id)
+            if (order.broker_order_id != intent.broker_order_id or order.symbol != intent.asset.symbol
+                    or order.side != intent.side or order.raw.get('client_order_id') != intent.trade_intent_id):
+                raise ValueError('RECOVERY_BROKER_ORDER_IDENTITY_MISMATCH')
+            result = await resolve_order_from_broker(repositories, broker, settlement, alerts, intent, lambda: now)
+            current = await repositories.trade_intents.get(intent.trade_intent_id)
+            complete = current['status'] in {'filled', 'canceled', 'expired', 'rejected'} and result.quantity == order.filled_qty
+            record = ReconciliationRecord(str(uuid4()), 'order', intent.broker_order_id,
+                ReconciliationOutcome.MATCHED if complete else ReconciliationOutcome.DRIFT_DETECTED,
+                expected={'broker_filled_quantity': str(order.filled_qty)},
+                actual={'broker_order': order.raw, 'broker_order_sha256': sha256(encode_payload(order.raw).encode()).hexdigest(),
+                        'attributed_quantity': str(result.quantity), 'trade_intent_id': intent.trade_intent_id,
+                        'local_status': current['status']}, occurred_at=now)
+        except Exception as exc:  # noqa: BLE001 - record one order's unresolved evidence; retain other lanes
+            record = ReconciliationRecord(str(uuid4()), 'order', intent.broker_order_id,
+                ReconciliationOutcome.DRIFT_DETECTED, expected={'authoritative_recovery': True},
+                actual={'error': str(exc), 'trade_intent_id': intent.trade_intent_id}, occurred_at=now)
+        await _record_feed_transition(repositories, record)
+
+
 async def run_reconciliation(
     repositories: PersistenceRepositories,
     broker: AlpacaClient,
@@ -476,12 +525,21 @@ async def run_reconciliation(
     lease_lost: asyncio.Event | None = None,
 ) -> ReconciliationSummary:
     now = clock()
+    from tradepulse.settlement.accounting import replay_accounting, accounting_issues
+    projection_error = None
+    try:
+        await replay_accounting(repositories)
+    except Exception as exc:
+        projection_error = 'CANONICAL_ACCOUNTING_REPLAY_FAILED:' + str(exc)
+        await latch_financial_integrity_block(repositories, projection_error, clock=lambda: now)
+    await _recover_inflight_orders(repositories, broker, settlement, alerts, now, lease_lost)
+    fee_error = None
     try:
         if not await reconcile_asset_fees(repositories, broker, now=now, lease_lost=lease_lost):
-            return ReconciliationSummary("degraded", error="ASSET_FEE_RECONCILIATION_FAILED")
-    except Exception as exc:  # noqa: BLE001 - preserve the caller when fee evidence cannot be persisted
+            fee_error = "ASSET_FEE_RECONCILIATION_FAILED"
+    except Exception as exc:  # noqa: BLE001 - preserve other instruments and reconciliation work
         await alerts.send("critical", f"Asset-fee reconciliation unavailable: {exc}", {})
-        return ReconciliationSummary("degraded", error=f"ASSET_FEE_RECONCILIATION_UNAVAILABLE: {exc}")
+        fee_error = f"ASSET_FEE_RECONCILIATION_UNAVAILABLE: {exc}"
     try:
         positions_checked, view_drift_corrected, accounting_drift_detected = await _reconcile_positions(
             repositories, broker, alerts, now, lease_lost
@@ -511,7 +569,26 @@ async def run_reconciliation(
             error=f"BROKER_VERIFICATION_UNAVAILABLE: {exc}",
         )
 
+    try:
+        from .equity_epochs import reconcile_equity_epochs
+        if not await reconcile_equity_epochs(repositories, broker, now=now):
+            fee_error = fee_error or 'ACCOUNTING_EPOCH_INCOMPLETE'
+        elif await list_all_by_json_field(repositories.reconciliation_records, 'subject_id', 'equity_checkpoint'):
+            from .asset_fees import _record_feed_transition
+            await _record_feed_transition(repositories, ReconciliationRecord(str(uuid4()), 'accounting_population',
+                'equity_checkpoint', ReconciliationOutcome.MATCHED, expected={'complete_verified_population': True},
+                actual={'population_reverified': True}, occurred_at=now))
+    except Exception as exc:
+        fee_error = fee_error or 'ACCOUNTING_EPOCH_FAILED:' + str(exc)
+        from .asset_fees import _record_feed_transition
+        await _record_feed_transition(repositories, ReconciliationRecord(str(uuid4()), 'accounting_population',
+            'equity_checkpoint', ReconciliationOutcome.INCOMPLETE_EVIDENCE,
+            expected={'complete_verified_population': True}, actual={'error': str(exc)}, occurred_at=now))
+    projection_problems = await accounting_issues(repositories)
+    if projection_problems:
+        projection_error = 'CANONICAL_ACCOUNTING_INCOMPLETE'
+        await latch_financial_integrity_block(repositories, projection_error, clock=lambda: now)
     return ReconciliationSummary(
-        "ok", positions_checked, view_drift_corrected, accounting_drift_detected,
-        fills_checked, missed_fills_detected, late_fills_recovered, verification_holds_reverified,
+        "degraded" if fee_error or projection_error or accounting_drift_detected or missed_fills_detected else "ok", positions_checked, view_drift_corrected, accounting_drift_detected,
+        fills_checked, missed_fills_detected, late_fills_recovered, verification_holds_reverified, error=fee_error or projection_error,
     )

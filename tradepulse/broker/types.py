@@ -30,6 +30,7 @@ class AlpacaAccount:
     buying_power: Decimal
     portfolio_value: Decimal
     equity_components: Mapping[str, Decimal] = field(default_factory=dict)
+    received_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +43,7 @@ class AlpacaPosition:
     current_price: Decimal
     unrealized_pl: Decimal
     cost_basis: Decimal | None = None
+    received_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -62,7 +62,13 @@ export function RiskExposurePanel() {
     <Panel title="Risk Exposure" error={error} loading={loading}>
       {data && (
         <>
+          {Object.entries(data.accounting_states ?? {}).map(([asset, state]) => (
+            <p key={asset} role="status">{asset}: {state.replaceAll('_', ' ')}{state !== 'reconciled_net' ? ' — provisional inventory; excluded from verified results' : ''}</p>
+          ))}
           {data.equity_reconciliation_status === 'failed' && <p role="alert">Valuation reconciliation failed: {data.valuation_errors?.join(', ')}</p>}
+          {data.position_value_observation_status === 'different_uncoordinated_observations' && (
+            <p role="status">Account and position values were observed separately and differ by {data.position_value_observation_difference}. A common valuation time is unavailable; quantity reconciliation is checked separately.</p>
+          )}
           <dl className="kv">
             <dt>Total equity</dt>
             <dd>{money(data.total_equity)}</dd>

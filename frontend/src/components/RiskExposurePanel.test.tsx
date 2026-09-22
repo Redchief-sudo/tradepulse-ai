@@ -58,3 +58,19 @@ describe('RiskExposurePanel position-cap utilization', () => {
     expect(row.querySelector('.util-bar-pct')?.textContent).toBe('71%')
   })
 })
+
+it('labels fee-pending inventory without labeling exact equity arithmetic as failed', async () => {
+  vi.mocked(api.getRiskExposure).mockResolvedValue({
+    ...RISK_EXPOSURE,
+    equity_reconciliation_status: 'matched',
+    accounting_states: { 'crypto:default:alpaca:SOL/USD': 'fee_pending' },
+    position_value_observation_status: 'different_uncoordinated_observations',
+    position_value_observation_difference: '2.52',
+  })
+  vi.mocked(api.getRiskLimits).mockResolvedValue(RISK_LIMITS)
+  vi.mocked(api.getPositions).mockResolvedValue([])
+  render(<RiskExposurePanel />)
+  expect(await screen.findByText(/SOL\/USD: fee pending/)).toHaveTextContent('provisional inventory')
+  expect(screen.getByText(/differ by 2.52/)).toBeInTheDocument()
+  expect(screen.queryByText(/Valuation reconciliation failed/)).not.toBeInTheDocument()
+})

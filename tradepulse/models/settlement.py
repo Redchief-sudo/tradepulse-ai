@@ -18,9 +18,9 @@ class SettlementEvent:
     next incomplete stage rather than restarting
     (settlement/stages.py::run_settlement_stages).
 
-    `trade_projected` covers updating the originating TradeIntent's
-    cumulative fill/realized-pnl summary -- there is no separate "Trade"
-    entity in this system (TradeIntent already carries that summary).
+    `cash_projected` requires canonical cash_ledger evidence.
+    `trade_projected` requires pnl_records for every closed-lot attribution
+    and the originating TradeIntent cumulative summary.
     """
 
     settlement_event_id: str

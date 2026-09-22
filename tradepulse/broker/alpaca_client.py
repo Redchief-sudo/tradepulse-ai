@@ -197,6 +197,7 @@ class AlpacaClient:
             raise_alpaca_error(response, "getAccount")
         data = response.json()
         return AlpacaAccount(
+            received_at=datetime.now(UTC),
             equity=_decimal(data["equity"]),
             last_equity=_decimal(data["last_equity"]),
             cash=_decimal(data["cash"]),
@@ -213,8 +214,11 @@ class AlpacaClient:
         if not response.is_success:
             raise_alpaca_error(response, "getPositions")
         data = response.json()
-        rows = data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            raise AlpacaDataIntegrityError("positions response is not a list")
+        rows = data
         positions: list[AlpacaPosition] = []
+        received_at = datetime.now(UTC)
         for row in rows:
             raw_class = row.get("asset_class")
             # Verified live against Alpaca's docs 2026-08-26: "crypto",
@@ -237,9 +241,10 @@ class AlpacaClient:
                 )
             positions.append(
                 AlpacaPosition(
+                    received_at=received_at,
                     symbol=normalize_alpaca_symbol(str(row.get("symbol", "")), asset_class),
                     asset_class=asset_class,
-                    qty=_decimal(row.get("qty", "0")),
+                    qty=_decimal(row["qty"]),
                     avg_entry_price=_decimal(row.get("avg_entry_price", "0")),
                     market_value=_decimal(row["market_value"]),
                     cost_basis=_decimal_or_none(row.get("cost_basis")),
@@ -452,13 +457,19 @@ class AlpacaClient:
             raise_alpaca_error(response, "cancelOrder")
 
     async def get_activities(
-        self, activity_type: str = "FILL", since: datetime | None = None, page_size: int = 100
+        self, activity_type: str | None = "FILL", since: datetime | None = None, page_size: int = 100,
+        *, after_id: str | None = None, page_evidence: list | None = None,
     ) -> list[AlpacaActivity]:
         activities: list[AlpacaActivity] = []
-        page_token: str | None = None
-        seen_tokens: set[str] = set()
+        page_token: str | None = after_id
+        seen_tokens: set[str] = {after_id} if after_id else set()
+        seen_ids: set[str] = set()
+        if not 1 <= page_size <= 100:
+            raise ValueError("invalid activity page size")
         while True:
-            params: dict[str, str] = {"activity_types": activity_type, "page_size": str(page_size), "direction": "asc"}
+            params: dict[str, str] = {"page_size": str(page_size), "direction": "asc"}
+            if activity_type is not None:
+                params["activity_types"] = activity_type
             if since is not None:
                 params["after"] = since.isoformat()
             if page_token:
@@ -469,7 +480,19 @@ class AlpacaClient:
             page = response.json()
             if not isinstance(page, list):
                 raise AlpacaDataIntegrityError("activities response is not a list")
+            if len(page) > page_size:
+                raise AlpacaDataIntegrityError("oversized activities page")
+            if page_evidence is not None:
+                from hashlib import sha256
+
+                from tradepulse.persistence.codec import encode_payload
+                page_evidence.append({'request': params, 'activity_ids': [r.get('id') for r in page],
+                                      'response_hash': sha256(encode_payload(page).encode()).hexdigest(),
+                                      'terminal': len(page) < page_size})
             for row in page:
+                if not isinstance(row, dict) or not isinstance(row.get('id'), str) or not row['id'] or row['id'] in seen_ids:
+                    raise AlpacaDataIntegrityError("missing or repeated activity identity")
+                seen_ids.add(row['id'])
                 side_raw = str(row.get("side") or "").lower()
                 side = Side.BUY if side_raw in ("buy", "buy_to_cover") else Side.SELL if side_raw in ("sell", "sell_short") else None
                 raw_symbol = str(row.get("symbol", ""))

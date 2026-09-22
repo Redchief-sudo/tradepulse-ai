@@ -428,8 +428,8 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
     positions_route.mock(return_value=httpx.Response(200, json=[]))  # broker shows no position, matching the closed local state
     respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
         return_value=httpx.Response(200, json=[
-            {"id": "activity-buy-1", "activity_type": "FILL", "symbol": "AAPL", "side": "buy", "qty": str(bought_qty), "price": "199.60", "transaction_time": QUOTE_TS},
-            {"id": "activity-sell-1", "activity_type": "FILL", "symbol": "AAPL", "side": "sell", "qty": str(bought_qty), "price": breach_price, "transaction_time": QUOTE_TS},
+            {"id": "activity-buy-1", "activity_type": "FILL", "symbol": "AAPL", "side": "buy", "qty": str(bought_qty), "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-1"},
+            {"id": "activity-sell-1", "activity_type": "FILL", "symbol": "AAPL", "side": "sell", "qty": str(bought_qty), "price": breach_price, "transaction_time": QUOTE_TS, "order_id": "order-2"},
         ])
     )
 
@@ -444,9 +444,15 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
     # two fills, and canonical closed-position receipt all survive restart.
     records = await repositories_c.reconciliation_records.list_all()
     payloads = [hydrate("reconciliation_records", r["payload"]) for r in records]
-    assert len(payloads) == 4
-    assert all(p.outcome == ReconciliationOutcome.MATCHED for p in payloads)
-    assert sorted(p.reconciliation_type for p in payloads) == ["equity", "fill", "fill", "position"]
+    base = [p for p in payloads if p.reconciliation_type in {'equity', 'fill', 'position'}]
+    assert len(base) == 4
+    assert all(p.outcome == ReconciliationOutcome.MATCHED for p in base if p.reconciliation_type != 'equity')
+    assert all(p.outcome == ReconciliationOutcome.MATCHED for p in base)
+    assert sorted(p.reconciliation_type for p in base) == ["equity", "fill", "fill", "position"]
+    assert len(await repositories_c.accounting_epochs.list_all()) == 1
+    assert (await repositories_c.accounting_epochs.list_all())[0]['status'] == 'reconciled_net'
+    assert len(await repositories_c.broker_activity_inbox.list_all()) == 2
+    assert any(p.reconciliation_type == 'accounting_population' for p in payloads)
 
 
 @respx.mock

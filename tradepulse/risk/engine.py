@@ -353,6 +353,7 @@ async def build_portfolio_snapshot(
     account_equity: Decimal | None = None,
     broker_prev_close_equity: Decimal | None = None,
     mark_prices: Mapping[str, Decimal] | None = None,
+    broker_positions: Mapping | None = None,
     now: datetime | None = None,
 ) -> PortfolioSnapshot:
     """Caller supplies cash_balance (from the broker account or the local
@@ -383,14 +384,31 @@ async def build_portfolio_snapshot(
     holding_rows = await paginate_all_rows(repositories.holdings)
     holdings = [hydrate("holdings", row["payload"]) for row in holding_rows]
 
+    from tradepulse.reconciliation.epochs import pending_assets
+    pending_keys = await pending_assets(repositories)
+    if pending_keys and (broker_positions is None or account_equity is None):
+        raise ValueError("PENDING_CRYPTO_REQUIRES_BROKER_EXPOSURE")
+
     holdings_value = Decimal("0")
     sector_exposure: dict[str, Decimal] = {}
     for holding in holdings:
+        if asset_identity_key(holding.asset) in pending_keys:
+            continue
         mark = mark_prices.get(asset_identity_key(holding.asset), holding.average_price)
         notional = abs(holding.quantity) * mark * contract_multiplier_of(holding.asset)
         holdings_value += notional
         sector = holding.sector or "Other"
         sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + notional
+
+    sectors_by_key = {asset_identity_key(h.asset): h.sector or "Other" for h in holdings}
+    for key in pending_keys:
+        position = broker_positions.get(key)
+        if position is None:
+            continue  # complete broker response proves zero current inventory
+        notional = abs(position.market_value)
+        holdings_value += notional
+        sector = sectors_by_key.get(key, "Other")
+        sector_exposure[sector] = sector_exposure.get(sector, Decimal(0)) + notional
 
     # Status-filtered, unbounded pagination -- NOT list_all(limit=1000),
     # which is oldest-first and can silently undercount pending exposure
@@ -441,7 +459,7 @@ async def build_portfolio_snapshot(
             sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + pending_notional
 
         for event in events:
-            if event.holding_projected:
+            if event.holding_projected or asset_identity_key(event.asset) in pending_keys:
                 continue
             unsettled_notional = event.quantity * event.price * contract_multiplier_of(event.asset)
             holdings_value += unsettled_notional
@@ -475,7 +493,8 @@ async def build_portfolio_snapshot(
     )
     for row in unsettled_rows:
         event = hydrate("settlements", row["payload"])
-        if event.holding_projected or event.settlement_event_id in already_counted_settlement_ids:
+        if (event.holding_projected or event.settlement_event_id in already_counted_settlement_ids
+                or asset_identity_key(event.asset) in pending_keys):
             continue
         unsettled_notional = event.quantity * event.price * contract_multiplier_of(event.asset)
         holdings_value += unsettled_notional

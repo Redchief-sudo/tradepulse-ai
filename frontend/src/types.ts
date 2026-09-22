@@ -181,6 +181,10 @@ export interface PortfolioSnapshot {
   holdings_cost_basis?: string | null
   equity_reconciliation_status?: string | null
   valuation_errors?: string[]
+  position_value_observation_difference?: string | null
+  position_value_observation_status?: string | null
+  accounting_states?: Record<string, string>
+  reconciliation_results?: Record<string, unknown>
   sector_exposure: Record<string, string>
   open_positions: number
   outstanding_orders: number

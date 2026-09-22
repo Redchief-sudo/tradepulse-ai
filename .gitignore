@@ -36,6 +36,9 @@ frontend/dist/
 # Cached historical calibration data (tools/historical_data/) -- regeneratable
 # from Alpaca, not source; see docs/exit-parameter-calibration.md
 data/calibration/*
+# Runtime forensic captures and repaired database copies are distributed
+# separately from the source release.
+/forensic_evidence/
 # Exception: the Generation-2 freeze manifest is a deliberate scientific
 # commitment (the immutable contamination boundary), not regeneratable
 # cache -- it must be tracked so its history is auditable. See

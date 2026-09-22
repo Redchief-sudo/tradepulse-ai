@@ -1,6 +1,6 @@
 """Synthetic regression inputs, never the immutable evidence or broker account."""
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
 from unittest.mock import AsyncMock
 
@@ -51,7 +51,7 @@ async def test_marked_reporting_precision_cost_and_price_change(tmp_path):
     assert restored == s
 
 
-@pytest.mark.parametrize('problem', ['equity', 'position', 'missing_components', 'missing_cost'])
+@pytest.mark.parametrize('problem', ['equity', 'missing_components'])
 async def test_valuation_discrepancies_persist_failure_without_balancing(tmp_path, problem):
     r = await repos(tmp_path)
     a, p = account(), position()
@@ -71,7 +71,7 @@ async def test_valuation_discrepancies_persist_failure_without_balancing(tmp_pat
     assert s.total_equity == a.equity
     rows = await r.reconciliation_records.list_all()
     assert len(rows) == 1
-    assert rows[0]['payload']['outcome'] == 'drift_detected'
+    assert rows[0]['payload']['outcome'] == 'unresolved_mismatch'
 
 
 async def test_short_and_explicit_memopost_components(tmp_path):
@@ -105,11 +105,12 @@ async def test_sol_fractional_quantity_detection_is_persisted_and_never_mutates_
     assert await r.position_lots.list_all() == before
     assert (await r.holdings.get(key))['payload']['quantity'] == str(qty)
     records = await r.reconciliation_records.list_all()
-    assert all(row['payload']['subject_id'] == key for row in records)
+    assert all(row['payload']['subject_id'] == key for row in records if row['payload']['reconciliation_type'].startswith('position'))
     if broker_qty != str(qty):
         assert qty-D(broker_qty) == D('0.091809079')
         assert all(row['payload']['outcome'] == 'drift_detected' for row in records)
-        assert (await load_session(r)).financial_integrity_manual_reenable_required
+        assert not (await load_session(r)).financial_integrity_manual_reenable_required
+        assert (await r.accounting_epochs.list_all())[0]['status'] == 'integrity_blocked'
 
 
 async def test_duplicate_canonical_broker_identity_is_rejected(tmp_path):
@@ -128,7 +129,7 @@ async def test_bare_symbol_cannot_merge_distinct_asset_classes(tmp_path):
     broker.get_positions.return_value = [position('SOL', AssetClass.CRYPTO, '1')]
     assert await _reconcile_positions(r, broker, AsyncMock(), NOW) == (2, 0, 2)
     records = await r.reconciliation_records.list_all()
-    assert len({row['payload']['subject_id'] for row in records}) == 2
+    assert len({row['payload']['subject_id'] for row in records if row['payload']['reconciliation_type'].startswith('position')}) == 2
 
 
 def test_unreconciled_position_prevents_prove_edge_success():
@@ -164,3 +165,40 @@ def test_prove_edge_requires_current_canonical_position_receipt(defect):
     assert result['criteria']['eligible_round_trips']['actual'] == 0
     assert result['population'] == []
     assert not result['criteria']['evidence_errors']['passed']
+
+
+@pytest.mark.parametrize('difference', ['0.000000001', '0.009', '2.52', '10000'])
+async def test_separate_position_observations_do_not_fail_equity_arithmetic(tmp_path, difference):
+    r = await repos(tmp_path)
+    a, p = account(), position()
+    s = await marked_snapshot(r, a, [replace(p, market_value=p.market_value+D(difference))], now=NOW)
+    assert s.equity_reconciliation_status == 'matched'
+    assert s.equity_reconciliation_difference == 0
+    assert s.position_value_observation_difference == D(difference)
+    assert s.position_value_observation_status == 'different_uncoordinated_observations'
+    await record_valuation(r, s)
+    row = (await r.reconciliation_records.list_all())[0]['payload']
+    assert D(row['actual']['position_value_observation_difference']) == D(difference)
+    await r.equity_snapshots.create_once(s.snapshot_id, s)
+    assert hydrate('equity_snapshots', (await r.equity_snapshots.get(s.snapshot_id))['payload']) == s
+
+
+async def test_observation_times_are_transport_times_not_a_common_price_instant(tmp_path):
+    r = await repos(tmp_path)
+    a = replace(account(), received_at=NOW)
+    p = replace(position(), received_at=NOW+timedelta(seconds=1))
+    s = await marked_snapshot(r, a, [p], now=NOW+timedelta(seconds=2))
+    assert s.position_value_observation_status == 'equal_uncoordinated_observations'
+    assert s.valuation_observation_times['account_response_received_at'] == NOW.isoformat()
+    assert s.valuation_observation_times['position_response_received_at:equity:default:alpaca:AAPL'] == p.received_at.isoformat()
+    await r.equity_snapshots.create_once(s.snapshot_id, s)
+    assert hydrate('equity_snapshots', (await r.equity_snapshots.get(s.snapshot_id))['payload']) == s
+
+
+async def test_missing_cost_basis_does_not_change_exact_equity_arithmetic(tmp_path):
+    r = await repos(tmp_path)
+    s = await marked_snapshot(r, account(), [replace(position(), cost_basis=None)], now=NOW)
+    assert s.equity_reconciliation_status == 'matched'
+    assert s.equity_reconciliation_difference == 0
+    assert s.holdings_cost_basis is None
+    assert any(error.startswith('cost_basis_missing:') for error in s.valuation_errors)

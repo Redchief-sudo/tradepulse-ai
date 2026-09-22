@@ -147,6 +147,9 @@ def decode_trade_intent(d: Mapping[str, Any]) -> TradeIntent:
         sector=d.get("sector"),
         stop_loss=_decimal_or_none(d.get("stop_loss")),
         target_price=_decimal_or_none(d.get("target_price")),
+        order_type=d.get("order_type", "market"),
+        signal_timestamp=d.get("signal_timestamp"),
+        submitted_at=_datetime_or_none(d.get("submitted_at")),
     )
 
 
@@ -181,6 +184,14 @@ def decode_fill(d: Mapping[str, Any]) -> Fill:
         slippage=_decimal(d["slippage"]),
         filled_at=_datetime(d["filled_at"]),
         broker_fill_id=d.get("broker_fill_id"),
+        reference_price=_decimal_or_none(d.get("reference_price")),
+        reference_bid=_decimal_or_none(d.get("reference_bid")),
+        reference_ask=_decimal_or_none(d.get("reference_ask")),
+        reference_observed_at=_datetime_or_none(d.get("reference_observed_at")),
+        submitted_at=_datetime_or_none(d.get("submitted_at")),
+        order_type=d.get("order_type"),
+        fee_currency=d.get("fee_currency"),
+        fee_source=d.get("fee_source", "unavailable"),
     )
 
 
@@ -406,6 +417,11 @@ def decode_equity_snapshot(d: Mapping[str, Any]) -> PortfolioSnapshot:
         equity_reconciliation_status=d.get("equity_reconciliation_status"),
         equity_reconciliation_difference=_decimal_or_none(d.get("equity_reconciliation_difference")),
         valuation_errors=tuple(d.get("valuation_errors", ())),
+        position_value_observation_difference=d.get("position_value_observation_difference"),
+        position_value_observation_status=d.get("position_value_observation_status"),
+        accounting_states=d.get("accounting_states", {}),
+        reconciliation_results=d.get("reconciliation_results", {}),
+        valuation_observation_times=d.get("valuation_observation_times", {}),
     )
 
 

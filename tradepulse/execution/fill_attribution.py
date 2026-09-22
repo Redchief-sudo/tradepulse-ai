@@ -16,7 +16,16 @@ from decimal import Decimal
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaActivity, AlpacaClient, AlpacaError
-from tradepulse.models import Fill, IntegrityHold, IntegrityHoldType, SettlementEvent, SettlementStatus, TradeIntent, TradeIntentStatus
+from tradepulse.models import (
+    AssetClass,
+    Fill,
+    IntegrityHold,
+    IntegrityHoldType,
+    SettlementEvent,
+    SettlementStatus,
+    TradeIntent,
+    TradeIntentStatus,
+)
 from tradepulse.persistence import PersistenceRepositories, hydrate, list_all_by_json_field
 from tradepulse.risk import latch_financial_integrity_block
 from tradepulse.settlement import SettlementProcessor
@@ -104,6 +113,36 @@ def _is_valid_fill_activity(activity: AlpacaActivity, current: TradeIntent) -> b
     if activity.transaction_time is None:
         return False
     return True
+
+
+def _activity_costs(activity: AlpacaActivity, current: TradeIntent) -> tuple[Decimal, str | None, str]:
+    """Read broker-reported costs when the activity contract supplies them.
+
+    Equity activity commonly omits fees; that remains explicitly marked as
+    unavailable so zero is never mistaken for an observed zero-cost fill.
+    """
+    raw = activity.raw
+    fee_value = next((raw.get(key) for key in ("fee", "fees", "commission") if raw.get(key) is not None), None)
+    if fee_value is None:
+        return Decimal("0"), None, "unavailable"
+    try:
+        fee = Decimal(str(fee_value))
+    except ArithmeticError:
+        return Decimal("0"), None, "invalid"
+    if fee < 0:
+        return Decimal("0"), None, "invalid"
+    currency = raw.get("fee_currency") or raw.get("currency")
+    return fee, str(currency).upper() if currency else None, "broker_activity"
+
+
+def _reference_evidence(current: TradeIntent) -> tuple[Decimal | None, Decimal | None, Decimal | None, datetime | None]:
+    snapshot = current.risk_snapshot
+    def decimal(key: str) -> Decimal | None:
+        value = snapshot.get(key)
+        return Decimal(str(value)) if value is not None else None
+    observed = snapshot.get("reference_observed_at")
+    observed_at = datetime.fromisoformat(str(observed)) if observed else None
+    return decimal("entry_price"), decimal("reference_bid"), decimal("reference_ask"), observed_at
 
 
 async def attribute_order_fills(
@@ -275,13 +314,23 @@ async def attribute_order_fills(
         await latch_financial_integrity_block(repositories, disputed_reason, clock=clock)
 
     for activity in validated:
+        reference_price, reference_bid, reference_ask, reference_observed_at = _reference_evidence(current)
+        fees, fee_currency, fee_source = _activity_costs(activity, current)
+        slippage = abs(activity.price - reference_price) if reference_price is not None else Decimal("0")
         fill = Fill(
             fill_id=activity.activity_id, trade_intent_id=current.trade_intent_id, order_id=current.broker_order_id,
             asset=current.asset, side=current.side, execution_mode=current.execution_mode,
-            quantity=activity.qty, price=activity.price, fees=Decimal("0"), slippage=Decimal("0"),
+            quantity=activity.qty, price=activity.price, fees=fees, slippage=slippage,
             filled_at=activity.transaction_time, broker_fill_id=activity.activity_id,
+            reference_price=reference_price, reference_bid=reference_bid, reference_ask=reference_ask,
+            reference_observed_at=reference_observed_at, submitted_at=current.submitted_at,
+            order_type=current.order_type, fee_currency=fee_currency, fee_source=fee_source,
         )
-        await repositories.fills.create_once(fill.fill_id, fill, unique_value=fill.fill_id)
+        if fill.asset.asset_class == AssetClass.CRYPTO:
+            from tradepulse.reconciliation.epochs import record_gross_fill
+            await record_gross_fill(repositories, fill, now=clock())
+        else:
+            await repositories.fills.create_once(fill.fill_id, fill, unique_value=fill.fill_id)
         # FIN-091-01: SettlementEvent creation must NOT depend on `created`
         # from the Fill insert above -- a crash between the two writes
         # (two separate SQLite transactions) would otherwise permanently
@@ -302,6 +351,7 @@ async def attribute_order_fills(
             settlement_event_id=fill.fill_id, fill_id=fill.fill_id, trade_intent_id=current.trade_intent_id,
             asset=current.asset, side=current.side, execution_mode=current.execution_mode,
             quantity=fill.quantity, price=fill.price, occurred_at=activity.transaction_time,
+            fees=fill.fees,
             broker_order_id=current.broker_order_id, broker_fill_id=activity.activity_id,
             client_order_id=current.client_order_id, sector=current.sector,
         )

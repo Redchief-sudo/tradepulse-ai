@@ -13,18 +13,9 @@ system's architecture:
   dance, which existed only because Base44's BaaS platform had no way to
   enforce compare-and-swap at the database level -- SQLite's own
   transaction serialization gives that for free here.
-- `cash_projected` is a structural no-op: this MVP's ExecutionGateway always
-  submits through Alpaca (paper or live) -- there is no Base44-style
-  internal_paper/shadow_live mode with a locally-simulated fill -- so
-  Alpaca's account endpoint is the sole cash authority, exactly as the
-  source system itself says for broker_paper/live mode. The stage stays in
-  the pipeline for structural fidelity and in case a no-broker mode is added
-  later.
-- No separate "Trade" entity or "AITradeDecision" entity: TradeIntent already
-  carries its own cumulative fill/realized-pnl summary directly, and no
-  learning-sample entity exists in this system, so `trade_projected` updates
-  TradeIntent's summary in place instead of writing a second denormalized
-  record.
+- Cash and realized-PnL stages persist canonical cash_ledger and pnl_records
+  evidence before checkpointing. The durable staged state machine retries
+  partial projection without duplicating financial effects.
 """
 
 from __future__ import annotations
@@ -60,6 +51,7 @@ from tradepulse.persistence import (
 )
 from tradepulse.risk import latch_financial_integrity_block
 
+from .accounting import project_accounting, project
 from .lots import IntegrityViolationError, plan_signed_lot_fill
 from .stages import (
     StageHandler,
@@ -374,7 +366,7 @@ async def _project_trade(repositories: PersistenceRepositories, event: Settlemen
     return None
 
 
-async def _verify_integrity(repositories: PersistenceRepositories, event: SettlementEvent) -> None:
+async def _verify_integrity(repositories: PersistenceRepositories, event: SettlementEvent, *, check_lots: bool = True) -> None:
     # FIN-095-02: cheap, explicit belt-and-suspenders check -- the actual
     # atomicity guarantee already comes from the guard on each earlier
     # stage's own financial write (position_lots/holdings/trade_intents),
@@ -399,7 +391,7 @@ async def _verify_integrity(repositories: PersistenceRepositories, event: Settle
     holding_row = await repositories.holdings.get(_holding_record_id(event.asset))
     holding_qty = hydrate("holdings", holding_row["payload"]).quantity if holding_row is not None else Decimal("0")
 
-    if lot_qty != holding_qty:
+    if check_lots and lot_qty != holding_qty:
         errors.append(f"HOLDING_LOT_MISMATCH: holding {holding_qty}, lots {lot_qty} for {event.asset.symbol}")
 
     if event.broker_fill_id:
@@ -452,13 +444,15 @@ class SettlementProcessor:
             return None
 
         async def project_cash(state: SettlementEvent) -> None:
-            return None  # Alpaca is the cash authority in this MVP -- see module docstring.
+            await project_accounting(self._repositories, state, cash=True)
+            return None
 
         async def project_holding(state: SettlementEvent) -> None:
             await _project_holding(self._repositories, state)
             return None
 
         async def project_trade(state: SettlementEvent) -> None:
+            await project_accounting(self._repositories, state, trade=True)
             await _project_trade(self._repositories, state)
             return None
 
@@ -476,7 +470,20 @@ class SettlementProcessor:
         }
 
     async def _checkpoint(self, event: SettlementEvent) -> None:
-        await self._repositories.settlements.update(event.settlement_event_id, event, status=event.status.value)
+        from tradepulse.persistence.codec import encode_payload
+
+        def checkpoint(connection):
+            # Re-read evidence and commit the checkpoint under the SAME write
+            # lock. A successful handler alone is never evidence of durability.
+            if event.status == SettlementStatus.COMPLETED and not all(getattr(event, flag) for flag in (
+                    'lot_projected', 'attribution_projected', 'holding_projected',
+                    'cash_projected', 'trade_projected', 'integrity_verified')):
+                raise ValueError('ACCOUNTING_COMPLETED_PROJECTION_FLAGS_INCOMPLETE')
+            project(connection, event, cash=event.cash_projected, trade=event.trade_projected)
+            connection.execute(
+                'UPDATE settlements SET payload=?,status=?,updated_at=? WHERE record_id=?',
+                (encode_payload(event), event.status.value, self._clock().isoformat(), event.settlement_event_id))
+        await self._repositories.settlements.database.run(checkpoint, write=True)
 
     async def process_pending(
         self,
@@ -522,6 +529,7 @@ class SettlementProcessor:
             if claimed is None:
                 continue  # lost the race, or another caller already claimed/resolved it
             try:
+                await _verify_integrity(self._repositories, claimed, check_lots=False)
                 final_state = await run_settlement_stages(claimed, self._handlers(), self._checkpoint)
                 done = replace(
                     final_state, status=SettlementStatus.COMPLETED, processing_owner=None,

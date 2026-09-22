@@ -93,6 +93,10 @@ class ScanRunStatus(StrEnum):
 
 class ReconciliationOutcome(StrEnum):
     MATCHED = "matched"
+    TRANSIENT_OBSERVATION_DIFFERENCE = "transient_observation_difference"
+    UNRESOLVED_MISMATCH = "unresolved_mismatch"
+    INCOMPLETE_EVIDENCE = "incomplete_evidence"
+    ERROR = "error"
     DRIFT_DETECTED = "drift_detected"
     CORRECTED = "corrected"
 

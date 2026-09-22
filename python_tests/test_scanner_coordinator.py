@@ -1984,6 +1984,10 @@ async def test_candidate_correlated_with_existing_holding_is_demoted(tmp_path) -
     held_asset = AssetIdentity("MSFT", AssetClass.EQUITY, "alpaca:MSFT")
     holding = Holding(asset=held_asset, quantity=Decimal("5"), average_price=Decimal("300"), updated_at=NOW)
     await repositories.holdings.create_once(asset_identity_key(held_asset), holding)
+    from tradepulse.models import PositionLot
+    lot = PositionLot('held-lot', 'held-fill', held_asset, 'long', holding.quantity,
+                      holding.quantity, holding.average_price, NOW)
+    await repositories.position_lots.create_once(lot.lot_id, lot, unique_value=lot.originating_fill_id)
     _mock_bars_for("MSFT", duplicate_closes)  # the holding's own candle history, fetched by _correlation_adjusted_rank
 
     respx.post("https://api.anthropic.com/v1/messages").mock(
@@ -1992,7 +1996,10 @@ async def test_candidate_correlated_with_existing_holding_is_demoted(tmp_path) -
         )
     )
     _mock_account(cash="50000")
-    _mock_positions()  # broker reports no open positions -- the correlation check reads local `holdings`, not the broker, for this
+    _mock_positions({'symbol': held_asset.symbol, 'asset_class': 'crypto' if held_asset.asset_class == AssetClass.CRYPTO else 'us_equity',
+                     'qty': str(holding.quantity), 'avg_entry_price': str(holding.average_price),
+                     'market_value': str(holding.quantity * holding.average_price),
+                     'current_price': str(holding.average_price), 'unrealized_pl': '0'})
     _mock_quote_for("AAPL")
     _mock_bars_for("AAPL", _BULLISH_CLOSES)
     _mock_spy_bars()
@@ -2035,6 +2042,10 @@ async def test_candidate_not_demoted_by_correlation_with_a_different_asset_class
     # this test is about correlation-demotion, not exposure sizing.
     holding = Holding(asset=held_asset, quantity=Decimal("0.01"), average_price=Decimal("60000"), updated_at=NOW)
     await repositories.holdings.create_once(asset_identity_key(held_asset), holding)
+    from tradepulse.models import PositionLot
+    lot = PositionLot('held-lot', 'held-fill', held_asset, 'long', holding.quantity,
+                      holding.quantity, holding.average_price, NOW)
+    await repositories.position_lots.create_once(lot.lot_id, lot, unique_value=lot.originating_fill_id)
     _mock_crypto_bars(duplicate_closes)  # the crypto holding's own candle history
 
     respx.post("https://api.anthropic.com/v1/messages").mock(
@@ -2043,7 +2054,10 @@ async def test_candidate_not_demoted_by_correlation_with_a_different_asset_class
         )
     )
     _mock_account(cash="50000")
-    _mock_positions()
+    _mock_positions({'symbol': held_asset.symbol, 'asset_class': 'crypto' if held_asset.asset_class == AssetClass.CRYPTO else 'us_equity',
+                     'qty': str(holding.quantity), 'avg_entry_price': str(holding.average_price),
+                     'market_value': str(holding.quantity * holding.average_price),
+                     'current_price': str(holding.average_price), 'unrealized_pl': '0'})
     _mock_quote_for("AAPL")
     _mock_bars_for("AAPL", _BULLISH_CLOSES)
     _mock_spy_bars()
@@ -2069,6 +2083,10 @@ async def test_holding_candle_fetch_failure_degrades_gracefully(tmp_path) -> Non
     held_asset = AssetIdentity("MSFT", AssetClass.EQUITY, "alpaca:MSFT")
     holding = Holding(asset=held_asset, quantity=Decimal("5"), average_price=Decimal("300"), updated_at=NOW)
     await repositories.holdings.create_once(asset_identity_key(held_asset), holding)
+    from tradepulse.models import PositionLot
+    lot = PositionLot('held-lot', 'held-fill', held_asset, 'long', holding.quantity,
+                      holding.quantity, holding.average_price, NOW)
+    await repositories.position_lots.create_once(lot.lot_id, lot, unique_value=lot.originating_fill_id)
     respx.get("https://data.alpaca.markets/v2/stocks/MSFT/bars").mock(return_value=httpx.Response(500, json={"message": "server error"}))
 
     respx.post("https://api.anthropic.com/v1/messages").mock(
@@ -2077,7 +2095,10 @@ async def test_holding_candle_fetch_failure_degrades_gracefully(tmp_path) -> Non
         )
     )
     _mock_account(cash="50000")
-    _mock_positions()
+    _mock_positions({'symbol': held_asset.symbol, 'asset_class': 'crypto' if held_asset.asset_class == AssetClass.CRYPTO else 'us_equity',
+                     'qty': str(holding.quantity), 'avg_entry_price': str(holding.average_price),
+                     'market_value': str(holding.quantity * holding.average_price),
+                     'current_price': str(holding.average_price), 'unrealized_pl': '0'})
     _mock_quote_for("AAPL")
     _mock_bars_for("AAPL", _BULLISH_CLOSES)
     _mock_spy_bars()

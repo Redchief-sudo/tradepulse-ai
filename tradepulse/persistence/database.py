@@ -24,6 +24,17 @@ class RepositoryPaginationError(DatabaseError):
 
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS accounting_epochs (
+  record_id TEXT PRIMARY KEY, status TEXT NOT NULL, payload TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS broker_activity_inbox (
+  record_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS broker_activity_cursors (
+  record_id TEXT PRIMARY KEY, status TEXT NOT NULL, payload TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS opportunities (
   record_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
 );
