@@ -1,10 +1,11 @@
 from dataclasses import replace
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
 
 from test_settlement_engine import _repositories, _seed_buy, _no_op_alerter, NOW, asset
-from tradepulse.models import Fill, SettlementEvent, TradeIntent, Side, ExecutionMode
+from tradepulse.models import Fill, SettlementEvent, TradeIntent, Side, ExecutionMode, TradeIntentStatus
 from tradepulse.persistence import hydrate
 from tradepulse.settlement import SettlementProcessor
 from tradepulse.settlement.accounting import replay_accounting, ProjectionEvidenceError
@@ -200,6 +201,45 @@ async def test_failed_new_population_supersedes_verified_equity_checkpoint(tmp_p
     with pytest.raises(ValueError, match='new population unavailable'):
         await reconcile_equity_epochs(r, broker, now=NOW)
     assert await r.reconciliation_records.list_all() == before
+
+
+async def test_historical_fee_in_full_feed_does_not_block_new_equity_epoch(tmp_path):
+    from types import SimpleNamespace
+    from tradepulse.reconciliation.equity_epochs import reconcile_equity_epochs
+    from test_accounting_epochs import pagination
+
+    r = await _repositories(tmp_path)
+    intent = TradeIntent('entry', 'entry', 'opportunity', asset(), Side.BUY, ExecutionMode.PAPER, 'test', NOW,
+        requested_quantity=Decimal(1), status=TradeIntentStatus.FILLED, broker_order_id='order')
+    await r.trade_intents.create_once('entry', intent, status='filled', unique_value='entry')
+    fill = Fill('receipt', 'entry', 'order', asset(), Side.BUY, ExecutionMode.PAPER,
+                Decimal(1), Decimal(100), Decimal(0), Decimal(0), NOW, broker_fill_id='receipt')
+    await r.fills.create_once('receipt', fill, unique_value='receipt')
+    event = SettlementEvent('receipt', 'receipt', 'entry', asset(), Side.BUY, ExecutionMode.PAPER,
+        fill.quantity, fill.price, NOW, broker_order_id='order', broker_fill_id='receipt')
+    await r.settlements.create_once('receipt', event, status='pending', unique_value='receipt')
+    assert (await SettlementProcessor(r, _no_op_alerter(), clock=lambda: NOW).process_pending()).completed == 1
+
+    historical_fee = {
+        'id': 'fee-old', 'activity_type': 'FEE', 'currency': 'USD', 'status': 'executed',
+        'net_amount': '-0.50', 'created_at': (NOW - timedelta(days=2)).isoformat(), 'date': '2025-01-01',
+    }
+    fill_raw = {'id': 'receipt', 'activity_type': 'FILL', 'symbol': 'AAPL', 'side': 'buy', 'qty': '1',
+                'price': '100', 'order_id': 'order', 'transaction_time': NOW.isoformat()}
+
+    class Broker:
+        async def get_activities(self, *, activity_type, page_evidence):
+            page_evidence.extend(pagination([historical_fee, fill_raw])['pages'])
+            return [SimpleNamespace(raw=historical_fee, activity_id='fee-old'),
+                    SimpleNamespace(raw=fill_raw, activity_id='receipt')]
+
+        async def get_positions(self):
+            return [SimpleNamespace(asset_class=asset().asset_class, symbol='AAPL', qty=Decimal(1))]
+
+    assert await reconcile_equity_epochs(r, Broker(), now=NOW)
+    epoch = (await r.accounting_epochs.list_all())[0]['payload']
+    assert epoch['fee_accounting_status'] == 'reconciled_net'
+    assert epoch['population_proof_id'] is not None
 
 
 def test_explicit_fill_fees_reduce_net_once_without_changing_gross():

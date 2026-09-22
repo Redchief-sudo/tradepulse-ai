@@ -226,9 +226,23 @@ def finalize_population(connection, *, key, proof, population_id, fills, fees, c
         if fills[0].asset.asset_class == AssetClass.CRYPTO:
             fee_complete = (not buys or bool(epoch_fees)) and (not sells or bool(selected_cash)) and terminal
         else:
-            # Complete observations permit a zero-fee checkpoint, not a claim
-            # that no future fee can arrive. Unallocated account fees block it.
-            fee_complete = terminal and not any(r.get('activity_type') == 'FEE' for r in activities)
+            # The generation boundary is the opening event, not the full broker
+            # feed. Historical fees remain auditable evidence for the prior
+            # period, but they cannot make a fresh post-generation epoch remain
+            # fee_pending merely because they still exist in the complete Alpaca
+            # activity history.
+            generation_fees = [
+                r for r in activities
+                if r.get('activity_type') == 'FEE'
+                and r.get('status') == 'executed'
+                and r.get('currency') == 'USD'
+                and (
+                    (datetime.fromisoformat(r['created_at']).replace(tzinfo=opened.tzinfo) if 'created_at' in r else opened)
+                    >= opened
+                )
+                and (not end or (datetime.fromisoformat(r['created_at']).replace(tzinfo=opened.tzinfo) if 'created_at' in r else opened) < end)
+            ]
+            fee_complete = terminal and not generation_fees
         fee_complete = fee_complete and pagination is not None and pagination.get('complete') is True
         if end:
             # Closed epoch retains its established ending balance. The current
