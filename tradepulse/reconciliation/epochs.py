@@ -3,11 +3,31 @@
 All state transitions execute under SQLite's write transaction. Execution facts
 remain immutable; an epoch is a separate statement about their finality.
 """
+from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 
 from tradepulse.models import AssetClass, asset_identity_key
 from tradepulse.persistence.codec import decode_payload, encode_payload
+
+
+def _aware_utc(value, *, field_name):
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        raise ValueError(f'{field_name} is naive and cannot represent a broker instant')
+    return dt.astimezone(UTC)
+
+
+def _generation_boundary(epoch):
+    for key in ('generation_opened_at', 'verification_generation_opened_at', 'opened_at'):
+        value = epoch.get(key)
+        if value is None:
+            continue
+        return _aware_utc(value, field_name=key)
+    raise ValueError('missing_generation_boundary')
 
 STATES = frozenset({'submitted', 'filled_gross', 'fee_pending', 'reconciled_net', 'integrity_blocked'})
 
@@ -74,12 +94,21 @@ def save_epoch(connection, epoch, now):
 
 
 def new_epoch(key, identifier, now, starting_quantity, intent_ids):
+    boundary = now.isoformat()
     return {'canonical_asset_key': key, 'accounting_epoch_id': identifier,
             'starting_broker_quantity': str(starting_quantity), 'ending_broker_quantity': None,
             'gross_filled_quantity': '0', 'asset_fee_quantity': '0', 'net_inventory_quantity': None,
             'cash_fee_amount': '0', 'fee_accounting_status': 'submitted',
             'broker_activity_cursor': None, 'broker_activity_window': None, 'fee_evidence_ids': [],
-            'population_proof_id': None, 'population_hash': None, 'opened_at': now.isoformat(),
+            'population_proof_id': None, 'population_hash': None, 'opened_at': boundary,
+            'generation_opened_at': boundary,
+            'generation_id': None,
+            'verification_generation_id': None,
+            'account_identity_digest': None,
+            'opening_activity_cursor': None,
+            'opening_activity_population_hash': None,
+            'opening_positions': None,
+            'opening_cash_equity': None,
             'reconciled_at': None, 'trade_intent_ids': list(intent_ids), 'fill_ids': [],
             'checkpoint_version': 0, 'checkpoint_id': None, 'superseded_checkpoint_ids': []}
 
@@ -194,16 +223,17 @@ def finalize_population(connection, *, key, proof, population_id, fills, fees, c
         selected = [f for f in fills if f.trade_intent_id in epoch['trade_intent_ids']]
         if not selected:
             continue
-        from datetime import datetime
-        opened = datetime.fromisoformat(epoch['opened_at'])
-        epoch_fees = [fee for fee in fees if fee.occurred_at >= opened]
+        boundary = _generation_boundary(epoch)
+        opened = boundary
+        epoch_fees = [fee for fee in fees if fee.occurred_at.astimezone(UTC) >= boundary]
         # A later epoch does not consume fees already accounted in its starting
         # broker balance. Historical bootstrap covers the complete instrument.
-        later = [datetime.fromisoformat(e['opened_at']) for e in epochs
-                 if datetime.fromisoformat(e['opened_at']) > opened]
+        later = [_aware_utc(e['generation_opened_at'] if e.get('generation_opened_at') else e['opened_at'], field_name='opened_at')
+                 for e in epochs if (e.get('generation_opened_at') or e.get('opened_at')) is not None and _aware_utc(
+                     e.get('generation_opened_at') if e.get('generation_opened_at') else e['opened_at'], field_name='opened_at') > boundary]
         end = min(later) if later else None
         if end:
-            epoch_fees = [fee for fee in epoch_fees if fee.occurred_at < end]
+            epoch_fees = [fee for fee in epoch_fees if fee.occurred_at.astimezone(UTC) < end]
         selected_cash = [(raw, order, allocation) for raw, order, allocation in cash_plans
                          if set(order['trade_intent_ids']) & set(epoch['trade_intent_ids'])]
         buys = sum((f.quantity for f in selected if f.side.value == 'buy'), Decimal(0))
@@ -215,7 +245,7 @@ def finalize_population(connection, *, key, proof, population_id, fills, fees, c
             # balance; never infer it from a stale local Holding.
             preceding = sum((f.quantity if f.side.value == 'buy' else -f.quantity
                              for f in fills if f.filled_at < opened), Decimal(0))
-            preceding -= sum((fee.quantity for fee in fees if fee.occurred_at < opened), Decimal(0))
+            preceding -= sum((fee.quantity for fee in fees if fee.occurred_at.astimezone(UTC) < boundary), Decimal(0))
             start = str(preceding)
             epoch['starting_broker_quantity'] = start
         terminal = True
@@ -226,21 +256,18 @@ def finalize_population(connection, *, key, proof, population_id, fills, fees, c
         if fills[0].asset.asset_class == AssetClass.CRYPTO:
             fee_complete = (not buys or bool(epoch_fees)) and (not sells or bool(selected_cash)) and terminal
         else:
-            # The generation boundary is the opening event, not the full broker
-            # feed. Historical fees remain auditable evidence for the prior
-            # period, but they cannot make a fresh post-generation epoch remain
-            # fee_pending merely because they still exist in the complete Alpaca
-            # activity history.
+            # The generation boundary is frozen at the verification opening, not the
+            # first fill timestamp in an epoch. Historical receipts remain auditable,
+            # but they cannot contaminate the active generation's fee status.
             generation_fees = [
                 r for r in activities
                 if r.get('activity_type') == 'FEE'
                 and r.get('status') == 'executed'
                 and r.get('currency') == 'USD'
-                and (
-                    (datetime.fromisoformat(r['created_at']).replace(tzinfo=opened.tzinfo) if 'created_at' in r else opened)
-                    >= opened
-                )
-                and (not end or (datetime.fromisoformat(r['created_at']).replace(tzinfo=opened.tzinfo) if 'created_at' in r else opened) < end)
+                and (('created_at' in r and _aware_utc(r['created_at'], field_name='activity_created_at') >= boundary)
+                     or ('transaction_time' in r and _aware_utc(r['transaction_time'], field_name='activity_transaction_time') >= boundary))
+                and (not end or (('created_at' in r and _aware_utc(r['created_at'], field_name='activity_created_at') < end)
+                                 or ('transaction_time' in r and _aware_utc(r['transaction_time'], field_name='activity_transaction_time') < end)))
             ]
             fee_complete = terminal and not generation_fees
         fee_complete = fee_complete and pagination is not None and pagination.get('complete') is True

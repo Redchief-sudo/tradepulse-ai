@@ -1,5 +1,5 @@
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, timedelta
 from decimal import Decimal
 
 import pytest
@@ -240,6 +240,20 @@ async def test_historical_fee_in_full_feed_does_not_block_new_equity_epoch(tmp_p
     epoch = (await r.accounting_epochs.list_all())[0]['payload']
     assert epoch['fee_accounting_status'] == 'reconciled_net'
     assert epoch['population_proof_id'] is not None
+    assert epoch['generation_opened_at'] == epoch['opened_at']
+    assert 'generation_boundary' not in epoch
+
+
+async def test_generation_boundary_uses_frozen_epoch_timestamp_not_fill_opened_time(tmp_path):
+    from tradepulse.reconciliation.epochs import _generation_boundary
+
+    epoch = {
+        'opened_at': (NOW - timedelta(days=3)).isoformat(),
+        'generation_opened_at': NOW.isoformat(),
+    }
+    boundary = _generation_boundary(epoch)
+    assert boundary == NOW.astimezone(UTC)
+    assert boundary != (NOW - timedelta(days=3)).astimezone(UTC)
 
 
 def test_explicit_fill_fees_reduce_net_once_without_changing_gross():
