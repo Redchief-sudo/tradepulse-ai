@@ -614,7 +614,7 @@ async def run_scan_cycle(
     # never trip (drawdown against an empty history is always 0%).
     try:
         positions = await broker.get_positions()
-        equity_snapshot = await marked_snapshot(repositories, account, positions, now=now)
+        equity_snapshot = await marked_snapshot(repositories, account, positions, now=clock())
         await record_valuation(repositories, equity_snapshot)
         await repositories.equity_snapshots.create_once(equity_snapshot.snapshot_id, equity_snapshot)
     except Exception as exc:  # noqa: BLE001 - valuation failure must not kill the scan worker

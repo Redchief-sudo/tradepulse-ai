@@ -19,6 +19,7 @@ def add_parser(subparsers) -> None:
     parser.add_argument("--generation", required=True)
     parser.add_argument("--fee-bps", type=str, default=None, help="explicit verification-only fee model, per-side basis points")
     parser.add_argument("--slippage-bps", type=str, default=None, help="explicit verification-only slippage model, per-side basis points")
+    parser.add_argument("--soak-report", action="append", default=[], help="preserved hashable passing soak report; required twice for official freeze")
 
 
 async def command(settings, args) -> int:
@@ -34,7 +35,7 @@ async def command(settings, args) -> int:
                 raise VerificationError("negative_cost_model_rate")
             database = await asyncio.to_thread(AsyncSQLiteDatabase, settings.database_url)
             await database.initialize()
-            result = await asyncio.to_thread(freeze, settings, args.generation, costs)
+            result = await freeze(settings, args.generation, costs, soak_reports=args.soak_report)
         elif args.action == "verify":
             if args.fee_bps is not None or args.slippage_bps is not None:
                 raise VerificationError("cost_model_is_freeze_only")
@@ -51,7 +52,7 @@ async def command(settings, args) -> int:
                 result = await asyncio.to_thread(verification.report, seal=True)
         logger.info("paper_verification_result", extra={"event": "paper_verification_result", "result": result})
         return 1 if result.get("integrity_valid") is False or result.get("status") == "PROVE_EDGE_FAILED_INTEGRITY" else 0
-    except (OSError, ValueError, KeyError, TypeError, ArithmeticError, DatabaseError, sqlite3.Error) as exc:
+    except Exception as exc:
         logger.error("paper_verification_failed", extra={"event": "paper_verification_failed", "reason": str(exc)})
         return 1
     finally:
@@ -75,11 +76,11 @@ def permit_command(settings, command_name: str, generation: str | None) -> bool:
         return False
 
 
-async def run_official(settings, generation: str, run) -> int:
+async def run_official(settings, generation: str, run, *, reconciliation_only: bool = False) -> int:
     verification = None
     try:
         verification = await asyncio.to_thread(Verification, settings, generation)
-        if not await verification.start():
+        if not await verification.start(reconciliation_only=reconciliation_only):
             return 1
         code = await run(verification)
         result = await verification.finish()

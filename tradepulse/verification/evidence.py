@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from .integrity import VerificationError, canonical, digest
+from tradepulse.time import aware_utc
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +61,8 @@ def snapshot_database(path: Path) -> dict:
                 if table != 'accounting_epochs' and "status" in row.keys() and row["status"] != payload.get("status", payload.get("state", payload.get("hold_type"))):
                     raise VerificationError("persisted_status_mismatch")
                 result[table].append(payload)
+        from .opening import load_bound_opening_checkpoint
+        result['generation_opening_checkpoint'] = load_bound_opening_checkpoint(connection)
         return result
     finally:
         connection.close()
@@ -76,10 +79,10 @@ def number(value) -> Decimal:
 
 
 def timestamp(value: str) -> datetime:
-    result = datetime.fromisoformat(value)
-    if result.tzinfo is None:
-        raise VerificationError("naive_evidence_timestamp")
-    return result
+    try:
+        return aware_utc(value, field_name='evidence_timestamp')
+    except (TypeError, ValueError) as exc:
+        raise VerificationError(str(exc)) from exc
 
 
 def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> dict:
@@ -92,15 +95,36 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     """
     policy = VerificationPolicy()
     start = timestamp(started_at)
-    if now.tzinfo is None or now < start:
+    now = timestamp(now)
+    if now < start:
         raise VerificationError("assessment_time_invalid")
     problems: list[str] = []
+    checkpoint = rows.get('generation_opening_checkpoint')
+    classifications = None
+    if checkpoint:
+        from tradepulse.reconciliation.membership import verify_membership_record, ELIGIBLE_MEMBERSHIPS
+        membership_records = [r for r in rows['reconciliation_records']
+                              if r['record_id'].startswith('generation_membership:')]
+        try:
+            membership = max(membership_records, key=lambda r: timestamp(r['occurred_at']))
+            classifications = verify_membership_record(checkpoint, membership)
+            if (not set(membership['actual']['generation_order_ids']) <= {
+                    i['broker_order_id'] for i in rows['trade_intents'] if i.get('broker_order_id')}
+                    or not set(membership['actual']['generation_fill_ids']) <= {
+                    f['broker_fill_id'] for f in rows['fills'] if f.get('broker_fill_id')}):
+                raise ValueError('generation_membership_link_population_invalid')
+            if 'unresolved_generation_membership' in classifications.values():
+                problems.append('unresolved_generation_membership')
+        except (KeyError, ValueError, TypeError):
+            problems.append('generation_membership_evidence_invalid')
     fills = {row["fill_id"]: row for row in rows["fills"]}
     settlements = {row["fill_id"]: row for row in rows["settlements"]}
     intents = {row["trade_intent_id"]: row for row in rows["trade_intents"]}
     if len(fills) != len(rows["fills"]) or len(settlements) != len(rows["settlements"]) or len(intents) != len(rows["trade_intents"]):
         problems.append("duplicate_authoritative_identity")
     for fill in fills.values():
+        if checkpoint and (classifications is None or classifications.get(fill.get('broker_fill_id')) not in ELIGIBLE_MEMBERSHIPS):
+            problems.append('fill_not_in_verified_generation_population')
         if fill["execution_mode"] != "paper" or not start <= timestamp(fill["filled_at"]) <= now:
             problems.append("fill_outside_paper_generation")
     attrs = defaultdict(list)
@@ -158,7 +182,8 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
                 raise ValueError('fee population authority invalid')
             checked_fees, checked_proof = validate_fee_population(fee.asset, proof['activities'],
                 [hydrate('fills', item) for item in fills.values()],
-                [hydrate('trade_intents', item) for item in intents.values()], number(proof['broker_quantity']))
+                [hydrate('trade_intents', item) for item in intents.values()], number(proof['broker_quantity']),
+                membership=proof.get('generation_membership'))
             from hashlib import sha256
 
             from tradepulse.persistence.codec import encode_payload
@@ -212,11 +237,11 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
             if order:
                 return order.get('asset_key')
         return None
-    expected_cash_entries = {'asset_cash_fee:'+fee_id for fee_id in cash_records}
-    if {key for key in cash_entries if key.startswith('asset_cash_fee:')} != expected_cash_entries:
+    expected_cash_entries = {'broker:fee:'+fee_id for fee_id in cash_records}
+    if not expected_cash_entries <= cash_entries.keys() or any(key.startswith('asset_cash_fee:') for key in cash_entries):
         problems.append('cash_fee_ledger_missing_or_orphaned')
-        for entry_id in {key for key in cash_entries if key.startswith('asset_cash_fee:')} ^ expected_cash_entries:
-            key = cash_asset(entry_id.removeprefix('asset_cash_fee:'))
+        for entry_id in expected_cash_entries - cash_entries.keys():
+            key = cash_asset(entry_id.removeprefix('broker:fee:'))
             if key:
                 cash_invalid_assets.add(key)
             else:
@@ -251,7 +276,8 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
             closing = next(fill for fill in fills.values() if fill['trade_intent_id'] in order['trade_intent_ids'])
             _, checked = validate_fee_population(hydrate('fills', closing).asset, proof['activities'],
                 [hydrate('fills', item) for item in fills.values()],
-                [hydrate('trade_intents', item) for item in intents.values()], number(proof['broker_quantity']))
+                [hydrate('trade_intents', item) for item in intents.values()], number(proof['broker_quantity']),
+                membership=proof.get('generation_membership'))
             from hashlib import sha256
 
             from tradepulse.persistence.codec import encode_payload
@@ -262,12 +288,12 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
                      allocate_cash_fees(proof, [hydrate('trade_attributions', item) for item in rows['trade_attributions']])}
             raw, linked, allocations = plans[fee_id]
             entry = cash_entries[actual['cash_entry_id']]
-            if (row['record_id'] != 'asset_cash_fee:'+fee_id or actual['cash_entry_id'] != row['record_id']
+            if (row['record_id'] != 'asset_cash_fee:'+fee_id or actual['cash_entry_id'] != 'broker:fee:'+fee_id
                     or row['outcome'] != 'corrected' or actual['activity'] != raw or actual['order'] != linked
                     or actual['allocation_policy'] != 'verified_sell_population_proceeds_proportion'
                     or {k: number(v) for k, v in actual['allocations'].items()} != allocations
                     or entry['currency'] != 'USD' or number(entry['amount']) != number(raw['net_amount'])
-                    or entry['idempotency_key'] != 'alpaca:CFEE:USD:'+fee_id
+                    or entry['idempotency_key'] != 'broker:fee:'+fee_id
                     or timestamp(entry['occurred_at']) != timestamp(raw['created_at'])
                     or not start <= timestamp(raw['created_at']) <= now):
                 raise ValueError('cash fee expense mismatch')
@@ -410,6 +436,10 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     for intent_id, lots in sorted(groups.items()):
         if integrity_issues or invalid_projection_fills or reconciliation_issues:
             continue
+        if checkpoint and (classifications is None or any(
+                classifications.get(fills[fid].get('broker_fill_id')) not in ELIGIBLE_MEMBERSHIPS
+                for lot in lots for fid in {lot['originating_fill_id'], *lot['closures']} if fid in fills)):
+            continue
         if any(asset_identity_key(hydrate("fills", fills[lot["originating_fill_id"]]).asset) in unreconciled_assets for lot in lots):
             continue  # unresolved positions never contribute eligible round trips or net results
         if not cash_integrity_valid and any(lot['asset']['asset_class'] == 'crypto' for lot in lots):
@@ -502,6 +532,12 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
                         or number(row["entry_price"]) != number(lot["acquisition_price"])):
                     problems.append("attribution_evidence_mismatch")
                     valid = False
+                expected_price_pnl = (number(closing['price']) - number(lot['acquisition_price'])) * number(quantity) * multiplier
+                if lot['position_side'] == 'short':
+                    expected_price_pnl = -expected_price_pnl
+                if number(row['realized_pnl']) != expected_price_pnl:
+                    problems.append('attribution_price_pnl_mismatch')
+                    valid = False
                 lot_pnl += number(row["realized_pnl"])
                 notional += number(quantity) * number(closing["price"]) * multiplier
             if lot_pnl != number(lot["realized_pnl"]):
@@ -517,25 +553,35 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
             accounting_breakdown.append({'trade_intent_id': intent_id, 'gross_price_pnl': str(price_pnl),
                                          'actual_asset_fee_basis_expense': str(native_expense),
                                          'actual_cash_fee_expense': str(usd_expense), 'actual_result': str(gross),
-                                         'modeled_cost_overlay': str(notional*cost_rate) if cost_rate is not None else None})
+                                         'modeled_cost_overlay': str(notional*cost_rate) if cost_rate is not None else None,
+                                         'modeled_trade_net': str(price_pnl-notional*cost_rate) if cost_rate is not None else None})
             if cost_rate is not None:
-                net_results.append(gross - notional * cost_rate)
+                net_results.append(price_pnl - notional * cost_rate)
     count = len(population)
     net = sum(net_results, Decimal(0)) if costs_available else None
     win_rate = Decimal(sum(value > 0 for value in net_results)) / count * 100 if count and costs_available else None
     expectancy = net / count if count and net is not None else None
     snapshots = sorted(rows["equity_snapshots"], key=lambda row: (timestamp(row["as_of"]), row["snapshot_id"]))
     drawdown = None
+    def observed_equity(row):
+        return observed_generation_equity(row, rows, checkpoint) if checkpoint else number(row['total_equity'])
+    if snapshots and checkpoint:
+        try:
+            for row in snapshots:
+                observed_equity(row)
+        except (KeyError, ValueError, TypeError, ArithmeticError):
+            problems.append('generation_equity_authority_unavailable')
+            snapshots = []
     if snapshots:
         if any(row["source"] != "broker" or not start <= timestamp(row["as_of"]) <= now for row in snapshots):
             problems.append("equity_outside_broker_generation")
-        peak = number(snapshots[0]["total_equity"])
+        peak = observed_equity(snapshots[0])
         if peak <= 0:
             problems.append("nonpositive_initial_equity")
         else:
             drawdown = Decimal(0)
             for row in snapshots:
-                equity = number(row["total_equity"])
+                equity = observed_equity(row)
                 if equity < 0:
                     raise VerificationError("negative_equity")
                 peak = max(peak, equity)
@@ -543,6 +589,12 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
         if fills and (timestamp(snapshots[0]["as_of"]) > min(timestamp(f["filled_at"]) for f in fills.values())
                       or timestamp(snapshots[-1]["as_of"]) < max(timestamp(f["filled_at"]) for f in fills.values())):
             problems.append("equity_series_does_not_cover_fills")
+    observed, bridge, generation_fee_errors = observed_generation_result(rows, fills, fee_receipts, valid_fee_receipts,
+        fee_basis, cash_entries, records_by_id)
+    problems.extend(generation_fee_errors)
+    if (problems or missing or duplicates or settlement_issues or reconciliation_issues or integrity_issues
+            or provisional or not latest):
+        observed = None
     criteria = {}
 
     def criterion(name, actual, operator, required):
@@ -557,6 +609,7 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     criterion("win_rate_pct", win_rate, ">=", number(policy.minimum_win_rate_pct))
     criterion("maximum_drawdown_pct", drawdown, "<=", number(policy.maximum_drawdown_pct))
     criterion("net_realized_pnl", net, ">", number(policy.minimum_net_pnl_exclusive))
+    criterion("observed_generation_net", observed, ">", number(policy.minimum_net_pnl_exclusive))
     criterion("net_expectancy", expectancy, ">", number(policy.minimum_expectancy_exclusive))
     criterion("reconciliation_issues", reconciliation_issues if latest else None, "==", policy.maximum_unresolved)
     criterion("settlement_issues", settlement_issues, "==", policy.maximum_unresolved)
@@ -566,6 +619,8 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     criterion("evidence_errors", len(problems), "==", policy.maximum_unresolved)
     integrity_failed = bool(problems or missing or duplicates or settlement_issues or reconciliation_issues or integrity_issues)
     if integrity_failed:
+        population = []
+        criterion("eligible_round_trips", 0, ">=", policy.minimum_round_trips)
         status = "PROVE_EDGE_FAILED_INTEGRITY"
     elif all(row["passed"] for row in criteria.values()):
         status = "PROVE_EDGE_PASSED"
@@ -576,4 +631,198 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     return {"status": status, "criteria": criteria, "errors": sorted(set(problems)),
             "population": population, "evidence_sha256": digest(canonical(rows)),
             "assessed_at": now.isoformat(), "cost_model": costs,
-            "provisional_population": provisional, "accounting_breakdown": accounting_breakdown}
+            "provisional_population": provisional, "accounting_breakdown": accounting_breakdown,
+            "modeled_trade_net": str(net) if net is not None else None,
+            "observed_generation_net": str(observed) if observed is not None else None,
+            "performance_authorities": {
+                "modeled_trade_net": "Gross eligible completed round-trip PnL minus frozen fee/slippage overlay; win rate and expectancy authority.",
+                "observed_generation_net": "Generation gross realized PnL minus authoritative actual expenses; account profitability authority. The modeled overlay is not deducted."},
+            "observed_generation_bridge": bridge}
+
+
+def observed_generation_result(rows, fills, native_receipts, valid_native_receipts, native_basis, cash_entries, records_by_id):
+    """Independently conserve actual expenses; the overlay never enters here."""
+    from tradepulse.reconciliation.generation_fees import (
+        ELIGIBLE_MEMBERSHIPS, cash_fee_receipt, validate_generation_fee, adjustment_receipt,
+        validate_generation_adjustment,
+    )
+    errors = []
+    checkpoint = rows.get('generation_opening_checkpoint')
+    # Every checkpoint contains the full feed; generations also retain an
+    # account-wide population when they have fees but no traded instrument.
+    observations = []
+    for record in rows['reconciliation_records']:
+        if record['record_id'].startswith('asset_fee_population:'):
+            observations.append(record['actual']['activities'])
+        elif record['record_id'].startswith('generation_membership:'):
+            observations.append(record['actual']['activities'])
+    raw_by_id = {}
+    for population in observations:
+        for raw in population:
+            identifier = raw['id']
+            if identifier in raw_by_id and raw_by_id[identifier] != raw:
+                errors.append('broker_activity_receipt_changed')
+            raw_by_id[identifier] = raw
+    if not observations:
+        errors.append('generation_fee_population_missing')
+    opening_ids = {raw['id'] for raw in checkpoint['activities']} if checkpoint else set()
+    eligible_ids = set(raw_by_id) - opening_ids
+    if checkpoint:
+        from tradepulse.reconciliation.membership import verify_membership_record
+        try:
+            latest_membership = max((record for record in rows['reconciliation_records']
+                if record['record_id'].startswith('generation_membership:')), key=lambda r: timestamp(r['occurred_at']))
+            classifications = verify_membership_record(checkpoint, latest_membership)
+            eligible_ids = {identifier for identifier, status in classifications.items() if status in ELIGIBLE_MEMBERSHIPS}
+            if set(classifications) != set(raw_by_id) or 'unresolved_generation_membership' in classifications.values():
+                errors.append('generation_membership_unresolved_or_incomplete')
+        except (ValueError, TypeError, KeyError):
+            errors.append('generation_membership_evidence_invalid')
+            eligible_ids = set()
+    generation_records = {record['record_id'].removeprefix('generation_fee:'): record
+                          for record in rows['reconciliation_records']
+                          if record['record_id'].startswith('generation_fee:')}
+    expected = set()
+    unallocated = Decimal(0)
+    attributed = Decimal(0)
+    try:
+        for identifier, raw in raw_by_id.items():
+            fee = cash_fee_receipt(raw)
+            if fee is None or identifier not in eligible_ids:
+                continue
+            expected.add(identifier)
+            record = generation_records[identifier]
+            entry = cash_entries['broker:fee:' + identifier]
+            verified = validate_generation_fee(record, entry, raw=raw, checkpoint=checkpoint)
+            if verified['fee_classification'] == 'unallocated_account_fee':
+                unallocated -= verified['amount']
+            else:
+                attributed -= verified['amount']
+    except (KeyError, ValueError, TypeError, ArithmeticError):
+        errors.append('generation_fee_receipt_or_cash_invalid')
+    if expected != generation_records.keys():
+        errors.append('generation_fee_receipt_missing_or_orphaned')
+    if {'broker:fee:' + identifier for identifier in expected} != {
+            identifier for identifier in cash_entries if identifier.startswith('broker:fee:')}:
+        errors.append('generation_fee_cash_missing_or_orphaned')
+    # Native quantities were independently proved against immutable receipts,
+    # FIFO lot basis, and current broker inventory above.
+    expected_native = {identifier for identifier, raw in raw_by_id.items() if identifier in eligible_ids
+                       and raw.get('activity_type') == 'CFEE'
+                       and raw.get('description') == 'Coin Pair Transaction Fee (Non USD)'}
+    if expected_native != native_receipts.keys() or native_receipts.keys() != valid_native_receipts:
+        errors.append('generation_native_fee_authority_invalid')
+    native_expense = sum((native_basis[identifier] for identifier in valid_native_receipts), Decimal(0))
+    explicit_fill_expense = sum((number(fill['fees']) for fill in fills.values()), Decimal(0))
+    # A nonzero fill fee plus a separate linked activity could represent the
+    # same expense. Without an immutable expense identity bridge, fail closed
+    # rather than deducting two representations of one charge.
+    for record in generation_records.values():
+        relation = record['actual']['authoritative_relationship']
+        if any(number(fill['fees']) != 0 and (
+                relation.get('fill_id') == fill.get('broker_fill_id') or
+                relation.get('order_id') == fill.get('order_id')) for fill in fills.values()):
+            errors.append('fill_fee_activity_overlap_requires_expense_identity_bridge')
+    gross = sum((number(row['realized_pnl']) for row in rows['trade_attributions']), Decimal(0))
+    verified_adjustments = Decimal(0)
+    capital_flows = Decimal(0)
+    expected_adjustments = set()
+    adjustment_records = {record['record_id'].removeprefix('generation_adjustment:'): record
+                          for record in rows['reconciliation_records']
+                          if record['record_id'].startswith('generation_adjustment:')}
+    try:
+        for identifier, raw in raw_by_id.items():
+            adjustment = adjustment_receipt(raw)
+            if adjustment is None or identifier not in eligible_ids:
+                continue
+            expected_adjustments.add(identifier)
+            verified = validate_generation_adjustment(adjustment_records[identifier],
+                cash_entries['broker:adjustment:' + identifier], raw=raw, checkpoint=checkpoint)
+            if verified['economic_type'] == 'capital_flow':
+                capital_flows += verified['amount']
+            else:
+                verified_adjustments += verified['amount']
+    except (KeyError, ValueError, TypeError, ArithmeticError):
+        errors.append('generation_adjustment_receipt_or_cash_invalid')
+    if expected_adjustments != adjustment_records.keys():
+        errors.append('generation_adjustment_missing_or_orphaned')
+    expected_journal = {'fill:cash:' + identifier for identifier in fills} | {
+        'broker:fee:' + identifier for identifier in expected} | {
+        'broker:adjustment:' + identifier for identifier in expected_adjustments}
+    if cash_entries.keys() - expected_journal:
+        errors.append('unverified_generation_cash_adjustment')
+    # Cash transfers/expenses cannot disappear from the feed simply because
+    # they have no instrument. Their economic classification must be explicit.
+    if any(raw['id'] in eligible_ids and raw.get('activity_type') not in {'FILL', 'CFEE', 'FEE', 'CSD', 'CSW', 'INT'}
+           for raw in raw_by_id.values()):
+        errors.append('unverified_generation_activity_adjustment')
+    bridge = {'gross_realized_pnl': str(gross), 'authoritative_attributed_cash_fees': str(attributed),
+              'unallocated_account_fees': str(unallocated), 'explicit_fill_fees': str(explicit_fill_expense),
+              'crypto_native_asset_fee_basis': str(native_expense),
+              'verified_adjustments_and_expenses': str(verified_adjustments),
+              'capital_flows_excluded_from_pnl': str(capital_flows),
+              'modeled_overlay_deducted': False, 'cash_fee_activity_ids': sorted(expected)}
+    observed = gross - attributed - unallocated - explicit_fill_expense - native_expense + verified_adjustments
+    return (None if errors else observed), bridge, errors
+
+
+def observed_generation_equity(snapshot, rows, checkpoint):
+    """Broker-observed curve independent of asynchronous projection completion.
+
+    All observations remain in the drawdown population. Pending settlement
+    flags cannot erase a drawdown or permanently invalidate a real broker mark.
+    Opening inventory performance and confirmed capital transfers are removed.
+    """
+    from tradepulse.models import AssetClass, asset_key_from_broker_symbol
+    from tradepulse.broker.symbols import normalize_alpaca_symbol
+    from tradepulse.reconciliation.generation_fees import validate_generation_adjustment
+
+    observation = snapshot['reconciliation_results']['broker_observation']
+    account, positions = observation['account'], observation['positions']
+    received = timestamp(account['received_at'])
+    as_of = timestamp(snapshot['as_of'])
+    if received > as_of or received < timestamp(checkpoint['opened_at']):
+        raise VerificationError('equity_account_receipt_time_invalid')
+    if (digest(canonical({'account_id': account['account_id'], 'account_number': account['account_number']}))
+            != checkpoint['account_identity_digest'] or account['raw']['id'] != account['account_id']
+            or number(account['raw']['equity']) != number(account['equity'])
+            or number(account['raw']['cash']) != number(account['cash'])
+            or number(snapshot['total_equity']) != number(account['equity'])):
+        raise VerificationError('equity_account_receipt_mismatch')
+    current = {}
+    for position in positions:
+        asset_class = AssetClass(position['asset_class'])
+        key = asset_key_from_broker_symbol(asset_class, position['symbol'])
+        position_received = timestamp(position['received_at'])
+        if (key in current or not timestamp(checkpoint['opened_at']) <= position_received <= as_of
+                or normalize_alpaca_symbol(position['raw']['symbol'], asset_class) != position['symbol']
+                or position['raw']['asset_class'] != {
+                    AssetClass.EQUITY: 'us_equity', AssetClass.OPTION: 'us_option', AssetClass.CRYPTO: 'crypto'
+                }[asset_class]
+                or number(position['raw']['qty']) != number(position['qty'])
+                or number(position['raw']['market_value']) != number(position['market_value'])):
+            raise VerificationError('equity_position_receipt_mismatch')
+        current[key] = position
+    opening_change = Decimal(0)
+    for old in checkpoint['positions']:
+        qty = number(old['qty'])
+        if not qty:
+            continue
+        key = asset_key_from_broker_symbol(AssetClass(old['asset_class']), old['symbol'])
+        position = current[key]
+        if not number(position['qty']):
+            raise VerificationError('opening_inventory_mark_missing')
+        opening_change += qty * number(position['market_value']) / number(position['qty']) - number(old['market_value'])
+    entries = {row['entry_id']: row for row in rows['cash_ledger']}
+    capital = Decimal(0)
+    for record in rows['reconciliation_records']:
+        if not record['record_id'].startswith('generation_adjustment:'):
+            continue
+        adjustment = validate_generation_adjustment(record, entries[record['actual']['cash_entry_id']], checkpoint=checkpoint)
+        if adjustment['economic_type'] != 'capital_flow' or adjustment['occurred_at'] > received:
+            continue
+        # No invented effective posting time for a late-arriving transfer.
+        if timestamp(record['occurred_at']) > received:
+            raise VerificationError('historical_capital_flow_effective_time_unresolved')
+        capital += adjustment['amount']
+    return number(account['equity']) - opening_change - capital

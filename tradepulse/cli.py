@@ -141,6 +141,7 @@ CRYPTO_SCAN_INTERVAL_SECONDS = 600
 OPTION_SCAN_INTERVAL_SECONDS = 1200
 MONITOR_INTERVAL_SECONDS = 120
 SETTLE_INTERVAL_SECONDS = 60
+VERIFICATION_RECONCILE_INTERVAL_SECONDS = 60
 # Bounded retry after an INDETERMINATE market-clock check (broker/network
 # trouble) -- distinct from a CONFIRMED-closed result, which correctly
 # waits the full lane interval instead (see _scan_action). Short enough to
@@ -504,6 +505,20 @@ async def _run_reconcile(settings: Settings) -> int:
                 run_reconciliation(repositories, broker, settlement, alerts, lease_lost=lease_lost),
                 on_renewal_failed=on_lease_lost,
             )
+            from tradepulse.verification.opening import load_bound_opening_checkpoint
+            if await database.run(load_bound_opening_checkpoint) is not None:
+                from tradepulse.valuation import marked_snapshot, record_valuation, reconciliation_outcome
+                account = await broker.get_account()
+                positions = await broker.get_positions()
+                snapshot = await marked_snapshot(repositories, account, positions, now=datetime.now(UTC))
+                await record_valuation(repositories, snapshot)
+                await repositories.equity_snapshots.create_once(snapshot.snapshot_id, snapshot)
+                if reconciliation_outcome(snapshot).value != 'matched':
+                    logger.warning('generation_reconciliation_incomplete', extra={
+                        'event': 'generation_reconciliation_incomplete', 'snapshot_id': snapshot.snapshot_id,
+                        'mandatory_invariants': snapshot.reconciliation_results.get('mandatory_invariants'),
+                    })
+                    return 1
         finally:
             await release_lock(database, RECONCILE_LOCK_KEY, owner_token)
     finally:
@@ -615,6 +630,7 @@ async def _settle_action(
 async def _periodic_loop(
     action: Callable[[], Awaitable[float]], shutdown: asyncio.Event,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    *, cycle_completed: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Calls `action` repeatedly until shutdown -- `action` ITSELF decides how
     long to wait before the next call (its return value, in seconds). That's
@@ -625,6 +641,8 @@ async def _periodic_loop(
     without needing cancellation."""
     while not shutdown.is_set():
         wait_seconds = await action()
+        if cycle_completed is not None:
+            await cycle_completed()
         waited = 0.0
         while waited < wait_seconds and not shutdown.is_set():
             await sleep(1)
@@ -689,11 +707,45 @@ async def _supervised_lane(
         backoff = min(backoff * 2, LANE_RESTART_MAX_BACKOFF_SECONDS)
 
 
+async def _verification_reconcile_action(settings: Settings, repositories: PersistenceRepositories,
+                                         broker: AlpacaClient) -> float:
+    # The supervisor already holds the generation lease. Reuse the sole
+    # one-shot reconciliation implementation and its independent DB lease.
+    await _run_reconcile(settings)
+    from tradepulse.time import aware_utc
+    broker_clock = await broker.get_clock()
+    received_at = datetime.now(UTC)
+    event = AuditEvent(
+        event_id=str(uuid4()), event_type='verification_broker_clock', severity='info',
+        message='Broker market session clock receipt', occurred_at=received_at,
+        entity_type='trading_supervisor', entity_id='reconcile', details={
+            'timestamp': aware_utc(broker_clock.timestamp, field_name='broker_clock_timestamp').isoformat(),
+            'is_open': broker_clock.is_open,
+            'next_open': aware_utc(broker_clock.next_open, field_name='broker_clock_next_open').isoformat(),
+            'next_close': aware_utc(broker_clock.next_close, field_name='broker_clock_next_close').isoformat(),
+            'received_at': received_at.isoformat(),
+        },
+    )
+    await repositories.audit_events.create_once(event.event_id, event)
+    return VERIFICATION_RECONCILE_INTERVAL_SECONDS
+
+
+async def _verification_cycle(repositories: PersistenceRepositories, lane: str) -> None:
+    now = datetime.now(UTC)
+    event = AuditEvent(
+        event_id=str(uuid4()), event_type='verification_lane_cycle', severity='info',
+        message='Scheduled verification lane completed a tick', occurred_at=now,
+        entity_type='trading_supervisor', entity_id=lane, details={'lane': lane},
+    )
+    await repositories.audit_events.create_once(event.event_id, event)
+
+
 async def _run_trading_supervisor(
     database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, ai_provider: AIProvider,
     market_data: AlpacaMarketDataProvider, broker: AlpacaClient, gateway: ExecutionGateway,
     settlement: SettlementProcessor, settings: Settings, alerts: TelegramAlerter, shutdown: asyncio.Event,
     capabilities: MarketDataCapabilities, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    *, verification_enabled: bool = False,
 ) -> None:
     """Launches ONE independent asyncio task per lane (equity, crypto,
     option, monitor, settle) -- genuine concurrency, never a shared serial
@@ -710,31 +762,38 @@ async def _run_trading_supervisor(
     Each lane is a zero-arg FACTORY (not an already-built coroutine) --
     _supervised_lane calls it again on every restart attempt, and a
     coroutine object can only ever be awaited once."""
+    def heartbeat(lane: str) -> dict:
+        return {'cycle_completed': lambda: _verification_cycle(repositories, lane)} if verification_enabled else {}
+
     lanes: dict[str, Callable[[], Awaitable[None]]] = {
         "equity": lambda: _periodic_loop(
             lambda: _scan_action(
                 AssetClass.EQUITY, EQUITY_SCAN_INTERVAL_SECONDS, database, repositories, ai_provider, market_data,
                 broker, gateway, settings, alerts, capabilities,
             ),
-            shutdown, sleep,
+            shutdown, sleep, **heartbeat('equity'),
         ),
         "crypto": lambda: _periodic_loop(
             lambda: _scan_action(
                 AssetClass.CRYPTO, CRYPTO_SCAN_INTERVAL_SECONDS, database, repositories, ai_provider, market_data,
                 broker, gateway, settings, alerts, capabilities,
             ),
-            shutdown, sleep,
+            shutdown, sleep, **heartbeat('crypto'),
         ),
         "option": lambda: _periodic_loop(
             lambda: _scan_action(
                 AssetClass.OPTION, OPTION_SCAN_INTERVAL_SECONDS, database, repositories, ai_provider, market_data,
                 broker, gateway, settings, alerts, capabilities,
             ),
-            shutdown, sleep,
+            shutdown, sleep, **heartbeat('option'),
         ),
-        "monitor": lambda: _periodic_loop(lambda: _monitor_action(database, repositories, broker, market_data, gateway, alerts, settings), shutdown, sleep),
-        "settle": lambda: _periodic_loop(lambda: _settle_action(database, repositories, settlement, alerts), shutdown, sleep),
+        "monitor": lambda: _periodic_loop(lambda: _monitor_action(database, repositories, broker, market_data, gateway, alerts, settings), shutdown, sleep, **heartbeat('monitor')),
+        "settle": lambda: _periodic_loop(lambda: _settle_action(database, repositories, settlement, alerts), shutdown, sleep, **heartbeat('settle')),
     }
+    if verification_enabled:
+        lanes["reconcile"] = lambda: _periodic_loop(
+            lambda: _verification_reconcile_action(settings, repositories, broker), shutdown, sleep, **heartbeat('reconcile'),
+        )
     await asyncio.gather(*(_supervised_lane(name, factory, repositories, alerts, shutdown, sleep) for name, factory in lanes.items()))
 
 
@@ -809,6 +868,7 @@ async def _run_application(settings: Settings, port: int, open_browser: bool, *,
     alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
 
     async def work() -> int:
+        verification_startup_id = str(uuid4())
         capabilities = await _resolve_and_apply_market_data_feeds(broker, settings)
         market_data = AlpacaMarketDataProvider(broker)
         gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
@@ -850,6 +910,23 @@ async def _run_application(settings: Settings, port: int, open_browser: bool, *,
             start_result = 0
         else:
             start_result = await _run_start(settings)
+        if start_result == 0 and verification is not None:
+            first_start = not await asyncio.to_thread((verification.directory / 'started.json').exists)
+            initial_reconciliation = await _run_reconcile(settings)
+            current_session = await load_session(repositories)
+            if (initial_reconciliation != 0 or current_session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED
+                    or not await verification.runtime_started(broker)):
+                start_result = 1
+                shutdown.set()
+            else:
+                event = AuditEvent(
+                    event_id=str(uuid4()), event_type='verification_runtime_started', severity='info',
+                    message='Guarded runtime activated after reconciliation', occurred_at=datetime.now(UTC),
+                    entity_type='verification_generation', entity_id=verification.generation,
+                    details={'generation': verification.generation, 'startup_id': verification_startup_id,
+                             'first_start': first_start},
+                )
+                await repositories.audit_events.create_once(event.event_id, event)
         trading_task: asyncio.Task[None] | None = None
         if start_result != 0:
             logger.error("run_session_activation_failed", extra={"event": "run_session_activation_failed"})
@@ -867,6 +944,7 @@ async def _run_application(settings: Settings, port: int, open_browser: bool, *,
                 _run_trading_supervisor(
                     database, repositories, ai_provider, market_data, broker, gateway, settlement, settings, alerts,
                     shutdown, capabilities,
+                    **({"verification_enabled": True} if verification is not None else {}),
                 )
             )
 
@@ -874,9 +952,22 @@ async def _run_application(settings: Settings, port: int, open_browser: bool, *,
         # ---- graceful shutdown: stop scheduling, let in-flight work finish, stop the server, done ----
         if trading_task is not None:
             await trading_task
+        if verification is not None and start_result == 0:
+            # Capture final evidence after in-flight trading work drains. This
+            # uses existing one-shot authorities and their own DB leases.
+            await _run_settle(settings)
+            await _run_reconcile(settings)
         await dashboard_task
         if verification_task is not None:
             await verification_task
+        if verification is not None:
+            event = AuditEvent(
+                event_id=str(uuid4()), event_type='verification_runtime_stopped', severity='info',
+                message='Guarded runtime drained and stopped', occurred_at=datetime.now(UTC),
+                entity_type='verification_generation', entity_id=verification.generation,
+                details={'generation': verification.generation, 'startup_id': verification_startup_id},
+            )
+            await repositories.audit_events.create_once(event.event_id, event)
         return 0
 
     owner_token = str(uuid4())
@@ -1042,7 +1133,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "verification":
             return asyncio.run(verification_command(settings, args))
         if args.command == "reconcile" and generation is not None:
-            return asyncio.run(run_official(settings, generation, lambda verification: _run_reconcile(settings)))
+            return asyncio.run(run_official(settings, generation, lambda verification: _run_reconcile(settings),
+                                            reconciliation_only=True))
         if args.command == "reset-integrity":
             return asyncio.run(_run_reset_integrity(settings, force=args.force))
         if args.command == "scan":

@@ -245,6 +245,7 @@ def test_prove_edge_conserves_fee_units_and_expenses_basis_once(tamper):
     from tradepulse.verification.evidence import assess
 
     rows = passing_rows(count=1, wins=1)
+    rows['reconciliation_records'] = rows['reconciliation_records'][:1]
     asset = decode_payload(encode_payload(ASSET))
     for table in ['fills', 'settlements', 'position_lots', 'trade_attributions', 'trade_intents']:
         for row in rows[table]:
@@ -271,7 +272,7 @@ def test_prove_edge_conserves_fee_units_and_expenses_basis_once(tamper):
                    'order_id': f['order_id'], 'side': f['side'], 'qty': f['quantity'], 'price': f['price'],
                    'transaction_time': f['filled_at']} for f in rows['fills']] + [raw]
     if tamper in ('cash', 'cash_missing', 'cash_amount'):
-        cash = {**cash_receipt('cash-test', '-0.09'), 'created_at': (ASSESS_NOW-timedelta(minutes=1)).isoformat()}
+        cash = {**cash_receipt('cash-test', '-0.09'), 'order_id': rows['fills'][1]['order_id'], 'created_at': (ASSESS_NOW-timedelta(minutes=1)).isoformat()}
         activities.append(cash)
     _, proof = validate_fee_population(ASSET, activities, [hydrate('fills', f) for f in rows['fills']],
                                       [hydrate('trade_intents', i) for i in rows['trade_intents']], D(0))
@@ -294,7 +295,9 @@ def test_prove_edge_conserves_fee_units_and_expenses_basis_once(tamper):
     rows['reconciliation_records'].append({'record_id': epoch['checkpoint_id'], 'subject_id': 'test-epoch',
         'reconciliation_type': 'asset_fee', 'outcome': 'matched', 'occurred_at': ASSESS_NOW.isoformat(), 'actual': epoch})
     if tamper in ('cash', 'cash_amount'):
-        from tradepulse.models import CashLedgerEntry
+        import sqlite3
+        from tradepulse.persistence.database import SCHEMA
+        from tradepulse.reconciliation.generation_fees import persist_generation_fees
         from tradepulse.reconciliation.cash_fees import allocate_cash_fees
         _, order, allocations = allocate_cash_fees(proof, [hydrate('trade_attributions', a) for a in rows['trade_attributions']])[0]
         cash_id = 'asset_cash_fee:cash-test'
@@ -302,10 +305,17 @@ def test_prove_edge_conserves_fee_units_and_expenses_basis_once(tamper):
             'reconciliation_type': 'asset_fee', 'outcome': 'corrected', 'occurred_at': ASSESS_NOW.isoformat(),
             'actual': decode_payload(encode_payload({'activity': cash, 'order': order, 'allocations': allocations,
                 'allocation_policy': 'verified_sell_population_proceeds_proportion', 'population_record_id': pop_id,
-                'cash_entry_id': cash_id}))})
-        entry = CashLedgerEntry(cash_id, 'alpaca:CFEE:USD:cash-test', D('-0.09') if tamper == 'cash' else D('-1'),
-                                'USD', datetime.fromisoformat(cash['created_at']), 'test')
-        rows['cash_ledger'].append(decode_payload(encode_payload(entry)))
+                'cash_entry_id': 'broker:fee:cash-test'}))})
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        connection.executescript(SCHEMA)
+        persist_generation_fees(connection, [cash], {'checkpoint': None,
+            'classifications': {'cash-test': 'in_generation'}}, now=ASSESS_NOW)
+        for table in ('cash_ledger', 'reconciliation_records'):
+            rows[table].extend(decode_payload(row['payload']) for row in connection.execute('SELECT payload FROM '+table))
+        connection.close()
+        if tamper == 'cash_amount':
+            next(row for row in rows['cash_ledger'] if row['entry_id'] == 'broker:fee:cash-test')['amount'] = '-1'
     if tamper == 'amount':
         record['actual']['cost_basis_debit'] = '0'
     if tamper == 'asset':
@@ -323,7 +333,8 @@ def test_prove_edge_conserves_fee_units_and_expenses_basis_once(tamper):
     result = assess(rows, START.isoformat(), ASSESS_NOW, COSTS)
     if tamper in (None, 'cash'):
         assert result['criteria']['eligible_round_trips']['actual'] == 1
-        assert D(result['criteria']['net_realized_pnl']['actual']) == D('-8.23836') - (D('.09') if tamper == 'cash' else D(0))  # -8.2 actual result, less the unchanged 2 bps model on 191.8 notional
+        assert D(result['modeled_trade_net']) == D('1.76164')  # price PnL less only the frozen overlay
+        assert D(result['observed_generation_net']) == D('-8.2') - (D('.09') if tamper == 'cash' else D(0))
         assert result['criteria']['evidence_errors']['actual'] == 0
     else:
         assert result['status'] == 'PROVE_EDGE_FAILED_INTEGRITY'
@@ -492,7 +503,7 @@ async def test_population_ambiguity_cannot_debit_local_lots(tmp_path, problem):
     elif problem == 'missing_fill':
         raw = raw[1:]
     elif problem == 'unknown_transfer':
-        raw.append({'id': 'transfer', 'symbol': 'SOLUSD', 'activity_type': 'JNLS', 'qty': '1'})
+        raw.append({'id': 'transfer', 'symbol': 'SOLUSD', 'activity_type': 'JNLS', 'qty': '1', 'created_at': NOW.isoformat()})
     else:
         qty += 1
     before = await r.position_lots.list_all()
@@ -508,7 +519,7 @@ def cash_receipt(identifier='cash-1', amount='-3.54'):
             'net_amount': amount, 'status': 'executed'}
 
 
-async def test_usd_fees_are_recorded_once_and_allocations_conserve_actual_expense(tmp_path):
+async def test_usd_account_fees_are_recorded_once_without_inventing_allocations(tmp_path):
     from tradepulse.reconciliation.fee_replay import replay_asset_fees
     r = await seeded(tmp_path)
     await sold_history(r)
@@ -520,18 +531,17 @@ async def test_usd_fees_are_recorded_once_and_allocations_conserve_actual_expens
     assert len(entries) == 2
     assert sum((D(x['amount']) for x in entries), D(0)) == D('-9.31')
     records = [x['payload'] for x in await r.reconciliation_records.list_all()]
-    cash_records = [x for x in records if x['record_id'].startswith('asset_cash_fee:')]
+    cash_records = [x for x in records if x['record_id'].startswith('generation_fee:')]
     assert len(cash_records) == 2
-    for row in cash_records:
-        assert sum((D(v) for v in row['actual']['allocations'].values()), D(0)) == -D(row['actual']['activity']['net_amount'])
-        assert row['actual']['order']['broker_order_ids'] == ['sell-order']
+    assert all(x['actual']['fee_classification'] == 'unallocated_account_fee' for x in cash_records)
+    assert not any(x['record_id'].startswith('asset_cash_fee:') for x in records)
     for _ in range(3):
         assert not await replay_asset_fees(r, ASSET, raw, qty, now=stamp)
     assert len(await r.reconciliation_records.list_all()) == len(records)
     assert [x['payload'] for x in await r.cash_ledger.list_all()] == entries
 
 
-async def test_unlinked_cash_fee_uses_exhaustive_single_asset_population_not_a_guessed_order(tmp_path):
+async def test_unlinked_cash_fee_never_infers_single_asset_or_order_population(tmp_path):
     from tradepulse.reconciliation.fee_population import validate_fee_population
     r = await seeded(tmp_path)
     await sold_history(r)
@@ -545,10 +555,7 @@ async def test_unlinked_cash_fee_uses_exhaustive_single_asset_population_not_a_g
     sale_raw = next(x for x in raw if x.get('id') == sell.broker_fill_id)
     raw += [{**sale_raw, 'id': 'alternative', 'order_id': 'another-order'}, cash_receipt()]
     _, proof = validate_fee_population(ASSET, raw, fills, intents, qty-alternative.quantity)
-    linked = proof['cash_fee_populations']['cash-1']
-    assert linked['broker_order_ids'] == ['another-order', 'sell-order']
-    assert linked['trade_intent_ids'] == ['another-intent', 'sell-intent']
-    assert linked['method'] == 'exhaustive_single_asset_sell_population'
+    assert proof['cash_fee_populations'] == {}
 
 
 async def test_cash_insert_failure_rolls_back_entire_historical_replay(tmp_path):
@@ -560,7 +567,7 @@ async def test_cash_insert_failure_rolls_back_entire_historical_replay(tmp_path)
     before = [await table.list_all() for table in tables]
     await r.position_lots.database.run(lambda c: c.execute(
         "CREATE TRIGGER reject_second_fee BEFORE INSERT ON cash_ledger "
-        "WHEN NEW.record_id='asset_cash_fee:cash-2' BEGIN SELECT RAISE(ABORT,'cash rollback'); END"), write=True)
+        "WHEN NEW.record_id='broker:fee:cash-2' BEGIN SELECT RAISE(ABORT,'cash rollback'); END"), write=True)
     raw, qty = await population(r, four_receipts())
     raw += [cash_receipt(), cash_receipt('cash-2', '-5.77')]
     with pytest.raises(DatabaseError, match='cash rollback'):

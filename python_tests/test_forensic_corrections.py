@@ -41,7 +41,9 @@ async def test_marked_reporting_precision_cost_and_price_change(tmp_path):
     assert s.holdings_cost_basis == D('10.617283945')
     assert s.sector_exposure == {'Tech': s.holdings_value}
     assert s.sector_cost_basis == {'Tech': s.holdings_cost_basis}
-    assert s.equity_reconciliation_status == 'matched'
+    assert s.equity_reconciliation_status == 'failed'  # holdings have no conserved lot projection
+    assert s.reconciliation_results['broker_equity'] == 'matched'
+    assert s.reconciliation_results['position_quantities'][asset_identity_key(asset)] == 'mismatch'
     assert s.broker_equity_components['accrued_fees'] == D('.23')
     changed = await marked_snapshot(r, account('22'), [replace(p, market_value=D(22))], now=NOW)
     assert changed.holdings_value == 22
@@ -82,7 +84,8 @@ async def test_short_and_explicit_memopost_components(tmp_path):
     s = await marked_snapshot(r, a, [p], now=NOW)
     assert s.holdings_value == -20
     assert s.equity_reconciliation_difference == 0
-    assert s.equity_reconciliation_status == 'matched'
+    assert s.equity_reconciliation_status == 'failed'  # external position has no local inventory
+    assert s.reconciliation_results['broker_equity'] == 'matched'
 
 
 @pytest.mark.parametrize('broker_qty', ['36.72363133', '36.631822251'])
@@ -172,7 +175,8 @@ async def test_separate_position_observations_do_not_fail_equity_arithmetic(tmp_
     r = await repos(tmp_path)
     a, p = account(), position()
     s = await marked_snapshot(r, a, [replace(p, market_value=p.market_value+D(difference))], now=NOW)
-    assert s.equity_reconciliation_status == 'matched'
+    assert s.equity_reconciliation_status == 'failed'
+    assert s.reconciliation_results['broker_equity'] == 'matched'
     assert s.equity_reconciliation_difference == 0
     assert s.position_value_observation_difference == D(difference)
     assert s.position_value_observation_status == 'different_uncoordinated_observations'
@@ -198,7 +202,8 @@ async def test_observation_times_are_transport_times_not_a_common_price_instant(
 async def test_missing_cost_basis_does_not_change_exact_equity_arithmetic(tmp_path):
     r = await repos(tmp_path)
     s = await marked_snapshot(r, account(), [replace(position(), cost_basis=None)], now=NOW)
-    assert s.equity_reconciliation_status == 'matched'
+    assert s.equity_reconciliation_status == 'failed'
+    assert s.reconciliation_results['broker_equity'] == 'matched'
     assert s.equity_reconciliation_difference == 0
     assert s.holdings_cost_basis is None
     assert any(error.startswith('cost_basis_missing:') for error in s.valuation_errors)

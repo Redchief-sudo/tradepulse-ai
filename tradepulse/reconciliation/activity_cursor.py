@@ -11,7 +11,25 @@ from tradepulse.persistence.codec import encode_payload
 from .asset_fees import AssetFeeIntegrityError
 
 
+def cursor_evidence(activity_id):
+    if activity_id is not None and (not isinstance(activity_id, str) or not activity_id):
+        raise AssetFeeIntegrityError('ACTIVITY_CURSOR_IDENTITY_INVALID')
+    return {'kind': 'broker_activity' if activity_id is not None else 'empty_population',
+            'last_activity_id': activity_id}
+
+
+def cursor_activity_id(cursor):
+    if not isinstance(cursor, dict) or set(cursor) != {'kind', 'last_activity_id'}:
+        raise AssetFeeIntegrityError('ACTIVITY_CURSOR_EVIDENCE_INVALID')
+    identifier = cursor['last_activity_id']
+    if cursor != cursor_evidence(identifier):
+        raise AssetFeeIntegrityError('ACTIVITY_CURSOR_EVIDENCE_INVALID')
+    return identifier
+
+
 async def activity_population(broker, cursor=None):
+    if isinstance(cursor, dict):
+        cursor = cursor_activity_id(cursor)
     tail_pages = []
     tail = None
     if cursor:
@@ -35,10 +53,14 @@ async def activity_population(broker, cursor=None):
              'pages': pages, 'resume_pages': tail_pages,
              'activity_ids': [r['id'] for r in raw], 'complete': True,
              'population_hash': sha256(encode_payload(raw).encode()).hexdigest()}
+    validate_pagination(raw, proof)
     return raw, proof
 
 
 def validate_pagination(raw, proof):
+    identifiers = [row.get('id') for row in raw]
+    if any(not isinstance(i, str) or not i for i in identifiers) or len(set(identifiers)) != len(identifiers):
+        raise AssetFeeIntegrityError('ACTIVITY_PAGINATION_DUPLICATE_IDENTITY')
     if not isinstance(proof, dict) or proof.get('complete') is not True:
         raise AssetFeeIntegrityError('ACTIVITY_PAGINATION_INCOMPLETE')
     if proof.get('population_hash') != sha256(encode_payload(raw).encode()).hexdigest():

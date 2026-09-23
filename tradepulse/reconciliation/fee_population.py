@@ -1,14 +1,14 @@
 """Exhaustive instrument-population proof, not guessed fee-to-fill linkage."""
-from datetime import datetime
 from decimal import Decimal
 from hashlib import sha256
 
 from tradepulse.models import asset_identity_key
-from tradepulse.models.base import decimal_value, require_aware, require_text
+from tradepulse.models.base import decimal_value, require_text
+from tradepulse.time import aware_utc
 from tradepulse.persistence.codec import encode_payload
 
 
-def validate_fee_population(asset, activities, fills, intents, broker_quantity):
+def validate_fee_population(asset, activities, fills, intents, broker_quantity, *, membership=None):
     """Require the complete, unfiltered broker activity feed and exact local fills.
 
     The caller must obtain every page without a date/type filter. Every fill
@@ -18,6 +18,7 @@ def validate_fee_population(asset, activities, fills, intents, broker_quantity):
     instruments do not confer ownership and cannot consume this inventory.
     """
     from .asset_fees import AssetFeeIntegrityError, parse_asset_fee
+    from .generation_fees import cash_fee_receipt
 
     key = asset_identity_key(asset)
     symbol = asset.symbol.replace('/', '')
@@ -31,13 +32,23 @@ def validate_fee_population(asset, activities, fills, intents, broker_quantity):
     cash_fees = []
     fees = []
     net = Decimal(0)
+    from .membership import eligible_activities, activity_time
+    eligible = eligible_activities(activities, membership) if membership else activities
+    eligible_ids = {r['id'] for r in eligible}
     for raw in activities:
         identifier = require_text(raw.get('id'), 'activity_id')
         if identifier in seen:
             raise AssetFeeIntegrityError('ASSET_FEE_POPULATION_DUPLICATE_ACTIVITY')
         seen.add(identifier)
+        activity_time(raw)
+        if identifier not in eligible_ids:
+            continue
         kind = raw.get('activity_type')
         raw_symbol = str(raw.get('symbol') or '').replace('/', '')
+        cash_fee = cash_fee_receipt(raw)
+        if cash_fee is not None:
+            cash_fees.append(dict(raw))
+            continue
         # Cash-only non-trade activities have no inventory quantity. Do not
         # misclassify USD sell fees as asset-unit debits or invent their linkage.
         if not raw_symbol:
@@ -47,10 +58,6 @@ def validate_fee_population(asset, activities, fills, intents, broker_quantity):
                     or decimal_value(raw.get('qty', '0'), 'cash_activity_qty') != 0):
                 raise AssetFeeIntegrityError('ASSET_FEE_POPULATION_UNCLASSIFIED_MOVEMENT')
             amount = decimal_value(raw['net_amount'], 'cash_activity_amount')
-            if kind == 'CFEE':
-                if isinstance(raw['net_amount'], float) or amount >= 0:
-                    raise AssetFeeIntegrityError('CASH_FEE_UNSUPPORTED_RECEIPT')
-                cash_fees.append(dict(raw))
             continue
         if raw_symbol != symbol:
             continue
@@ -60,7 +67,7 @@ def validate_fee_population(asset, activities, fills, intents, broker_quantity):
                 raise AssetFeeIntegrityError('ASSET_FEE_POPULATION_INEXACT_RECEIPT')
             fill = local.get(identifier)
             intent = intent_by_id.get(fill.trade_intent_id) if fill else None
-            at = require_aware(datetime.fromisoformat(raw['transaction_time']), 'activity_time')
+            at = aware_utc(raw.get('transaction_time'), field_name='activity_time')
             if (fill is None or intent is None or intent.broker_order_id != raw.get('order_id')
                     or fill.order_id != raw.get('order_id') or asset_identity_key(intent.asset) != key
                     or fill.side != intent.side or fill.execution_mode != intent.execution_mode
@@ -78,52 +85,43 @@ def validate_fee_population(asset, activities, fills, intents, broker_quantity):
             raise AssetFeeIntegrityError('ASSET_FEE_POPULATION_UNCLASSIFIED_MOVEMENT')
     if matched != local.keys():
         raise AssetFeeIntegrityError('ASSET_FEE_POPULATION_INCOMPLETE_FILL_HISTORY')
-    if net != broker_quantity:
+    from .membership import opening_quantities
+    opening_quantity = opening_quantities(membership['checkpoint'] if membership else None).get(key, Decimal(0))
+    if net + opening_quantity != broker_quantity:
         raise AssetFeeIntegrityError('ASSET_FEE_POPULATION_BROKER_QUANTITY_MISMATCH')
-    # An unlinked cash receipt proves an expense for an exhaustive sell
-    # population, not an individual order. When that population contains only
-    # this canonical instrument, allocate the expense across the population's
-    # proceeds. Never guess ownership across different instruments.
-    from tradepulse.broker.symbols import infer_alpaca_asset_class, normalize_alpaca_symbol
-    from tradepulse.models import AssetClass
+    # Only a broker-provided order/fill relationship proves trade ownership.
+    # Account-level fees remain in the generation ledger without guessed splits.
     cash_populations = {}
     all_local = {fill.broker_fill_id: fill for fill in fills}
     for cash in cash_fees:
-        at = require_aware(datetime.fromisoformat(cash['created_at']), 'cash_fee_time')
-        candidates = []
-        for raw in activities:
-            raw_symbol = str(raw.get('symbol') or '')
-            if (raw.get('activity_type') != 'FILL' or raw.get('side') != 'sell'
-                    or infer_alpaca_asset_class(raw_symbol) != AssetClass.CRYPTO
-                    or not raw_symbol.replace('/', '').endswith('USD')):
-                continue
-            filled_at = require_aware(datetime.fromisoformat(raw['transaction_time']), 'cash_fee_fill_time')
-            if filled_at <= at and (not cash.get('order_id') or cash['order_id'] == raw.get('order_id')):
-                candidates.append(raw)
-        symbols = {normalize_alpaca_symbol(raw['symbol'], AssetClass.CRYPTO) for raw in candidates}
-        if asset.symbol not in symbols:
-            continue  # this instrument cannot consume another instrument's fee
-        if len(symbols) != 1:
-            raise AssetFeeIntegrityError('CASH_FEE_ASSET_POPULATION_AMBIGUOUS')
-        orders = {}
-        for raw in candidates:
-            fill = all_local.get(raw['id'])
-            intent = intent_by_id.get(fill.trade_intent_id) if fill else None
-            filled_at = require_aware(datetime.fromisoformat(raw['transaction_time']), 'cash_fee_fill_time')
-            if (fill is None or intent is None or fill.order_id != raw.get('order_id')
-                    or intent.broker_order_id != fill.order_id or fill.side.value != 'sell'
-                    or fill.side != intent.side or fill.execution_mode != intent.execution_mode
-                    or asset_identity_key(fill.asset) != key or asset_identity_key(intent.asset) != key
-                    or fill.filled_at != filled_at or fill.quantity != decimal_value(raw['qty'], 'sell_qty')
-                    or fill.price != decimal_value(raw['price'], 'sell_price')):
-                raise AssetFeeIntegrityError('CASH_FEE_EXTERNAL_OR_MISMATCHED_SELL')
-            orders[fill.order_id] = fill.trade_intent_id
+        aware_utc(cash.get('created_at'), field_name='cash_fee_time')
+        if not cash.get('order_id') and not cash.get('fill_id'):
+            continue
+        candidates = [raw for raw in eligible if raw.get('activity_type') == 'FILL'
+                      and ((cash.get('order_id') and raw.get('order_id') == cash['order_id'])
+                           or (cash.get('fill_id') and raw['id'] == cash['fill_id']))]
+        if not candidates:
+            raise AssetFeeIntegrityError('CASH_FEE_AUTHORITATIVE_LINK_MISSING')
+        if any(all_local.get(raw['id']) is None for raw in candidates):
+            raise AssetFeeIntegrityError('CASH_FEE_EXTERNAL_OR_MISMATCHED_SELL')
+        selected = [all_local[raw['id']] for raw in candidates]
+        if any(fill.side.value != 'sell' for fill in selected):
+            continue  # authoritative entry fee stays in the generation cash ledger
+        keys = {asset_identity_key(fill.asset) for fill in selected}
+        if len(keys) != 1:
+            raise AssetFeeIntegrityError('CASH_FEE_AUTHORITATIVE_LINK_AMBIGUOUS')
+        if key not in keys:
+            continue
+        orders = {fill.order_id: fill.trade_intent_id for fill in selected}
         cash_populations[cash['id']] = {'broker_order_ids': sorted(orders),
             'trade_intent_ids': sorted(set(orders.values())), 'asset_key': key,
-            'method': 'authoritative_order_link' if cash.get('order_id') else 'exhaustive_single_asset_sell_population'}
+            'method': 'authoritative_order_link' if cash.get('order_id') else 'authoritative_fill_link'}
     relevant.sort(key=lambda row: row['id'])
     proof = {'method': 'complete_instrument_activity_population', 'asset_key': key,
              'activities': sorted((dict(row) for row in activities), key=lambda row: row['id']),
              'cash_fee_populations': cash_populations, 'broker_quantity': broker_quantity,
              'activity_digest': sha256(encode_payload(relevant).encode()).hexdigest()}
+    if membership and membership.get('checkpoint'):
+        proof['generation_membership'] = membership
+        proof['opening_broker_quantity'] = opening_quantity
     return fees, proof

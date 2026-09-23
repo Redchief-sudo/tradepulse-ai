@@ -16,13 +16,19 @@ class AssetIdentity:
     native_asset_id: str
     venue: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    contract_multiplier: Decimal | str | int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.asset_class, AssetClass):
             raise TypeError("asset_class must be AssetClass")
         object.__setattr__(self, "symbol", require_text(self.symbol, "symbol").upper())
         object.__setattr__(self, "native_asset_id", require_text(self.native_asset_id, "native_asset_id"))
-        object.__setattr__(self, "metadata", immutable_metadata(self.metadata))
+        metadata = dict(self.metadata)
+        if self.contract_multiplier is not None:
+            metadata["contract_multiplier"] = str(decimal_value(
+                self.contract_multiplier, "contract_multiplier", positive=True
+            ))
+        object.__setattr__(self, "metadata", immutable_metadata(metadata))
 
 
 def asset_identity_key(asset: AssetIdentity) -> str:

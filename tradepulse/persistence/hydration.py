@@ -17,6 +17,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
+from tradepulse.time import aware_utc
 
 from tradepulse.models import (
     AIResponse,
@@ -77,11 +78,11 @@ def _decimal_or_none(value: Any) -> Decimal | None:
 
 
 def _datetime(value: Any) -> datetime:
-    return datetime.fromisoformat(value)
+    return aware_utc(value)
 
 
 def _datetime_or_none(value: Any) -> datetime | None:
-    return None if value is None else datetime.fromisoformat(value)
+    return None if value is None else aware_utc(value)
 
 
 def _asset_identity(d: Mapping[str, Any]) -> AssetIdentity:

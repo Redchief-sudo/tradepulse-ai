@@ -13,7 +13,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA = "paper-verification-v1"
+from tradepulse.time import aware_utc
+
+SCHEMA = "paper-verification-v2"
 SOURCE_SUFFIXES = frozenset({".py", ".json", ".toml", ".yaml", ".yml", ".sql", ".ini", ".cfg"})
 ROOT_AUTHORITY = ("pyproject.toml", "uv.lock", "requirements.txt", "requirements.lock")
 GENERATION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}\Z")
@@ -115,7 +117,8 @@ def load_json(path: Path) -> dict:
     return value
 
 
-def freeze_source(root: Path, directory: Path, generation: str, *, context: dict, policy: dict, revision: str) -> dict:
+def freeze_source(root: Path, directory: Path, generation: str, *, context: dict, policy: dict,
+                  revision: str, opening_checkpoint: dict | None = None) -> dict:
     if directory.exists():
         raise VerificationError("generation_already_exists")
     files = source_files(root)
@@ -125,8 +128,14 @@ def freeze_source(root: Path, directory: Path, generation: str, *, context: dict
         "protected_file_count": len(files), "protected_files": files,
         "aggregate_sha256": digest(canonical(files)), "verification_status": "FROZEN",
         "context": context, "policy": policy,
+        "generation_opening_checkpoint_sha256": digest(canonical(opening_checkpoint)) if opening_checkpoint is not None else None,
     }
+    if opening_checkpoint is not None and opening_checkpoint["source_manifest_digest"] != manifest["aggregate_sha256"]:
+        raise VerificationError("source_changed_during_opening_capture")
     directory.mkdir(parents=True, exist_ok=False)
+    if opening_checkpoint is not None:
+        from .opening import CHECKPOINT_FILENAME, validate_checkpoint
+        write_once(directory / CHECKPOINT_FILENAME, validate_checkpoint(opening_checkpoint))
     write_once(directory / "manifest.json", manifest)
     write_once(directory / "manifest-sha256.json", {"sha256": digest(canonical(manifest))})
     return manifest
@@ -138,13 +147,14 @@ def read_manifest(directory: Path) -> dict:
     if expected != {"sha256": digest(canonical(manifest))}:
         raise VerificationError("manifest_digest_mismatch")
     required = {"schema", "verification_generation_id", "created_at", "mode", "source_revision",
-                "protected_file_count", "protected_files", "aggregate_sha256", "verification_status", "context", "policy"}
+                "protected_file_count", "protected_files", "aggregate_sha256", "verification_status", "context", "policy",
+                "generation_opening_checkpoint_sha256"}
     if set(manifest) != required or manifest["schema"] != SCHEMA or manifest["mode"] != "paper":
         raise VerificationError("manifest_schema_invalid")
     if manifest["verification_generation_id"] != directory.name or manifest["verification_status"] != "FROZEN":
         raise VerificationError("manifest_generation_invalid")
-    stamp = datetime.fromisoformat(manifest["created_at"])
-    if stamp.tzinfo is None or stamp > datetime.now(UTC):
+    stamp = aware_utc(manifest["created_at"], field_name="manifest_created_at")
+    if stamp > datetime.now(UTC):
         raise VerificationError("manifest_timestamp_invalid")
     files = manifest["protected_files"]
     if not isinstance(files, dict) or not files or manifest["protected_file_count"] != len(files):

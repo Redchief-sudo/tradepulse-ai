@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any, Mapping
+from tradepulse.time import aware_utc
 
 
 class DomainValidationError(ValueError):
@@ -18,9 +19,10 @@ def require_text(value: str, field: str) -> str:
 
 
 def require_aware(value: datetime, field: str) -> datetime:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise DomainValidationError(f"{field} must be timezone-aware")
-    return value.astimezone(UTC)
+    try:
+        return aware_utc(value, field_name=field)
+    except ValueError as exc:
+        raise DomainValidationError(f"{field} must be timezone-aware") from exc
 
 
 def decimal_value(value: Decimal | str | int | float, field: str, *, positive: bool = False, nonnegative: bool = False) -> Decimal:

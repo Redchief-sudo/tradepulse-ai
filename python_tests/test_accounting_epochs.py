@@ -56,6 +56,24 @@ async def test_no_fee_is_provisional_and_same_asset_serialized_across_restart(tm
     assert 'later' in epoch['trade_intent_ids']
 
 
+async def test_conserved_unallocated_cash_receipt_closes_crypto_buy_checkpoint_once(tmp_path):
+    r = await seeded(tmp_path)
+    raw, qty = await population(r, [])
+    raw.append({'id': 'account-fee', 'activity_type': 'FEE', 'currency': 'USD', 'status': 'executed',
+                'net_amount': '-1.23', 'created_at': NOW.isoformat()})
+    await replay_asset_fees(r, ASSET, raw, qty, now=NOW, pagination=pagination(raw))
+    epoch = (await r.accounting_epochs.list_all())[0]['payload']
+    assert epoch['fee_accounting_status'] == 'reconciled_net'
+    assert epoch['generation_fee_evidence_ids'] == ['account-fee']
+    assert epoch['fee_evidence_ids'] == []
+    assert epoch['cash_fee_amount'] == '0'
+    assert (await r.cash_ledger.get('broker:fee:account-fee'))['payload']['amount'] == '-1.23'
+    tables = [r.fills, r.accounting_epochs, r.cash_ledger, r.position_lots, r.trade_attributions, r.pnl_records, r.reconciliation_records]
+    before = [await table.list_all() for table in tables]
+    await replay_asset_fees(r, ASSET, raw, qty, now=NOW, pagination=pagination(raw))
+    assert [await table.list_all() for table in tables] == before
+
+
 async def test_cursor_and_inbox_rollback_with_accounting_writes(tmp_path):
     r = await seeded(tmp_path)
     raw, qty = await population(r, four_receipts())

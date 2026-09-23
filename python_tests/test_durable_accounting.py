@@ -240,7 +240,7 @@ async def test_historical_fee_in_full_feed_does_not_block_new_equity_epoch(tmp_p
     epoch = (await r.accounting_epochs.list_all())[0]['payload']
     assert epoch['fee_accounting_status'] == 'reconciled_net'
     assert epoch['population_proof_id'] is not None
-    assert epoch['generation_opened_at'] == epoch['opened_at']
+    assert 'generation_opened_at' not in epoch  # unbound operational evidence has no official boundary
     assert 'generation_boundary' not in epoch
 
 
@@ -268,5 +268,6 @@ def test_explicit_fill_fees_reduce_net_once_without_changing_gross():
             'realized': str(-Decimal(fee)), 'unrealized': '0', 'as_of': fill['filled_at']})
     result = assess(rows, START.isoformat(), NOW, COSTS)
     assert result['criteria']['eligible_round_trips']['actual'] == 1
-    assert Decimal(result['criteria']['net_realized_pnl']['actual']) == Decimal('1.9296')
+    assert Decimal(result['criteria']['net_realized_pnl']['actual']) == Decimal('1.9596')
+    assert result['modeled_trade_net'] != result['observed_generation_net']
     assert rows['trade_attributions'][0]['realized_pnl'] == '2'

@@ -69,6 +69,7 @@ from tradepulse.persistence import (
 from tradepulse.risk import latch_financial_integrity_block
 from tradepulse.settlement import SettlementProcessor
 from tradepulse.settlement.stages import retry_delay_seconds
+from tradepulse.time import aware_utc
 
 from ..execution.fill_attribution import resolve_order_from_broker
 from .asset_fees import reconcile_asset_fees
@@ -137,6 +138,10 @@ async def _reconcile_positions(
     repositories: PersistenceRepositories, broker: AlpacaClient, alerts: TelegramAlerter, now: datetime,
     lease_lost: asyncio.Event | None = None,
 ) -> tuple[int, int, int]:
+    from tradepulse.verification.opening import load_bound_opening_checkpoint
+    from .membership import opening_quantities
+    checkpoint = await repositories.fills.database.run(load_bound_opening_checkpoint)
+    opening_positions = opening_quantities(checkpoint)
     broker_positions = await broker.get_positions()
     broker_by_asset_key = {asset_key_from_broker_symbol(p.asset_class, p.symbol): p for p in broker_positions}
 
@@ -171,6 +176,12 @@ async def _reconcile_positions(
             key, AssetIdentity(symbol=position.symbol, asset_class=position.asset_class, native_asset_id=f"alpaca:{position.symbol.upper()}")
         )
 
+    if checkpoint:
+        for position in checkpoint['positions']:
+            key = asset_key_from_broker_symbol(AssetClass(position['asset_class']), position['symbol'])
+            asset_by_key.setdefault(key, AssetIdentity(symbol=position['symbol'],
+                asset_class=AssetClass(position['asset_class']), native_asset_id='alpaca:' + position['symbol'].upper()))
+
     def _display_symbol(key: str) -> str:
         if key in broker_by_asset_key:
             return broker_by_asset_key[key].symbol
@@ -178,7 +189,7 @@ async def _reconcile_positions(
             return asset_by_key[key].symbol
         return holdings_by_asset_key[key].asset.symbol
 
-    asset_keys = set(broker_by_asset_key) | set(asset_by_key) | set(holdings_by_asset_key)
+    asset_keys = set(broker_by_asset_key) | set(asset_by_key) | set(holdings_by_asset_key) | set(opening_positions)
 
     positions_checked = 0
     view_drift_corrected = 0
@@ -189,7 +200,8 @@ async def _reconcile_positions(
             continue  # reconcile's own command lease may no longer be exclusive -- stop starting new work
         positions_checked += 1
         display_symbol = _display_symbol(key)
-        broker_qty = broker_by_asset_key[key].qty if key in broker_by_asset_key else Decimal("0")
+        actual_broker_qty = broker_by_asset_key[key].qty if key in broker_by_asset_key else Decimal("0")
+        broker_qty = actual_broker_qty - opening_positions.get(key, Decimal(0))
         lots_qty = open_lots_by_asset_key.get(key, Decimal("0"))
         holding = holdings_by_asset_key.get(key)
         holding_qty = holding.quantity if holding is not None else Decimal("0")
@@ -291,8 +303,9 @@ async def _reconcile_fills(
     repositories: PersistenceRepositories, broker: AlpacaClient, settlement: SettlementProcessor,
     alerts: TelegramAlerter, now: datetime, lookback: timedelta,
     lease_lost: asyncio.Event | None = None,
+    generation_membership=None,
 ) -> tuple[int, int, int]:
-    activities = await broker.get_activities(activity_type="FILL", since=now - lookback)
+    activities = await broker.get_activities(activity_type="FILL", since=None if generation_membership is not None else now - lookback)
     # FIN-090-01: scoped to the actual match window (_find_heuristic_match
     # never matches beyond +/-_FILL_MATCH_WINDOW_SECONDS of an activity's
     # transaction_time, and activities themselves are already bounded to
@@ -300,7 +313,8 @@ async def _reconcile_fills(
     # drop this window's own fills once enough OTHER (older or newer)
     # fills existed first.
     match_window = timedelta(seconds=_FILL_MATCH_WINDOW_SECONDS)
-    fill_rows = await list_all_by_json_time_range(repositories.fills, "filled_at", now - lookback - match_window, now + match_window)
+    fill_rows = (await paginate_all_rows(repositories.fills) if generation_membership is not None else
+                 await list_all_by_json_time_range(repositories.fills, "filled_at", now - lookback - match_window, now + match_window))
     local_fills = [hydrate("fills", row["payload"]) for row in fill_rows]
 
     fills_checked = 0
@@ -309,12 +323,19 @@ async def _reconcile_fills(
     matched: set[str] = set()
 
     for activity in activities:
+        if generation_membership is not None:
+            from .membership import ELIGIBLE_MEMBERSHIPS
+            membership_status = generation_membership['classifications'].get(activity.activity_id)
+            if membership_status == 'pre_generation' or membership_status == 'post_generation':
+                continue
+            if membership_status not in ELIGIBLE_MEMBERSHIPS:
+                raise ValueError('UNRESOLVED_GENERATION_MEMBERSHIP:' + activity.activity_id)
         if lease_lost is not None and lease_lost.is_set():
             continue  # reconcile's own command lease may no longer be exclusive -- stop starting new work
         fills_checked += 1
         match = _find_exact_id_match(activity, local_fills, matched)
         match_method = "exact_id"
-        if match is None:
+        if match is None and generation_membership is None:
             match = _find_heuristic_match(activity, local_fills, matched)
             match_method = "heuristic"
         if match is not None:
@@ -524,7 +545,28 @@ async def run_reconciliation(
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     lease_lost: asyncio.Event | None = None,
 ) -> ReconciliationSummary:
-    now = clock()
+    now = aware_utc(clock(), field_name='reconciliation_observed_at')
+    generation_membership = None
+    try:
+        from tradepulse.verification.opening import load_bound_opening_checkpoint
+        opening = await repositories.fills.database.run(load_bound_opening_checkpoint)
+        if opening is not None:
+            from .activity_cursor import activity_population
+            from .membership import classify_population, require_resolved
+            from .generation_fees import persist_generation_fees
+            activities, pagination = await activity_population(broker, opening['opening_activity_cursor'])
+            now = aware_utc(clock(), field_name='activity_population_observed_at')
+            generation_membership = await repositories.fills.database.run(
+                lambda connection: classify_population(connection, activities, pagination, now=now), write=True)
+            # Membership incidents survive a later failed financial transaction.
+            require_resolved(generation_membership)
+            await repositories.fills.database.run(lambda connection: persist_generation_fees(
+                connection, activities, generation_membership, now=now), write=True)
+    except Exception as exc:
+        reason = 'GENERATION_POPULATION_INVALID:' + str(exc)
+        await latch_financial_integrity_block(repositories, reason, clock=lambda: now)
+        await alerts.send('critical', reason, {})
+        return ReconciliationSummary('degraded', error=reason)
     from tradepulse.settlement.accounting import replay_accounting, accounting_issues
     projection_error = None
     try:
@@ -535,7 +577,7 @@ async def run_reconciliation(
     await _recover_inflight_orders(repositories, broker, settlement, alerts, now, lease_lost)
     fee_error = None
     try:
-        if not await reconcile_asset_fees(repositories, broker, now=now, lease_lost=lease_lost):
+        if not await reconcile_asset_fees(repositories, broker, now=now, lease_lost=lease_lost, clock=clock):
             fee_error = "ASSET_FEE_RECONCILIATION_FAILED"
     except Exception as exc:  # noqa: BLE001 - preserve other instruments and reconciliation work
         await alerts.send("critical", f"Asset-fee reconciliation unavailable: {exc}", {})
@@ -550,7 +592,7 @@ async def run_reconciliation(
 
     try:
         fills_checked, missed_fills_detected, late_fills_recovered = await _reconcile_fills(
-            repositories, broker, settlement, alerts, now, fill_lookback, lease_lost
+            repositories, broker, settlement, alerts, now, fill_lookback, lease_lost, generation_membership
         )
     except Exception as exc:  # noqa: BLE001 - same principle for the activities call
         await alerts.send("critical", f"Reconciliation degraded -- Alpaca activities unavailable: {exc}", {})
@@ -571,7 +613,7 @@ async def run_reconciliation(
 
     try:
         from .equity_epochs import reconcile_equity_epochs
-        if not await reconcile_equity_epochs(repositories, broker, now=now):
+        if not await reconcile_equity_epochs(repositories, broker, now=now, clock=clock):
             fee_error = fee_error or 'ACCOUNTING_EPOCH_INCOMPLETE'
         elif await list_all_by_json_field(repositories.reconciliation_records, 'subject_id', 'equity_checkpoint'):
             from .asset_fees import _record_feed_transition
@@ -588,6 +630,9 @@ async def run_reconciliation(
     if projection_problems:
         projection_error = 'CANONICAL_ACCOUNTING_INCOMPLETE'
         await latch_financial_integrity_block(repositories, projection_error, clock=lambda: now)
+    active_holds = await paginate_all_rows(repositories.integrity_holds)
+    if active_holds:
+        projection_error = projection_error or 'ACTIVE_INTEGRITY_HOLD'
     return ReconciliationSummary(
         "degraded" if fee_error or projection_error or accounting_drift_detected or missed_fills_detected else "ok", positions_checked, view_drift_corrected, accounting_drift_detected,
         fills_checked, missed_fills_detected, late_fills_recovered, verification_holds_reverified, error=fee_error or projection_error,

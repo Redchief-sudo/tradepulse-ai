@@ -15,6 +15,8 @@ def allocate_cash_fees(proof, attributions):
     receipts = {row['id']: row for row in proof['activities']}
     plans = []
     for fee_id, order in proof.get('cash_fee_populations', {}).items():
+        if order.get('method') not in {'authoritative_order_link', 'authoritative_fill_link'}:
+            raise AssetFeeIntegrityError('CASH_FEE_AUTHORITATIVE_LINK_REQUIRED')
         selected = sorted((a for a in attributions if a.closing_trade_intent_id in order['trade_intent_ids']),
                           key=lambda a: a.attribution_id)
         if not selected:

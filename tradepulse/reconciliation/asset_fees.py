@@ -9,16 +9,17 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
 from tradepulse.broker.symbols import normalize_alpaca_symbol
 from tradepulse.models import AssetClass, AssetIdentity, ReconciliationOutcome, ReconciliationRecord, asset_identity_key
-from tradepulse.models.base import decimal_value, require_aware, require_text
+from tradepulse.models.base import decimal_value, require_text
 from tradepulse.persistence import hydrate, paginate_all_rows
 from tradepulse.persistence.codec import decode_payload, encode_payload
+from tradepulse.time import aware_utc
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +54,12 @@ def parse_asset_fee(raw: Mapping[str, Any]) -> AssetFee:
     symbol = normalize_alpaca_symbol(require_text(raw.get('symbol'), 'asset_fee_symbol'), AssetClass.CRYPTO)
     if len(symbol.split('/')) != 2 or not all(symbol.split('/')) or symbol.split('/')[1] != 'USD':
         raise AssetFeeIntegrityError('ASSET_FEE_IDENTITY_INVALID')
-    occurred_at = require_aware(datetime.fromisoformat(raw['created_at']), 'asset_fee_created_at')
+    occurred_at = aware_utc(raw.get('created_at'), field_name='asset_fee_created_at')
     return AssetFee(activity_id, AssetIdentity(symbol, AssetClass.CRYPTO, f'alpaca:{symbol}'), quantity, occurred_at, dict(raw))
 
 
-async def reconcile_asset_fees(repositories, broker, *, now: datetime, lease_lost=None) -> bool:
+async def reconcile_asset_fees(repositories, broker, *, now: datetime, lease_lost=None,
+                               clock=lambda: datetime.now(UTC)) -> bool:
     """Called by reconciliation, never by a dashboard read or order submission."""
     lots = [hydrate('position_lots', row['payload']) for row in await paginate_all_rows(repositories.position_lots)]
     crypto_lots = [lot for lot in lots if lot.asset.asset_class == AssetClass.CRYPTO]
@@ -93,6 +95,7 @@ async def reconcile_asset_fees(repositories, broker, *, now: datetime, lease_los
             cursor = await repositories.broker_activity_cursors.get(key)
             boundary = cursor['payload']['last_complete_activity_id'] if cursor else None
             raw, pagination = await activity_population(broker, boundary)
+            now = aware_utc(clock(), field_name='asset_fee_population_observed_at')
             await replay_asset_fees(repositories, asset, raw, quantities.get(key, Decimal(0)),
                                     now=now, lease_lost=lease_lost, pagination=pagination)
             record = ReconciliationRecord(str(uuid4()), 'asset_fee', subject+':'+key, ReconciliationOutcome.MATCHED,

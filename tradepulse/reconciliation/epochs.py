@@ -3,7 +3,6 @@
 All state transitions execute under SQLite's write transaction. Execution facts
 remain immutable; an epoch is a separate statement about their finality.
 """
-from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 
@@ -11,23 +10,27 @@ from tradepulse.models import AssetClass, asset_identity_key
 from tradepulse.persistence.codec import decode_payload, encode_payload
 
 
-def _aware_utc(value, *, field_name):
-    if isinstance(value, datetime):
-        dt = value
-    else:
-        dt = datetime.fromisoformat(value)
-    if dt.tzinfo is None:
-        raise ValueError(f'{field_name} is naive and cannot represent a broker instant')
-    return dt.astimezone(UTC)
+from tradepulse.time import aware_utc
 
 
 def _generation_boundary(epoch):
-    for key in ('generation_opened_at', 'verification_generation_opened_at', 'opened_at'):
-        value = epoch.get(key)
-        if value is None:
-            continue
-        return _aware_utc(value, field_name=key)
-    raise ValueError('missing_generation_boundary')
+    return aware_utc(epoch.get('generation_opened_at'), field_name='generation_opened_at')
+
+
+def _opening(connection):
+    from tradepulse.verification.opening import load_bound_opening_checkpoint
+    return load_bound_opening_checkpoint(connection) if connection is not None else None
+
+def _verify_opening_reference(epoch, checkpoint):
+    fields = {'verification_generation_id': 'verification_generation_id',
+              'generation_opening_checkpoint_id': 'checkpoint_id', 'generation_opened_at': 'opened_at',
+              'opening_activity_cursor': 'opening_activity_cursor',
+              'opening_activity_population_hash': 'opening_activity_population_hash',
+              'account_identity_digest': 'account_identity_digest'}
+    if any(epoch.get(field) != checkpoint[key] for field, key in fields.items()):
+        raise ValueError('EPOCH_GENERATION_OPENING_REFERENCE_INVALID')
+    _generation_boundary(epoch)
+
 
 STATES = frozenset({'submitted', 'filled_gross', 'fee_pending', 'reconciled_net', 'integrity_blocked'})
 
@@ -42,6 +45,10 @@ def epochs_for(connection, key):
 
 
 def save_epoch(connection, epoch, now):
+    now = aware_utc(now, field_name='epoch_updated_at')
+    checkpoint = _opening(connection)
+    if checkpoint:
+        _verify_opening_reference(epoch, checkpoint)
     status = epoch['fee_accounting_status']
     if status not in STATES:
         raise ValueError('invalid accounting state')
@@ -93,24 +100,26 @@ def save_epoch(connection, epoch, now):
                        (transition['record_id'], encode_payload(transition), now.isoformat()))
 
 
-def new_epoch(key, identifier, now, starting_quantity, intent_ids):
-    boundary = now.isoformat()
-    return {'canonical_asset_key': key, 'accounting_epoch_id': identifier,
-            'starting_broker_quantity': str(starting_quantity), 'ending_broker_quantity': None,
+def new_epoch(key, identifier, now, starting_quantity, intent_ids, *, connection=None):
+    opened = aware_utc(now, field_name='epoch_opened_at')
+    checkpoint = _opening(connection)
+    epoch = {'canonical_asset_key': key, 'accounting_epoch_id': identifier,
+            'starting_broker_quantity': str(starting_quantity) if starting_quantity is not None else None,
+            'ending_broker_quantity': None,
             'gross_filled_quantity': '0', 'asset_fee_quantity': '0', 'net_inventory_quantity': None,
             'cash_fee_amount': '0', 'fee_accounting_status': 'submitted',
             'broker_activity_cursor': None, 'broker_activity_window': None, 'fee_evidence_ids': [],
-            'population_proof_id': None, 'population_hash': None, 'opened_at': boundary,
-            'generation_opened_at': boundary,
-            'generation_id': None,
-            'verification_generation_id': None,
-            'account_identity_digest': None,
-            'opening_activity_cursor': None,
-            'opening_activity_population_hash': None,
-            'opening_positions': None,
-            'opening_cash_equity': None,
+            'population_proof_id': None, 'population_hash': None, 'opened_at': opened.isoformat(),
             'reconciled_at': None, 'trade_intent_ids': list(intent_ids), 'fill_ids': [],
             'checkpoint_version': 0, 'checkpoint_id': None, 'superseded_checkpoint_ids': []}
+    if checkpoint is not None:
+        epoch.update(verification_generation_id=checkpoint['verification_generation_id'],
+                     generation_opening_checkpoint_id=checkpoint['checkpoint_id'],
+                     generation_opened_at=checkpoint['opened_at'],
+                     opening_activity_cursor=checkpoint['opening_activity_cursor'],
+                     opening_activity_population_hash=checkpoint['opening_activity_population_hash'],
+                     account_identity_digest=checkpoint['account_identity_digest'])
+    return epoch
 
 
 async def reserve_epoch(repositories, intent, broker_quantity, *, protective, now):
@@ -142,7 +151,9 @@ async def reserve_epoch(repositories, intent, broker_quantity, *, protective, no
             epoch = pending[-1]
             epoch['trade_intent_ids'].append(intent.trade_intent_id)
         else:
-            epoch = new_epoch(key, 'crypto_epoch:'+intent.trade_intent_id, now, broker_quantity, [intent.trade_intent_id])
+            from .membership import opening_quantities
+            owned_quantity = broker_quantity - opening_quantities(_opening(connection)).get(key, Decimal(0))
+            epoch = new_epoch(key, 'crypto_epoch:'+intent.trade_intent_id, now, owned_quantity, [intent.trade_intent_id], connection=connection)
         save_epoch(connection, epoch, now)
         return epoch['accounting_epoch_id']
     return await repositories.accounting_epochs.database.run(reserve, write=True)
@@ -162,7 +173,7 @@ async def record_gross_fill(repositories, fill, *, now):
         if epoch is None:
             # Recovery of pre-lifecycle history has no observed starting balance.
             # It remains pending until the complete history proves that balance.
-            epoch = new_epoch(key, 'crypto_epoch:'+fill.trade_intent_id, fill.filled_at, None, [fill.trade_intent_id])
+            epoch = new_epoch(key, 'crypto_epoch:'+fill.trade_intent_id, fill.filled_at, None, [fill.trade_intent_id], connection=connection)
             epoch['starting_broker_quantity'] = None
         row = connection.execute('SELECT payload FROM fills WHERE record_id=?', (fill.fill_id,)).fetchone()
         if row and decode_payload(row['payload']) != decode_payload(encode_payload(fill)):
@@ -189,7 +200,7 @@ async def pending_assets(repositories):
 
 
 def finalize_population(connection, *, key, proof, population_id, fills, fees, cash_plans,
-                        lots, quantity, activities, now, pagination=None, evidence_hash=None):
+                        lots, quantity, activities, now, pagination=None, evidence_hash=None, membership=None):
     """Commit inbox, cursor, and epoch proof alongside the accounting replay.
 
     A populated, conserved inventory is not sufficient to assume zero fees:
@@ -202,11 +213,12 @@ def finalize_population(connection, *, key, proof, population_id, fills, fees, c
     if historical:
         prefix = 'crypto_epoch:history:' if fills[0].asset.asset_class == AssetClass.CRYPTO else 'accounting_epoch:history:'
         epoch = new_epoch(key, prefix+sha256(key.encode()).hexdigest(),
-                          min(f.filled_at for f in fills), Decimal(0), historical)
+                          min(f.filled_at for f in fills), Decimal(0), historical, connection=connection)
         epoch['historical_population'] = True
         existing_history = next((e for e in epochs if e['accounting_epoch_id'] == epoch['accounting_epoch_id']), None)
         if existing_history is not None:
-            existing_history.update(epoch)
+            existing_history['trade_intent_ids'] = sorted(set(existing_history['trade_intent_ids']) | set(historical))
+            existing_history['reconciled_at'] = None
         else:
             epochs.append(epoch)
     if pagination is not None:
@@ -223,17 +235,14 @@ def finalize_population(connection, *, key, proof, population_id, fills, fees, c
         selected = [f for f in fills if f.trade_intent_id in epoch['trade_intent_ids']]
         if not selected:
             continue
-        boundary = _generation_boundary(epoch)
-        opened = boundary
-        epoch_fees = [fee for fee in fees if fee.occurred_at.astimezone(UTC) >= boundary]
-        # A later epoch does not consume fees already accounted in its starting
-        # broker balance. Historical bootstrap covers the complete instrument.
-        later = [_aware_utc(e['generation_opened_at'] if e.get('generation_opened_at') else e['opened_at'], field_name='opened_at')
-                 for e in epochs if (e.get('generation_opened_at') or e.get('opened_at')) is not None and _aware_utc(
-                     e.get('generation_opened_at') if e.get('generation_opened_at') else e['opened_at'], field_name='opened_at') > boundary]
-        end = min(later) if later else None
-        if end:
-            epoch_fees = [fee for fee in epoch_fees if fee.occurred_at.astimezone(UTC) < end]
+        # A fee follows the inventory lot it actually debits. Epoch-local time
+        # windows cannot assign a receipt or define a verification generation.
+        selected_ids = {f.fill_id for f in selected}
+        own_lots = [lot for lot in lots if lot.originating_fill_id in selected_ids]
+        epoch_fees = [fee for fee in fees if any(
+            fee.activity_id in lot.asset_fee_quantities for lot in own_lots)]
+        later = [e for e in epochs if aware_utc(e['opened_at']) > aware_utc(epoch['opened_at'])]
+        end = bool(later)
         selected_cash = [(raw, order, allocation) for raw, order, allocation in cash_plans
                          if set(order['trade_intent_ids']) & set(epoch['trade_intent_ids'])]
         buys = sum((f.quantity for f in selected if f.side.value == 'buy'), Decimal(0))
@@ -241,11 +250,13 @@ def finalize_population(connection, *, key, proof, population_id, fills, fees, c
         native = sum((f.quantity for f in epoch_fees), Decimal(0))
         start = epoch['starting_broker_quantity']
         if start is None:
-            # Exhaustive source history establishes a recovery epoch's starting
-            # balance; never infer it from a stale local Holding.
+            # Recovery on a clean generation starts with zero owned inventory;
+            # existing broker inventory is separately conserved by its checkpoint.
             preceding = sum((f.quantity if f.side.value == 'buy' else -f.quantity
-                             for f in fills if f.filled_at < opened), Decimal(0))
-            preceding -= sum((fee.quantity for fee in fees if fee.occurred_at.astimezone(UTC) < boundary), Decimal(0))
+                             for f in fills if aware_utc(f.filled_at) < aware_utc(epoch['opened_at'])), Decimal(0))
+            preceding -= sum((lot.asset_fee_quantities.get(fee.activity_id, Decimal(0))
+                              for fee in fees for lot in lots
+                              if lot.originating_fill_id not in selected_ids), Decimal(0))
             start = str(preceding)
             epoch['starting_broker_quantity'] = start
         terminal = True
@@ -253,35 +264,46 @@ def finalize_population(connection, *, key, proof, population_id, fills, fees, c
             row = connection.execute('SELECT status FROM trade_intents WHERE record_id=?', (intent_id,)).fetchone()
             if row is None or row['status'] not in {'filled', 'canceled', 'expired', 'rejected'}:
                 terminal = False
+        from .generation_fees import cash_fee_receipt, generation_fee_recorded
+        from .membership import ELIGIBLE_MEMBERSHIPS
+        eligible = [r for r in activities if membership is None or
+                    membership['classifications'][r['id']] in ELIGIBLE_MEMBERSHIPS]
+        cash_receipts = [(r, fee) for r in eligible if (fee := cash_fee_receipt(r)) is not None]
+        account_fees = [r for r, fee in cash_receipts if not fee['relationship']]
+        own_orders = {f.order_id for f in selected}
+        own_fills = {f.broker_fill_id for f in selected}
+        symbol = selected[0].asset.symbol.replace('/', '')
+        linked_cash = [r for r, fee in cash_receipts if (
+            fee['relationship'].get('order_id') in own_orders
+            or fee['relationship'].get('fill_id') in own_fills
+            or (not any(k in fee['relationship'] for k in ('order_id', 'fill_id'))
+                and str(fee['relationship'].get('symbol') or '').replace('/', '') == symbol))]
+        account_fees_conserved = all(generation_fee_recorded(connection, r['id']) for r, _ in cash_receipts)
+        raw_by_id = {r['id']: r for r in eligible}
+        def reported_fill_fee(fill):
+            raw = raw_by_id[fill.broker_fill_id]
+            value = next((raw[k] for k in ('fee', 'fees', 'commission') if raw.get(k) is not None), None)
+            return (value is not None and fill.fee_source == 'broker_activity' and fill.fee_currency == 'USD'
+                    and (raw.get('fee_currency') or raw.get('currency')) == 'USD'
+                    and not isinstance(value, (float, bool)) and Decimal(str(value)) == fill.fees)
+        buy_receipts = all(reported_fill_fee(f) for f in selected if f.side.value == 'buy')
+        sell_receipts = all(reported_fill_fee(f) for f in selected if f.side.value == 'sell')
+        cash_evidenced = bool(account_fees or linked_cash)
         if fills[0].asset.asset_class == AssetClass.CRYPTO:
-            fee_complete = (not buys or bool(epoch_fees)) and (not sells or bool(selected_cash)) and terminal
+            # A durably conserved account expense closes the generation fee
+            # obligation without fabricating an allocation to this asset.
+            fee_complete = (not buys or bool(epoch_fees) or cash_evidenced or buy_receipts) and (
+                not sells or bool(selected_cash) or cash_evidenced or sell_receipts)
         else:
-            # The generation boundary is frozen at the verification opening, not the
-            # first fill timestamp in an epoch. Historical receipts remain auditable,
-            # but they cannot contaminate the active generation's fee status.
-            generation_fees = [
-                r for r in activities
-                if r.get('activity_type') == 'FEE'
-                and r.get('status') == 'executed'
-                and r.get('currency') == 'USD'
-                and (('created_at' in r and _aware_utc(r['created_at'], field_name='activity_created_at') >= boundary)
-                     or ('transaction_time' in r and _aware_utc(r['transaction_time'], field_name='activity_transaction_time') >= boundary))
-                and (not end or (('created_at' in r and _aware_utc(r['created_at'], field_name='activity_created_at') < end)
-                                 or ('transaction_time' in r and _aware_utc(r['transaction_time'], field_name='activity_transaction_time') < end)))
-            ]
-            fee_complete = terminal and not generation_fees
-        fee_complete = fee_complete and pagination is not None and pagination.get('complete') is True
-        if end:
-            # Closed epoch retains its established ending balance. The current
-            # cumulative population revalidates source receipts independently.
-            ending = epoch['ending_broker_quantity']
-        else:
-            ending = str(quantity)
+            fee_complete = not sells or cash_evidenced or sell_receipts
+        fee_complete = (fee_complete and terminal and account_fees_conserved
+                        and pagination is not None and pagination.get('complete') is True)
+        ending = str(Decimal(start)+buys-sells-native) if end and start is not None else str(quantity)
         conserved = start is not None and ending is not None and Decimal(start)+buys-sells-native == Decimal(ending)
         status = 'reconciled_net' if conserved and fee_complete else 'fee_pending'
         epoch.pop('reason', None)
         if fills[0].asset.asset_class != AssetClass.CRYPTO and not fee_complete:
-            epoch['reason'] = 'unallocated_account_fee_or_nonterminal_order'
+            epoch['reason'] = 'missing_fee_receipt_or_nonterminal_order'
         epoch.update(gross_filled_quantity=str(buys+sells), asset_fee_quantity=str(native),
                      net_inventory_quantity=ending if status == 'reconciled_net' else None,
                      ending_broker_quantity=ending,
@@ -290,6 +312,9 @@ def finalize_population(connection, *, key, proof, population_id, fills, fees, c
                      fee_accounting_status=status, broker_activity_cursor=cursor,
                      broker_activity_window={'from': epoch['opened_at'], 'through_activity_id': cursor},
                      fee_evidence_ids=sorted([f.activity_id for f in epoch_fees]+[r['id'] for r, _, _ in selected_cash]),
+                     generation_fee_evidence_ids=sorted({r['id'] for r in account_fees + linked_cash}),
+                     fee_evidence_state=('receipt_backed' if cash_evidenced or epoch_fees or selected_cash
+                         or (buy_receipts and sell_receipts) else 'complete_population_no_fee_observed'),
                      population_proof_id=population_id, population_hash=population_hash,
                      fill_ids=sorted(f.fill_id for f in selected),
                      included_activity_ids=sorted([f.broker_fill_id for f in selected]+[f.activity_id for f in epoch_fees]
@@ -320,7 +345,7 @@ async def block_asset(repositories, asset, reason, *, now, pending=False):
     key = asset_identity_key(asset)
     def write(connection):
         epochs = epochs_for(connection, key)
-        epoch = epochs[-1] if epochs else new_epoch(key, 'crypto_epoch:history:'+sha256(key.encode()).hexdigest(), now, None, [])
+        epoch = epochs[-1] if epochs else new_epoch(key, 'crypto_epoch:history:'+sha256(key.encode()).hexdigest(), now, None, [], connection=connection)
         if not epochs:
             epoch['starting_broker_quantity'] = None
         epoch['fee_accounting_status'] = 'fee_pending' if pending else 'integrity_blocked'
@@ -347,6 +372,15 @@ def verify_checkpoint(epoch, records, fills, intents):
     if identifier != epoch['checkpoint_id'] or identifier in epoch.get('superseded_checkpoint_ids', []):
         raise ValueError('CHECKPOINT_VERSION_INVALID')
     proof = records[epoch['population_proof_id']]['actual']
+    membership = proof.get('generation_membership')
+    if membership:
+        _verify_opening_reference(epoch, membership['checkpoint'])
+        from .membership import verify_membership_record
+        classifications = verify_membership_record(membership['checkpoint'], records[membership['record_id']])
+        if classifications != membership['classifications']:
+            raise ValueError('CHECKPOINT_GENERATION_MEMBERSHIP_CHANGED')
+    elif epoch.get('verification_generation_id'):
+        raise ValueError('CHECKPOINT_GENERATION_MEMBERSHIP_MISSING')
     digest = sha256(encode_payload(proof).encode()).hexdigest()
     if epoch['population_hash'] != digest or epoch['population_proof_id'] != 'asset_fee_population:'+digest:
         raise ValueError('CHECKPOINT_POPULATION_HASH_MISMATCH')
@@ -358,7 +392,8 @@ def verify_checkpoint(epoch, records, fills, intents):
     source_fills = [hydrate('fills', f) for f in fills if f['broker_fill_id'] in activities]
     asset = next(f.asset for f in source_fills if asset_identity_key(f.asset) == epoch['canonical_asset_key'])
     _, verified = validate_fee_population(asset, proof['activities'], source_fills,
-        [hydrate('trade_intents', i) for i in intents], Decimal(proof['broker_quantity']))
+        [hydrate('trade_intents', i) for i in intents], Decimal(proof['broker_quantity']),
+        membership=proof.get('generation_membership'))
     if encode_payload(verified) != encode_payload(proof):
         raise ValueError('CHECKPOINT_POPULATION_CHANGED')
     c = epoch['conservation']

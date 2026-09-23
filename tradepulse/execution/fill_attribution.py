@@ -110,7 +110,10 @@ def _is_valid_fill_activity(activity: AlpacaActivity, current: TradeIntent) -> b
         return False
     if activity.price is None or activity.price <= 0:
         return False
-    if activity.transaction_time is None:
+    from tradepulse.time import aware_utc
+    try:
+        aware_utc(activity.transaction_time, field_name="fill.transaction_time")
+    except ValueError:
         return False
     return True
 
@@ -141,7 +144,8 @@ def _reference_evidence(current: TradeIntent) -> tuple[Decimal | None, Decimal |
         value = snapshot.get(key)
         return Decimal(str(value)) if value is not None else None
     observed = snapshot.get("reference_observed_at")
-    observed_at = datetime.fromisoformat(str(observed)) if observed else None
+    from tradepulse.time import aware_utc
+    observed_at = aware_utc(observed, field_name="reference_observed_at") if observed else None
     return decimal("entry_price"), decimal("reference_bid"), decimal("reference_ask"), observed_at
 
 

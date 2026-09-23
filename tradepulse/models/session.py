@@ -19,6 +19,11 @@ class TradingSession:
     financial_integrity_reason: str | None = None
     financial_integrity_manual_reenable_required: bool = False
 
+    @property
+    def halt_reason(self) -> str | None:
+        """Compatibility name for reconciliation and operator diagnostics."""
+        return self.financial_integrity_reason
+
     def __post_init__(self) -> None:
         if not isinstance(self.state, SessionState):
             raise TypeError("state must be SessionState")

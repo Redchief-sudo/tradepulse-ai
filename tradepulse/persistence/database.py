@@ -5,6 +5,8 @@ import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
+from datetime import UTC, datetime
+from uuid import uuid4
 
 
 T = TypeVar("T")
@@ -24,6 +26,13 @@ class RepositoryPaginationError(DatabaseError):
 
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS verification_identity (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  database_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+  ever_evidence INTEGER NOT NULL CHECK(ever_evidence IN (0,1)),
+  legacy_database INTEGER NOT NULL CHECK(legacy_database IN (0,1)),
+  generation_id TEXT, checkpoint_id TEXT, manifest_digest TEXT
+);
 CREATE TABLE IF NOT EXISTS accounting_epochs (
   record_id TEXT PRIMARY KEY, status TEXT NOT NULL, payload TEXT NOT NULL,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -132,6 +141,44 @@ CREATE INDEX IF NOT EXISTS idx_scan_runs_status ON scan_runs(status, created_at,
 CREATE INDEX IF NOT EXISTS idx_integrity_holds_status ON integrity_holds(status, created_at, record_id);
 """
 
+# These triggers record provenance even if an operator later deletes all rows.
+# Old files cannot prove that their previously deleted history was empty.
+EVIDENCE_TABLES = (
+    "accounting_epochs", "broker_activity_inbox", "broker_activity_cursors",
+    "opportunities", "trade_intents", "orders", "fills", "settlements", "holdings",
+    "position_lots", "cash_ledger", "pnl_records", "reconciliation_records",
+    "scan_runs", "equity_snapshots", "trade_attributions", "integrity_holds",
+)
+
+
+def initialize_identity(connection: sqlite3.Connection, *, legacy: bool) -> None:
+    connection.execute(
+        "INSERT OR IGNORE INTO verification_identity "
+        "(singleton,database_id,created_at,ever_evidence,legacy_database) VALUES (1,?,?,?,?)",
+        (str(uuid4()), datetime.now(UTC).isoformat(), int(legacy), int(legacy)),
+    )
+    for table in EVIDENCE_TABLES:
+        connection.execute(f"""CREATE TRIGGER IF NOT EXISTS evidence_history_{table}
+            AFTER INSERT ON {table} BEGIN
+              UPDATE verification_identity SET ever_evidence=1 WHERE singleton=1;
+            END""")
+    connection.executescript("""
+        CREATE TRIGGER IF NOT EXISTS verification_identity_no_delete
+        BEFORE DELETE ON verification_identity BEGIN
+          SELECT RAISE(ABORT, 'database identity cannot be deleted');
+        END;
+        CREATE TRIGGER IF NOT EXISTS verification_identity_immutable
+        BEFORE UPDATE ON verification_identity
+        WHEN NEW.database_id != OLD.database_id OR NEW.created_at != OLD.created_at
+          OR NEW.singleton != OLD.singleton OR NEW.legacy_database != OLD.legacy_database
+          OR NEW.ever_evidence < OLD.ever_evidence
+          OR (OLD.generation_id IS NOT NULL AND
+              (NEW.generation_id IS NOT OLD.generation_id
+               OR NEW.checkpoint_id IS NOT OLD.checkpoint_id
+               OR NEW.manifest_digest IS NOT OLD.manifest_digest))
+        BEGIN SELECT RAISE(ABORT, 'database identity cannot be reset or rebound'); END;
+    """)
+
 
 class AsyncSQLiteDatabase:
     """SQLite boundary that moves every blocking operation off the event loop."""
@@ -154,11 +201,12 @@ class AsyncSQLiteDatabase:
         return connection
 
     async def initialize(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-
         def initialize_sync() -> None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            existed = self.path.exists() and self.path.stat().st_size > 0
             with self._connect() as connection:
                 connection.executescript(SCHEMA)
+                initialize_identity(connection, legacy=existed)
 
         await asyncio.to_thread(initialize_sync)
 

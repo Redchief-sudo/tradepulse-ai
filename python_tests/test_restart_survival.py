@@ -359,7 +359,8 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
             200,
             json=[{
                 "id": "activity-buy-1", "activity_type": "FILL", "symbol": "AAPL", "side": "buy",
-                "qty": placed["buy_qty"], "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-1",
+                    "qty": placed["buy_qty"], "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-1",
+                    "commission": "0", "fee_currency": "USD",
             }],
         )
 
@@ -408,7 +409,8 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
             200,
             json=[{
                 "id": "activity-sell-1", "activity_type": "FILL", "symbol": "AAPL", "side": "sell",
-                "qty": str(bought_qty), "price": breach_price, "transaction_time": QUOTE_TS, "order_id": "order-2",
+                    "qty": str(bought_qty), "price": breach_price, "transaction_time": QUOTE_TS, "order_id": "order-2",
+                    "commission": "0", "fee_currency": "USD",
             }],
         )
     )
@@ -428,8 +430,8 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
     positions_route.mock(return_value=httpx.Response(200, json=[]))  # broker shows no position, matching the closed local state
     respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(
         return_value=httpx.Response(200, json=[
-            {"id": "activity-buy-1", "activity_type": "FILL", "symbol": "AAPL", "side": "buy", "qty": str(bought_qty), "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-1"},
-            {"id": "activity-sell-1", "activity_type": "FILL", "symbol": "AAPL", "side": "sell", "qty": str(bought_qty), "price": breach_price, "transaction_time": QUOTE_TS, "order_id": "order-2"},
+                {"id": "activity-buy-1", "activity_type": "FILL", "symbol": "AAPL", "side": "buy", "qty": str(bought_qty), "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-1", "commission": "0", "fee_currency": "USD"},
+                {"id": "activity-sell-1", "activity_type": "FILL", "symbol": "AAPL", "side": "sell", "qty": str(bought_qty), "price": breach_price, "transaction_time": QUOTE_TS, "order_id": "order-2", "commission": "0", "fee_currency": "USD"},
         ])
     )
 

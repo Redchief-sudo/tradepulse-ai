@@ -1,11 +1,9 @@
 """Atomic restoration of derived FIFO accounting from complete broker history."""
 from dataclasses import replace
-from datetime import datetime
 from decimal import Decimal
 from hashlib import sha256
 
 from tradepulse.models import (
-    CashLedgerEntry,
     PnlRecord,
     ReconciliationOutcome,
     ReconciliationRecord,
@@ -14,6 +12,7 @@ from tradepulse.models import (
 )
 from tradepulse.persistence import hydrate
 from tradepulse.persistence.codec import decode_payload, encode_payload
+from tradepulse.time import aware_utc
 from tradepulse.settlement.engine import _infer_exit_reason, _parse_int_or_none
 
 from .asset_fees import AssetFeeIntegrityError, AssetFeePending
@@ -31,6 +30,7 @@ async def replay_asset_fees(repositories, asset, activities, broker_quantity, *,
     fills, existing cash entries, order quantities/prices, and broker state are
     unchanged. Authoritative USD fee receipts create new immutable cash debits.
     """
+    now = aware_utc(now, field_name='fee_replay_observed_at')
     key = asset_identity_key(asset)
     if pagination is not None:
         from .activity_cursor import validate_pagination
@@ -46,9 +46,23 @@ async def replay_asset_fees(repositories, asset, activities, broker_quantity, *,
         raw_fills, raw_events, raw_intents = rows('fills'), rows('settlements'), rows('trade_intents')
         fills = [hydrate('fills', row) for row in raw_fills.values()]
         intents = [hydrate('trade_intents', row) for row in raw_intents.values()]
-        fees, proof = validate_fee_population(asset, activities, fills, intents, broker_quantity)
+        from .membership import classify_population, require_resolved
+        from .generation_fees import persist_generation_fees
+        from tradepulse.verification.opening import load_bound_opening_checkpoint
+        if pagination is None and load_bound_opening_checkpoint(connection) is not None:
+            raise AssetFeeIntegrityError('GENERATION_ACTIVITY_PAGINATION_REQUIRED')
+        membership = classify_population(connection, activities, pagination, now=now) if pagination else None
+        if membership:
+            require_resolved(membership)
+            persist_generation_fees(connection, activities, membership, now=now)
+        fees, proof = validate_fee_population(asset, activities, fills, intents, broker_quantity, membership=membership)
+        if membership is None:
+            # An unbound repair has no official eligibility. Its verified source
+            # receipts still require the same exact-once generation cash ledger.
+            persist_generation_fees(connection, activities, {'checkpoint': None,
+                'classifications': {raw['id']: 'in_generation' for raw in activities}}, now=now)
         if (any(fee.occurred_at > now for fee in fees)
-                or any(datetime.fromisoformat(raw['created_at']) > now for raw in activities
+                or any(aware_utc(raw.get('created_at'), field_name='cash_fee_created_at') > now for raw in activities
                        if raw['id'] in proof.get('cash_fee_populations', {}))):
             raise AssetFeeIntegrityError('ASSET_FEE_FUTURE_TIMESTAMP')
         raw_lots = rows('position_lots')
@@ -78,7 +92,9 @@ async def replay_asset_fees(repositories, asset, activities, broker_quantity, *,
             raise AssetFeeIntegrityError('ASSET_FEE_HOLDING_LOT_MISMATCH')
         new_lots, realized = preview_fee_replay(lots, events, fees)
         quantity = sum((lot.signed_quantity for lot in new_lots), Decimal(0))
-        if quantity != broker_quantity:
+        from .membership import opening_quantities
+        baseline = opening_quantities(membership['checkpoint'] if membership else None).get(key, Decimal(0))
+        if quantity + baseline != broker_quantity:
             raise AssetFeeIntegrityError('ASSET_FEE_REPLAY_BROKER_QUANTITY_MISMATCH')
         population_id = 'asset_fee_population:' + sha256(encode_payload(proof).encode()).hexdigest()
         from .epochs import epochs_for, save_epoch
@@ -190,18 +206,18 @@ async def replay_asset_fees(repositories, asset, activities, broker_quantity, *,
         cash_allocation_versions = {}
         for raw, order, allocations in cash_plans:
             identifier = 'asset_cash_fee:' + raw['id']
-            entry = CashLedgerEntry(identifier, 'alpaca:CFEE:USD:'+raw['id'], Decimal(raw['net_amount']), 'USD',
-                                   datetime.fromisoformat(raw['created_at']), 'authoritative Alpaca USD crypto fee')
-            row = connection.execute('SELECT payload FROM cash_ledger WHERE record_id=?', (identifier,)).fetchone()
+            from .generation_fees import fee_cash_entry
+            entry = fee_cash_entry(raw)
+            row = connection.execute('SELECT payload FROM cash_ledger WHERE record_id=?', (entry.entry_id,)).fetchone()
             old = decode_payload(row['payload']) if row else None
             if old is not None and old != decode_payload(encode_payload(entry)):
                 raise AssetFeeIntegrityError('CASH_FEE_LEDGER_RECEIPT_MISMATCH')
             if old is None:
-                before.setdefault('cash_ledger', {})[identifier] = None
-                after.setdefault('cash_ledger', {})[identifier] = decode_payload(encode_payload(entry))
+                before.setdefault('cash_ledger', {})[entry.entry_id] = None
+                after.setdefault('cash_ledger', {})[entry.entry_id] = decode_payload(encode_payload(entry))
                 cash_entries.append(entry)
             actual = {'activity': raw, 'order': order, 'allocations': allocations,
-                      'population_record_id': population_id, 'cash_entry_id': identifier,
+                      'population_record_id': population_id, 'cash_entry_id': entry.entry_id,
                       'allocation_policy': 'verified_sell_population_proceeds_proportion',
                       'canonical_asset_key': key,
                       'accounting_epoch_ids': [e['accounting_epoch_id'] for e in epochs_for(connection, key)
@@ -241,7 +257,7 @@ async def replay_asset_fees(repositories, asset, activities, broker_quantity, *,
         for raw, _, _ in cash_plans:
             identifier = 'asset_cash_fee:pnl:' + raw['id']
             desired_pnl[identifier] = PnlRecord(identifier, asset, Decimal(raw['net_amount']), Decimal(0),
-                                               datetime.fromisoformat(raw['created_at']))
+                                               aware_utc(raw.get('created_at'), field_name='cash_fee_created_at'))
         existing_pnl = {identifier: raw for identifier, raw in raw_pnl.items()
                         if asset_identity_key(hydrate('pnl_records', raw).asset) == key
                         and identifier.startswith(('fill:pnl:', 'asset_fee:pnl:', 'asset_cash_fee:pnl:'))}
@@ -306,7 +322,7 @@ async def replay_asset_fees(repositories, asset, activities, broker_quantity, *,
         finalize_population(connection, key=key, proof=proof, population_id=population_id,
                             fills=list(asset_fills.values()), fees=fees, cash_plans=cash_plans,
                             lots=new_lots, quantity=quantity, activities=activities, now=now,
-                            pagination=pagination, evidence_hash=evidence_hash)
+                            pagination=pagination, evidence_hash=evidence_hash, membership=membership)
         return bool(before or ledgers or cash_records)
 
     return await repositories.position_lots.database.run(apply, write=True)

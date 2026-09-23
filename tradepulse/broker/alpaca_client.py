@@ -19,6 +19,7 @@ from typing import Any, Literal
 import httpx
 
 from tradepulse.models import AssetClass, Side
+from tradepulse.time import aware_utc
 
 from .errors import AlpacaDataIntegrityError, extract_request_id, raise_alpaca_error
 from .symbols import infer_alpaca_asset_class, normalize_alpaca_symbol
@@ -63,7 +64,7 @@ def _parse_timestamp(raw: str | None) -> datetime | None:
         return None
     value = raw.replace("Z", "+00:00")
     value = _FRACTION_RE.sub(r"\1", value)
-    return datetime.fromisoformat(value)
+    return aware_utc(value, field_name="broker_timestamp")
 
 
 def _decimal(value: object) -> Decimal:
@@ -93,6 +94,7 @@ class AlpacaClient:
         self._option_feed = option_feed
         self._sleep = sleep
         self._rate_limit: AlpacaRateLimitSnapshot | None = None
+        self.last_positions_received_at: datetime | None = None
 
     def set_market_data_feeds(self, *, equity_feed: Literal["iex", "sip"], option_feed: Literal["indicative", "opra"]) -> None:
         self._equity_feed = equity_feed
@@ -198,6 +200,9 @@ class AlpacaClient:
         data = response.json()
         return AlpacaAccount(
             received_at=datetime.now(UTC),
+            account_id=data.get("id"),
+            account_number=data.get("account_number"),
+            raw=dict(data),
             equity=_decimal(data["equity"]),
             last_equity=_decimal(data["last_equity"]),
             cash=_decimal(data["cash"]),
@@ -210,6 +215,7 @@ class AlpacaClient:
         )
 
     async def get_positions(self) -> list[AlpacaPosition]:
+        self.last_positions_received_at = None
         response = await self._request("GET", f"{self._trading_base}/positions")
         if not response.is_success:
             raise_alpaca_error(response, "getPositions")
@@ -242,6 +248,7 @@ class AlpacaClient:
             positions.append(
                 AlpacaPosition(
                     received_at=received_at,
+                    raw=dict(row),
                     symbol=normalize_alpaca_symbol(str(row.get("symbol", "")), asset_class),
                     asset_class=asset_class,
                     qty=_decimal(row["qty"]),
@@ -252,6 +259,7 @@ class AlpacaClient:
                     unrealized_pl=_decimal(row.get("unrealized_pl", "0")),
                 )
             )
+        self.last_positions_received_at = received_at
         return positions
 
     async def get_latest_quote(self, symbol: str, asset_class: AssetClass, feed_override: str | None = None) -> RawQuote:
@@ -478,15 +486,19 @@ class AlpacaClient:
             if not response.is_success:
                 raise_alpaca_error(response, "getActivities")
             page = response.json()
+            received_at = datetime.now(UTC)
             if not isinstance(page, list):
                 raise AlpacaDataIntegrityError("activities response is not a list")
             if len(page) > page_size:
                 raise AlpacaDataIntegrityError("oversized activities page")
+            if any(not isinstance(row, dict) for row in page):
+                raise AlpacaDataIntegrityError("invalid activity object")
             if page_evidence is not None:
                 from hashlib import sha256
 
                 from tradepulse.persistence.codec import encode_payload
                 page_evidence.append({'request': params, 'activity_ids': [r.get('id') for r in page],
+                                      'received_at': received_at.isoformat(),
                                       'response_hash': sha256(encode_payload(page).encode()).hexdigest(),
                                       'terminal': len(page) < page_size})
             for row in page:
