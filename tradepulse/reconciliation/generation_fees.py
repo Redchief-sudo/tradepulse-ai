@@ -143,7 +143,7 @@ def generation_fee_recorded(connection, activity_id):
 def adjustment_receipt(raw):
     """Only broker-declared transfers and interest establish economic purpose."""
     kind = raw.get('activity_type')
-    if kind not in {'CSD', 'CSW', 'INT'}:
+    if kind not in {'CSD', 'CSW', 'INT', 'JNLC', 'JNLD'}:
         return None
     identifier = require_text(raw.get('id'), 'adjustment_activity_id')
     if (raw.get('currency') != 'USD' or raw.get('status') != 'executed'
@@ -151,11 +151,11 @@ def adjustment_receipt(raw):
             or decimal_value(raw.get('qty', '0'), 'adjustment_quantity') != 0):
         raise ValueError('GENERATION_ADJUSTMENT_UNSUPPORTED_RECEIPT:' + identifier)
     amount = decimal_value(raw.get('net_amount'), 'adjustment_amount')
-    if amount == 0 or (kind == 'CSD' and amount < 0) or (kind == 'CSW' and amount > 0):
+    if amount == 0 or (kind in {'CSD', 'JNLC'} and amount < 0) or (kind in {'CSW', 'JNLD'} and amount > 0):
         raise ValueError('GENERATION_ADJUSTMENT_DIRECTION_INVALID:' + identifier)
     return {'activity_id': identifier, 'amount': amount,
             'occurred_at': aware_utc(raw.get('created_at'), field_name='adjustment_created_at'),
-            'economic_type': 'capital_flow' if kind in {'CSD', 'CSW'} else 'interest_income_or_expense'}
+            'economic_type': 'capital_flow' if kind in {'CSD', 'CSW', 'JNLC', 'JNLD'} else 'interest_income_or_expense'}
 
 
 def adjustment_cash_entry(raw):
@@ -197,8 +197,6 @@ def _persist_generation_adjustments(connection, activities, membership, *, now):
     for raw in activities:
         if membership['classifications'].get(raw['id']) not in ELIGIBLE_MEMBERSHIPS:
             continue
-        if raw.get('activity_type') == 'JNLC':
-            raise ValueError('GENERATION_ADJUSTMENT_ECONOMIC_PURPOSE_UNRESOLVED:' + raw['id'])
         adjustment = adjustment_receipt(raw)
         if adjustment is None:
             continue

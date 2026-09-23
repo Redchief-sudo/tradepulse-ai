@@ -7,7 +7,7 @@ import pytest
 
 from tradepulse.persistence.database import SCHEMA
 from tradepulse.persistence.codec import decode_payload
-from tradepulse.reconciliation.generation_fees import persist_generation_fees, validate_generation_fee
+from tradepulse.reconciliation.generation_fees import adjustment_receipt, persist_generation_fees, validate_generation_fee
 from tradepulse.verification.evidence import observed_generation_result
 
 NOW = datetime(2026, 9, 22, tzinfo=UTC)
@@ -114,6 +114,20 @@ def test_native_fee_quote_currency_usd_does_not_create_cash_debit(db):
                   symbol='BTCUSD', qty='-0.0001', net_amount='0')
     assert persist_generation_fees(db, [raw], membership([raw]), now=NOW) == set()
     assert payloads(db, 'cash_ledger') == []
+
+
+    @pytest.mark.parametrize(('activity_type', 'amount'), [('JNLC', '100000'), ('JNLD', '-100000')])
+    def test_alpaca_journal_cash_activity_is_an_authoritative_capital_flow(db, activity_type, amount):
+        raw = {'id': 'journal-1', 'activity_type': activity_type, 'currency': 'USD',
+            'status': 'executed', 'net_amount': amount, 'qty': '0',
+            'created_at': NOW.isoformat(), 'description': ''}
+        adjustment = adjustment_receipt(raw)
+        assert adjustment['economic_type'] == 'capital_flow'
+        assert adjustment['amount'] == Decimal(amount)
+        assert persist_generation_fees(db, [raw], membership([raw]), now=NOW) == set()
+        entry = payloads(db, 'cash_ledger')[0]
+        assert entry['amount'] == amount
+        assert entry['reason'].startswith('immutable broker cash adjustment')
 
 
 def test_observed_equity_normalizes_crypto_receipt_and_excludes_opening_gain():
