@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -21,8 +20,8 @@ from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient, AlpacaError
 from tradepulse.config import Settings, SettingsError, risk_limits_for_profile
 from tradepulse.execution import ExecutionGateway
-from tradepulse.models import AuditEvent, ExecutionMode, SessionState, TradingSession
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, paginate_all_rows
+from tradepulse.models import AuditEvent, ExecutionMode, ReconciliationOutcome, SessionState, TradingSession
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories
 from tradepulse.providers import AlpacaMarketDataProvider
 from tradepulse.reconciliation import run_reconciliation
 from tradepulse.risk import SESSION_RECORD_ID, load_session, transition_session
@@ -228,124 +227,116 @@ async def run_reset_risk(settings: Settings) -> int:
 
 
 async def run_reset_integrity(settings: Settings, *, force: bool) -> int:
-    """`tradepulse reset-integrity`: the only way to clear
-    FINANCIAL_INTEGRITY_BLOCKED. By default runs a real reconciliation pass
-    first and requires it to come back clean -- an operator's word alone is
-    not evidence that a financial-integrity condition has actually
-    resolved. `--force` skips that check for a genuine emergency override,
-    but is unmistakably logged as an unverified critical action."""
+    """Clear only a deliberately acknowledged, independently verified block.
+
+    Reconciliation may repair derived accounting. A fresh valuation and exact
+    checkpoint proof must then remain valid through the session-write commit.
+    No override may erase unresolved financial evidence.
+    """
     database = AsyncSQLiteDatabase(settings.database_url)
     await database.initialize()
     repositories = PersistenceRepositories.create(database)
-
     current = await load_session(repositories)
     if current.state != SessionState.FINANCIAL_INTEGRITY_BLOCKED:
         logger.info("reset_integrity_noop", extra={"event": "reset_integrity_noop"})
         return 0
+    if force:
+        logger.error("reset_integrity_force_refused", extra={"event": "reset_integrity_force_refused",
+                     "reason": "independent accounting verification is mandatory"})
+        return 1
 
-    now = datetime.now(UTC)
-    reconciliation_details: dict[str, Any] = {}
+    from tradepulse.persistence.codec import encode_payload
+    from tradepulse.reconciliation.epochs import require_unlock_proof, unlock_proof
+    from tradepulse.time import aware_utc
+    from tradepulse.valuation import marked_snapshot, record_valuation, reconciliation_outcome, valuation_record
 
-    if not force:
+    broker = None
+    try:
         require_credentials(settings, require_ai=False)
         broker = build_broker(settings)
-        try:
-            alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
-            settlement = SettlementProcessor(repositories, alerts)
-            summary = await run_reconciliation(repositories, broker, settlement, alerts)
-        finally:
+        alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
+        settlement = SettlementProcessor(repositories, alerts)
+        summary = await run_reconciliation(repositories, broker, settlement, alerts)
+        if summary.status != "ok" or summary.accounting_drift_detected or summary.missed_fills_detected:
+            logger.error("reset_integrity_refused_drift_detected", extra={
+                "event": "reset_integrity_refused_drift_detected", "reconciliation_status": summary.status,
+                "accounting_drift_detected": summary.accounting_drift_detected,
+                "missed_fills_detected": summary.missed_fills_detected,
+            })
+            return 1
+        # Capture BEFORE external observations and multi-read valuation. A
+        # concurrent accounting change during either must invalidate the proof.
+        proof = await database.run(unlock_proof)
+        if proof["issues"]:
+            logger.error("reset_integrity_refused_checkpoint_unproven", extra={
+                "event": "reset_integrity_refused_checkpoint_unproven", "issues": proof["issues"],
+            })
+            return 1
+        account = await broker.get_account()
+        positions = await broker.get_positions()
+        if proof['account_identity_digest'] is not None:
+            from tradepulse.verification.integrity import canonical, digest
+            identity = {'account_id': account.account_id, 'account_number': account.account_number}
+            if digest(canonical(identity)) != proof['account_identity_digest']:
+                raise ValueError('RESET_BROKER_ACCOUNT_IDENTITY_CHANGED')
+        aware_utc(account.received_at, field_name="reset_account_received_at")
+        for position in positions:
+            aware_utc(position.received_at, field_name="reset_position_received_at")
+        snapshot = await marked_snapshot(repositories, account, positions)
+        if reconciliation_outcome(snapshot) != ReconciliationOutcome.MATCHED:
+            await record_valuation(repositories, snapshot)
+            logger.error("reset_integrity_refused_current_accounting_unproven", extra={
+                "event": "reset_integrity_refused_current_accounting_unproven",
+                "outcome": reconciliation_outcome(snapshot).value,
+            })
+            return 1
+        receipt = valuation_record(snapshot)
+    except Exception as exc:  # noqa: BLE001 - evidence/provider failure must preserve the latch
+        logger.error("reset_integrity_verification_failed", extra={
+            "event": "reset_integrity_verification_failed", "error": str(exc),
+        })
+        return 1
+    finally:
+        if broker is not None:
             await broker.aclose()
-        if summary.status != "ok" or summary.accounting_drift_detected > 0 or summary.missed_fills_detected > 0:
-            logger.error(
-                "reset_integrity_refused_drift_detected",
-                extra={
-                    "event": "reset_integrity_refused_drift_detected", "reconciliation_status": summary.status,
-                    "accounting_drift_detected": summary.accounting_drift_detected,
-                    "missed_fills_detected": summary.missed_fills_detected,
-                },
-            )
-            return 1
-        # FIN-095-02: a clean POSITION-level reconciliation is not evidence
-        # that a specific order-level fill-quantity dispute was ever
-        # actually explained -- positions can balance while the underlying
-        # anomaly (e.g. a phantom/erroneous Activities entry with no real
-        # extra broker holding behind it) stays factually unresolved.
-        # run_reconciliation's own _reverify_pending_holds step already
-        # tries to resolve any verification_pending hold via a real broker
-        # re-check as part of THIS pass -- so any hold still present here
-        # (of EITHER type) represents something that reconciliation itself
-        # could not resolve, and the non-force path must refuse rather
-        # than silently clear it just because aggregates happen to look
-        # right. Only --force (already explicitly logged as an unverified
-        # critical action) may clear a hold that reconciliation alone
-        # didn't actually resolve.
-        remaining_holds = await paginate_all_rows(repositories.integrity_holds)
-        if remaining_holds:
-            logger.error(
-                "reset_integrity_refused_active_integrity_holds",
-                extra={
-                    "event": "reset_integrity_refused_active_integrity_holds",
-                    "remaining_holds": len(remaining_holds),
-                    "broker_order_ids": [row["record_id"] for row in remaining_holds],
-                },
-            )
-            return 1
-        reconciliation_details = {
-            "reconciliation_status": summary.status,
-            "positions_checked": str(summary.positions_checked),
-            "accounting_drift_detected": str(summary.accounting_drift_detected),
-            "missed_fills_detected": str(summary.missed_fills_detected),
-        }
+
+    now = datetime.now(UTC)
+
+    def validate_write(connection):
+        # This runs in transition_session's BEGIN IMMEDIATE transaction, before
+        # any reset write. Never delete holds: every hold must already be absent.
+        require_unlock_proof(connection, proof["digest"])
+        connection.execute('INSERT INTO reconciliation_records(record_id,payload,created_at) VALUES(?,?,?)',
+                           (receipt.record_id, encode_payload(receipt), now.isoformat()))
 
     def decide(session: TradingSession) -> tuple[TradingSession, AuditEvent] | None:
         if session.state != SessionState.FINANCIAL_INTEGRITY_BLOCKED:
             return None
         new_session = TradingSession(SESSION_RECORD_ID, SessionState.MANUALLY_STOPPED, False, now)
-        if force:
-            event = AuditEvent(
-                event_id=str(uuid4()), event_type="session_transition", severity="critical",
-                message="financial_integrity_blocked force-cleared WITHOUT a verifying reconciliation pass", occurred_at=now,
-                entity_type="trading_session", entity_id=SESSION_RECORD_ID,
-                details={
-                    "action": "reset_integrity_forced", "previous_state": "financial_integrity_blocked",
-                    "new_state": "manually_stopped", "reason": session.financial_integrity_reason,
-                },
-            )
-        else:
-            event = AuditEvent(
-                event_id=str(uuid4()), event_type="session_transition", severity="info",
-                message="financial_integrity_blocked cleared after a clean reconciliation pass", occurred_at=now,
-                entity_type="trading_session", entity_id=SESSION_RECORD_ID,
-                details={
-                    "action": "reset_integrity", "previous_state": "financial_integrity_blocked",
-                    "new_state": "manually_stopped", "reason": session.financial_integrity_reason,
-                    **reconciliation_details,
-                },
-            )
+        event = AuditEvent(
+            event_id=str(uuid4()), event_type="session_transition", severity="info",
+            message="financial_integrity_blocked cleared after independently verified accounting", occurred_at=now,
+            entity_type="trading_session", entity_id=SESSION_RECORD_ID,
+            details={
+                "action": "reset_integrity", "previous_state": "financial_integrity_blocked",
+                "new_state": "manually_stopped", "reason": session.financial_integrity_reason,
+                "reconciliation_status": summary.status,
+                "positions_checked": str(summary.positions_checked),
+                "accounting_drift_detected": str(summary.accounting_drift_detected),
+                "missed_fills_detected": str(summary.missed_fills_detected),
+                "equity_reconciliation_status": snapshot.equity_reconciliation_status,
+                "valuation_record_id": receipt.record_id, "financial_evidence_sha256": proof["digest"],
+            },
+        )
         return new_session, event
 
-    # FIN-095-02: clearing integrity_holds and transitioning the session
-    # out of FINANCIAL_INTEGRITY_BLOCKED must be ONE atomic transaction,
-    # not merely ordered operations -- if the session-state write failed
-    # AFTER holds were already deleted (as separate, already-committed
-    # operations), the settlement's atomic guard would see no hold for a
-    # still-genuinely-disputed order even though the session still
-    # (correctly) reports blocked. clear_integrity_holds=True folds the
-    # hold deletion into transition_session's own single BEGIN IMMEDIATE
-    # transaction alongside the session/audit-event write -- either both
-    # happen or neither does; a failure anywhere in that transaction rolls
-    # BOTH back, so this must fail closed (return 1, session untouched)
-    # rather than let the exception propagate uncaught.
     try:
-        result = await transition_session(repositories, decide, clear_integrity_holds=True)
-    except Exception as exc:  # noqa: BLE001 - must refuse the reset, never crash past a rolled-back transaction
-        logger.error(
-            "reset_integrity_failed_clearing_holds",
-            extra={"event": "reset_integrity_failed_clearing_holds", "error": str(exc)},
-        )
+        result = await transition_session(repositories, decide, validate_write=validate_write)
+    except Exception as exc:  # noqa: BLE001 - atomic rollback preserves all evidence and the latch
+        logger.error("reset_integrity_commit_refused", extra={"event": "reset_integrity_commit_refused", "error": str(exc)})
         return 1
     if result is None:
-        logger.info("reset_integrity_noop_state_changed_concurrently", extra={"event": "reset_integrity_noop_state_changed_concurrently"})
-        return 0
-    logger.info("session_integrity_reset", extra={"event": "session_integrity_reset", "forced": force})
+        logger.error("reset_integrity_state_changed_concurrently", extra={"event": "reset_integrity_state_changed_concurrently"})
+        return 1
+    logger.info("session_integrity_reset", extra={"event": "session_integrity_reset", "forced": False})
     return 0

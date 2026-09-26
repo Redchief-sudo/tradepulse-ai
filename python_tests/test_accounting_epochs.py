@@ -179,3 +179,47 @@ async def test_new_receipt_supersedes_checkpoint_and_reconciles_new_version(tmp_
     assert new['checkpoint_id'] != old['checkpoint_id']
     assert await r.reconciliation_records.get(old['checkpoint_id']) == receipt
     assert any(row['record_id'].startswith('epoch_proof_superseded:') for row in await r.reconciliation_records.list_all())
+
+
+@pytest.mark.parametrize('legacy_mismatch', [False, True])
+async def test_refreshed_page_receipt_versions_checkpoint_and_preserves_history(tmp_path, legacy_mismatch):
+    from datetime import timedelta
+    from tradepulse.reconciliation.epochs import checkpoint_issues, verify_checkpoint
+
+    r = await seeded(tmp_path)
+    raw, qty = await population(r, four_receipts())
+    first = pagination(raw)
+    first['pages'][0]['received_at'] = NOW.isoformat()
+    await replay_asset_fees(r, ASSET, raw, qty, now=NOW, pagination=first)
+    old = (await r.accounting_epochs.list_all())[0]['payload']
+    receipt = await r.reconciliation_records.get(old['checkpoint_id'])
+    refreshed = pagination(raw)
+    refreshed['pages'][0]['received_at'] = (NOW + timedelta(minutes=5)).isoformat()
+    if legacy_mismatch:
+        broken = {**old, 'pagination_proof': refreshed}
+        await r.accounting_epochs.update(old['accounting_epoch_id'], broken, status='reconciled_net')
+        issues = await r.accounting_epochs.database.run(checkpoint_issues)
+        assert issues[old['accounting_epoch_id']] == 'CHECKPOINT_RECEIPT_MISMATCH'
+    await replay_asset_fees(r, ASSET, raw, qty, now=NOW + timedelta(minutes=5), pagination=refreshed)
+    new = (await r.accounting_epochs.list_all())[0]['payload']
+    assert new['checkpoint_version'] == old['checkpoint_version'] + 1
+    assert old['checkpoint_id'] in new['superseded_checkpoint_ids']
+    assert new['checkpoint_id'] != old['checkpoint_id']
+    assert await r.reconciliation_records.get(old['checkpoint_id']) == receipt
+    records = {row['record_id']: row['payload'] for row in await r.reconciliation_records.list_all()}
+    fills = [row['payload'] for row in await r.fills.list_all()]
+    intents = [row['payload'] for row in await r.trade_intents.list_all()]
+    verify_checkpoint(new, records, fills, intents)
+    verify_checkpoint(old, records, fills, intents)
+    assert await r.accounting_epochs.database.run(checkpoint_issues) == {}
+    before = await r.reconciliation_records.list_all()
+    await replay_asset_fees(r, ASSET, raw, qty, now=NOW + timedelta(minutes=5), pagination=refreshed)
+    assert await r.reconciliation_records.list_all() == before
+
+
+async def test_checkpoint_verifier_refuses_uncovered_execution_population(tmp_path):
+    from tradepulse.reconciliation.epochs import checkpoint_issues
+    r = await seeded(tmp_path)
+    issues = await r.accounting_epochs.database.run(checkpoint_issues)
+    assert 'CHECKPOINT_FILL_MEMBERSHIP_MISSING' in issues.values()
+    assert 'CHECKPOINT_EPOCH_MISSING' in issues.values()

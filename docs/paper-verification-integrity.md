@@ -16,26 +16,55 @@ Manifests, start records, invalidation records, sealed summaries, and sealed evi
 
 ## Operator workflow
 
-Stop existing processes using the chosen database before freezing. Use the same environment, broker credentials, and settings for freeze and run, with execution mode `paper` and live trading disabled. Choose a new database path for the generation; do not reset or reuse the previous generation's database.
+Finish and validate source changes before freezing. Use the same source, environment, broker account, credentials, and settings for both disposable soaks and the later official generation, with execution mode `paper` and live trading disabled. Each run needs a distinct, never-used database and generation name. Preserve the legacy database and any legacy evidence seal; neither reusing that database nor clearing its integrity latch is a prerequisite for starting a new soak.
+
+Arrange exclusive use of the broker account before starting. Database and generation leases do not coordinate separate databases using one account. Confirm that no other runtime or operator will trade or monitor exits on that account and that no legacy broker orders remain pending. Do not automatically cancel orders or close positions to meet this prerequisite. A fresh database can checkpoint existing broker inventory as an excluded opening balance, but it does not acquire the old database's protective-management history. Mixed old and new inventory in the same symbol also needs review: the position monitor currently requests the entire broker position quantity on exit, while generation reconciliation preserves the opening quantity. Do not treat this combination as proven safe merely because freeze accepts the opening checkpoint.
+
+Run the disposable soaks sequentially from the validated checkout, choosing unused paths and an available local dashboard port:
+
+```bash
+.venv/bin/python scripts/run_accounting_soak.py \
+  --run-number 1 \
+  --database /absolute/path/soak-accounting-1.db \
+  --report /absolute/path/soak-accounting-1.json \
+  --port 8766
+
+.venv/bin/python scripts/run_accounting_soak.py \
+  --run-number 2 \
+  --database /absolute/path/soak-accounting-2.db \
+  --report /absolute/path/soak-accounting-2.json \
+  --port 8766
+```
+
+The runner sets paper mode and disables live trading. Run 1 requires at least 12 uninterrupted hours after guarded startup, followed by graceful shutdown, reconciliation, and at least 30 minutes of restart operation. Run 2 requires at least 24 uninterrupted hours plus the same restart exercise; it must also capture a complete equity session from before opening through closing using persisted broker-clock receipts. `--hours` and `--restart-minutes` can extend these minimums. Startup and shutdown add time beyond the 12.5/24.5-hour minimum runtime. The runner refuses existing databases, sidecars, and report paths rather than cleaning or reusing them.
+
+Elapsed time alone cannot pass a soak. Reports require continuous evidence from all six lanes, real completed round trips and reconciled epochs for equities, crypto, and options, conserved fee receipts, an exercised late-fee reopening, complete slippage evidence within the overlay, and clean accounting/reconciliation evidence. No synthetic trades or relaxed gates substitute for missing coverage. Preserve an incomplete or failed run; any replacement run needs new paths.
+
+After shutdown, the runner preserves a private, self-contained SQLite backup and its verification sidecar beside the report. The report binds the database, manifest, opening checkpoint, artifacts, source, configuration, and broker account with hashes. Official freeze independently reanalyzes two passing preserved reports with distinct database identities and generations, run numbers 1 and 2, and the same source/configuration/account. A protected source or configuration change requires both soaks to be repeated. Keep the reports, preserved databases, and sidecars together.
+
+Only after both reports pass, freeze a third fresh database for the official generation:
 
 ```bash
 export TRADEPULSE_DATABASE_URL=sqlite:////absolute/path/paper-generation-1.db
 export TRADEPULSE_EXECUTION_MODE=paper
 export TRADEPULSE_LIVE_TRADING_ENABLED=false
 
-tradepulse verification freeze --generation paper-1
+tradepulse verification freeze --generation paper-1 \
+  --fee-bps 25 --slippage-bps 15 \
+  --soak-report /absolute/path/soak-accounting-1.json \
+  --soak-report /absolute/path/soak-accounting-2.json
 tradepulse verification verify --generation paper-1
 tradepulse run --verification-generation paper-1
 tradepulse verification status --generation paper-1
 ```
 
-Rev.100 writes `Fill.fees` and `Fill.slippage` as literal zero; those fields do not establish a cost model. Freeze therefore assumes **no cost rates**. Without an explicit model, net P&L, net expectancy, and net win rate remain unavailable and the completion gate cannot pass. To define a model, supply both `--fee-bps` and `--slippage-bps` to **freeze**, using deliberately chosen numerical rates. They are per-side basis points of actual fill notional (including the canonical options multiplier), applied uniformly to all asset classes as a verification-only overlay. They never change fills, accounting, execution, or the production P&L calculation. Zero is accepted only when explicitly supplied. Rates are frozen in the manifest and cannot be supplied to verify/status or changed during a generation. No rates are recommended or preselected here.
+Freeze requires exactly **25 fee basis points and 15 slippage basis points per side**; the soak runner supplies them automatically. These rates apply to actual fill notional, including the canonical options multiplier, as a verification-only model. They do not change fills, accounting, execution, or observed broker fees. Modeled trade net and receipt-backed observed generation net remain separate authorities. Rates are frozen in the manifest and cannot be supplied to verify/status or changed during a generation; missing, zero, or different rates are refused.
 
 Official startup checks source and frozen context before invoking the runtime. A missing, corrupt, mismatched, invalidated, or sealed generation refuses startup with a nonzero exit. A generation process lease prevents concurrent official processes and prevents an external status command from sealing while supervised work is in flight.
 
 During `run`, an independent verification task checks source and assesses evidence every five seconds after the preceding check completes. Source mismatch records the exact modified/missing/new paths, permanently invalidates the generation, and requests the existing graceful shutdown. In-flight work drains; it does not become certified evidence for an invalid generation. A transient change made and restored entirely between checks is outside this polling mechanism's guarantee. Verification errors also request shutdown rather than silently downgrading to ordinary paper mode.
 
-`run` does not schedule reconciliation. Stop it cleanly, run the existing one-shot reconciliation with the same generation, then restart:
+With `--verification-generation`, `run` performs startup reconciliation and adds an independent reconciliation lane with a 60-second cadence alongside equity, crypto, options, monitor, and settlement lanes. It also settles and reconciles after trading work drains at shutdown. For an additional standalone reconciliation, stop the runtime cleanly to release its generation lease, use the same generation, then restart:
 
 ```bash
 tradepulse reconcile --verification-generation paper-1
@@ -44,7 +73,7 @@ tradepulse run --verification-generation paper-1
 
 The one-shot command verifies before and after its existing work; it adds no scheduling loop. Ordinary scan/monitor/settle/reconcile/start/reset/dashboard CLI invocations are refused for a bound database; official `run` retains its existing local dashboard and controls. `stop` and ordinary session `status` remain available. Use `verification status` for generation integrity/completion, not session `status`.
 
-A normal restart reuses the immutable start timestamp and manifest. It never creates a new generation. Elapsed duration is calendar time from the first successful verification-guard startup, including downtime, not a claim of uninterrupted operation.
+A normal restart reuses the immutable start timestamp and manifest. It never creates a new generation. The official 60-day duration is calendar time from the first successful guarded startup, including downtime. Soak duration and restart coverage are separately checked against paired runtime start/stop receipts and lane continuity; downtime cannot satisfy the uninterrupted soak minimum.
 
 ## Completion population and gates
 

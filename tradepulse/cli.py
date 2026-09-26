@@ -1007,7 +1007,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "reset-integrity", help="clear a FINANCIAL_INTEGRITY_BLOCKED session after a clean reconciliation pass (run start afterward to resume trading)"
     )
     reset_integrity_parser.add_argument(
-        "--force", action="store_true", help="skip the verifying reconciliation pass (emergency override, logged as a critical unverified action)"
+        "--force", action="store_true", help="unsupported: financial-integrity verification cannot be bypassed"
     )
     dashboard_parser = subparsers.add_parser(
         "dashboard", help="run the local operator dashboard (read-only observability + start/stop/reset controls); always binds 127.0.0.1, no remote option"

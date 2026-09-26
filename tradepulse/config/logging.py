@@ -10,6 +10,11 @@ from datetime import UTC, datetime
 # Anything else on the record was added via `extra=` and must be surfaced.
 _RESERVED_RECORD_ATTRS = frozenset(logging.makeLogRecord({}).__dict__) | {"message"}
 
+# HTTP client request lines carry the full URL, and some provider URLs embed a
+# credential (the Telegram Bot API puts the bot token in the path). Keep these
+# transport loggers at WARNING so secrets never reach INFO logs.
+_URL_LOGGING_TRANSPORTS = ("httpx", "httpcore")
+
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -36,3 +41,5 @@ def configure_logging(level: str = "INFO") -> None:
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(level)
+    for name in _URL_LOGGING_TRANSPORTS:
+        logging.getLogger(name).setLevel(logging.WARNING)

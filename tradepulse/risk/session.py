@@ -57,6 +57,7 @@ async def transition_session(
     repositories: PersistenceRepositories,
     decide: Callable[[TradingSession], tuple[TradingSession, AuditEvent] | None],
     *, clear_integrity_holds: bool = False,
+    validate_write: Callable[[sqlite3.Connection], None] | None = None,
 ) -> TradingSession | None:
     """Atomically re-read the singleton TradingSession row, call
     decide(current) for a final go/no-go against the FRESH state (not
@@ -100,6 +101,8 @@ async def transition_session(
         decision = decide(current)
         if decision is None:
             return None
+        if validate_write is not None:
+            validate_write(connection)
         new_session, event = decision
         now = utc_now()
         if clear_integrity_holds:

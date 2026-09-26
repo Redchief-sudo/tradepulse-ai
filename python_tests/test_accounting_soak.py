@@ -231,6 +231,27 @@ def test_complete_equity_session_requires_broker_clock_coverage_and_continuous_c
     assert not _complete_market_session(clocks, segments, {"crypto": {"continuous": False}})["complete"]
 
 
+def test_broker_clock_tolerates_bounded_server_lead_but_refuses_future_receipts():
+    opened = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
+    closed = opened + timedelta(hours=6, minutes=30)
+    segments = [{"started_at": (opened - timedelta(hours=1)).isoformat(),
+                 "ended_at": (closed + timedelta(hours=1)).isoformat()}]
+    lead = timedelta(milliseconds=45)
+    clocks = []
+    at = opened - timedelta(minutes=1)
+    while at <= closed + timedelta(minutes=1):
+        clocks.append(event("verification_broker_clock", at, timestamp=(at + lead).isoformat(),
+            is_open=opened <= at < closed,
+            next_open=(opened if at < opened else opened + timedelta(days=1)).isoformat(),
+            next_close=(closed if at < closed else closed + timedelta(days=1)).isoformat(), received_at=at.isoformat()))
+        at += timedelta(minutes=1)
+    lanes = {"crypto": {"continuous": True}}
+    assert _complete_market_session(clocks, segments, lanes)["complete"]
+    future = clocks[0]["details"] | {"timestamp": (opened + timedelta(minutes=1)).isoformat()}
+    with pytest.raises(VerificationError, match="invalid_soak_broker_clock"):
+        _complete_market_session([{**clocks[0], "details": future}, *clocks[1:]], segments, lanes)
+
+
 def test_adverse_slippage_uses_direction_and_complete_aware_reference_receipts():
     def fill(identifier, side, price, **changes):
         return {"fill_id": identifier, "broker_fill_id": identifier, "side": side, "price": price,

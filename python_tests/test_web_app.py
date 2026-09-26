@@ -136,7 +136,7 @@ async def test_reset_integrity_force_with_wrong_confirmation_is_rejected(tmp_pat
 
 
 @respx.mock
-async def test_reset_integrity_force_with_exact_confirmation_matches_cli_force_path(tmp_path) -> None:
+async def test_reset_integrity_force_with_exact_confirmation_cannot_bypass_proof(tmp_path) -> None:
     client, state = await _client_for(tmp_path)
     await save_session(
         state.repositories,
@@ -149,11 +149,9 @@ async def test_reset_integrity_force_with_exact_confirmation_matches_cli_force_p
     await client.aclose()
 
     assert response.status_code == 200
-    assert response.json()["session"]["state"] == "manually_stopped"
-
-    audit_rows = await state.repositories.audit_events.list_recent()
-    events = [hydrate("audit_events", r["payload"]) for r in audit_rows]
-    assert any(e.severity == "critical" and "force-cleared" in e.message for e in events)
+    assert response.json()["exit_code"] == 1
+    assert response.json()["session"]["state"] == "financial_integrity_blocked"
+    assert await state.repositories.audit_events.list_recent() == []
     await state.broker.aclose()
 
 

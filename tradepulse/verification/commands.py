@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 def add_parser(subparsers) -> None:
     parser = subparsers.add_parser("verification", help="paper-verification generation integrity and completion")
-    parser.add_argument("action", choices=("freeze", "verify", "status"))
+    parser.add_argument("action", choices=("freeze", "verify", "status", "seal-legacy"))
     parser.add_argument("--generation", required=True)
     parser.add_argument("--fee-bps", type=str, default=None, help="explicit verification-only fee model, per-side basis points")
     parser.add_argument("--slippage-bps", type=str, default=None, help="explicit verification-only slippage model, per-side basis points")
@@ -26,7 +26,12 @@ async def command(settings, args) -> int:
     verification = None
     try:
         verification = await asyncio.to_thread(Verification, settings, args.generation)
-        if args.action == "freeze":
+        if args.action == "seal-legacy":
+            from .legacy import seal_legacy_database
+            database = await asyncio.to_thread(AsyncSQLiteDatabase, settings.database_url)
+            await database.initialize()
+            result = await asyncio.to_thread(seal_legacy_database, database.path)
+        elif args.action == "freeze":
             from .evidence import number
             if (args.fee_bps is None) != (args.slippage_bps is None):
                 raise VerificationError("supply_both_cost_model_rates_or_neither")

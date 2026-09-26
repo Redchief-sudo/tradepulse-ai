@@ -11,6 +11,7 @@ import asyncio
 import logging
 import random
 import re
+from urllib.parse import quote
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -464,6 +465,22 @@ class AlpacaClient:
         if not response.is_success:
             raise_alpaca_error(response, "cancelOrder")
 
+    async def get_open_orders(self) -> list[AlpacaOrderResponse]:
+        """Return the broker's complete currently-open order population."""
+        response = await self._request("GET", f"{self._trading_base}/orders", params={"status": "open", "nested": "false"})
+        if not response.is_success:
+            raise_alpaca_error(response, "getOpenOrders")
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise AlpacaDataIntegrityError("open orders response is not a list")
+        return [self._parse_order_data(row, request_id=None) for row in rows]
+
+    async def close_position(self, symbol: str) -> None:
+        """Submit Alpaca's broker-side close-position operation for one symbol."""
+        response = await self._request("DELETE", f"{self._trading_base}/positions/{quote(symbol, safe='')}")
+        if not response.is_success:
+            raise_alpaca_error(response, "closePosition")
+
     async def get_activities(
         self, activity_type: str | None = "FILL", since: datetime | None = None, page_size: int = 100,
         *, after_id: str | None = None, page_evidence: list | None = None,
@@ -533,7 +550,9 @@ class AlpacaClient:
         return activities
 
     def _parse_order_response(self, response: httpx.Response) -> AlpacaOrderResponse:
-        data = response.json()
+        return self._parse_order_data(response.json(), request_id=extract_request_id(response))
+
+    def _parse_order_data(self, data: dict, *, request_id: str | None) -> AlpacaOrderResponse:
         side_raw = str(data.get("side") or "").lower()
         side = Side.BUY if side_raw == "buy" else Side.SELL if side_raw == "sell" else None
         return AlpacaOrderResponse(
@@ -544,6 +563,6 @@ class AlpacaClient:
             filled_qty=_decimal(data.get("filled_qty") or "0"),
             filled_avg_price=_decimal_or_none(data.get("filled_avg_price")),
             submitted_at=_parse_timestamp(data.get("submitted_at")),
-            request_id=extract_request_id(response),
+            request_id=request_id,
             raw=data,
         )

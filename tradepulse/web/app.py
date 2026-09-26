@@ -159,11 +159,8 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
 
     @app.post("/api/session/reset-integrity")
     async def post_reset_integrity(request: Request, body: ResetIntegrityRequest) -> Response:
-        # Operator-interface guard ON TOP OF (never instead of) the CLI's
-        # own --force semantics -- a stray click or a bare `force: true`
-        # must never be enough to trigger an unverified critical override.
-        # This never touches session_commands or the audit trail itself;
-        # it only decides whether the request is even allowed to reach it.
+        # Retain input validation for old clients; the shared authority refuses
+        # every force request, even when the confirmation phrase is correct.
         if body.force and body.confirmation != _CONFIRMATION_PHRASE:
             raise HTTPException(status_code=400, detail=f"force=true requires confirmation == {_CONFIRMATION_PHRASE!r}")
         s = _state(request)

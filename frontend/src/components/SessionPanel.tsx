@@ -5,8 +5,6 @@ import { time, duration } from '../format'
 import { Panel } from './Panel'
 import type { SessionState } from '../types'
 
-const CONFIRMATION_PHRASE = 'RESET_FINANCIAL_INTEGRITY'
-
 const STATE_LABEL: Record<SessionState, string> = {
   disabled: 'Disabled',
   active: 'Active',
@@ -22,8 +20,6 @@ export function SessionPanel() {
   const { data: session, error, loading, refresh } = usePolling(api.getSession, 5000)
   const [busy, setBusy] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
-  const [confirmText, setConfirmText] = useState('')
-  const [showForceConfirm, setShowForceConfirm] = useState(false)
 
   async function run(action: () => Promise<unknown>) {
     setBusy(true)
@@ -84,46 +80,6 @@ export function SessionPanel() {
               Reset Integrity (verified)
             </button>
           </div>
-
-          {session.state === 'financial_integrity_blocked' && (
-            <div className="danger-zone">
-              {!showForceConfirm ? (
-                <button className="danger" disabled={busy} onClick={() => setShowForceConfirm(true)}>
-                  Force Reset Integrity (skip verification)
-                </button>
-              ) : (
-                <div className="confirm-box">
-                  <p>
-                    This skips the verifying reconciliation pass and is logged as a{' '}
-                    <strong>critical, unverified</strong> action. Type <code>{CONFIRMATION_PHRASE}</code> to confirm.
-                  </p>
-                  <input value={confirmText} onChange={(e) => setConfirmText(e.target.value)} placeholder={CONFIRMATION_PHRASE} />
-                  <div className="button-row">
-                    <button
-                      className="danger"
-                      disabled={busy || confirmText !== CONFIRMATION_PHRASE}
-                      onClick={() =>
-                        run(() => api.resetIntegrity(true, confirmText)).then(() => {
-                          setShowForceConfirm(false)
-                          setConfirmText('')
-                        })
-                      }
-                    >
-                      Confirm Force Reset
-                    </button>
-                    <button
-                      onClick={() => {
-                        setShowForceConfirm(false)
-                        setConfirmText('')
-                      }}
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
 
           {actionError && <div className="panel-error">{actionError}</div>}
         </>

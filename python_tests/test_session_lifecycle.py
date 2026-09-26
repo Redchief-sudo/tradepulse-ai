@@ -387,6 +387,13 @@ async def test_reset_integrity_clears_after_clean_reconciliation(tmp_path) -> No
     repositories = await _repositories(tmp_path)
     await save_session(repositories, _integrity_blocked(reason="broker position mismatch"))
     _mock_clean_reconciliation()
+    respx.get("https://paper-api.alpaca.markets/v2/account").mock(
+        return_value=httpx.Response(200, json={
+            "equity": "100000", "last_equity": "100000", "cash": "100000",
+            "buying_power": "100000", "portfolio_value": "100000",
+            "long_market_value": "0", "short_market_value": "0",
+        })
+    )
 
     exit_code = await _run_reset_integrity(_settings_with_creds(f"sqlite:///{tmp_path}/test.db"), force=False)
     assert exit_code == 0
@@ -429,8 +436,7 @@ async def test_reset_integrity_refuses_non_force_while_an_integrity_hold_remains
     per-order anomaly stays factually unresolved (e.g. a phantom/erroneous
     Activities entry with no real extra broker holding behind it). The
     non-force path must refuse to clear a still-active hold just because
-    reconciliation happens to report clean; only --force (already an
-    explicitly logged unverified action) may do that."""
+    reconciliation happens to report clean; unverified overrides must also refuse."""
     repositories = await _repositories(tmp_path)
     await save_session(repositories, _integrity_blocked(reason="order fill quantity disputed"))
     hold = IntegrityHold(
@@ -448,91 +454,52 @@ async def test_reset_integrity_refuses_non_force_while_an_integrity_hold_remains
     assert await repositories.integrity_holds.get("order-1") is not None  # hold still present
     assert (await _audit_events(repositories)) == []
 
-    # --force remains the only path that can clear it when nothing has
-    # actually resolved the dispute -- unchanged, already-existing contract.
+    # An override cannot erase a dispute that has not been resolved.
     with respx.mock:
         forced_exit_code = await _run_reset_integrity(_settings_no_creds(f"sqlite:///{tmp_path}/test.db"), force=True)
-    assert forced_exit_code == 0
-    assert (await load_session(repositories)).state == SessionState.MANUALLY_STOPPED
-    assert await repositories.integrity_holds.get("order-1") is None
+    assert forced_exit_code == 1
+    assert (await load_session(repositories)).state == SessionState.FINANCIAL_INTEGRITY_BLOCKED
+    assert await repositories.integrity_holds.get("order-1") is not None
 
 
-async def test_reset_integrity_force_clears_without_reconciliation(tmp_path) -> None:
+async def test_reset_integrity_force_refuses_without_reconciliation(tmp_path) -> None:
     repositories = await _repositories(tmp_path)
-    await save_session(repositories, _integrity_blocked(reason="broker position mismatch"))
-    # No broker mocks registered at all -- proves no reconciliation call is made.
-
-    exit_code = await _run_reset_integrity(_settings_no_creds(f"sqlite:///{tmp_path}/test.db"), force=True)
-    assert exit_code == 0
-
-    session = await load_session(repositories)
-    assert session.state == SessionState.MANUALLY_STOPPED
-    events = await _audit_events(repositories)
-    assert len(events) == 1
-    assert events[0].details["action"] == "reset_integrity_forced"
-    assert events[0].severity == "critical"
-
-
-async def test_reset_integrity_clears_persisted_integrity_holds(tmp_path) -> None:
-    """FIN-095-02: a fill_quantity_disputed hold left in place after
-    reset-integrity would silently re-trigger latch_financial_integrity_block
-    on the very next legitimate fill for that order, with no symptom
-    pointing at the real (stale-hold) cause -- reset-integrity must clear
-    every integrity_holds row, not just the session-level state."""
-    repositories = await _repositories(tmp_path)
-    await save_session(repositories, _integrity_blocked(reason="order fill quantity disputed"))
-    hold = IntegrityHold(
-        broker_order_id="order-1", trade_intent_id="ti-1", hold_type=IntegrityHoldType.FILL_QUANTITY_DISPUTED,
-        reason="INTEGRITY_VIOLATION: disputed", created_at=NOW,
-    )
+    await save_session(repositories, _integrity_blocked())
+    hold = IntegrityHold("order-1", "ti-1", IntegrityHoldType.FILL_QUANTITY_DISPUTED,
+                         "INTEGRITY_VIOLATION: disputed", NOW)
     await repositories.integrity_holds.create_once("order-1", hold, status=hold.hold_type.value)
+    before = await repositories.trading_sessions.get(SESSION_RECORD_ID)
+    assert await _run_reset_integrity(_settings_no_creds(f"sqlite:///{tmp_path}/test.db"), force=True) == 1
+    assert await repositories.trading_sessions.get(SESSION_RECORD_ID) == before
+    assert await repositories.integrity_holds.get("order-1") is not None
+    assert await _audit_events(repositories) == []
 
-    exit_code = await _run_reset_integrity(_settings_no_creds(f"sqlite:///{tmp_path}/test.db"), force=True)
-    assert exit_code == 0
-    assert await repositories.integrity_holds.get("order-1") is None
 
-
-async def test_reset_integrity_fails_closed_when_the_transaction_fails_after_holds_are_queued(tmp_path, monkeypatch) -> None:
-    """The exact interleaving flagged as a residual gap: holds cleared as
-    a separate, already-committed step, then the session-state write
-    fails -- would leave the session correctly still
-    FINANCIAL_INTEGRITY_BLOCKED while the settlement guard's only evidence
-    of a still-genuinely-disputed order was already gone. Clearing holds
-    and transitioning the session are now ONE transaction
-    (transition_session's clear_integrity_holds=True), so a failure
-    injected AFTER the hold-deletion SQL has been issued (but before the
-    transaction commits) must roll back BOTH -- the hold must still exist
-    afterward, not just the session state."""
+@respx.mock
+async def test_reset_integrity_rolls_back_proof_when_session_write_fails(tmp_path, monkeypatch) -> None:
     repositories = await _repositories(tmp_path)
-    await save_session(repositories, _integrity_blocked(reason="order fill quantity disputed"))
-    hold = IntegrityHold(
-        broker_order_id="order-1", trade_intent_id="ti-1", hold_type=IntegrityHoldType.FILL_QUANTITY_DISPUTED,
-        reason="INTEGRITY_VIOLATION: disputed", created_at=NOW,
-    )
-    await repositories.integrity_holds.create_once("order-1", hold, status=hold.hold_type.value)
-
-    # Fails encode_payload specifically for the new TradingSession value --
-    # inside transition_session's op(), this is called AFTER the
-    # integrity_holds DELETE statements have already been issued on the
-    # same (uncommitted) connection, but BEFORE the session row itself is
-    # written -- exactly the ordering the user's scenario depends on.
+    await save_session(repositories, _integrity_blocked())
+    _mock_clean_reconciliation()
+    respx.get("https://paper-api.alpaca.markets/v2/account").mock(return_value=httpx.Response(200, json={
+        "equity": "100000", "last_equity": "100000", "cash": "100000",
+        "buying_power": "100000", "portfolio_value": "100000",
+        "long_market_value": "0", "short_market_value": "0",
+    }))
     from tradepulse.risk import session as session_module
-    original_encode_payload = session_module.encode_payload
-
-    def _boom(value):
+    original_encode = session_module.encode_payload
+    attempted = False
+    def fail_session_write(value):
+        nonlocal attempted
         if isinstance(value, TradingSession) and value.state == SessionState.MANUALLY_STOPPED:
-            raise RuntimeError("synthetic failure between hold-deletion and session-write")
-        return original_encode_payload(value)
-
-    monkeypatch.setattr(session_module, "encode_payload", _boom)
-
-    exit_code = await _run_reset_integrity(_settings_no_creds(f"sqlite:///{tmp_path}/test.db"), force=True)
-    assert exit_code == 1
-
-    session = await load_session(repositories)
-    assert session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED  # never transitioned
-    assert await repositories.integrity_holds.get("order-1") is not None  # hold survives -- the DELETE rolled back too
-    assert (await _audit_events(repositories)) == []  # no session-transition audit event was ever written
+            attempted = True
+            raise RuntimeError("fixture session write failure")
+        return original_encode(value)
+    monkeypatch.setattr(session_module, "encode_payload", fail_session_write)
+    assert await _run_reset_integrity(_settings_with_creds(f"sqlite:///{tmp_path}/test.db"), force=False) == 1
+    assert attempted
+    assert (await load_session(repositories)).state == SessionState.FINANCIAL_INTEGRITY_BLOCKED
+    assert await repositories.reconciliation_records.list_all() == []
+    assert await _audit_events(repositories) == []
 
 
 async def test_reset_integrity_does_not_clear_risk_stop(tmp_path) -> None:

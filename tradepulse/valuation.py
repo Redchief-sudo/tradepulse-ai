@@ -2,7 +2,7 @@
 import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from uuid import uuid4
 
 from tradepulse.broker.types import AlpacaAccount, AlpacaPosition
@@ -18,6 +18,21 @@ from tradepulse.persistence import (
 from tradepulse.risk.engine import _risk_day_bounds
 from tradepulse.time import aware_utc
 from tradepulse.persistence.codec import decode_payload, encode_payload
+
+
+def broker_settled_cash(entry) -> Decimal:
+    """Cash the broker actually posts for one canonical ledger entry.
+
+    Alpaca settles each individual fill's cash to the nearest cent, so an exact
+    fractional-share notional (e.g. 0.124 x 335.94 = 41.65656) posts as 41.66.
+    The immutable ledger keeps the exact amount; only the comparison against
+    broker cash applies the per-fill cent settlement. Non-fill entries are
+    broker-reported cent amounts already and pass through unchanged.
+    """
+    amount = Decimal(entry['amount'])
+    if entry['entry_id'].startswith('fill:cash:'):
+        return amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    return amount
 
 
 def _generation_invariants(connection, account, positions):
@@ -53,7 +68,7 @@ def _generation_invariants(connection, account, positions):
         if adjustment_receipt(raw) is not None:
             validate_generation_adjustment(by_record['generation_adjustment:' + raw['id']],
                                            entries['broker:adjustment:' + raw['id']], raw=raw, checkpoint=opening)
-    cash_movement = sum((Decimal(r['amount']) for r in entries.values()), Decimal(0))
+    cash_movement = sum((broker_settled_cash(r) for r in entries.values()), Decimal(0))
     if any(r['currency'] != 'USD' for r in entries.values()):
         raise ValueError('generation_cash_currency_unverified')
     expected_cash = Decimal(opening['cash']) + cash_movement
@@ -251,11 +266,11 @@ def reconciliation_outcome(snapshot: PortfolioSnapshot) -> ReconciliationOutcome
     return ReconciliationOutcome.MATCHED
 
 
-async def record_valuation(repositories: PersistenceRepositories, snapshot: PortfolioSnapshot) -> None:
-    outcome = reconciliation_outcome(snapshot)
-    record = ReconciliationRecord(
+def valuation_record(snapshot: PortfolioSnapshot) -> ReconciliationRecord:
+    """Build the same valuation receipt for standalone and atomic reset writes."""
+    return ReconciliationRecord(
         record_id=f'equity:{snapshot.snapshot_id}', reconciliation_type='equity', subject_id='broker_equity',
-        outcome=outcome,
+        outcome=reconciliation_outcome(snapshot),
         expected={'total_equity': snapshot.total_equity},
         actual={'cash': snapshot.cash_balance, 'holdings_value': snapshot.holdings_value,
                 'broker_components': snapshot.broker_equity_components,
@@ -266,6 +281,11 @@ async def record_valuation(repositories: PersistenceRepositories, snapshot: Port
                 'independent_results': snapshot.reconciliation_results, 'accounting_states': snapshot.accounting_states},
         occurred_at=snapshot.as_of,
     )
+
+
+async def record_valuation(repositories: PersistenceRepositories, snapshot: PortfolioSnapshot) -> None:
+    record = valuation_record(snapshot)
+    outcome = record.outcome
     await repositories.reconciliation_records.create_once(record.record_id, record)
     if outcome == ReconciliationOutcome.UNRESOLVED_MISMATCH:
         from tradepulse.risk import latch_financial_integrity_block

@@ -26,6 +26,10 @@ AUTHORIZED_COSTS = {"fee_bps": "25", "slippage_bps": "15"}
 REQUIRED_LANES = {"equity": 900, "crypto": 600, "option": 1200, "monitor": 120, "settle": 60, "reconcile": 60}
 MINIMUM_SECONDS = {1: 12 * 3600, 2: 24 * 3600}
 MINIMUM_RESTART_SECONDS = 30 * 60
+# Alpaca's server clock and the local receive clock are independent; observed
+# broker timestamps lead local receipt by tens of milliseconds. A bounded
+# tolerance accepts that jitter while still refusing materially future stamps.
+BROKER_CLOCK_SKEW_TOLERANCE_SECONDS = 5
 
 
 def _startup_record(directory: Path, checkpoint: dict) -> dict | None:
@@ -153,7 +157,8 @@ def _complete_market_session(events: list[dict], segments: list[dict], lanes: di
         raw = event["details"]
         stamps = {name: aware_utc(raw[name], field_name=f"broker_clock_{name}")
                   for name in ("timestamp", "next_open", "next_close", "received_at")}
-        if (not isinstance(raw.get("is_open"), bool) or stamps["timestamp"] > stamps["received_at"]
+        skew = (stamps["timestamp"] - stamps["received_at"]).total_seconds()
+        if (not isinstance(raw.get("is_open"), bool) or skew > BROKER_CLOCK_SKEW_TOLERANCE_SECONDS
                 or stamps["received_at"] != aware_utc(event["occurred_at"])):
             raise VerificationError("invalid_soak_broker_clock")
         clocks.append({**stamps, "is_open": raw["is_open"], "event_id": event["event_id"]})
@@ -169,7 +174,7 @@ def _complete_market_session(events: list[dict], segments: list[dict], lanes: di
             start, end = aware_utc(segment["started_at"]), aware_utc(segment["ended_at"])
             if not start <= before["timestamp"] < opened < closed <= end:
                 continue
-            inside = [clock for clock in clocks if start <= clock["timestamp"] <= clock["received_at"] <= end]
+            inside = [clock for clock in clocks if start <= clock["timestamp"] and clock["received_at"] <= end]
             active = sorted((clock for clock in inside if clock["is_open"]
                              and opened <= clock["timestamp"] < closed and clock["next_close"] == closed),
                             key=lambda clock: clock["timestamp"])

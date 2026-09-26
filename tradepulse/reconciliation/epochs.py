@@ -56,8 +56,21 @@ def save_epoch(connection, epoch, now):
     old = connection.execute('SELECT payload FROM accounting_epochs WHERE record_id=?', (identifier,)).fetchone()
     previous = decode_payload(old['payload']) if old else None
     prior_proof = previous.get('population_proof_id') if previous else None
+    prior_receipt = None
+    if previous and previous.get('checkpoint_id'):
+        row = connection.execute('SELECT payload FROM reconciliation_records WHERE record_id=?',
+                                 (previous['checkpoint_id'],)).fetchone()
+        prior_receipt = decode_payload(row['payload']) if row else None
+    receipt_matches = bool(prior_receipt and prior_receipt.get('outcome') == 'matched'
+                           and encode_payload(prior_receipt.get('actual')) == encode_payload(previous))
+    # A checkpoint binds the entire epoch, including its original pagination
+    # observation. Refreshing the same population can change that evidence;
+    # never update the epoch while retaining an incompatible immutable receipt.
+    # Reconciled successors are produced only by finalize_population after the
+    # caller has verified the complete population and accounting replay.
     changed_checkpoint = previous is not None and (
-        status != 'reconciled_net' or epoch.get('population_proof_id') != prior_proof)
+        status != 'reconciled_net' or encode_payload(epoch) != encode_payload(previous)
+        or not receipt_matches)
     if previous and previous['fee_accounting_status'] == 'reconciled_net' and changed_checkpoint and prior_proof:
         superseded = list(epoch.get('superseded_checkpoint_ids', []))
         prior_checkpoint = previous.get('checkpoint_id')
@@ -68,12 +81,16 @@ def save_epoch(connection, epoch, now):
             'epoch': identifier, 'proof': prior_proof, 'version': previous.get('checkpoint_version', 0)}).encode()).hexdigest(),
             'reconciliation_type': 'asset_fee', 'subject_id': identifier, 'outcome': 'drift_detected',
             'expected': {'active_checkpoint_id': prior_checkpoint, 'population_proof_id': prior_proof},
-            'actual': {'superseded_checkpoint': previous, 'reason': epoch.get('reason', 'new_accounting_evidence')},
+            'actual': {'superseded_checkpoint': prior_receipt['actual'] if prior_receipt else previous,
+                       'reason': epoch.get('reason', 'new_accounting_evidence')},
             'occurred_at': now.isoformat(), 'corrective_action': 'supersede_checkpoint_preserving_evidence'}
+        if not receipt_matches:
+            receipt['actual']['observed_epoch'] = previous
+            receipt['actual']['prior_checkpoint_receipt_mismatch'] = True
         connection.execute('INSERT OR IGNORE INTO reconciliation_records(record_id,payload,created_at) VALUES(?,?,?)',
                            (receipt['record_id'], encode_payload(receipt), now.isoformat()))
     if status == 'reconciled_net' and (previous is None or previous['fee_accounting_status'] != status
-                                     or previous.get('population_proof_id') != epoch.get('population_proof_id')):
+                                     or changed_checkpoint):
         epoch['checkpoint_version'] = (previous.get('checkpoint_version', 0) if previous else 0) + 1
         epoch['checkpoint_id'] = 'epoch_checkpoint:'+sha256(encode_payload({
             'epoch': identifier, 'version': epoch['checkpoint_version'], 'population': epoch['population_proof_id']}).encode()).hexdigest()
@@ -400,3 +417,132 @@ def verify_checkpoint(epoch, records, fills, intents):
     if (Decimal(c['starting_broker_quantity'])+Decimal(c['buys'])-Decimal(c['sells'])-Decimal(c['asset_fees'])
             != Decimal(c['ending_broker_quantity']) or epoch['net_inventory_quantity'] != c['ending_broker_quantity']):
         raise ValueError('CHECKPOINT_QUANTITY_NOT_CONSERVED')
+
+
+def checkpoint_issues(connection):
+    """Independently verify every current epoch in the caller's read snapshot.
+
+    Include closed instruments and every local fill; an empty epoch table must
+    not make an existing execution population appear verified. No state, proof,
+    or reconciliation receipt is created or repaired by this function.
+    """
+    from collections import Counter, defaultdict
+    from tradepulse.persistence import hydrate
+
+    issues = {}
+    tables = {}
+    for table in ('fills', 'trade_intents', 'position_lots', 'holdings', 'reconciliation_records'):
+        tables[table] = {}
+        for row in connection.execute(f'SELECT record_id,payload FROM {table} ORDER BY record_id'):
+            try:
+                tables[table][row['record_id']] = decode_payload(row['payload'])
+            except (ValueError, TypeError) as exc:
+                issues[table + ':' + row['record_id']] = str(exc)
+    fills = tables['fills']
+    intents = tables['trade_intents']
+    records = tables['reconciliation_records']
+    fills_by_asset = defaultdict(set)
+    lots_by_asset = defaultdict(Decimal)
+    holdings_by_asset = defaultdict(Decimal)
+    epochs_by_asset = defaultdict(list)
+    covered = Counter()
+    for table, destination in (('fills', fills_by_asset), ('position_lots', lots_by_asset),
+                               ('holdings', holdings_by_asset)):
+        for identifier, raw in tables[table].items():
+            try:
+                item = hydrate(table, raw)
+                key = asset_identity_key(item.asset)
+                if table == 'fills':
+                    if item.fill_id != identifier:
+                        raise ValueError('CHECKPOINT_FILL_IDENTITY_MISMATCH')
+                    destination[key].add(identifier)
+                elif table == 'position_lots':
+                    destination[key] += item.signed_quantity
+                else:
+                    if key != identifier:
+                        raise ValueError('CHECKPOINT_HOLDING_IDENTITY_MISMATCH')
+                    destination[key] += item.quantity
+            except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
+                issues[table + ':' + identifier] = str(exc)
+    for row in connection.execute('SELECT record_id,status,payload FROM accounting_epochs ORDER BY record_id'):
+        identifier = row['record_id']
+        try:
+            epoch = decode_payload(row['payload'])
+            key = epoch['canonical_asset_key']
+            epochs_by_asset[key].append(epoch)
+            if identifier != epoch['accounting_epoch_id']:
+                raise ValueError('CHECKPOINT_EPOCH_IDENTITY_MISMATCH')
+            if row['status'] != epoch['fee_accounting_status']:
+                raise ValueError('CHECKPOINT_EPOCH_STATUS_MISMATCH')
+            expected = {fid for fid in fills_by_asset[key]
+                        if fills[fid]['trade_intent_id'] in epoch['trade_intent_ids']}
+            declared = epoch['fill_ids']
+            if not expected or len(declared) != len(set(declared)) or set(declared) != expected:
+                raise ValueError('CHECKPOINT_EPOCH_FILL_POPULATION_MISMATCH')
+            covered.update(declared)
+            verify_checkpoint(epoch, records, list(fills.values()), list(intents.values()))
+        except (ValueError, KeyError, TypeError, ArithmeticError, StopIteration) as exc:
+            issues[identifier] = str(exc)
+    for identifier in sorted(fills):
+        if covered[identifier] != 1:
+            issues['fill:' + identifier] = ('CHECKPOINT_FILL_MEMBERSHIP_MISSING' if not covered[identifier]
+                                            else 'CHECKPOINT_FILL_MEMBERSHIP_DUPLICATED')
+    for key in sorted(set(fills_by_asset) | set(lots_by_asset) | set(holdings_by_asset) | set(epochs_by_asset)):
+        epochs = epochs_by_asset[key]
+        if not epochs:
+            issues['asset:' + key] = 'CHECKPOINT_EPOCH_MISSING'
+            continue
+        try:
+            latest = max(epochs, key=lambda epoch: aware_utc(epoch['opened_at'], field_name='epoch_opened_at'))
+            quantity = Decimal(latest['ending_broker_quantity'])
+            if (not quantity.is_finite() or quantity != lots_by_asset[key]
+                    or quantity != holdings_by_asset[key]):
+                raise ValueError('CHECKPOINT_CURRENT_QUANTITY_MISMATCH')
+        except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
+            issues['asset:' + key] = str(exc)
+    return issues
+
+
+_UNLOCK_TABLES = (
+    'trading_sessions', 'trade_intents', 'orders', 'fills', 'settlements',
+    'position_lots', 'holdings', 'cash_ledger', 'pnl_records', 'trade_attributions',
+    'accounting_epochs', 'broker_activity_inbox', 'broker_activity_cursors',
+    'reconciliation_records', 'integrity_holds', 'verification_identity',
+)
+
+
+def financial_evidence_digest(connection):
+    """Bind the reset to financial rows, session, and generation identity."""
+    parts = []
+    for table in _UNLOCK_TABLES:
+        key = 'singleton' if table == 'verification_identity' else 'record_id'
+        parts.append((table, [dict(row) for row in connection.execute(f'SELECT * FROM {table} ORDER BY {key}')]))
+    return sha256(encode_payload(parts).encode()).hexdigest()
+
+
+def unlock_proof(connection):
+    """Independent checkpoint verification plus a digest of financial evidence."""
+    if not connection.in_transaction:
+        connection.execute('BEGIN')
+    issues = checkpoint_issues(connection)
+    if connection.execute('SELECT 1 FROM integrity_holds LIMIT 1').fetchone():
+        issues['integrity_holds'] = 'RESET_ACTIVE_INTEGRITY_HOLD'
+    for table in ('trade_intents', 'orders'):
+        if connection.execute(f"SELECT 1 FROM {table} WHERE status NOT IN "
+                              "('filled','canceled','expired','rejected','failed') LIMIT 1").fetchone():
+            issues[table] = 'RESET_ORDER_NOT_TERMINAL'
+    # Historical journal movements do not establish an opening cash balance.
+    # A new disposable generation carries its own authoritative opening proof;
+    # never assume a zero opening balance to unlock an unbound legacy ledger.
+    opening = _opening(connection)
+    if opening is None and any(connection.execute(f'SELECT 1 FROM {table} LIMIT 1').fetchone()
+            for table in ('fills', 'settlements', 'position_lots', 'holdings', 'cash_ledger', 'pnl_records')):
+        issues['cash_baseline'] = 'RESET_CASH_OPENING_EVIDENCE_MISSING'
+    return {'issues': issues, 'digest': financial_evidence_digest(connection),
+            'account_identity_digest': opening['account_identity_digest'] if opening else None}
+
+
+def require_unlock_proof(connection, digest):
+    proof = unlock_proof(connection)
+    if proof['issues'] or proof['digest'] != digest:
+        raise ValueError('RESET_UNLOCK_PROOF_CHANGED')

@@ -35,3 +35,13 @@ def test_no_extra_fields_still_produces_valid_json() -> None:
     payload = _format()
     assert payload["message"] == "something_happened"
     assert "error" not in payload
+
+
+def test_http_transport_request_urls_never_reach_info_logs():
+    import logging as _logging
+
+    from tradepulse.config.logging import configure_logging
+
+    configure_logging("DEBUG")
+    for name in ("httpx", "httpcore"):
+        assert not _logging.getLogger(name).isEnabledFor(_logging.INFO)
