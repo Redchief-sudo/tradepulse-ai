@@ -44,3 +44,7 @@ data/calibration/*
 # cache -- it must be tracked so its history is auditable. See
 # docs/generation-2-calibration-freeze.md.
 !data/calibration/generation_2_freeze_manifest.json
+# Accounting soak runtime output and sealed legacy-evidence copies are
+# runtime evidence, preserved locally, not source.
+/data/soaks/
+/tradepulse.db.legacy-evidence/
