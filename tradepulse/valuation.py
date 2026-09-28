@@ -35,6 +35,55 @@ def broker_settled_cash(entry) -> Decimal:
     return amount
 
 
+_CENT = Decimal('0.01')
+POSITION_OBSERVATION_MATCHED = frozenset({'equal_uncoordinated_observations', 'equal_after_broker_cent_rounding'})
+
+
+def position_value_observation(market_values: Sequence[Decimal], signed_value: Decimal) -> tuple[Decimal, str]:
+    """Compare exact position marks with the broker's account-level value.
+
+    Alpaca reports long/short market value on the account rounded to the cent
+    while each position carries its exact mark (3388.937475 posts as 3388.94).
+    When the broker value is itself a whole-cent amount, reproducing that
+    rounding -- on the total or per position -- is the same modeling as
+    broker_settled_cash, not a tolerance: any quote move that survives the
+    rounding stays a difference. The exact difference is always preserved.
+    """
+    total = sum(market_values, Decimal(0))
+    difference = total - signed_value
+    if difference == 0:
+        return difference, 'equal_uncoordinated_observations'
+    if signed_value == signed_value.quantize(_CENT) and signed_value in (
+        total.quantize(_CENT, rounding=ROUND_HALF_UP),
+        sum((value.quantize(_CENT, rounding=ROUND_HALF_UP) for value in market_values), Decimal(0)),
+    ):
+        return difference, 'equal_after_broker_cent_rounding'
+    return difference, 'different_uncoordinated_observations'
+
+
+def _position_marks(positions: Sequence[AlpacaPosition]):
+    return sorted((p.asset_class.value, p.symbol, p.qty, p.market_value) for p in positions)
+
+
+async def observe_broker_valuation(broker, *, attempts: int = 3) -> tuple[AlpacaAccount, list[AlpacaPosition]]:
+    """Read positions -> account -> positions until the marks bracket the account read.
+
+    The account and positions endpoints share no valuation timestamp, so a
+    quote move between the two responses looks like a value difference.
+    Identical position marks before and after the account read show the marks
+    did not move across it. If they keep moving, the last observation is
+    returned unchanged and the difference stays visible to the valuation.
+    """
+    before = await broker.get_positions()
+    for _ in range(attempts):
+        account = await broker.get_account()
+        after = await broker.get_positions()
+        if _position_marks(before) == _position_marks(after):
+            break
+        before = after
+    return account, after
+
+
 def _generation_invariants(connection, account, positions):
     """Reconcile an official population against its immutable opening balances."""
     from tradepulse.verification.opening import load_bound_opening_checkpoint
@@ -144,6 +193,7 @@ async def marked_snapshot(
     components = dict(account.equity_components)
     difference = None
     observation_difference = None
+    observation_status = 'unavailable'
     if not {'long_market_value', 'short_market_value'} <= components.keys():
         errors.append('broker_equity_components_missing')
     else:
@@ -158,8 +208,10 @@ async def marked_snapshot(
             errors.append('broker_equity_discrepancy')
         # Separate HTTP responses have no common broker valuation timestamp.
         # Preserve their exact difference; it cannot prove an equity arithmetic
-        # failure, quantity drift, or a harmless quote move. No tolerance hides it.
-        observation_difference = market - signed_value
+        # failure, quantity drift, or a harmless quote move. No tolerance hides
+        # it -- only the broker's own cent rounding is reproduced.
+        observation_difference, observation_status = position_value_observation(
+            [position.market_value for position in positions], signed_value)
     start, end = _risk_day_bounds(now)
     fills = await list_all_by_json_time_range(repositories.fills, 'filled_at', start, end)
     pending = await list_all_by_statuses(repositories.trade_intents, ['submitted', 'accepted', 'partially_filled', 'submission_unknown'])
@@ -207,7 +259,7 @@ async def marked_snapshot(
                        and all(v == 'matched' for v in (*quantities.values(), *lots_result.values()))
                        and all(v == 'reconciled_net' for v in states.values())
                        and all(states.get(key) == 'reconciled_net' for key in set(lot_quantities) | set(holdings))
-                       and observation_difference == 0
+                       and observation_status in POSITION_OBSERVATION_MATCHED
                        and not generation_failed
                        and (generation is None or generation['generation_cash']['status'] == 'matched'))
     results['mandatory_invariants'] = 'matched' if mandatory_match else 'incomplete_or_mismatched'
@@ -242,11 +294,7 @@ async def marked_snapshot(
         equity_reconciliation_status='matched' if mandatory_match else 'failed', valuation_errors=tuple(errors),
         position_value_observation_difference=observation_difference,
         valuation_observation_times=observation_times, accounting_states=states, reconciliation_results=results,
-        position_value_observation_status=(
-            'unavailable' if observation_difference is None else
-            'equal_uncoordinated_observations' if observation_difference == 0 else
-            'different_uncoordinated_observations'
-        ),
+        position_value_observation_status=observation_status,
     )
 
 
@@ -260,7 +308,8 @@ def reconciliation_outcome(snapshot: PortfolioSnapshot) -> ReconciliationOutcome
     if (snapshot.equity_reconciliation_difference is None or results.get('projection_evidence')
             or results.get('mandatory_invariants') != 'matched'):
         return ReconciliationOutcome.INCOMPLETE_EVIDENCE
-    if snapshot.position_value_observation_difference not in (None, Decimal(0)):
+    if (snapshot.position_value_observation_difference not in (None, Decimal(0))
+            and snapshot.position_value_observation_status != 'equal_after_broker_cent_rounding'):
         # Uncoordinated responses cannot prove a transient market move.
         return ReconciliationOutcome.INCOMPLETE_EVIDENCE
     return ReconciliationOutcome.MATCHED

@@ -21,7 +21,7 @@ No thresholds, fee/slippage overlay rates, risk parameters or trading logic chan
 
 ## Operational notes
 
-- Soak 1 and the legacy `tradepulse.db` used the same Alpaca paper account. The soak's GOOGL/SPY sells and AAPL buy therefore appear as unexplained drift in the legacy database, which remains `FINANCIAL_INTEGRITY_BLOCKED`. Per `paper-verification-integrity.md`, that latch is preserved as legacy evidence and is not a prerequisite for a new soak.
+- Soak 1 and the legacy `tradepulse.db` used the same Alpaca paper account. The soak's AAPL buy, and out-of-band API-key orders the legacy database never placed (GOOGL/SPY sells created 2026-09-23 23:11 UTC; an AAPL close created 2026-09-26 06:16 UTC by an agent session), therefore appear as unexplained drift in the legacy database, which remains `FINANCIAL_INTEGRITY_BLOCKED`. Correction (Rev.110): an earlier version of this note attributed the GOOGL/SPY sells to the soak. Per `paper-verification-integrity.md`, that latch is preserved as legacy evidence and is not a prerequisite for a new soak.
 - Because the protected source changed, both soaks must be run (again) from Rev.109 with new database/report paths before an official freeze.
 - Earlier runtime logs contain the Telegram bot token in request URLs; the token should be rotated.
 

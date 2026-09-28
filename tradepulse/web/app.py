@@ -37,7 +37,7 @@ from tradepulse.provenance import get_provenance
 from tradepulse.providers import AlpacaMarketDataProvider, resolve_market_data_capabilities
 from tradepulse.risk import load_session
 from tradepulse.session_commands import build_broker, run_reset_integrity, run_reset_risk, run_start, run_stop
-from tradepulse.valuation import marked_snapshot
+from tradepulse.valuation import marked_snapshot, observe_broker_valuation
 
 _CONFIRMATION_PHRASE = "RESET_FINANCIAL_INTEGRITY"
 _ACCOUNT_CACHE_SECONDS = 5
@@ -220,8 +220,7 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
     async def get_risk_exposure(request: Request) -> Response:
         s = _state(request)
         try:
-            account = await s.broker.get_account()
-            positions = await s.broker.get_positions()
+            account, positions = await observe_broker_valuation(s.broker)
         except (AlpacaError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=503, detail=f"BROKER_UNAVAILABLE: {exc}") from exc
         try:

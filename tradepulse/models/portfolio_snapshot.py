@@ -59,7 +59,8 @@ class PortfolioSnapshot:
         if self.valuation_version == 2 and self.equity_reconciliation_status not in ("matched", "failed"):
             raise ValueError("marked snapshots require explicit equity reconciliation status")
         if self.position_value_observation_status not in (None, 'unavailable',
-                'equal_uncoordinated_observations', 'different_uncoordinated_observations'):
+                'equal_uncoordinated_observations', 'equal_after_broker_cent_rounding',
+                'different_uncoordinated_observations'):
             raise ValueError('unknown position observation status')
         for value in self.valuation_observation_times.values():
             require_aware(datetime.fromisoformat(value), 'valuation_received_at')

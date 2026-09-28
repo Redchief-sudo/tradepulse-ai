@@ -29,13 +29,13 @@ async def run(database_path, apply, report_path, reconcile=False):
         if reconcile:
             from tradepulse.cli import _load_dotenv, _build_broker
             from tradepulse.config import Settings
-            from tradepulse.valuation import marked_snapshot
+            from tradepulse.valuation import marked_snapshot, observe_broker_valuation
             _load_dotenv()
             settings = Settings.from_env()
             if settings.execution_mode != 'paper':
                 raise ValueError('repair broker verification requires paper mode')
             broker = _build_broker(settings)
-            account, positions = await asyncio.gather(broker.get_account(), broker.get_positions())
+            account, positions = await observe_broker_valuation(broker)
             snapshots['before'] = decode_payload(encode_payload(await marked_snapshot(repositories, account, positions)))
         if apply:
             def stopped(connection):
@@ -60,12 +60,12 @@ async def run(database_path, apply, report_path, reconcile=False):
             from tradepulse.alerts import TelegramAlerter
             from tradepulse.settlement import SettlementProcessor
             from tradepulse.reconciliation.coordinator import run_reconciliation
-            from tradepulse.valuation import record_valuation, reconciliation_outcome
+            from tradepulse.valuation import observe_broker_valuation, record_valuation, reconciliation_outcome
             if apply:
                 alerts = TelegramAlerter(None, None)
                 summary = decode_payload(encode_payload(await run_reconciliation(
                     repositories, broker, SettlementProcessor(repositories, alerts), alerts)))
-            account, positions = await asyncio.gather(broker.get_account(), broker.get_positions())
+            account, positions = await observe_broker_valuation(broker)
             snapshot = await marked_snapshot(repositories, account, positions)
             snapshots['after'] = decode_payload(encode_payload(snapshot))
             snapshots['overall_outcome'] = reconciliation_outcome(snapshot).value

@@ -507,9 +507,8 @@ async def _run_reconcile(settings: Settings) -> int:
             )
             from tradepulse.verification.opening import load_bound_opening_checkpoint
             if await database.run(load_bound_opening_checkpoint) is not None:
-                from tradepulse.valuation import marked_snapshot, record_valuation, reconciliation_outcome
-                account = await broker.get_account()
-                positions = await broker.get_positions()
+                from tradepulse.valuation import marked_snapshot, observe_broker_valuation, record_valuation, reconciliation_outcome
+                account, positions = await observe_broker_valuation(broker)
                 snapshot = await marked_snapshot(repositories, account, positions, now=datetime.now(UTC))
                 await record_valuation(repositories, snapshot)
                 await repositories.equity_snapshots.create_once(snapshot.snapshot_id, snapshot)

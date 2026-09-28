@@ -92,7 +92,7 @@ from tradepulse.strategy import (
     signal_from_composite,
     weighted_composite,
 )
-from tradepulse.valuation import marked_snapshot, record_valuation
+from tradepulse.valuation import marked_snapshot, observe_broker_valuation, record_valuation
 
 logger = logging.getLogger(__name__)
 
@@ -613,8 +613,8 @@ async def run_scan_cycle(
     # equity_snapshots stays permanently empty and drawdown protection can
     # never trip (drawdown against an empty history is always 0%).
     try:
-        positions = await broker.get_positions()
-        equity_snapshot = await marked_snapshot(repositories, account, positions, now=clock())
+        valuation_account, positions = await observe_broker_valuation(broker)
+        equity_snapshot = await marked_snapshot(repositories, valuation_account, positions, now=clock())
         await record_valuation(repositories, equity_snapshot)
         await repositories.equity_snapshots.create_once(equity_snapshot.snapshot_id, equity_snapshot)
     except Exception as exc:  # noqa: BLE001 - valuation failure must not kill the scan worker

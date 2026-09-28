@@ -248,7 +248,9 @@ async def run_reset_integrity(settings: Settings, *, force: bool) -> int:
     from tradepulse.persistence.codec import encode_payload
     from tradepulse.reconciliation.epochs import require_unlock_proof, unlock_proof
     from tradepulse.time import aware_utc
-    from tradepulse.valuation import marked_snapshot, record_valuation, reconciliation_outcome, valuation_record
+    from tradepulse.valuation import (
+        marked_snapshot, observe_broker_valuation, record_valuation, reconciliation_outcome, valuation_record,
+    )
 
     broker = None
     try:
@@ -272,8 +274,7 @@ async def run_reset_integrity(settings: Settings, *, force: bool) -> int:
                 "event": "reset_integrity_refused_checkpoint_unproven", "issues": proof["issues"],
             })
             return 1
-        account = await broker.get_account()
-        positions = await broker.get_positions()
+        account, positions = await observe_broker_valuation(broker)
         if proof['account_identity_digest'] is not None:
             from tradepulse.verification.integrity import canonical, digest
             identity = {'account_id': account.account_id, 'account_number': account.account_number}
