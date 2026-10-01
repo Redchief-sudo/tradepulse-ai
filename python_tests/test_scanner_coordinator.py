@@ -2171,3 +2171,65 @@ def test_atr_stop_loss_falls_back_when_distance_is_pathologically_large() -> Non
     price = Decimal("199.55")
     result = _atr_stop_loss_price(price, candles, Decimal("2"), AssetClass.EQUITY, Decimal("0.5"), Decimal("0.1"))
     assert result is None
+
+
+@respx.mock
+async def test_options_scan_never_reopens_an_opening_inventory_contract(tmp_path, monkeypatch) -> None:
+    """Rev.112: a verification generation never opens a new position in an
+    instrument it began holding. The exit monitor sizes exits from the whole
+    broker position, so a new lot in that contract would also sell the
+    excluded opening inventory and break lot conservation."""
+    occ_symbol = "AAPL" + (NOW + timedelta(days=30)).date().strftime("%y%m%d") + "C00205000"
+    checkpoint = {"positions": [{"asset_class": "option", "symbol": occ_symbol, "qty": "1"}]}
+    monkeypatch.setattr("tradepulse.verification.opening.load_bound_opening_checkpoint", lambda _: checkpoint)
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(
+        200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])))
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
+    _mock_spy_bars()
+    _mock_options_chain(occ_symbol)
+    _mock_options_quote(occ_symbol)
+    order_route = _mock_options_dynamic_full_fill(occ_symbol)
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, OPTIONS_UNIVERSE, limits, AssetClass.OPTION, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert order_route.call_count == 0
+    assert summary.orders_submitted == 0
+    assert await repositories.trade_intents.list_all() == []
+    reasons = [row["payload"]["reason"] for row in await repositories.rejected_candidates.list_all()]
+    assert reasons == ["OPENING_INVENTORY_INSTRUMENT"]
+
+
+@respx.mock
+async def test_opening_inventory_guard_is_instrument_exact(tmp_path, monkeypatch) -> None:
+    """Holding the underlying stock at opening does not block its option contract."""
+    occ_symbol = "AAPL" + (NOW + timedelta(days=30)).date().strftime("%y%m%d") + "C00205000"
+    checkpoint = {"positions": [{"asset_class": "equity", "symbol": "AAPL", "qty": "3"}]}
+    monkeypatch.setattr("tradepulse.verification.opening.load_bound_opening_checkpoint", lambda _: checkpoint)
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(
+        200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])))
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
+    _mock_spy_bars()
+    _mock_options_chain(occ_symbol)
+    _mock_options_quote(occ_symbol)
+    order_route = _mock_options_dynamic_full_fill(occ_symbol)
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, OPTIONS_UNIVERSE, limits, AssetClass.OPTION, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert order_route.call_count == 1
+    assert summary.orders_submitted == 1

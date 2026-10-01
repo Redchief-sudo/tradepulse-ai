@@ -639,6 +639,15 @@ async def run_scan_cycle(
     # authoritative quote regardless) or naturally 1:1 with actually
     # attempting to spend the budget, so they shouldn't be paid for
     # candidates that never get a shot at it.
+    # A bound verification generation excludes the inventory it opened with.
+    # The exit monitor sizes exits from the whole broker position, so a new
+    # lot in one of those exact instruments would also sell the excluded
+    # opening quantity and break lot conservation -- never open one.
+    from tradepulse.reconciliation.membership import opening_quantities
+    from tradepulse.verification.opening import load_bound_opening_checkpoint
+    opening_inventory = {key for key, quantity in opening_quantities(
+        await repositories.trade_intents.database.run(load_bound_opening_checkpoint)).items() if quantity}
+
     scored: list[_ScoredCandidate] = []
     for candidate in candidates:
         if lease_lost is not None and lease_lost.is_set():
@@ -778,6 +787,10 @@ async def run_scan_cycle(
         else:
             trade_asset = asset
             trade_quote = quote
+
+        if asset_identity_key(trade_asset) in opening_inventory:
+            await _reject(candidate.symbol, "OPENING_INVENTORY_INSTRUMENT", instrument=trade_asset.symbol)
+            continue
 
         database = repositories.trade_intents.database
         owner_token = str(uuid4())
