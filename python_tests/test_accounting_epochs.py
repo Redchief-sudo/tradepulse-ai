@@ -182,7 +182,13 @@ async def test_new_receipt_supersedes_checkpoint_and_reconciles_new_version(tmp_
 
 
 @pytest.mark.parametrize('legacy_mismatch', [False, True])
-async def test_refreshed_page_receipt_versions_checkpoint_and_preserves_history(tmp_path, legacy_mismatch):
+async def test_refreshed_page_receipt_versions_only_a_mismatched_checkpoint(tmp_path, legacy_mismatch):
+    """Rev.111: transport receipt times alone are not new accounting evidence.
+
+    A refresh differing only in page `received_at` keeps the checkpoint (it
+    superseded on every poll in the 2026-09-29 soak). An epoch whose stored
+    state no longer matches its immutable receipt is still versioned.
+    """
     from datetime import timedelta
     from tradepulse.reconciliation.epochs import checkpoint_issues, verify_checkpoint
 
@@ -202,6 +208,12 @@ async def test_refreshed_page_receipt_versions_checkpoint_and_preserves_history(
         assert issues[old['accounting_epoch_id']] == 'CHECKPOINT_RECEIPT_MISMATCH'
     await replay_asset_fees(r, ASSET, raw, qty, now=NOW + timedelta(minutes=5), pagination=refreshed)
     new = (await r.accounting_epochs.list_all())[0]['payload']
+    if not legacy_mismatch:
+        assert new == old
+        assert not any(row['record_id'].startswith('epoch_proof_superseded:')
+                       for row in await r.reconciliation_records.list_all())
+        assert await r.accounting_epochs.database.run(checkpoint_issues) == {}
+        return
     assert new['checkpoint_version'] == old['checkpoint_version'] + 1
     assert old['checkpoint_id'] in new['superseded_checkpoint_ids']
     assert new['checkpoint_id'] != old['checkpoint_id']

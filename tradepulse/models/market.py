@@ -67,8 +67,13 @@ def contract_multiplier_of(asset: AssetIdentity) -> Decimal:
     call this rather than reading asset.metadata["contract_multiplier"]
     directly -- a second, independent read site is how defaults/conversions
     quietly drift apart. Defaults to 1 for every asset class that doesn't
-    set it (equity, crypto today)."""
-    return Decimal(str(asset.metadata.get("contract_multiplier", "1")))
+    set it (equity, crypto today). An option without one fails closed: a
+    silent 1x would understate every option notional, exposure and P&L 100x."""
+    if "contract_multiplier" not in asset.metadata:
+        if asset.asset_class == AssetClass.OPTION:
+            raise ValueError("option contract multiplier missing")
+        return Decimal(1)
+    return Decimal(str(asset.metadata["contract_multiplier"]))
 
 
 def asset_key_from_broker_symbol(asset_class: AssetClass, symbol: str) -> str:

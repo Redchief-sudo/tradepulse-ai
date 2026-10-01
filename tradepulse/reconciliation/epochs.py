@@ -239,7 +239,9 @@ def finalize_population(connection, *, key, proof, population_id, fills, fees, c
         else:
             epochs.append(epoch)
     if pagination is not None:
-        pagination = {k: pagination[k] for k in ('method', 'pages', 'activity_ids', 'complete', 'population_hash')}
+        from .activity_cursor import observation_independent
+        pagination = observation_independent(
+            {k: pagination[k] for k in ('method', 'pages', 'activity_ids', 'complete', 'population_hash')})
     for raw in activities:
         old = connection.execute('SELECT payload FROM broker_activity_inbox WHERE record_id=?', (raw['id'],)).fetchone()
         if old and decode_payload(old['payload']) != raw:

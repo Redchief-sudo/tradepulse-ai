@@ -8,7 +8,7 @@ from hashlib import sha256
 from tradepulse.persistence.codec import decode_payload, encode_payload
 from tradepulse.time import aware_utc
 
-from .activity_cursor import cursor_activity_id, validate_pagination
+from .activity_cursor import cursor_activity_id, observation_independent, validate_pagination
 
 ELIGIBLE_MEMBERSHIPS = frozenset({'in_generation', 'late_arriving_in_generation'})
 
@@ -105,7 +105,7 @@ def classify_population(connection, activities, pagination, *, now):
                 'population_hash': pagination['population_hash'], 'activities': activities,
                 'generation_order_ids': sorted(generation_orders), 'generation_fill_ids': sorted(generation_fills),
                 'classifications': classifications,
-                'reasons': reasons, 'pagination': pagination, 'closing_checkpoint': closing}
+                'reasons': reasons, 'pagination': observation_independent(pagination), 'closing_checkpoint': closing}
         identifier = 'generation_membership:' + sha256(encode_payload(body).encode()).hexdigest()
         unresolved = any(s == 'unresolved_generation_membership' for s in classifications.values())
         record = {'record_id': identifier, 'reconciliation_type': 'generation_membership',

@@ -220,6 +220,18 @@ def _late_fee_reopenings(rows: dict, supersessions: list[dict]) -> list[dict]:
     return result
 
 
+def _assessment_end(rows: dict, segment_end: datetime) -> datetime:
+    """Latest persisted generation evidence, never earlier than the last runtime segment.
+
+    The runner's mandatory post-shutdown reconciliation writes equity and
+    reconciliation evidence after the final segment ends. Deriving the bound
+    from the database keeps reanalysis at freeze deterministic.
+    """
+    times = [aware_utc(row["as_of"]) for row in rows["equity_snapshots"]]
+    times += [aware_utc(row["occurred_at"]) for row in rows["reconciliation_records"]]
+    return max([segment_end, *times])
+
+
 def analyze_soak_database(database: Path, *, run_number: int) -> dict:
     if run_number not in MINIMUM_SECONDS:
         raise VerificationError("soak_run_number_invalid")
@@ -260,7 +272,8 @@ def analyze_soak_database(database: Path, *, run_number: int) -> dict:
     first = segments[0] if segments else None
     start = aware_utc(first["started_at"]) if first else aware_utc(checkpoint["opened_at"])
     end = aware_utc(segments[-1]["ended_at"]) if segments else start
-    assessment = assess(rows, start.isoformat(), end, AUTHORIZED_COSTS)
+    assessment_end = _assessment_end(rows, end)
+    assessment = assess(rows, start.isoformat(), assessment_end, AUTHORIZED_COSTS)
     slippage = slippage_evidence(rows["fills"])
     all_ids = [row["broker_fill_id"] for row in rows["fills"]]
     fee_records = [row for row in rows["reconciliation_records"] if row["record_id"].startswith("generation_fee:")]
@@ -308,6 +321,7 @@ def analyze_soak_database(database: Path, *, run_number: int) -> dict:
     }
     return {"generation": generation, "database_identity": identity["database_id"], "run_number": run_number,
             "started_at": start.isoformat(), "ended_at": end.isoformat(), "duration_seconds": (end - start).total_seconds(),
+            "assessment_ended_at": assessment_end.isoformat(),
             "required_continuous_seconds": MINIMUM_SECONDS[run_number], "continuous_segments": segments,
             "guarded_start": started, "late_fee_reopenings": late_fee_reopenings,
             "runtime_boundary_errors": sorted(set(boundary_errors)), "lanes": lanes, "market_session": market_session,
@@ -431,7 +445,7 @@ def verify_soak_prerequisites(reports, *, source_digest: str, context: dict, cos
                 or checkpoint["account_identity_digest"] != report["account_identity_digest"]):
             raise VerificationError("soak_report_manifest_or_account_binding_invalid")
         analysis = analyze_soak_database(database, run_number=report["analysis"]["run_number"])
-        if analysis != report["analysis"] or created < aware_utc(analysis["ended_at"]):
+        if analysis != report["analysis"] or created < aware_utc(analysis["assessment_ended_at"]):
             raise VerificationError("soak_evidence_incomplete_or_failed")
         if _preserved_database_digest(database) != report["database_sha256"] or _artifact_digests(directory) != report["artifacts_sha256"]:
             raise VerificationError("preserved_soak_evidence_changed_during_verification")

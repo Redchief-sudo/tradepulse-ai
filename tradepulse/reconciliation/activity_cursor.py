@@ -57,6 +57,23 @@ async def activity_population(broker, cursor=None):
     return raw, proof
 
 
+def observation_independent(pagination):
+    """Pagination evidence without per-response transport receipt times.
+
+    `received_at` records when one HTTP response arrived. Re-reading an
+    unchanged population yields new receipt times but identical pages
+    (request, activity ids, response hash), so recurring membership and
+    checkpoint proofs exclude it: the same population must hash identically,
+    or every poll supersedes its own checkpoint. The opening checkpoint keeps
+    its receipt times, which prove it was read before the generation opened.
+    """
+    result = dict(pagination)
+    for name in ('pages', 'resume_pages'):
+        if name in result:
+            result[name] = [{k: v for k, v in page.items() if k != 'received_at'} for page in result[name]]
+    return result
+
+
 def validate_pagination(raw, proof):
     identifiers = [row.get('id') for row in raw]
     if any(not isinstance(i, str) or not i for i in identifiers) or len(set(identifiers)) != len(identifiers):

@@ -85,6 +85,16 @@ def timestamp(value: str) -> datetime:
         raise VerificationError(str(exc)) from exc
 
 
+def equity_evidence_window_start(checkpoint, start: datetime) -> datetime:
+    """Earliest admissible broker equity snapshot for this generation.
+
+    A bound generation's evidence begins at its opening checkpoint: the guarded
+    startup reconciliation records a snapshot before the runtime-start
+    receipt. Unbound assessments keep the caller's start.
+    """
+    return timestamp(checkpoint['opened_at']) if checkpoint else start
+
+
 def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> dict:
     """One completed opening intent is one round trip, never one partial fill.
 
@@ -573,7 +583,8 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
             problems.append('generation_equity_authority_unavailable')
             snapshots = []
     if snapshots:
-        if any(row["source"] != "broker" or not start <= timestamp(row["as_of"]) <= now for row in snapshots):
+        window_start = equity_evidence_window_start(checkpoint, start)
+        if any(row["source"] != "broker" or not window_start <= timestamp(row["as_of"]) <= now for row in snapshots):
             problems.append("equity_outside_broker_generation")
         peak = observed_equity(snapshots[0])
         if peak <= 0:
