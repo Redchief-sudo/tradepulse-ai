@@ -26,7 +26,12 @@ Broker-side protective stops (F3) change exit semantics and get their own design
 - Each revision adds `docs/revNNN-<slug>.md` in the existing style (finding, change, validation).
 - Keep explanatory `# noqa: BLE001 - <reason>` comments. Keep the `Decimal("2")` house style.
 - Separate runtime resources while a soak runs. Never start `tradepulse run`, the dashboard, a soak, or anything that calls the live Alpaca account from the worktree, since port 8766 and the paper account belong to the running soak. Tests use `tmp_path` databases and respx/AsyncMock brokers only.
-- A missing `broker_order_id` never proves an order was not submitted. Only Alpaca's definitive 404 for the intent's `client_order_id` (= `trade_intent_id`) may close a stranded intent, and only while holding, and renewing, the asset's execution reservation.
+- A missing `broker_order_id` never proves an order was not submitted. A stranded intent may be closed only when all of these hold:
+  1. A **successful** lookup returns Alpaca's definitive 404 for the **exact** `client_order_id` (the gateway always sets it to `trade_intent_id`).
+  2. The lookup is made against the **same broker account** the intent was approved on (`risk_snapshot.broker_account_number`, recorded by Task 1).
+  3. No submission is still in progress. A submission is in progress exactly while the asset's execution reservation is held and renewed, so the sweep skips any held reservation, and the 120 s grace period exceeds the 45 s reservation TTL, so a crashed submitter's lease has expired.
+
+  The sweep holds and renews that reservation for its whole decision. An adopted order must match on `client_order_id`, symbol and side.
 
 ## Review Focus
 
@@ -36,7 +41,7 @@ Broker-side protective stops (F3) change exit semantics and get their own design
 4. **Dashboard GET polling and curl usage.** GETs must keep working without the control header. A mutation with no `Origin` header (curl, tests) is allowed when the header is present (Task 6 tests).
 5. **The cumulative cap on options.** Held notional must include the x100 multiplier, which it does because it comes from the broker `market_value` (Task 5 test `test_held_option_notional_counts_toward_position_cap`).
 6. **A restart with integrity holds present.** The stranded-intent sweep must never alter or clear an integrity hold or the session latch (Task 2 test `test_sweep_preserves_integrity_holds_and_session_latch`).
-7. **Soak evidence vs runtime cadence.** The soak's lane-continuity criterion must use the same interval as the runtime lane (Task 4 test `test_soak_lane_criteria_match_runtime_intervals`).
+7. **Soak evidence vs runtime cadence.** The soak's lane-continuity criterion must use the same interval as the runtime lane, and a monitor stall over 120 s must fail continuity (Task 4 tests `test_soak_lane_criteria_match_runtime_intervals`, `test_monitor_stall_over_two_minutes_breaks_continuity`).
 
 ---
 
@@ -68,6 +73,7 @@ Broker-side protective stops (F3) change exit semantics and get their own design
 
 **Interfaces:**
 - Produces: `ExecutionGateway._reject_before_submission(intent: TradeIntent, reason: str) -> ExecutionResult`. It persists `REJECTED` and returns `ExecutionResult("rejected", ...)`.
+- Produces: `TradeIntent.risk_snapshot["broker_account_number"]`, the broker account the intent was approved on. Task 2 requires it to close a stranded intent.
 
 - [ ] **Step 1: Write the failing test** (append to `python_tests/test_execution_gateway.py`)
 
@@ -100,6 +106,7 @@ async def test_crypto_protective_exit_position_reread_failure_closes_the_intent(
     assert order_route.call_count == 0
     intent = (await repositories.trade_intents.list_all())[0]["payload"]
     assert intent["status"] == "rejected"
+    assert "broker_account_number" in intent["risk_snapshot"]
     assert await has_in_flight_intent(repositories, _btc()) is False
 ```
 
@@ -130,6 +137,15 @@ Replace the two early returns in the crypto protective re-read:
                     held_quantity = matched[0].qty
                 except (AlpacaError, AlpacaDataIntegrityError, httpx.HTTPError) as exc:
                     return await self._reject_before_submission(approved, f"BROKER_POSITIONS_UNAVAILABLE: {exc}")
+```
+
+In the `risk_snapshot = {...}` dict, directly after the `"max_hold_days": ...` entry, add:
+
+```python
+                # The account this intent was approved on. Stranded-intent
+                # recovery (reconciliation) may only close the intent after a
+                # definitive not-found from this same account.
+                "broker_account_number": account.account_number,
 ```
 
 Also route the existing `AccountingEpochPending` rejection (the block that builds `rejected = replace(approved, ...)`, a few lines lower) through the helper: `return await self._reject_before_submission(approved, str(exc))`.
@@ -169,9 +185,21 @@ NOW = datetime(2026, 10, 1, 18, tzinfo=UTC)
 BTC = AssetIdentity("BTC/USD", AssetClass.CRYPTO, "alpaca:BTC/USD")
 
 
-async def _stranded(repositories, status=TradeIntentStatus.RISK_APPROVED, age=timedelta(minutes=10)):
+def _broker(account_number="PA1"):
+    broker = AsyncMock()
+    broker.get_account.return_value = SimpleNamespace(account_number=account_number)
+    return broker
+
+
+def _order(**overrides):
+    fields = {"broker_order_id": "order-9", "symbol": "BTC/USD", "side": Side.SELL, "raw": {"client_order_id": "ti-1"}}
+    return SimpleNamespace(**{**fields, **overrides})
+
+
+async def _stranded(repositories, status=TradeIntentStatus.RISK_APPROVED, age=timedelta(minutes=10), account="PA1"):
+    snapshot = {} if account is None else {"broker_account_number": account}
     intent = TradeIntent("ti-1", "idem-1", "corr-1", BTC, Side.SELL, ExecutionMode.PAPER, "position_monitor",
-                         NOW - age, requested_quantity=Decimal(1), status=status)
+                         NOW - age, requested_quantity=Decimal(1), status=status, risk_snapshot=snapshot)
     await repositories.trade_intents.create_once("ti-1", intent, status=status.value, unique_value="idem-1")
 
 
@@ -182,7 +210,7 @@ async def _status(repositories):
 async def test_sweep_closes_intent_alpaca_never_received(tmp_path):
     repositories = await _repositories(tmp_path)
     await _stranded(repositories)
-    broker = AsyncMock()
+    broker = _broker()
     broker.get_order_by_client_order_id.return_value = None
     assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 1
     assert await _status(repositories) == "rejected"
@@ -193,17 +221,38 @@ async def test_sweep_closes_intent_alpaca_never_received(tmp_path):
 async def test_sweep_adopts_order_alpaca_did_receive(tmp_path):
     repositories = await _repositories(tmp_path)
     await _stranded(repositories, status=TradeIntentStatus.SUBMITTED)
-    broker = AsyncMock()
-    broker.get_order_by_client_order_id.return_value = SimpleNamespace(broker_order_id="order-9")
+    broker = _broker()
+    broker.get_order_by_client_order_id.return_value = _order()
     assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 1
     payload = (await repositories.trade_intents.get("ti-1"))["payload"]
     assert (payload["status"], payload["broker_order_id"]) == ("accepted", "order-9")
 
 
+async def test_sweep_refuses_close_when_account_identity_is_unproven(tmp_path):
+    for recorded, current in ((None, "PA1"), ("PA1", "PA2")):
+        repositories = await _repositories(tmp_path / f"{recorded}-{current}")
+        await _stranded(repositories, account=recorded)
+        broker = _broker(account_number=current)
+        broker.get_order_by_client_order_id.return_value = None
+        assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 0
+        assert await _status(repositories) == "risk_approved"
+        broker.get_order_by_client_order_id.assert_not_awaited()
+
+
+async def test_sweep_refuses_to_adopt_an_order_that_does_not_match(tmp_path):
+    for i, mismatch in enumerate(({"symbol": "ETH/USD"}, {"side": Side.BUY}, {"raw": {"client_order_id": "someone-else"}})):
+        repositories = await _repositories(tmp_path / f"case-{i}")
+        await _stranded(repositories)
+        broker = _broker()
+        broker.get_order_by_client_order_id.return_value = _order(**mismatch)
+        assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 0
+        assert await _status(repositories) == "risk_approved"
+
+
 async def test_sweep_lookup_error_leaves_intent_unchanged(tmp_path):
     repositories = await _repositories(tmp_path)
     await _stranded(repositories)
-    broker = AsyncMock()
+    broker = _broker()
     broker.get_order_by_client_order_id.side_effect = RuntimeError("503")
     assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 0
     assert await _status(repositories) == "risk_approved"
@@ -214,7 +263,7 @@ async def test_sweep_lookup_error_leaves_intent_unchanged(tmp_path):
 async def test_sweep_ignores_young_intent(tmp_path):
     repositories = await _repositories(tmp_path)
     await _stranded(repositories, age=timedelta(seconds=30))
-    broker = AsyncMock()
+    broker = _broker()
     assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 0
     broker.get_order_by_client_order_id.assert_not_awaited()
 
@@ -232,7 +281,7 @@ async def test_sweep_preserves_integrity_holds_and_session_latch(tmp_path):
     hold_before = await repositories.integrity_holds.get("order-1")
     session_before = await load_session(repositories)
     await _stranded(repositories)
-    broker = AsyncMock()
+    broker = _broker()
     broker.get_order_by_client_order_id.return_value = None
     assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 1
     assert await repositories.integrity_holds.get("order-1") == hold_before
@@ -243,7 +292,7 @@ async def test_sweep_skips_asset_with_live_reservation(tmp_path):
     repositories = await _repositories(tmp_path)
     await _stranded(repositories)
     assert await reserve_symbol_for_execution(repositories.trade_intents.database, BTC, "live-gateway")
-    broker = AsyncMock()
+    broker = _broker()
     assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 0
     broker.get_order_by_client_order_id.assert_not_awaited()
     assert await _status(repositories) == "risk_approved"
@@ -299,14 +348,25 @@ async def _recover_stranded_intents(repositories, broker, alerts, now, lease_los
 
 
 async def _resolve_stranded(repositories, broker, alerts, intent, now) -> bool:
-    """Adopt Alpaca's order for this client_order_id, or close the intent on a definitive 404."""
-    try:
-        order = await broker.get_order_by_client_order_id(intent.trade_intent_id)
-    except Exception as exc:  # noqa: BLE001 - an unavailable lookup proves nothing; retry next pass
+    """Adopt Alpaca's matching order for this client_order_id, or close the
+    intent on a definitive 404 from the account it was approved on."""
+    async def unresolved(reason: str) -> bool:
         await _record(repositories, reconciliation_type="order", subject_id=intent.trade_intent_id,
                       outcome=ReconciliationOutcome.DRIFT_DETECTED, expected={"stranded_intent_resolved": True},
-                      actual={"error": str(exc), "status": intent.status.value}, occurred_at=now)
+                      actual={"error": reason, "status": intent.status.value}, occurred_at=now)
         return False
+
+    try:
+        account = await broker.get_account()
+        approved_on = intent.risk_snapshot.get("broker_account_number")
+        if approved_on is None or account.account_number != approved_on:
+            return await unresolved("ACCOUNT_IDENTITY_UNPROVEN")
+        order = await broker.get_order_by_client_order_id(intent.trade_intent_id)
+    except Exception as exc:  # noqa: BLE001 - an unavailable lookup proves nothing; retry next pass
+        return await unresolved(str(exc))
+    if order is not None and (order.raw.get("client_order_id") != intent.trade_intent_id
+                              or order.symbol != intent.asset.symbol or order.side != intent.side):
+        return await unresolved("STRANDED_ORDER_IDENTITY_MISMATCH")
     if order is not None:
         updated = replace(intent, status=TradeIntentStatus.ACCEPTED, broker_order_id=order.broker_order_id,
                           client_order_id=intent.trade_intent_id)
@@ -475,7 +535,7 @@ Expected: exit 0. If `create_once` returns `None` instead of `True` on insert, t
 
 The soak's lane-continuity criterion (`REQUIRED_LANES`, maximum gap `2 x interval + 120`) used to duplicate the runtime intervals. Changing only the runtime would leave the evidence check six times looser than the lane, so both must read one authority.
 
-- [ ] **Step 0: Write the failing test** (append to `python_tests/test_accounting_soak.py`)
+- [ ] **Step 0: Write the failing tests** (append to `python_tests/test_accounting_soak.py`; add `from datetime import UTC, datetime` to its imports if absent)
 
 ```python
 def test_soak_lane_criteria_match_runtime_intervals():
@@ -488,6 +548,27 @@ def test_soak_lane_criteria_match_runtime_intervals():
             cli.MONITOR_INTERVAL_SECONDS, cli.SETTLE_INTERVAL_SECONDS) == tuple(
         LANE_INTERVAL_SECONDS[k] for k in ("equity", "crypto", "option", "monitor", "settle"))
     assert LANE_INTERVAL_SECONDS["monitor"] == 30
+
+
+def test_monitor_stall_over_two_minutes_breaks_continuity():
+    from datetime import timedelta
+
+    from tradepulse.config.lanes import LANE_MAX_GAP_SECONDS
+    from tradepulse.verification.soak import _lane_evidence
+
+    assert LANE_MAX_GAP_SECONDS["monitor"] == 120
+    assert LANE_MAX_GAP_SECONDS["reconcile"] == 2 * 60 + 120  # unchanged for other lanes
+    start = datetime(2026, 10, 2, 14, tzinfo=UTC)
+
+    def cycles(offsets):
+        return [{"event_type": "verification_lane_cycle", "details": {"lane": "monitor"},
+                 "occurred_at": (start + timedelta(seconds=s)).isoformat()} for s in offsets]
+
+    segment = [{"started_at": start.isoformat(), "ended_at": (start + timedelta(seconds=600)).isoformat()}]
+    healthy = _lane_evidence(cycles(range(30, 600, 30)), segment)["monitor"]
+    stalled = _lane_evidence(cycles([30, 60, 210, *range(240, 600, 30)]), segment)["monitor"]
+    assert healthy["continuous"] and healthy["maximum_permitted_gap_seconds"] == 120
+    assert not stalled["continuous"]  # a 150 s silence
 ```
 
 Run it: `PYTHONPATH=$PWD /home/damien/tradepulse-ai/.venv/bin/python -m pytest python_tests/test_accounting_soak.py -k lane_criteria -q`. Expected: FAIL, `ModuleNotFoundError: No module named 'tradepulse.config.lanes'`.
@@ -503,6 +584,15 @@ can never drift apart. The monitor runs every 30 s because stops are evaluated
 in software (see the Phase 4 broker-side stop spec).
 """
 LANE_INTERVAL_SECONDS = {"equity": 900, "crypto": 600, "option": 1200, "monitor": 30, "settle": 60, "reconcile": 60}
+
+# Longest silence between completed cycles the soak accepts. A gap is one
+# cycle's duration plus the interval (the heartbeat fires at cycle end).
+# Scan/settle/reconcile keep the historical 2 x interval + 120 s. The monitor
+# gets an explicit 30 s + 90 s cycle budget: 4x the longest cycle observed
+# (22.5 s across 676 cycles in two soaks) and several 20 s fill waits, while
+# any protection stall over two minutes fails continuity.
+LANE_MAX_GAP_SECONDS = {lane: 2 * interval + 120 for lane, interval in LANE_INTERVAL_SECONDS.items()}
+LANE_MAX_GAP_SECONDS["monitor"] = 120
 ```
 
 In `tradepulse/cli.py`, replace the five interval constants with:
@@ -517,7 +607,7 @@ MONITOR_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["monitor"]
 SETTLE_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["settle"]
 ```
 
-In `tradepulse/verification/soak.py`, replace the `REQUIRED_LANES = {...}` literal with `REQUIRED_LANES = LANE_INTERVAL_SECONDS`, imported from `tradepulse.config.lanes`. Check that the verification-generation reconcile lane in `cli.py` still uses a 60 s cadence; if it has its own constant, route it through `LANE_INTERVAL_SECONDS["reconcile"]` too.
+In `tradepulse/verification/soak.py`, replace the `REQUIRED_LANES = {...}` literal with `REQUIRED_LANES = LANE_INTERVAL_SECONDS`, imported from `tradepulse.config.lanes` together with `LANE_MAX_GAP_SECONDS`. In `_lane_evidence`, replace both occurrences of `2 * interval + 120` (the `maximum = ...` line and the `"maximum_permitted_gap_seconds"` value) with `LANE_MAX_GAP_SECONDS[lane]`. Leave the separate market-session `maximum_gap = 2 * REQUIRED_LANES["reconcile"] + 120` unchanged: it bounds broker-clock receipts, not lane silence. Check that the verification-generation reconcile lane in `cli.py` still uses a 60 s cadence; if it has its own constant, route it through `LANE_INTERVAL_SECONDS["reconcile"]` too.
 
 - [ ] **Step 1: Replace the stale comments.** In `_fetch_atr`'s docstring, replace the sentence beginning "an unguarded fetch here would propagate out of this module" through "for the rest of the run." with:
 
@@ -731,7 +821,7 @@ Expected: both exit 0. If a frontend test asserts the exact fetch init for a POS
 
 ```python
 def _broker(activities, open_orders=()):
-    broker = AsyncMock()
+    broker = _broker()
     broker.get_open_orders.return_value = list(open_orders)
     broker.get_activities.return_value = [SimpleNamespace(raw=a) for a in activities]
     return broker
