@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Mapping
+from typing import Any
 
 from .codec import decode_payload, encode_payload
 from .database import AsyncSQLiteDatabase, RepositoryPaginationError

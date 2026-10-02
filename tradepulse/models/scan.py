@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Mapping
+from typing import Any
 
 from .base import immutable_metadata, require_aware, require_text
 from .enums import AssetClass, ScanRunStatus, ScanTrigger

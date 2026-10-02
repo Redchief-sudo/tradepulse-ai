@@ -4,7 +4,6 @@ import json
 import logging
 from datetime import UTC, datetime
 
-
 # Every attribute a plain LogRecord carries with no `extra=` at all -- computed
 # dynamically (not hand-listed) so it stays correct across Python versions.
 # Anything else on the record was added via `extra=` and must be surfaced.

@@ -139,6 +139,7 @@ async def _reconcile_positions(
     lease_lost: asyncio.Event | None = None,
 ) -> tuple[int, int, int]:
     from tradepulse.verification.opening import load_bound_opening_checkpoint
+
     from .membership import opening_quantities
     checkpoint = await repositories.fills.database.run(load_bound_opening_checkpoint)
     opening_positions = opening_quantities(checkpoint)
@@ -552,8 +553,8 @@ async def run_reconciliation(
         opening = await repositories.fills.database.run(load_bound_opening_checkpoint)
         if opening is not None:
             from .activity_cursor import activity_population
-            from .membership import classify_population, require_resolved
             from .generation_fees import persist_generation_fees
+            from .membership import classify_population, require_resolved
             activities, pagination = await activity_population(broker, opening['opening_activity_cursor'])
             now = aware_utc(clock(), field_name='activity_population_observed_at')
             generation_membership = await repositories.fills.database.run(
@@ -567,7 +568,7 @@ async def run_reconciliation(
         await latch_financial_integrity_block(repositories, reason, clock=lambda: now)
         await alerts.send('critical', reason, {})
         return ReconciliationSummary('degraded', error=reason)
-    from tradepulse.settlement.accounting import replay_accounting, accounting_issues
+    from tradepulse.settlement.accounting import accounting_issues, replay_accounting
     projection_error = None
     try:
         await replay_accounting(repositories)

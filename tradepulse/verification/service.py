@@ -14,8 +14,17 @@ from tradepulse.provenance import get_provenance
 
 from .evidence import VerificationPolicy, assess, snapshot_database, timestamp
 from .integrity import (
-    VerificationError, canonical, digest, freeze_source, generation_path, load_json,
-    read_manifest, source_files, utc_now, verify_source, write_once,
+    VerificationError,
+    canonical,
+    digest,
+    freeze_source,
+    generation_path,
+    load_json,
+    read_manifest,
+    source_files,
+    utc_now,
+    verify_source,
+    write_once,
 )
 from .opening import capture_checkpoint, database_identity, load_opening_checkpoint
 
@@ -249,8 +258,9 @@ class Verification:
             from tradepulse.reconciliation.membership import ELIGIBLE_MEMBERSHIPS
             for row in reversed(current['reconciliation_records']):
                 if row['reconciliation_type'] == 'generation_membership':
-                    from .opening import load_opening_checkpoint
                     from tradepulse.reconciliation.membership import verify_membership_record
+
+                    from .opening import load_opening_checkpoint
                     classifications = verify_membership_record(load_opening_checkpoint(self.database), row)
                     membership_state = classifications
                     sealed_ids = {a['id'] for r in evidence['reconciliation_records']

@@ -6,10 +6,11 @@ phases; they intentionally do not use models/base.py's validation helpers.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Mapping
+from typing import Any
 
 from tradepulse.models import AssetClass, Side
 

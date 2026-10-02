@@ -5,7 +5,6 @@ to avoid transcription errors across a 2,304-row result set.
 """
 
 import json
-from collections import defaultdict
 from pathlib import Path
 
 CACHE_ROOT = Path(__file__).resolve().parent.parent.parent / "data" / "calibration"

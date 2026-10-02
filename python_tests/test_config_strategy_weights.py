@@ -1,5 +1,4 @@
 from datetime import UTC, datetime
-from decimal import Decimal
 
 from tradepulse.config.strategy_weights import default_strategy_weights, regime_conditioned_weights
 

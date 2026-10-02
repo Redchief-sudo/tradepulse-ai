@@ -3,9 +3,15 @@ from decimal import Decimal
 
 import pytest
 
-from tradepulse.models import AssetClass, AssetIdentity, ExecutionMode, PositionLot, SettlementEvent, SettlementStatus, Side
+from tradepulse.models import (
+    AssetClass,
+    AssetIdentity,
+    ExecutionMode,
+    PositionLot,
+    SettlementEvent,
+    Side,
+)
 from tradepulse.settlement.lots import IntegrityViolationError, plan_signed_lot_fill
-
 
 NOW = datetime(2026, 8, 15, tzinfo=UTC)
 

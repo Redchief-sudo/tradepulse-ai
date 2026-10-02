@@ -15,9 +15,9 @@ from tradepulse.persistence import (
     list_all_by_statuses,
     paginate_all_rows,
 )
+from tradepulse.persistence.codec import decode_payload, encode_payload
 from tradepulse.risk.engine import _risk_day_bounds
 from tradepulse.time import aware_utc
-from tradepulse.persistence.codec import decode_payload, encode_payload
 
 
 def broker_settled_cash(entry) -> Decimal:
@@ -86,12 +86,15 @@ async def observe_broker_valuation(broker, *, attempts: int = 3) -> tuple[Alpaca
 
 def _generation_invariants(connection, account, positions):
     """Reconcile an official population against its immutable opening balances."""
-    from tradepulse.verification.opening import load_bound_opening_checkpoint
-    from tradepulse.reconciliation.membership import verify_membership_record
     from tradepulse.reconciliation.generation_fees import (
-        adjustment_receipt, cash_fee_receipt, generation_adjustment_totals,
-        validate_generation_adjustment, validate_generation_fee,
+        adjustment_receipt,
+        cash_fee_receipt,
+        generation_adjustment_totals,
+        validate_generation_adjustment,
+        validate_generation_fee,
     )
+    from tradepulse.reconciliation.membership import verify_membership_record
+    from tradepulse.verification.opening import load_bound_opening_checkpoint
 
     opening = load_bound_opening_checkpoint(connection)
     if opening is None:

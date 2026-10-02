@@ -32,10 +32,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from tradepulse.config import default_strategy_weights  # noqa: E402
 from tradepulse.models import AssetClass, Candle  # noqa: E402
 from tradepulse.scanner.coordinator import _atr_stop_loss_price, _stop_loss_price  # noqa: E402
 from tradepulse.strategy import atr, compute_real_factors, signal_from_composite, weighted_composite  # noqa: E402
-from tradepulse.config import default_strategy_weights  # noqa: E402
 
 CACHE_ROOT = REPO_ROOT / "data" / "calibration"
 MIN_CANDLES = 30

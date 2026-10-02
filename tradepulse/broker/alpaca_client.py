@@ -11,7 +11,6 @@ import asyncio
 import logging
 import random
 import re
-from urllib.parse import quote
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -474,12 +473,6 @@ class AlpacaClient:
         if not isinstance(rows, list):
             raise AlpacaDataIntegrityError("open orders response is not a list")
         return [self._parse_order_data(row, request_id=None) for row in rows]
-
-    async def close_position(self, symbol: str) -> None:
-        """Submit Alpaca's broker-side close-position operation for one symbol."""
-        response = await self._request("DELETE", f"{self._trading_base}/positions/{quote(symbol, safe='')}")
-        if not response.is_success:
-            raise_alpaca_error(response, "closePosition")
 
     async def get_activities(
         self, activity_type: str | None = "FILL", since: datetime | None = None, page_size: int = 100,

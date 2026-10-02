@@ -4,10 +4,17 @@ from decimal import Decimal
 import pytest
 
 from tradepulse.models import (
-    AssetClass, AssetIdentity, ExecutionMode, Fill, MarketQuote, Opportunity,
-    SettlementEvent, SettlementStatus, Side, TradeIntent,
+    AssetClass,
+    AssetIdentity,
+    ExecutionMode,
+    Fill,
+    MarketQuote,
+    Opportunity,
+    SettlementEvent,
+    SettlementStatus,
+    Side,
+    TradeIntent,
 )
-
 
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
 

@@ -3,8 +3,8 @@
 Unlinked account fees are retained as unresolved expenses. They are never
 assigned to an instrument by symbol coincidence, date-window guesses or rates.
 """
-from decimal import Decimal
 from datetime import UTC, datetime
+from decimal import Decimal
 from hashlib import sha256
 
 from tradepulse.models import AssetClass, asset_identity_key
@@ -43,8 +43,8 @@ async def reconcile_equity_epochs(repositories, broker, *, now, clock=lambda: da
             def rows(table):
                 return [hydrate(table, decode_payload(row['payload'])) for row in connection.execute(f'SELECT payload FROM {table}')]
             fills, intents, lots, events = (rows(t) for t in ('fills', 'trade_intents', 'position_lots', 'settlements'))
-            from .membership import classify_population, require_resolved
             from .generation_fees import persist_generation_fees
+            from .membership import classify_population, require_resolved
             membership = classify_population(connection, raw, pagination, now=now)
             require_resolved(membership)
             persist_generation_fees(connection, raw, membership, now=now)

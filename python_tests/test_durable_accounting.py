@@ -3,12 +3,12 @@ from datetime import UTC, timedelta
 from decimal import Decimal
 
 import pytest
+from test_settlement_engine import NOW, _no_op_alerter, _repositories, _seed_buy, asset
 
-from test_settlement_engine import _repositories, _seed_buy, _no_op_alerter, NOW, asset
-from tradepulse.models import Fill, SettlementEvent, TradeIntent, Side, ExecutionMode, TradeIntentStatus
+from tradepulse.models import ExecutionMode, Fill, SettlementEvent, Side, TradeIntent, TradeIntentStatus
 from tradepulse.persistence import hydrate
 from tradepulse.settlement import SettlementProcessor
-from tradepulse.settlement.accounting import replay_accounting, ProjectionEvidenceError
+from tradepulse.settlement.accounting import ProjectionEvidenceError, replay_accounting
 
 
 async def two_fill_exit(repositories):
@@ -86,9 +86,10 @@ async def test_checkpoint_refuses_lying_handler_and_replay_rejects_conflict(tmp_
 
 async def test_zero_equity_difference_cannot_mask_position_mismatch(tmp_path):
     from test_forensic_corrections import account, position
-    from tradepulse.valuation import marked_snapshot, record_valuation
-    from tradepulse.risk import load_session
+
     from tradepulse.models import SessionState
+    from tradepulse.risk import load_session
+    from tradepulse.valuation import marked_snapshot, record_valuation
     r = await _repositories(tmp_path)
     snapshot = await marked_snapshot(r, account(), [position()], now=NOW)
     assert snapshot.equity_reconciliation_difference == 0
@@ -99,7 +100,8 @@ async def test_zero_equity_difference_cannot_mask_position_mismatch(tmp_path):
 
 
 def test_missing_canonical_journals_and_hold_prevent_prove_edge_count():
-    from test_paper_verification import passing_rows, START, NOW, COSTS
+    from test_paper_verification import COSTS, NOW, START, passing_rows
+
     from tradepulse.verification.evidence import assess
     for defect in ('cash_ledger', 'pnl_records', 'integrity_holds'):
         rows = passing_rows()
@@ -133,7 +135,7 @@ async def test_legacy_attribution_contract_migration_requires_durable_evidence(t
 
 
 async def test_fractional_quantities_and_full_identity_never_collide(tmp_path):
-    from tradepulse.models import AssetIdentity, AssetClass, asset_identity_key
+    from tradepulse.models import AssetClass, AssetIdentity, asset_identity_key
     r = await _repositories(tmp_path)
     instruments = [AssetIdentity('SAME', AssetClass.EQUITY, 'native-one', venue='venue-one'),
                    AssetIdentity('SAME', AssetClass.EQUITY, 'native-two', venue='venue-two'),
@@ -161,9 +163,11 @@ async def test_fractional_quantities_and_full_identity_never_collide(tmp_path):
 
 async def test_failed_new_population_supersedes_verified_equity_checkpoint(tmp_path):
     from types import SimpleNamespace
+
+    from test_accounting_epochs import pagination
+
     from tradepulse.models import TradeIntentStatus
     from tradepulse.reconciliation.equity_epochs import reconcile_equity_epochs
-    from test_accounting_epochs import pagination
     r = await _repositories(tmp_path)
     intent = TradeIntent('entry', 'entry', 'opportunity', asset(), Side.BUY, ExecutionMode.PAPER, 'test', NOW,
         requested_quantity=Decimal(1), status=TradeIntentStatus.FILLED, broker_order_id='order')
@@ -205,8 +209,10 @@ async def test_failed_new_population_supersedes_verified_equity_checkpoint(tmp_p
 
 async def test_historical_fee_in_full_feed_does_not_block_new_equity_epoch(tmp_path):
     from types import SimpleNamespace
-    from tradepulse.reconciliation.equity_epochs import reconcile_equity_epochs
+
     from test_accounting_epochs import pagination
+
+    from tradepulse.reconciliation.equity_epochs import reconcile_equity_epochs
 
     r = await _repositories(tmp_path)
     intent = TradeIntent('entry', 'entry', 'opportunity', asset(), Side.BUY, ExecutionMode.PAPER, 'test', NOW,
@@ -257,7 +263,8 @@ async def test_generation_boundary_uses_frozen_epoch_timestamp_not_fill_opened_t
 
 
 def test_explicit_fill_fees_reduce_net_once_without_changing_gross():
-    from test_paper_verification import passing_rows, START, NOW, COSTS
+    from test_paper_verification import COSTS, NOW, START, passing_rows
+
     from tradepulse.verification.evidence import assess
     rows = passing_rows(count=1, wins=1)
     for fill, fee in zip(rows['fills'], ('0.01', '0.02')):

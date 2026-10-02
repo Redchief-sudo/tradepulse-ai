@@ -4,8 +4,8 @@ from hashlib import sha256
 
 from tradepulse.models import asset_identity_key
 from tradepulse.models.base import decimal_value, require_text
-from tradepulse.time import aware_utc
 from tradepulse.persistence.codec import encode_payload
+from tradepulse.time import aware_utc
 
 
 def validate_fee_population(asset, activities, fills, intents, broker_quantity, *, membership=None):
@@ -32,7 +32,7 @@ def validate_fee_population(asset, activities, fills, intents, broker_quantity, 
     cash_fees = []
     fees = []
     net = Decimal(0)
-    from .membership import eligible_activities, activity_time
+    from .membership import activity_time, eligible_activities
     eligible = eligible_activities(activities, membership) if membership else activities
     eligible_ids = {r['id'] for r in eligible}
     for raw in activities:
@@ -57,7 +57,7 @@ def validate_fee_population(asset, activities, fills, intents, broker_quantity, 
             if (not cash_only or raw.get('currency') != 'USD' or raw.get('status') != 'executed'
                     or decimal_value(raw.get('qty', '0'), 'cash_activity_qty') != 0):
                 raise AssetFeeIntegrityError('ASSET_FEE_POPULATION_UNCLASSIFIED_MOVEMENT')
-            amount = decimal_value(raw['net_amount'], 'cash_activity_amount')
+            decimal_value(raw['net_amount'], 'cash_activity_amount')  # validate only: cash-only rows carry no inventory
             continue
         if raw_symbol != symbol:
             continue

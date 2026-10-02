@@ -8,8 +8,9 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
-from .integrity import VerificationError, canonical, digest
 from tradepulse.time import aware_utc
+
+from .integrity import VerificationError, canonical, digest
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,7 +113,7 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     checkpoint = rows.get('generation_opening_checkpoint')
     classifications = None
     if checkpoint:
-        from tradepulse.reconciliation.membership import verify_membership_record, ELIGIBLE_MEMBERSHIPS
+        from tradepulse.reconciliation.membership import ELIGIBLE_MEMBERSHIPS, verify_membership_record
         membership_records = [r for r in rows['reconciliation_records']
                               if r['record_id'].startswith('generation_membership:')]
         try:
@@ -654,8 +655,11 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
 def observed_generation_result(rows, fills, native_receipts, valid_native_receipts, native_basis, cash_entries, records_by_id):
     """Independently conserve actual expenses; the overlay never enters here."""
     from tradepulse.reconciliation.generation_fees import (
-        ELIGIBLE_MEMBERSHIPS, cash_fee_receipt, validate_generation_fee, adjustment_receipt,
+        ELIGIBLE_MEMBERSHIPS,
+        adjustment_receipt,
+        cash_fee_receipt,
         validate_generation_adjustment,
+        validate_generation_fee,
     )
     errors = []
     checkpoint = rows.get('generation_opening_checkpoint')
@@ -784,8 +788,8 @@ def observed_generation_equity(snapshot, rows, checkpoint):
     flags cannot erase a drawdown or permanently invalidate a real broker mark.
     Opening inventory performance and confirmed capital transfers are removed.
     """
-    from tradepulse.models import AssetClass, asset_key_from_broker_symbol
     from tradepulse.broker.symbols import normalize_alpaca_symbol
+    from tradepulse.models import AssetClass, asset_key_from_broker_symbol
     from tradepulse.reconciliation.generation_fees import validate_generation_adjustment
 
     observation = snapshot['reconciliation_results']['broker_observation']

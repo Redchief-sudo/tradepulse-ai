@@ -17,7 +17,6 @@ from tradepulse.persistence.codec import decode_payload, encode_payload
 from tradepulse.reconciliation.fee_replay import replay_asset_fees
 from tradepulse.settlement.accounting import accounting_issues, replay_accounting
 
-
 TABLES = ('fills', 'settlements', 'position_lots', 'holdings', 'trade_attributions',
           'cash_ledger', 'pnl_records', 'accounting_epochs', 'broker_activity_inbox', 'broker_activity_cursors')
 

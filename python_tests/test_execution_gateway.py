@@ -27,7 +27,7 @@ from tradepulse.models import (
     TradingSession,
     asset_identity_key,
 )
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate, release_lock
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate
 from tradepulse.providers import AlpacaMarketDataProvider
 from tradepulse.risk import load_session, save_session
 from tradepulse.settlement import SettlementProcessor

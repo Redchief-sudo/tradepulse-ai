@@ -20,11 +20,19 @@ from tradepulse.persistence import AsyncSQLiteDatabase
 from tradepulse.persistence.repositories import RecordRepository
 from tradepulse.verification.integrity import VerificationError, canonical, digest, load_json
 from tradepulse.verification.opening import load_opening_checkpoint
-from tradepulse.verification.service import Verification, freeze, store_for
+from tradepulse.verification.service import Verification, freeze
 from tradepulse.verification.soak import (
-    AUTHORIZED_COSTS, MINIMUM_SECONDS, REQUIRED_LANES, _complete_market_session,
-    _lane_evidence, _late_fee_reopenings, _segments, analyze_soak_database,
-    create_soak_report, slippage_evidence, verify_soak_prerequisites,
+    AUTHORIZED_COSTS,
+    MINIMUM_SECONDS,
+    REQUIRED_LANES,
+    _complete_market_session,
+    _lane_evidence,
+    _late_fee_reopenings,
+    _segments,
+    analyze_soak_database,
+    create_soak_report,
+    slippage_evidence,
+    verify_soak_prerequisites,
 )
 
 

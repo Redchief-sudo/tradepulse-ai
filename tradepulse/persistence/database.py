@@ -3,11 +3,10 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypeVar
-from datetime import UTC, datetime
 from uuid import uuid4
-
 
 T = TypeVar("T")
 

@@ -40,13 +40,13 @@ REPO_ROOT = TOOL_DIR.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TOOL_DIR))
 
+import entry_calibration_ladder as ecl  # noqa: E402
+from fetch_alpaca_history import _fetch_and_cache, _load_dotenv  # noqa: E402
+from simulate_trades import CACHE_ROOT  # noqa: E402
+
 from tradepulse.broker import AlpacaClient  # noqa: E402
 from tradepulse.config import Settings  # noqa: E402
 from tradepulse.strategy.universe import DEFAULT_CRYPTO_UNIVERSE, DEFAULT_EQUITY_UNIVERSE  # noqa: E402
-import entry_calibration_ladder as ecl  # noqa: E402
-from entry_composite_audit import spearman  # noqa: E402
-from fetch_alpaca_history import _fetch_and_cache, _load_dotenv  # noqa: E402
-from simulate_trades import CACHE_ROOT  # noqa: E402
 
 RESULTS_PATH = CACHE_ROOT / "out_of_universe_check.json"
 

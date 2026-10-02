@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
+
 from tradepulse.time import aware_utc
 
 
@@ -25,7 +27,7 @@ def require_aware(value: datetime, field: str) -> datetime:
         raise DomainValidationError(f"{field} must be timezone-aware") from exc
 
 
-def decimal_value(value: Decimal | str | int | float, field: str, *, positive: bool = False, nonnegative: bool = False) -> Decimal:
+def decimal_value(value: Decimal | str | float, field: str, *, positive: bool = False, nonnegative: bool = False) -> Decimal:
     try:
         result = Decimal(str(value))
     except (InvalidOperation, ValueError) as exc:

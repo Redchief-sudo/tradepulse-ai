@@ -17,7 +17,6 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
-from tradepulse.time import aware_utc
 
 from tradepulse.models import (
     AIResponse,
@@ -52,6 +51,7 @@ from tradepulse.models import (
     TradeIntentStatus,
     TradingSession,
 )
+from tradepulse.time import aware_utc
 
 HydrateFn = Callable[[Mapping[str, Any]], Any]
 _HYDRATORS: dict[str, HydrateFn] = {}

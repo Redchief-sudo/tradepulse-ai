@@ -44,17 +44,26 @@ REPO_ROOT = TOOL_DIR.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TOOL_DIR))
 
+from entry_composite_audit import spearman  # noqa: E402
+from simulate_trades import (  # noqa: E402
+    CACHE_ROOT,
+    ENTRY_ATR_MULTIPLIER,
+    ENTRY_FALLBACK_STOP_LOSS_PCT,
+    ENTRY_MAX_STOP_DISTANCE_PCT,
+    ENTRY_MIN_STOP_DISTANCE_PCT,
+    MIN_CANDLES,
+    Entry,
+    _benchmark_closes_as_of,
+    _to_candle,
+    simulate_exit,
+)
+
+from tradepulse.config import default_strategy_weights  # noqa: E402
 from tradepulse.models import AssetClass  # noqa: E402
 from tradepulse.scanner.coordinator import _atr_stop_loss_price, _stop_loss_price  # noqa: E402
 from tradepulse.strategy import compute_real_factors, signal_from_composite, weighted_composite  # noqa: E402
 from tradepulse.strategy import indicators as ind  # noqa: E402
-from tradepulse.config import default_strategy_weights  # noqa: E402
 from tradepulse.strategy.universe import DEFAULT_CRYPTO_UNIVERSE, DEFAULT_EQUITY_UNIVERSE  # noqa: E402
-from entry_composite_audit import correlation_table, spearman  # noqa: E402
-from simulate_trades import (  # noqa: E402
-    CACHE_ROOT, ENTRY_ATR_MULTIPLIER, ENTRY_FALLBACK_STOP_LOSS_PCT, ENTRY_MAX_STOP_DISTANCE_PCT,
-    ENTRY_MIN_STOP_DISTANCE_PCT, MIN_CANDLES, Entry, TradeOutcome, _benchmark_closes_as_of, _to_candle, simulate_exit,
-)
 
 RESULTS_PATH = CACHE_ROOT / "entry_calibration_ladder.json"
 
@@ -63,6 +72,7 @@ RESULTS_PATH = CACHE_ROOT / "entry_calibration_ladder.json"
 # same fixed-exit-policy convention diagnose_signal_sparsity.py already
 # uses for its own hypothetical-outcome computation).
 from tradepulse.config import risk_limits_for_profile  # noqa: E402
+
 _BALANCED = risk_limits_for_profile("balanced")
 BREAK_EVEN_TRIGGER_PCT = _BALANCED.break_even_trigger_pct
 MAX_HOLD_DAYS = _BALANCED.max_hold_days
@@ -579,7 +589,9 @@ def main() -> None:
 
     # ---- Step 0: B0 parity proof -- STOP if it fails ----------------------
     print("Step 0 -- B0 parity proof against diagnose_signal_sparsity.generate_daily_samples...")
-    from diagnose_signal_sparsity import generate_daily_samples  # noqa: E402 (imported here, only needed for this proof)
+    from diagnose_signal_sparsity import (
+        generate_daily_samples,  # noqa: E402 (imported here, only needed for this proof)
+    )
     parity_mismatches: list[str] = []
     parity_checked = 0
     for asset_class, universe, benchmark_symbol in (

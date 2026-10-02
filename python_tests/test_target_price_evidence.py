@@ -10,7 +10,11 @@ TOOL_DIR = Path(__file__).resolve().parent.parent / "tools" / "historical_data"
 sys.path.insert(0, str(TOOL_DIR))
 
 from target_price_evidence import (  # noqa: E402
-    Entry, MilestoneResult, _milestone_evidence, simulate_exit, simulate_exit_with_target,
+    Entry,
+    MilestoneResult,
+    _milestone_evidence,
+    simulate_exit,
+    simulate_exit_with_target,
 )
 
 

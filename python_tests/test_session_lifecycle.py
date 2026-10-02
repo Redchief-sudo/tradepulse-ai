@@ -7,13 +7,6 @@ import pytest
 import respx
 
 from tradepulse.broker import AlpacaClient
-from tradepulse.session_commands import (
-    run_reset_integrity as _run_reset_integrity,
-    run_reset_risk as _run_reset_risk,
-    run_start as _run_start,
-    run_status as _run_status,
-    run_stop as _run_stop,
-)
 from tradepulse.config import Settings
 from tradepulse.models import (
     AssetClass,
@@ -34,6 +27,21 @@ from tradepulse.risk import (
     save_session,
     sync_market_session,
     transition_session,
+)
+from tradepulse.session_commands import (
+    run_reset_integrity as _run_reset_integrity,
+)
+from tradepulse.session_commands import (
+    run_reset_risk as _run_reset_risk,
+)
+from tradepulse.session_commands import (
+    run_start as _run_start,
+)
+from tradepulse.session_commands import (
+    run_status as _run_status,
+)
+from tradepulse.session_commands import (
+    run_stop as _run_stop,
 )
 
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)

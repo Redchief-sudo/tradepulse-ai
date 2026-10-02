@@ -1,6 +1,6 @@
 """Mandatory timestamp and non-resettable database provenance regressions."""
-from datetime import UTC, datetime, timedelta, timezone
 import sqlite3
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 

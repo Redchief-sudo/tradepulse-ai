@@ -3,7 +3,11 @@ from decimal import Decimal
 import pytest
 
 from tradepulse.config import (
-    RISK_PROFILE_IDS, RISK_PROFILES, SettingsError, profile_id_for_equity, risk_limits_for_profile,
+    RISK_PROFILE_IDS,
+    RISK_PROFILES,
+    SettingsError,
+    profile_id_for_equity,
+    risk_limits_for_profile,
 )
 
 

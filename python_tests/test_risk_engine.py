@@ -1,6 +1,6 @@
 import asyncio
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from tradepulse.config import risk_limits_for_profile
@@ -20,7 +20,14 @@ from tradepulse.models import (
     asset_identity_key,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories
-from tradepulse.risk.engine import RiskCheckInput, RiskEvalOptions, build_portfolio_snapshot, check_cash_sufficiency, check_max_drawdown, evaluate_risk
+from tradepulse.risk.engine import (
+    RiskCheckInput,
+    RiskEvalOptions,
+    build_portfolio_snapshot,
+    check_cash_sufficiency,
+    check_max_drawdown,
+    evaluate_risk,
+)
 
 NOW = datetime(2026, 8, 15, tzinfo=UTC)
 LIMITS = risk_limits_for_profile("balanced")

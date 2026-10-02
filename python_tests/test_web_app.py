@@ -9,7 +9,6 @@ from tradepulse.models import (
     AIResponse,
     AssetClass,
     AssetIdentity,
-    AuditEvent,
     ExecutionMode,
     Holding,
     Opportunity,
@@ -27,7 +26,7 @@ from tradepulse.models import (
 from tradepulse.models.market import MarketQuote
 from tradepulse.persistence import hydrate
 from tradepulse.risk import save_session
-from tradepulse.session_commands import run_reset_integrity, run_start
+from tradepulse.session_commands import run_start
 from tradepulse.web import build_app_state, create_app
 
 NOW = datetime(2026, 8, 28, 15, 0, tzinfo=UTC)

@@ -16,12 +16,12 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import AsyncIterator, Literal
+from typing import Literal
 from uuid import uuid4
 
 import httpx
@@ -49,7 +49,14 @@ from tradepulse.models import (
     contract_multiplier_of,
     is_continuous_market,
 )
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, acquire_lock, hydrate, release_lock, renew_lock
+from tradepulse.persistence import (
+    AsyncSQLiteDatabase,
+    PersistenceRepositories,
+    acquire_lock,
+    hydrate,
+    release_lock,
+    renew_lock,
+)
 from tradepulse.providers import AlpacaMarketDataProvider, ProviderError
 from tradepulse.risk import (
     RiskCheckInput,

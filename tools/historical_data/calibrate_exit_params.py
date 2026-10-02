@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import asdict
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -23,9 +22,10 @@ REPO_ROOT = TOOL_DIR.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TOOL_DIR))
 
+from simulate_trades import CACHE_ROOT, Entry, TradeOutcome, generate_entries, simulate_exit  # noqa: E402
+
 from tradepulse.config import risk_limits_for_profile  # noqa: E402
 from tradepulse.strategy.universe import DEFAULT_CRYPTO_UNIVERSE, DEFAULT_EQUITY_UNIVERSE  # noqa: E402
-from simulate_trades import CACHE_ROOT, Entry, TradeOutcome, generate_entries, simulate_exit  # noqa: E402
 
 RESULTS_PATH = CACHE_ROOT / "results.json"
 ENTRIES_CACHE_PATH = CACHE_ROOT / "entries.json"

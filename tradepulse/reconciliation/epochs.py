@@ -8,8 +8,6 @@ from hashlib import sha256
 
 from tradepulse.models import AssetClass, asset_identity_key
 from tradepulse.persistence.codec import decode_payload, encode_payload
-
-
 from tradepulse.time import aware_utc
 
 
@@ -299,7 +297,7 @@ def finalize_population(connection, *, key, proof, population_id, fills, fees, c
                 and str(fee['relationship'].get('symbol') or '').replace('/', '') == symbol))]
         account_fees_conserved = all(generation_fee_recorded(connection, r['id']) for r, _ in cash_receipts)
         raw_by_id = {r['id']: r for r in eligible}
-        def reported_fill_fee(fill):
+        def reported_fill_fee(fill, raw_by_id=raw_by_id):
             raw = raw_by_id[fill.broker_fill_id]
             value = next((raw[k] for k in ('fee', 'fees', 'commission') if raw.get(k) is not None), None)
             return (value is not None and fill.fee_source == 'broker_activity' and fill.fee_currency == 'USD'
@@ -429,6 +427,7 @@ def checkpoint_issues(connection):
     or reconciliation receipt is created or repaired by this function.
     """
     from collections import Counter, defaultdict
+
     from tradepulse.persistence import hydrate
 
     issues = {}

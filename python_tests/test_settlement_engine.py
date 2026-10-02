@@ -25,7 +25,6 @@ from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories,
 from tradepulse.risk import latch_financial_integrity_block, load_session
 from tradepulse.settlement import SettlementProcessor
 
-
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
 
 

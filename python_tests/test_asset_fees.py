@@ -296,9 +296,10 @@ def test_prove_edge_conserves_fee_units_and_expenses_basis_once(tamper):
         'reconciliation_type': 'asset_fee', 'outcome': 'matched', 'occurred_at': ASSESS_NOW.isoformat(), 'actual': epoch})
     if tamper in ('cash', 'cash_amount'):
         import sqlite3
+
         from tradepulse.persistence.database import SCHEMA
-        from tradepulse.reconciliation.generation_fees import persist_generation_fees
         from tradepulse.reconciliation.cash_fees import allocate_cash_fees
+        from tradepulse.reconciliation.generation_fees import persist_generation_fees
         _, order, allocations = allocate_cash_fees(proof, [hydrate('trade_attributions', a) for a in rows['trade_attributions']])[0]
         cash_id = 'asset_cash_fee:cash-test'
         rows['reconciliation_records'].append({'record_id': cash_id, 'subject_id': 'cash-test',

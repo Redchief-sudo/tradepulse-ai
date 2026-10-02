@@ -9,15 +9,22 @@ from pathlib import Path
 
 import pytest
 
+from python_tests.opening_fixtures import OpeningBroker
 from tradepulse.config import Settings
 from tradepulse.persistence.database import SCHEMA, initialize_identity
-from python_tests.opening_fixtures import OpeningBroker
 from tradepulse.verification.commands import permit_command, run_official
 from tradepulse.verification.evidence import TABLES, VerificationPolicy, assess
 from tradepulse.verification.integrity import (
-    VerificationError, canonical, digest, freeze_source, read_manifest, source_files, verify_source, write_once,
+    VerificationError,
+    canonical,
+    digest,
+    freeze_source,
+    read_manifest,
+    source_files,
+    verify_source,
+    write_once,
 )
-from tradepulse.verification.service import Verification, freeze, store_for
+from tradepulse.verification.service import Verification, freeze
 
 
 @pytest.fixture
@@ -156,6 +163,7 @@ ASSET = {"symbol": "X", "asset_class": "equity", "native_asset_id": "alpaca:X", 
 
 def population_pagination(activities):
     from hashlib import sha256
+
     from tradepulse.persistence.codec import encode_payload
 
     pages = []
@@ -172,6 +180,7 @@ def population_pagination(activities):
 
 def passing_rows(count=200, wins=120, *, merge_first=False, partial_first=False, asset=ASSET, opening_fee='0'):
     from decimal import Decimal
+
     from tradepulse.models import AssetClass, AssetIdentity, asset_identity_key, contract_multiplier_of
     from tradepulse.persistence import hydrate
     instrument = AssetIdentity(**{**asset, 'asset_class': AssetClass(asset['asset_class'])})
@@ -252,11 +261,11 @@ def passing_rows(count=200, wins=120, *, merge_first=False, partial_first=False,
             'realized': attr['realized_pnl'], 'unrealized': '0', 'as_of': attr['exit_at']})
     # Build a real, verifiable population checkpoint from the fixture's fills.
     # No eligibility flag or unverifiable epoch placeholder is used.
-    from tradepulse.persistence import hydrate
-    from tradepulse.persistence.codec import encode_payload, decode_payload
-    from tradepulse.reconciliation.fee_population import validate_fee_population
-    from tradepulse.reconciliation.epochs import finalize_population
     from hashlib import sha256
+
+    from tradepulse.persistence.codec import decode_payload, encode_payload
+    from tradepulse.reconciliation.epochs import finalize_population
+    from tradepulse.reconciliation.fee_population import validate_fee_population
     by_intent = {row['trade_intent_id']: row for row in rows['trade_intents']}
     for fill in rows['fills']:
         if fill['trade_intent_id'] not in by_intent:
@@ -386,11 +395,12 @@ def test_seal_preserves_snapshot_and_permits_development_only(generation):
     from dataclasses import replace
     from decimal import Decimal
     from hashlib import sha256
+
     from tradepulse.persistence import hydrate
-    from tradepulse.persistence.codec import encode_payload, decode_payload
-    from tradepulse.reconciliation.membership import classify_population
-    from tradepulse.reconciliation.fee_population import validate_fee_population
+    from tradepulse.persistence.codec import decode_payload, encode_payload
     from tradepulse.reconciliation.epochs import finalize_population
+    from tradepulse.reconciliation.fee_population import validate_fee_population
+    from tradepulse.reconciliation.membership import classify_population
     for index, snapshot in enumerate(rows['equity_snapshots']):
         balance = Decimal(checkpoint['equity']) + (Decimal('400') if index else Decimal('0'))
         account = replace(OpeningBroker(now=datetime.fromisoformat(snapshot['as_of'])).account,

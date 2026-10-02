@@ -5,9 +5,13 @@ from decimal import Decimal
 
 import pytest
 
-from tradepulse.persistence.database import SCHEMA
 from tradepulse.persistence.codec import decode_payload
-from tradepulse.reconciliation.generation_fees import adjustment_receipt, persist_generation_fees, validate_generation_fee
+from tradepulse.persistence.database import SCHEMA
+from tradepulse.reconciliation.generation_fees import (
+    adjustment_receipt,
+    persist_generation_fees,
+    validate_generation_fee,
+)
 from tradepulse.verification.evidence import observed_generation_result
 
 NOW = datetime(2026, 9, 22, tzinfo=UTC)
@@ -96,7 +100,8 @@ def test_observed_cash_fee_deducted_once_and_missing_receipt_is_not_zero(db):
 
 
 def test_modeled_overlay_and_observed_actual_expense_are_separate():
-    from python_tests.test_paper_verification import passing_rows, START, NOW as ASSESSED
+    from python_tests.test_paper_verification import NOW as ASSESSED
+    from python_tests.test_paper_verification import START, passing_rows
     from tradepulse.verification.evidence import assess
 
     rows = passing_rows(count=1, wins=1, opening_fee='0.50')

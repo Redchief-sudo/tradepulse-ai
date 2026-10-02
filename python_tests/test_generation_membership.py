@@ -1,12 +1,12 @@
 """Population and cursor evidence define the generation independently of clocks."""
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
-import sqlite3
 
 import pytest
-
 from test_accounting_epochs import pagination
+
 from tradepulse.persistence.codec import decode_payload, encode_payload
 from tradepulse.persistence.database import SCHEMA
 from tradepulse.reconciliation.epochs import new_epoch
@@ -97,8 +97,10 @@ def test_offset_timestamp_corrobates_correct_instant(boundary):
 
 async def test_late_account_fee_supersedes_equity_checkpoint_exactly_once(tmp_path, monkeypatch):
     from types import SimpleNamespace
-    from test_settlement_engine import _repositories, _no_op_alerter, asset
-    from tradepulse.models import Fill, SettlementEvent, TradeIntent, Side, ExecutionMode, TradeIntentStatus
+
+    from test_settlement_engine import _no_op_alerter, _repositories, asset
+
+    from tradepulse.models import ExecutionMode, Fill, SettlementEvent, Side, TradeIntent, TradeIntentStatus
     from tradepulse.reconciliation.equity_epochs import reconcile_equity_epochs
     from tradepulse.settlement import SettlementProcessor
     repositories = await _repositories(tmp_path)
@@ -169,11 +171,13 @@ def test_post_generation_requires_sealed_population_and_cursor(boundary, monkeyp
 
 async def test_old_external_generation_fill_is_not_hidden_by_reconciliation_lookback(tmp_path):
     from unittest.mock import AsyncMock
+
+    from test_settlement_engine import _no_op_alerter, _repositories
+
     from tradepulse.broker import AlpacaActivity
     from tradepulse.models import Side
     from tradepulse.reconciliation.coordinator import _reconcile_fills
     from tradepulse.risk import load_session
-    from test_settlement_engine import _repositories, _no_op_alerter
 
     repositories = await _repositories(tmp_path)
     raw = {'id': 'external', 'activity_type': 'FILL', 'order_id': 'external-order', 'symbol': 'AAPL',
@@ -193,8 +197,19 @@ async def test_old_external_generation_fill_is_not_hidden_by_reconciliation_look
 @pytest.mark.parametrize('receipt_kind', ['missing', 'account_fee', 'explicit_zero'])
 async def test_noncrypto_sell_requires_receipt_backed_fee_evidence(tmp_path, asset_kind, receipt_kind):
     from types import SimpleNamespace
-    from test_settlement_engine import _repositories, _no_op_alerter, asset
-    from tradepulse.models import AssetClass, AssetIdentity, Fill, SettlementEvent, TradeIntent, Side, ExecutionMode, TradeIntentStatus
+
+    from test_settlement_engine import _no_op_alerter, _repositories, asset
+
+    from tradepulse.models import (
+        AssetClass,
+        AssetIdentity,
+        ExecutionMode,
+        Fill,
+        SettlementEvent,
+        Side,
+        TradeIntent,
+        TradeIntentStatus,
+    )
     from tradepulse.reconciliation.equity_epochs import reconcile_equity_epochs
     from tradepulse.settlement import SettlementProcessor
 

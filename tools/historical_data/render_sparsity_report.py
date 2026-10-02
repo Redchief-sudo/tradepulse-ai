@@ -6,7 +6,6 @@ transcription errors across the volume of numbers involved.
 """
 
 import json
-import sys
 from pathlib import Path
 
 CACHE_ROOT = Path(__file__).resolve().parent.parent.parent / "data" / "calibration"

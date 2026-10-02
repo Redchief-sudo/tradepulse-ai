@@ -190,6 +190,7 @@ async def test_refreshed_page_receipt_versions_only_a_mismatched_checkpoint(tmp_
     state no longer matches its immutable receipt is still versioned.
     """
     from datetime import timedelta
+
     from tradepulse.reconciliation.epochs import checkpoint_issues, verify_checkpoint
 
     r = await seeded(tmp_path)

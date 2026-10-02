@@ -26,7 +26,6 @@ from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories,
 from tradepulse.providers import AlpacaMarketDataProvider
 from tradepulse.settlement import SettlementProcessor
 
-
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)
 QUOTE_TS = NOW.isoformat().replace("+00:00", "Z")
 LIMITS = risk_limits_for_profile("balanced")

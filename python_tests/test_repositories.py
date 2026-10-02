@@ -28,7 +28,6 @@ from tradepulse.persistence.repositories import (
     paginate_all_rows,
 )
 
-
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
 
 

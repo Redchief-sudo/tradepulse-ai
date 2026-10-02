@@ -5,7 +5,6 @@ from tradepulse.models import StrategyWeights
 from tradepulse.strategy.composite import factor_breakdown, signal_from_composite, weighted_composite
 from tradepulse.strategy.factors import FactorScores
 
-
 NOW = datetime(2026, 8, 15, tzinfo=UTC)
 
 

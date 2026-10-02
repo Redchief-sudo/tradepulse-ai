@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass
-from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
@@ -27,14 +26,20 @@ REPO_ROOT = TOOL_DIR.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TOOL_DIR))
 
+from simulate_trades import (  # noqa: E402
+    CACHE_ROOT,
+    MIN_CANDLES,
+    Entry,
+    _benchmark_closes_as_of,
+    _to_candle,
+    simulate_exit,
+)
+
 from tradepulse.config import default_strategy_weights, risk_limits_for_profile  # noqa: E402
 from tradepulse.models import AssetClass  # noqa: E402
 from tradepulse.scanner.coordinator import _atr_stop_loss_price, _stop_loss_price  # noqa: E402
 from tradepulse.strategy import compute_real_factors, signal_from_composite, weighted_composite  # noqa: E402
 from tradepulse.strategy.universe import DEFAULT_CRYPTO_UNIVERSE, DEFAULT_EQUITY_UNIVERSE  # noqa: E402
-from simulate_trades import (  # noqa: E402
-    CACHE_ROOT, MIN_CANDLES, Entry, _benchmark_closes_as_of, _to_candle, simulate_exit,
-)
 
 RESULTS_PATH = CACHE_ROOT / "sparsity_diagnostic.json"
 

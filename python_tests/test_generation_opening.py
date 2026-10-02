@@ -1,6 +1,4 @@
 """Canonical generation capture, immutable binding, and startup-clock proofs."""
-import asyncio
-import json
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -12,7 +10,7 @@ from tradepulse.config import Settings
 from tradepulse.persistence import AsyncSQLiteDatabase
 from tradepulse.time import aware_utc
 from tradepulse.verification.integrity import VerificationError, canonical, digest, load_json
-from tradepulse.verification.opening import CHECKPOINT_FILENAME, load_bound_opening_checkpoint, load_opening_checkpoint
+from tradepulse.verification.opening import CHECKPOINT_FILENAME, load_bound_opening_checkpoint
 from tradepulse.verification.service import Verification, freeze, store_for
 
 OVERLAY = {"fee_bps": "25", "slippage_bps": "15"}

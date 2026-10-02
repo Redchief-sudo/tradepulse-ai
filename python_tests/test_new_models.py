@@ -19,7 +19,6 @@ from tradepulse.models import (
     TradingSession,
 )
 
-
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
 
 

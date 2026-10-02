@@ -1,10 +1,9 @@
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from tradepulse.config import Settings
 from tradepulse.models import AssetClass, AssetIdentity, MarketQuote, Opportunity
 from tradepulse.strategy.universe import filter_executable, is_executable, load_executable_universe
-from datetime import UTC, datetime
-
 
 NOW = datetime(2026, 8, 15, tzinfo=UTC)
 

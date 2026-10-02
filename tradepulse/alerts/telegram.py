@@ -5,7 +5,8 @@ base44/shared/telegram.ts.
 from __future__ import annotations
 
 import logging
-from typing import Any, Literal, Mapping
+from collections.abc import Mapping
+from typing import Any, Literal
 
 import httpx
 

@@ -3,7 +3,6 @@ from datetime import UTC, datetime
 from tradepulse.models import AssetClass, SessionState, Side, TradingSession
 from tradepulse.risk.session import execution_session_decision
 
-
 NOW = datetime(2026, 8, 15, tzinfo=UTC)
 
 

@@ -12,8 +12,8 @@ from tradepulse.models import (
 )
 from tradepulse.persistence import hydrate
 from tradepulse.persistence.codec import decode_payload, encode_payload
-from tradepulse.time import aware_utc
 from tradepulse.settlement.engine import _infer_exit_reason, _parse_int_or_none
+from tradepulse.time import aware_utc
 
 from .asset_fees import AssetFeeIntegrityError, AssetFeePending
 from .cash_fees import allocate_cash_fees
@@ -46,9 +46,10 @@ async def replay_asset_fees(repositories, asset, activities, broker_quantity, *,
         raw_fills, raw_events, raw_intents = rows('fills'), rows('settlements'), rows('trade_intents')
         fills = [hydrate('fills', row) for row in raw_fills.values()]
         intents = [hydrate('trade_intents', row) for row in raw_intents.values()]
-        from .membership import classify_population, require_resolved
-        from .generation_fees import persist_generation_fees
         from tradepulse.verification.opening import load_bound_opening_checkpoint
+
+        from .generation_fees import persist_generation_fees
+        from .membership import classify_population, require_resolved
         if pagination is None and load_bound_opening_checkpoint(connection) is not None:
             raise AssetFeeIntegrityError('GENERATION_ACTIVITY_PAGINATION_REQUIRED')
         membership = classify_population(connection, activities, pagination, now=now) if pagination else None

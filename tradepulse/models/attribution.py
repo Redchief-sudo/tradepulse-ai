@@ -15,10 +15,11 @@ outcomes, not to change any decision this system makes today.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Literal, Mapping
+from typing import Any, Literal
 
 from .base import decimal_value, immutable_metadata, require_aware, require_text
 from .market import AssetIdentity

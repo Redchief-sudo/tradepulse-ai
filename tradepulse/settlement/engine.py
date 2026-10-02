@@ -22,11 +22,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Mapping
+from typing import Any
 from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter
@@ -51,7 +51,7 @@ from tradepulse.persistence import (
 )
 from tradepulse.risk import latch_financial_integrity_block
 
-from .accounting import project_accounting, project
+from .accounting import project, project_accounting
 from .lots import IntegrityViolationError, plan_signed_lot_fill
 from .stages import (
     StageHandler,
@@ -183,7 +183,7 @@ async def _project_attribution(repositories: PersistenceRepositories, event: Set
     lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
     closed_lots = [lot for lot in lots if event.fill_id in lot.closures]
     if not closed_lots:
-        return None  # a pure opening fill -- nothing has round-tripped yet
+        return  # a pure opening fill -- nothing has round-tripped yet
 
     multiplier = contract_multiplier_of(event.asset)
     for lot in closed_lots:
@@ -249,7 +249,7 @@ async def _project_attribution(repositories: PersistenceRepositories, event: Set
             },
         )
         await repositories.trade_attributions.create_once(attribution.attribution_id, attribution)
-    return None
+    return
 
 
 def _holding_record_id(asset: AssetIdentity) -> str:
@@ -291,7 +291,7 @@ async def _project_holding(repositories: PersistenceRepositories, event: Settlem
     if not open_lots:
         if existing_row is not None:
             await repositories.holdings.delete(record_id, guard_table="integrity_holds", guard_key=event.broker_order_id)
-        return None
+        return
 
     total_signed = sum((lot.signed_quantity for lot in open_lots), Decimal("0"))
     total_remaining = sum((lot.remaining_quantity for lot in open_lots), Decimal("0"))
@@ -322,13 +322,13 @@ async def _project_holding(repositories: PersistenceRepositories, event: Settlem
     else:
         # current_stop defaults None -- no ratchet history yet
         await repositories.holdings.create_once(record_id, holding, guard_table="integrity_holds", guard_key=event.broker_order_id)
-    return None
+    return
 
 
 async def _project_trade(repositories: PersistenceRepositories, event: SettlementEvent) -> None:
     intent_row = await repositories.trade_intents.get(event.trade_intent_id)
     if intent_row is None:
-        return None
+        return
     intent = hydrate("trade_intents", intent_row["payload"])
 
     # FIN-090-01: scoped to this trade_intent_id, unbounded -- NOT
@@ -363,7 +363,7 @@ async def _project_trade(repositories: PersistenceRepositories, event: Settlemen
         event.trade_intent_id, updated_intent, status=updated_intent.status.value,
         guard_table="integrity_holds", guard_key=event.broker_order_id,
     )
-    return None
+    return
 
 
 async def _verify_integrity(repositories: PersistenceRepositories, event: SettlementEvent, *, check_lots: bool = True) -> None:
@@ -441,24 +441,19 @@ class SettlementProcessor:
 
         async def project_attribution(state: SettlementEvent) -> None:
             await _project_attribution(self._repositories, state)
-            return None
 
         async def project_cash(state: SettlementEvent) -> None:
             await project_accounting(self._repositories, state, cash=True)
-            return None
 
         async def project_holding(state: SettlementEvent) -> None:
             await _project_holding(self._repositories, state)
-            return None
 
         async def project_trade(state: SettlementEvent) -> None:
             await project_accounting(self._repositories, state, trade=True)
             await _project_trade(self._repositories, state)
-            return None
 
         async def verify_integrity(state: SettlementEvent) -> None:
             await _verify_integrity(self._repositories, state)
-            return None
 
         return {
             "project_lot": project_lot,

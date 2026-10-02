@@ -27,7 +27,7 @@ async def run(database_path, apply, report_path, reconcile=False):
     broker = None
     try:
         if reconcile:
-            from tradepulse.cli import _load_dotenv, _build_broker
+            from tradepulse.cli import _build_broker, _load_dotenv
             from tradepulse.config import Settings
             from tradepulse.valuation import marked_snapshot, observe_broker_valuation
             _load_dotenv()
@@ -58,9 +58,9 @@ async def run(database_path, apply, report_path, reconcile=False):
             changed = await replay_accounting(repositories)
         if broker is not None:
             from tradepulse.alerts import TelegramAlerter
-            from tradepulse.settlement import SettlementProcessor
             from tradepulse.reconciliation.coordinator import run_reconciliation
-            from tradepulse.valuation import observe_broker_valuation, record_valuation, reconciliation_outcome
+            from tradepulse.settlement import SettlementProcessor
+            from tradepulse.valuation import observe_broker_valuation, reconciliation_outcome, record_valuation
             if apply:
                 alerts = TelegramAlerter(None, None)
                 summary = decode_payload(encode_payload(await run_reconciliation(

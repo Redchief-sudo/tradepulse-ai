@@ -19,7 +19,12 @@ sys.path.insert(0, str(TOOL_DIR))
 
 from diagnose_signal_sparsity import Sample  # noqa: E402
 from entry_composite_audit import (  # noqa: E402
-    MIN_INTERACTION_CELL, correlation_table, decile_table, interaction_table, spearman, tag_regimes,
+    MIN_INTERACTION_CELL,
+    correlation_table,
+    decile_table,
+    interaction_table,
+    spearman,
+    tag_regimes,
 )
 
 

@@ -249,7 +249,11 @@ async def run_reset_integrity(settings: Settings, *, force: bool) -> int:
     from tradepulse.reconciliation.epochs import require_unlock_proof, unlock_proof
     from tradepulse.time import aware_utc
     from tradepulse.valuation import (
-        marked_snapshot, observe_broker_valuation, record_valuation, reconciliation_outcome, valuation_record,
+        marked_snapshot,
+        observe_broker_valuation,
+        reconciliation_outcome,
+        record_valuation,
+        valuation_record,
     )
 
     broker = None

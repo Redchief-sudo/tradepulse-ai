@@ -5,7 +5,7 @@ from .risk_profiles import (
     risk_limits_for_profile,
 )
 from .sectors import EQUITY_SECTOR_MAP, sector_for_symbol
-from .settings import ALPACA_MARKET_DATA_TIER_IDS, AI_PROVIDER_IDS, RISK_PROFILE_IDS, Settings, SettingsError
+from .settings import AI_PROVIDER_IDS, ALPACA_MARKET_DATA_TIER_IDS, RISK_PROFILE_IDS, Settings, SettingsError
 from .strategy_weights import default_strategy_weights, regime_conditioned_weights
 
 __all__ = [

@@ -51,7 +51,7 @@ def classify_population(connection, activities, pagination, *, now):
     to an intent admitted to this database. A date alone cannot establish that
     a newly observed but backdated activity belongs to the generation.
     """
-    from tradepulse.verification.opening import load_bound_opening_checkpoint, load_bound_closing_checkpoint
+    from tradepulse.verification.opening import load_bound_closing_checkpoint, load_bound_opening_checkpoint
 
     now = aware_utc(now, field_name='membership_observed_at')
     validate_pagination(activities, pagination)
@@ -178,6 +178,7 @@ def verify_membership_record(checkpoint, record):
 def opening_quantities(checkpoint):
     """Broker inventory already owned at opening remains outside generation lots."""
     from decimal import Decimal
+
     from tradepulse.models import AssetClass, asset_key_from_broker_symbol
     if checkpoint is None:
         return {}

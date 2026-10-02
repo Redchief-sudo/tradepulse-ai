@@ -10,12 +10,18 @@ from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
 from tradepulse.execution.fill_attribution import attribute_order_fills, terminal_status_for_order
 from tradepulse.models import (
-    AssetClass, AssetIdentity, ExecutionMode, Fill, SessionState, Side, TradeIntent, TradeIntentStatus,
+    AssetClass,
+    AssetIdentity,
+    ExecutionMode,
+    Fill,
+    SessionState,
+    Side,
+    TradeIntent,
+    TradeIntentStatus,
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
 from tradepulse.risk import load_session
 from tradepulse.settlement import SettlementProcessor
-from tradepulse.settlement.stages import is_settlement_processable
 
 
 @pytest.mark.parametrize(

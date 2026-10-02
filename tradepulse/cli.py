@@ -105,12 +105,26 @@ from tradepulse.risk import load_session
 from tradepulse.scanner import ScanCycleSummary, run_scan_cycle
 from tradepulse.session_commands import (
     build_broker as _build_broker,
+)
+from tradepulse.session_commands import (
     build_gateway as _build_gateway,
+)
+from tradepulse.session_commands import (
     require_credentials as _require_credentials,
+)
+from tradepulse.session_commands import (
     run_reset_integrity as _run_reset_integrity,
+)
+from tradepulse.session_commands import (
     run_reset_risk as _run_reset_risk,
+)
+from tradepulse.session_commands import (
     run_start as _run_start,
+)
+from tradepulse.session_commands import (
     run_status as _run_status,
+)
+from tradepulse.session_commands import (
     run_stop as _run_stop,
 )
 from tradepulse.settlement import SettlementBatchSummary, SettlementProcessor
@@ -507,7 +521,12 @@ async def _run_reconcile(settings: Settings) -> int:
             )
             from tradepulse.verification.opening import load_bound_opening_checkpoint
             if await database.run(load_bound_opening_checkpoint) is not None:
-                from tradepulse.valuation import marked_snapshot, observe_broker_valuation, record_valuation, reconciliation_outcome
+                from tradepulse.valuation import (
+                    marked_snapshot,
+                    observe_broker_valuation,
+                    reconciliation_outcome,
+                    record_valuation,
+                )
                 account, positions = await observe_broker_valuation(broker)
                 snapshot = await marked_snapshot(repositories, account, positions, now=datetime.now(UTC))
                 await record_valuation(repositories, snapshot)
@@ -1123,7 +1142,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     configure_logging(settings.log_level)
 
-    from tradepulse.verification.commands import command as verification_command, permit_command, run_official
+    from tradepulse.verification.commands import command as verification_command
+    from tradepulse.verification.commands import permit_command, run_official
     generation = getattr(args, "verification_generation", None)
     if not permit_command(settings, args.command, generation):
         return 1

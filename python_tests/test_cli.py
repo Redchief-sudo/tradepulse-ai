@@ -260,7 +260,6 @@ async def test_three_lane_concurrent_scan_locks_independently_and_survives_one_c
         observed_lanes.append(asset_class)
         if asset_class == AssetClass.CRYPTO:
             raise RuntimeError("simulated crypto-lane crash")
-        return None  # None -> _log_scan_result treats it as a clean no-op, same as a lock-skip
 
     monkeypatch.setattr("tradepulse.cli.run_scan_cycle", _stub_scan_cycle)
     positions_route = respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[]))

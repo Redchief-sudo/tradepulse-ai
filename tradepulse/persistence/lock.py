@@ -105,7 +105,7 @@ async def run_with_lock_renewal(
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
                 return  # stop was set -- work finished
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             if not await renew_lock(database, lock_key, owner_token, ttl_seconds):
                 if on_renewal_failed is not None:

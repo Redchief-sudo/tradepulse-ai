@@ -45,14 +45,22 @@ REPO_ROOT = TOOL_DIR.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TOOL_DIR))
 
-from tradepulse.strategy.regime import Calendar, Regime, classify_regime  # noqa: E402
-from tradepulse.strategy.universe import DEFAULT_CRYPTO_UNIVERSE, DEFAULT_EQUITY_UNIVERSE  # noqa: E402
 from calibrate_exit_params import FOLDS  # noqa: E402
 from diagnose_signal_sparsity import (  # noqa: E402
-    COMPOSITE_BUCKETS, HORIZONS, Sample, _aggregate_bucket_metrics, _bucket_for,
-    _forward_metrics, _hypothetical_long_outcome, _r_metrics, generate_daily_samples,
+    COMPOSITE_BUCKETS,
+    HORIZONS,
+    Sample,
+    _aggregate_bucket_metrics,
+    _bucket_for,
+    _forward_metrics,
+    _hypothetical_long_outcome,
+    _r_metrics,
+    generate_daily_samples,
 )
 from simulate_trades import CACHE_ROOT, _benchmark_closes_as_of  # noqa: E402
+
+from tradepulse.strategy.regime import Calendar, Regime, classify_regime  # noqa: E402
+from tradepulse.strategy.universe import DEFAULT_CRYPTO_UNIVERSE, DEFAULT_EQUITY_UNIVERSE  # noqa: E402
 
 RESULTS_PATH = CACHE_ROOT / "entry_composite_audit.json"
 SPARSITY_DIAGNOSTIC_PATH = CACHE_ROOT / "sparsity_diagnostic.json"

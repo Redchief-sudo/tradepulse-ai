@@ -28,9 +28,10 @@ against developers.openai.com's function-calling guide rather than assumed:
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import UTC, datetime
-from typing import Any, Mapping
+from typing import Any
 
 import httpx
 

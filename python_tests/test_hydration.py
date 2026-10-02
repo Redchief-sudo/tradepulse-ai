@@ -34,7 +34,6 @@ from tradepulse.models import (
 from tradepulse.persistence import hydrate
 from tradepulse.persistence.codec import decode_payload, encode_payload
 
-
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
 
 

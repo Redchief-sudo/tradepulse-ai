@@ -16,9 +16,10 @@ must fail closed (skip the candidate/pass), matching the fail-closed
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import UTC, datetime
-from typing import Any, Mapping
+from typing import Any
 
 import httpx
 
