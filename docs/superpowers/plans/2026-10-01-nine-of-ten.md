@@ -25,6 +25,8 @@ Broker-side protective stops (F3) change exit semantics and get their own design
 - Commits are GPG-signed. Use `git commit -F -` with a `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` trailer. The full suite must pass before each revision commit.
 - Each revision adds `docs/revNNN-<slug>.md` in the existing style (finding, change, validation).
 - Keep explanatory `# noqa: BLE001 - <reason>` comments. Keep the `Decimal("2")` house style.
+- Separate runtime resources while a soak runs. Never start `tradepulse run`, the dashboard, a soak, or anything that calls the live Alpaca account from the worktree, since port 8766 and the paper account belong to the running soak. Tests use `tmp_path` databases and respx/AsyncMock brokers only.
+- A missing `broker_order_id` never proves an order was not submitted. Only Alpaca's definitive 404 for the intent's `client_order_id` (= `trade_intent_id`) may close a stranded intent, and only while holding, and renewing, the asset's execution reservation.
 
 ## Review Focus
 
@@ -33,6 +35,8 @@ Broker-side protective stops (F3) change exit semantics and get their own design
 3. **Opening-inventory positions in a bound generation.** These must not raise unmanaged-position alerts, while the same symbol at a different quantity must (Task 3 tests).
 4. **Dashboard GET polling and curl usage.** GETs must keep working without the control header. A mutation with no `Origin` header (curl, tests) is allowed when the header is present (Task 6 tests).
 5. **The cumulative cap on options.** Held notional must include the x100 multiplier, which it does because it comes from the broker `market_value` (Task 5 test `test_held_option_notional_counts_toward_position_cap`).
+6. **A restart with integrity holds present.** The stranded-intent sweep must never alter or clear an integrity hold or the session latch (Task 2 test `test_sweep_preserves_integrity_holds_and_session_latch`).
+7. **Soak evidence vs runtime cadence.** The soak's lane-continuity criterion must use the same interval as the runtime lane (Task 4 test `test_soak_lane_criteria_match_runtime_intervals`).
 
 ---
 
@@ -215,6 +219,26 @@ async def test_sweep_ignores_young_intent(tmp_path):
     broker.get_order_by_client_order_id.assert_not_awaited()
 
 
+async def test_sweep_preserves_integrity_holds_and_session_latch(tmp_path):
+    """Restart scenario: a latched session and a disputed-order hold survive the sweep untouched."""
+    from tradepulse.models import IntegrityHold, IntegrityHoldType
+    from tradepulse.risk import latch_financial_integrity_block, load_session
+
+    repositories = await _repositories(tmp_path)
+    await latch_financial_integrity_block(repositories, "pre-existing latch", clock=lambda: NOW)
+    hold = IntegrityHold(broker_order_id="order-1", trade_intent_id="other", hold_type=IntegrityHoldType.FILL_QUANTITY_DISPUTED,
+                         reason="INTEGRITY_VIOLATION: disputed", created_at=NOW)
+    await repositories.integrity_holds.create_once("order-1", hold, status=hold.hold_type.value)
+    hold_before = await repositories.integrity_holds.get("order-1")
+    session_before = await load_session(repositories)
+    await _stranded(repositories)
+    broker = AsyncMock()
+    broker.get_order_by_client_order_id.return_value = None
+    assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 1
+    assert await repositories.integrity_holds.get("order-1") == hold_before
+    assert await load_session(repositories) == session_before
+
+
 async def test_sweep_skips_asset_with_live_reservation(tmp_path):
     repositories = await _repositories(tmp_path)
     await _stranded(repositories)
@@ -241,13 +265,16 @@ async def _recover_stranded_intents(repositories, broker, alerts, now, lease_los
 
     A crash or early return between RISK_APPROVED and broker acceptance leaves
     an intent has_in_flight_intent treats as in flight forever, blocking every
-    later order on its asset -- protective exits included. Each is resolved
-    under the asset's execution reservation, so a live submission is never
-    raced: adopt Alpaca's order if it has one for this client_order_id,
-    otherwise close the intent as never submitted. A failed lookup proves
-    nothing and changes nothing.
+    later order on its asset -- protective exits included. A missing broker
+    id proves nothing about submission, so each intent is resolved only by
+    Alpaca's answer for its client_order_id, under the asset's execution
+    reservation, held and renewed for the whole resolution so a live
+    submission is never raced.
     """
-    from tradepulse.execution import release_symbol_reservation, reserve_symbol_for_execution
+    from tradepulse.execution import (
+        SYMBOL_LOCK_TTL_SECONDS, execution_lock_key, release_symbol_reservation, reserve_symbol_for_execution,
+    )
+    from tradepulse.persistence import run_with_lock_renewal
 
     database = repositories.trade_intents.database
     rows = await list_all_by_statuses(repositories.trade_intents,
@@ -263,32 +290,39 @@ async def _recover_stranded_intents(repositories, broker, alerts, now, lease_los
         if not await reserve_symbol_for_execution(database, intent.asset, token):
             continue  # a live execution owns this asset -- never race it
         try:
-            try:
-                order = await broker.get_order_by_client_order_id(intent.trade_intent_id)
-            except Exception as exc:  # noqa: BLE001 - an unavailable lookup proves nothing; retry next pass
-                await _record(repositories, reconciliation_type="order", subject_id=intent.trade_intent_id,
-                              outcome=ReconciliationOutcome.DRIFT_DETECTED, expected={"stranded_intent_resolved": True},
-                              actual={"error": str(exc), "status": intent.status.value}, occurred_at=now)
-                continue
-            if order is not None:
-                updated = replace(intent, status=TradeIntentStatus.ACCEPTED, broker_order_id=order.broker_order_id,
-                                  client_order_id=intent.trade_intent_id)
-                action = "adopted the broker order Alpaca holds for this client_order_id"
-            else:
-                updated = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason="STRANDED_BEFORE_SUBMISSION")
-                action = "closed: Alpaca has no order for this client_order_id"
-            await repositories.trade_intents.update(intent.trade_intent_id, updated, status=updated.status.value)
-            await _record(repositories, reconciliation_type="order", subject_id=intent.trade_intent_id,
-                          outcome=ReconciliationOutcome.CORRECTED, expected={"stranded_intent_resolved": True},
-                          actual={"previous_status": intent.status.value, "status": updated.status.value,
-                                  "broker_order_id": updated.broker_order_id},
-                          occurred_at=now, corrective_action=action)
-            await alerts.send("warning", f"Stranded {intent.status.value} intent for {intent.asset.symbol} resolved: {action}",
-                              {"trade_intent_id": intent.trade_intent_id})
-            resolved += 1
+            if await run_with_lock_renewal(database, execution_lock_key(intent.asset), token, SYMBOL_LOCK_TTL_SECONDS,
+                                           _resolve_stranded(repositories, broker, alerts, intent, now)):
+                resolved += 1
         finally:
             await release_symbol_reservation(database, intent.asset, token)
     return resolved
+
+
+async def _resolve_stranded(repositories, broker, alerts, intent, now) -> bool:
+    """Adopt Alpaca's order for this client_order_id, or close the intent on a definitive 404."""
+    try:
+        order = await broker.get_order_by_client_order_id(intent.trade_intent_id)
+    except Exception as exc:  # noqa: BLE001 - an unavailable lookup proves nothing; retry next pass
+        await _record(repositories, reconciliation_type="order", subject_id=intent.trade_intent_id,
+                      outcome=ReconciliationOutcome.DRIFT_DETECTED, expected={"stranded_intent_resolved": True},
+                      actual={"error": str(exc), "status": intent.status.value}, occurred_at=now)
+        return False
+    if order is not None:
+        updated = replace(intent, status=TradeIntentStatus.ACCEPTED, broker_order_id=order.broker_order_id,
+                          client_order_id=intent.trade_intent_id)
+        action = "adopted the broker order Alpaca holds for this client_order_id"
+    else:
+        updated = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason="STRANDED_BEFORE_SUBMISSION")
+        action = "closed: Alpaca has no order for this client_order_id"
+    await repositories.trade_intents.update(intent.trade_intent_id, updated, status=updated.status.value)
+    await _record(repositories, reconciliation_type="order", subject_id=intent.trade_intent_id,
+                  outcome=ReconciliationOutcome.CORRECTED, expected={"stranded_intent_resolved": True},
+                  actual={"previous_status": intent.status.value, "status": updated.status.value,
+                          "broker_order_id": updated.broker_order_id},
+                  occurred_at=now, corrective_action=action)
+    await alerts.send("warning", f"Stranded {intent.status.value} intent for {intent.asset.symbol} resolved: {action}",
+                      {"trade_intent_id": intent.trade_intent_id})
+    return True
 ```
 
 In `run_reconciliation`, insert this immediately before `await _recover_inflight_orders(repositories, broker, settlement, alerts, now, lease_lost)`:
@@ -312,6 +346,7 @@ Expected: exit 0. If an existing reconciliation test's mock broker raises on the
 
 **Interfaces:**
 - Produces: `MonitorCycleSummary.unmanaged_positions: int`. Audit event id format: `unmanaged_position:<asset_key>:<UTC date>`.
+- Alerting is immediate: the first cycle that sees an unprotected position (at most 30 s after it appears, per Task 4) sends a critical alert. Later cycles that day only count it, so Telegram isn't flooded every cycle.
 
 - [ ] **Step 1: Write the failing tests** (`python_tests/test_monitor_unmanaged.py`)
 
@@ -430,11 +465,59 @@ Expected: exit 0. If `create_once` returns `None` instead of `True` on insert, t
 
 - [ ] **Step 5: Commit** (message: `feat: alert once a day on broker positions with no protection (Rev.115 part 3)`)
 
-### Task 4: Correct stale lane comments, tighten monitor cadence, ship Rev.115
+### Task 4: Correct stale lane comments, tighten monitor cadence with one interval authority, ship Rev.115
 
 **Files:**
-- Modify: `tradepulse/monitor/coordinator.py:150-157` and `:171-175`; `tradepulse/cli.py:156`
+- Create: `tradepulse/config/lanes.py` (the single lane-interval authority)
+- Modify: `tradepulse/cli.py:153-157` (the interval constants come from it); `tradepulse/verification/soak.py:26` (`REQUIRED_LANES` comes from it); `tradepulse/monitor/coordinator.py:150-157` and `:171-175` (comments)
+- Test: `python_tests/test_accounting_soak.py` (append)
 - Create: `docs/rev115-position-protection-liveness.md`
+
+The soak's lane-continuity criterion (`REQUIRED_LANES`, maximum gap `2 x interval + 120`) used to duplicate the runtime intervals. Changing only the runtime would leave the evidence check six times looser than the lane, so both must read one authority.
+
+- [ ] **Step 0: Write the failing test** (append to `python_tests/test_accounting_soak.py`)
+
+```python
+def test_soak_lane_criteria_match_runtime_intervals():
+    from tradepulse import cli
+    from tradepulse.config.lanes import LANE_INTERVAL_SECONDS
+    from tradepulse.verification.soak import REQUIRED_LANES
+
+    assert REQUIRED_LANES == LANE_INTERVAL_SECONDS
+    assert (cli.EQUITY_SCAN_INTERVAL_SECONDS, cli.CRYPTO_SCAN_INTERVAL_SECONDS, cli.OPTION_SCAN_INTERVAL_SECONDS,
+            cli.MONITOR_INTERVAL_SECONDS, cli.SETTLE_INTERVAL_SECONDS) == tuple(
+        LANE_INTERVAL_SECONDS[k] for k in ("equity", "crypto", "option", "monitor", "settle"))
+    assert LANE_INTERVAL_SECONDS["monitor"] == 30
+```
+
+Run it: `PYTHONPATH=$PWD /home/damien/tradepulse-ai/.venv/bin/python -m pytest python_tests/test_accounting_soak.py -k lane_criteria -q`. Expected: FAIL, `ModuleNotFoundError: No module named 'tradepulse.config.lanes'`.
+
+Create `tradepulse/config/lanes.py`:
+
+```python
+"""The single authority for supervised lane intervals (seconds).
+
+The runtime schedules each lane at this cadence and the soak's lane-continuity
+evidence (verification/soak.py) bounds gaps from the same values, so the two
+can never drift apart. The monitor runs every 30 s because stops are evaluated
+in software (see the Phase 4 broker-side stop spec).
+"""
+LANE_INTERVAL_SECONDS = {"equity": 900, "crypto": 600, "option": 1200, "monitor": 30, "settle": 60, "reconcile": 60}
+```
+
+In `tradepulse/cli.py`, replace the five interval constants with:
+
+```python
+from tradepulse.config.lanes import LANE_INTERVAL_SECONDS
+
+EQUITY_SCAN_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["equity"]
+CRYPTO_SCAN_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["crypto"]
+OPTION_SCAN_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["option"]
+MONITOR_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["monitor"]
+SETTLE_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["settle"]
+```
+
+In `tradepulse/verification/soak.py`, replace the `REQUIRED_LANES = {...}` literal with `REQUIRED_LANES = LANE_INTERVAL_SECONDS`, imported from `tradepulse.config.lanes`. Check that the verification-generation reconcile lane in `cli.py` still uses a 60 s cadence; if it has its own constant, route it through `LANE_INTERVAL_SECONDS["reconcile"]` too.
 
 - [ ] **Step 1: Replace the stale comments.** In `_fetch_atr`'s docstring, replace the sentence beginning "an unguarded fetch here would propagate out of this module" through "for the rest of the run." with:
 
@@ -447,7 +530,7 @@ an unguarded fetch here would propagate out of this module and out of
 
 In the defense-in-depth comment, replace "since _supervised_lane never restarts a lane after an unhandled exception, this one matters enough" with "since a lane failure leaves every position unchecked until _supervised_lane's backoff restart, this one matters enough".
 
-- [ ] **Step 2: Tighten the cadence.** In `tradepulse/cli.py` set `MONITOR_INTERVAL_SECONDS = 30` and add the comment `# stops are software-evaluated (see Phase 4 spec); bound the unchecked window`.
+- [ ] **Step 2: Confirm the cadence.** `MONITOR_INTERVAL_SECONDS` is now 30 through `LANE_INTERVAL_SECONDS` (Step 0). Re-run the Step 0 test and expect PASS.
 
 - [ ] **Step 3: Write `docs/rev115-position-protection-liveness.md`** using the established revision-note format. Its "Finding" section covers F1, F5 and F6. "Changes" describes Tasks 1-4 with their exact reason strings (`BROKER_POSITIONS_UNAVAILABLE`, `BROKER_EXIT_QUANTITY_CHANGED`, `STRANDED_BEFORE_SUBMISSION`, `UNMANAGED_POSITION`) and the 120 → 30 s cadence. "Validation" lists the new test files.
 
