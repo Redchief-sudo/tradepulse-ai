@@ -71,6 +71,11 @@ class RiskLimits:
     options_expiry_max_days: int = 45
     options_target_otm_pct: Decimal = Decimal("3")
     options_forced_close_days_before_expiry: int = 2
+    # Option spreads are quoted relative to a small premium (5 cents on a $3
+    # contract is 1.7%), so share-calibrated limits block nearly every
+    # option. None falls back to the shared limits.
+    options_spread_limit_pct: Decimal | None = None
+    options_slippage_limit_pct: Decimal | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "profile_id", require_text(self.profile_id, "profile_id"))
@@ -84,6 +89,9 @@ class RiskLimits:
             "max_correlation_threshold_crypto",
         ):
             object.__setattr__(self, name, decimal_value(getattr(self, name), name, nonnegative=True))
+        for name in ("options_spread_limit_pct", "options_slippage_limit_pct"):
+            if getattr(self, name) is not None:
+                object.__setattr__(self, name, decimal_value(getattr(self, name), name, nonnegative=True))
         for name in ("max_daily_trades", "max_open_positions", "max_simultaneous_orders"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be at least 1")
@@ -101,3 +109,17 @@ class RiskLimits:
             raise ValueError("max_correlation_threshold must not exceed 1 (a Pearson correlation coefficient)")
         if self.max_correlation_threshold_crypto > 1:
             raise ValueError("max_correlation_threshold_crypto must not exceed 1 (a Pearson correlation coefficient)")
+
+    def spread_limit_for(self, asset_class) -> Decimal:
+        """Maximum quoted spread (% of mid) for a buy of this asset class."""
+        from .enums import AssetClass
+        if asset_class == AssetClass.OPTION and self.options_spread_limit_pct is not None:
+            return self.options_spread_limit_pct
+        return self.spread_limit_pct
+
+    def slippage_limit_for(self, asset_class) -> Decimal:
+        """Maximum estimated slippage (%) for a buy of this asset class."""
+        from .enums import AssetClass
+        if asset_class == AssetClass.OPTION and self.options_slippage_limit_pct is not None:
+            return self.options_slippage_limit_pct
+        return self.slippage_limit_pct

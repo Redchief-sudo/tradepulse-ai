@@ -83,13 +83,15 @@ from tradepulse.strategy import (
     FactorScores,
     Signal,
     atr,
+    choose_liquid_contract,
     classify_regime,
     compute_real_factors,
     factor_breakdown,
     is_executable,
+    option_candidates,
     pearson_correlation,
-    select_contract,
     signal_from_composite,
+    spread_pct,
     weighted_composite,
 )
 from tradepulse.valuation import marked_snapshot, observe_broker_valuation, record_valuation
@@ -449,6 +451,17 @@ def _build_scan_prompt(symbols: list[str], asset_class: AssetClass) -> str:
     )
 
 
+def _option_asset(contract) -> AssetIdentity:
+    return AssetIdentity(
+        symbol=contract.occ_symbol, asset_class=AssetClass.OPTION, native_asset_id=f"alpaca:{contract.occ_symbol}",
+        metadata={
+            "underlying_symbol": contract.underlying_symbol, "expiry": contract.expiry.isoformat(),
+            "strike": str(contract.strike), "option_type": contract.option_type,
+            "contract_multiplier": str(contract.contract_multiplier),
+        },
+    )
+
+
 def _asset_from_candidate(candidate: OpportunityCandidate) -> AssetIdentity:
     asset_class = AssetClass.CRYPTO if "/" in candidate.symbol else AssetClass.EQUITY
     return AssetIdentity(symbol=candidate.symbol, asset_class=asset_class, native_asset_id=f"alpaca:{candidate.symbol.upper()}")
@@ -764,26 +777,38 @@ async def run_scan_cycle(
             except ProviderError as exc:
                 await _reject(candidate.symbol, "OPTION_CHAIN_FETCH_FAILED", error=str(exc))
                 continue
-            contract = select_contract(
+            contracts = option_candidates(
                 "call", quote.price, chain, min_dte=risk_limits.options_expiry_min_days,
                 max_dte=risk_limits.options_expiry_max_days, target_otm_pct=risk_limits.options_target_otm_pct, now=now.date(),
             )
-            if contract is None:
+            if not contracts:
                 await _reject(candidate.symbol, "NO_ELIGIBLE_OPTION_CONTRACT")
                 continue
-            trade_asset = AssetIdentity(
-                symbol=contract.occ_symbol, asset_class=AssetClass.OPTION, native_asset_id=f"alpaca:{contract.occ_symbol}",
-                metadata={
-                    "underlying_symbol": contract.underlying_symbol, "expiry": contract.expiry.isoformat(),
-                    "strike": str(contract.strike), "option_type": contract.option_type,
-                    "contract_multiplier": str(contract.contract_multiplier),
-                },
-            )
-            try:
-                trade_quote = await market_data.fetch_quote(trade_asset)
-            except ProviderError as exc:
-                await _reject(candidate.symbol, "OPTION_QUOTE_FETCH_FAILED", error=str(exc))
+            # Quote the strikes nearest the target and trade the nearest one
+            # whose spread is executable (Rev.113); a wide target strike no
+            # longer discards a liquid neighbour.
+            quoted_contracts = []
+            quote_errors = []
+            for option in contracts:
+                option_asset = _option_asset(option)
+                try:
+                    option_quote = await market_data.fetch_quote(option_asset)
+                except ProviderError as exc:
+                    quote_errors.append(str(exc))
+                    continue
+                quoted_contracts.append((option, option_quote.bid, option_quote.ask, option_asset, option_quote))
+            chosen = choose_liquid_contract([row[:3] for row in quoted_contracts],
+                                            risk_limits.spread_limit_for(AssetClass.OPTION))
+            if chosen is None:
+                await _reject(candidate.symbol, "OPTION_QUOTE_FETCH_FAILED", error="; ".join(quote_errors))
                 continue
+            _, _, _, trade_asset, trade_quote = next(row for row in quoted_contracts if row[0] == chosen[0])
+            logger.info("option_contract_selected", extra={
+                "event": "option_contract_selected", "symbol": candidate.symbol, "contract": trade_asset.symbol,
+                "considered": [{"contract": row[0].occ_symbol, "spread_pct": f"{spread_pct(row[1], row[2]):.2f}"}
+                               for row in quoted_contracts],
+                "quote_errors": len(quote_errors),
+            })
         else:
             trade_asset = asset
             trade_quote = quote

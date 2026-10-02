@@ -182,23 +182,26 @@ def evaluate_risk(
 
     # Spread limit -- fail closed if bid/ask unavailable or spread excessive.
     # internal_paper/shadow_live have no real market data (skip_market_data_checks).
-    if intent.side == Side.BUY and limits.spread_limit_pct and not opts.skip_market_data_checks:
+    # Options carry their own, wider limits (see RiskLimits.spread_limit_for).
+    spread_limit = limits.spread_limit_for(intent.asset_class)
+    slippage_limit = limits.slippage_limit_for(intent.asset_class)
+    if intent.side == Side.BUY and spread_limit and not opts.skip_market_data_checks:
         if opts.bid is None or opts.ask is None:
             reasons.append("NO_QUOTE_DATA_FOR_SPREAD_CHECK")
         else:
             mid = (opts.bid + opts.ask) / 2
             if mid > 0:
                 spread_pct = ((opts.ask - opts.bid) / mid) * 100
-                if spread_pct > limits.spread_limit_pct:
-                    reasons.append(f"SPREAD_EXCEEDS_LIMIT ({spread_pct:.2f}% > {limits.spread_limit_pct}%)")
+                if spread_pct > spread_limit:
+                    reasons.append(f"SPREAD_EXCEEDS_LIMIT ({spread_pct:.2f}% > {spread_limit}%)")
 
     # Slippage limit -- fail closed if no estimate supplied.
-    if intent.side == Side.BUY and limits.slippage_limit_pct and not opts.skip_market_data_checks:
+    if intent.side == Side.BUY and slippage_limit and not opts.skip_market_data_checks:
         if opts.estimated_slippage_pct is None:
             reasons.append("NO_SLIPPAGE_ESTIMATE")
-        elif opts.estimated_slippage_pct > limits.slippage_limit_pct:
+        elif opts.estimated_slippage_pct > slippage_limit:
             reasons.append(
-                f"SLIPPAGE_EXCEEDS_LIMIT ({opts.estimated_slippage_pct:.2f}% > {limits.slippage_limit_pct}%)"
+                f"SLIPPAGE_EXCEEDS_LIMIT ({opts.estimated_slippage_pct:.2f}% > {slippage_limit}%)"
             )
 
     if intent.side == Side.BUY and not opts.protective_exit and opts.max_drawdown_breached:

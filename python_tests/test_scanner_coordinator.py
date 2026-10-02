@@ -2233,3 +2233,45 @@ async def test_opening_inventory_guard_is_instrument_exact(tmp_path, monkeypatch
 
     assert order_route.call_count == 1
     assert summary.orders_submitted == 1
+
+
+@respx.mock
+async def test_options_scan_trades_the_nearest_liquid_strike_when_the_target_is_too_wide(tmp_path) -> None:
+    """Rev.113: the target strike's 3.8% spread exceeds the 2.5% option
+    limit; the next-nearest strike (1.0%) is chosen and executed instead of
+    the whole candidate being rejected."""
+    repositories, broker, ai_provider, market_data, gateway, limits = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_market_open()
+    respx.post("https://api.anthropic.com/v1/messages").mock(return_value=httpx.Response(
+        200, json=_tool_use_response([{"symbol": "AAPL", "recommendation": "BUY", "confidence": 90, "summary": "Strong momentum."}])))
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_bars(_BULLISH_CLOSES)
+    _mock_spy_bars()
+    stamp = (NOW + timedelta(days=30)).date()
+    occ = {strike: "AAPL" + stamp.strftime("%y%m%d") + f"C00{strike}000" for strike in ("205", "210", "200")}
+    respx.get("https://paper-api.alpaca.markets/v2/options/contracts").mock(return_value=httpx.Response(200, json={
+        "option_contracts": [{"symbol": symbol, "underlying_symbol": "AAPL", "type": "call", "strike_price": strike,
+                              "expiration_date": stamp.isoformat(), "multiplier": "100", "status": "active", "tradable": True}
+                             for strike, symbol in occ.items()],
+        "next_page_token": None}))
+    quotes = {occ["205"]: (2.00, 2.077), occ["210"]: (1.00, 1.01), occ["200"]: (4.00, 4.01)}
+
+    def _quote(request: httpx.Request) -> httpx.Response:
+        symbol = request.url.params["symbols"]
+        bid, ask = quotes[symbol]
+        return httpx.Response(200, json={"quotes": {symbol: {"bp": bid, "ap": ask, "t": QUOTE_TS}}})
+
+    respx.get("https://data.alpaca.markets/v1beta1/options/quotes/latest").mock(side_effect=_quote)
+    order_route = _mock_options_dynamic_full_fill(occ["210"], price="1.01")
+
+    summary = await run_scan_cycle(repositories, ai_provider, market_data, broker, gateway, OPTIONS_UNIVERSE, limits, AssetClass.OPTION, clock=lambda: NOW)
+    await broker.aclose()
+    await ai_provider.aclose()
+
+    assert order_route.call_count == 1
+    assert summary.orders_submitted == 1
+    opportunity = hydrate("opportunities", (await repositories.opportunities.list_all())[0]["payload"])
+    assert opportunity.asset.symbol == occ["210"]
