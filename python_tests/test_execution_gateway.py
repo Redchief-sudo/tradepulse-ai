@@ -823,7 +823,7 @@ async def test_regime_multiplier_none_and_regime_snapshot_none_leave_risk_snapsh
         "reasons", "confidence", "entry_price", "stop_loss", "contract_multiplier",
             "requested_quantity", "approved_quantity", "risk_profile", "max_hold_days",
             "reference_bid", "reference_ask", "reference_observed_at", "estimated_slippage_pct",
-            "order_type", "signal_timestamp",
+            "order_type", "signal_timestamp", "broker_account_number",
     }
 
 
@@ -1555,3 +1555,35 @@ async def test_concurrent_buys_for_different_symbols_serialize_through_portfolio
     assert any(status in ("filled", "pending", "rejected") for status in statuses)  # the winner reached a real decision, not silently dropped
     skipped = [r for r in results if r.status == "skipped"]
     assert skipped[0].reasons == ["PORTFOLIO_RISK_EVALUATION_LOCKED"]
+
+
+@respx.mock
+async def test_crypto_protective_exit_position_reread_failure_closes_the_intent(tmp_path) -> None:
+    """F1: a failed pre-submission position re-read must not leave a
+    RISK_APPROVED intent that blocks every later exit on the asset."""
+    from tradepulse.execution import has_in_flight_intent
+
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account(cash="50000", equity="100000", last_equity="100000")
+    position = {"symbol": "BTC/USD", "asset_class": "crypto", "qty": "1", "avg_entry_price": "60000",
+                "market_value": "60000", "current_price": "60000", "unrealized_pl": "0"}
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(side_effect=[
+        httpx.Response(200, json=[position]),
+        httpx.Response(503, json={"message": "unavailable"}),
+    ])
+    respx.get("https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes").mock(
+        return_value=httpx.Response(200, json={"quotes": {"BTC/USD": {"bp": 60000.0, "ap": 60010.0, "t": QUOTE_TS}}}))
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    result = await gateway.execute_intent(ExecutionRequest(asset=_btc(), side=Side.SELL, requested_quantity=Decimal("1"),
+                                                           strategy="position_monitor", decision_id="exit-1"))
+    await broker.aclose()
+
+    assert result.status == "rejected"
+    assert any(r.startswith("BROKER_POSITIONS_UNAVAILABLE") for r in result.reasons)
+    assert order_route.call_count == 0
+    intent = (await repositories.trade_intents.list_all())[0]["payload"]
+    assert intent["status"] == "rejected"
+    assert "broker_account_number" in intent["risk_snapshot"]
+    assert await has_in_flight_intent(repositories, _btc()) is False

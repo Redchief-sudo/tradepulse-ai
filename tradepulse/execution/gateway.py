@@ -377,6 +377,10 @@ class ExecutionGateway:
                 # lookup would drift). Pure provenance, same shape as the
                 # regime_snapshot merge below -- not a decision input.
                 "max_hold_days": str(self._risk_limits.max_hold_days),
+                # The account this intent was approved on. Stranded-intent
+                # recovery may only close the intent after a definitive
+                # not-found from this same account.
+                "broker_account_number": account.account_number,
             }
             # Market Regime Phase 2 -- merged in verbatim, un-interpreted
             # (see ExecutionRequest.regime_snapshot's own docstring). Never
@@ -466,16 +470,14 @@ class ExecutionGateway:
                     matched = [p for p in fresh if asset_key_from_broker_symbol(p.asset_class, p.symbol)
                                == asset_identity_key(request.asset)]
                     if len(matched) != 1 or risk.approved_quantity > abs(matched[0].qty):
-                        return ExecutionResult("skipped", trade_intent_id, ["BROKER_EXIT_QUANTITY_CHANGED"], Decimal(0), None)
+                        return await self._reject_before_submission(approved, "BROKER_EXIT_QUANTITY_CHANGED")
                     held_quantity = matched[0].qty
                 except (AlpacaError, AlpacaDataIntegrityError, httpx.HTTPError) as exc:
-                    return ExecutionResult("skipped", trade_intent_id, [f"BROKER_POSITIONS_UNAVAILABLE: {exc}"], Decimal(0), None)
+                    return await self._reject_before_submission(approved, f"BROKER_POSITIONS_UNAVAILABLE: {exc}")
             try:
                 await reserve_epoch(self._repositories, approved, held_quantity, protective=protective_exit, now=now)
             except AccountingEpochPending as exc:
-                rejected = replace(approved, status=TradeIntentStatus.REJECTED, rejection_reason=str(exc))
-                await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
-                return ExecutionResult("rejected", trade_intent_id, [str(exc)], Decimal(0), None)
+                return await self._reject_before_submission(approved, str(exc))
 
         order_request = AlpacaOrderRequest(
             symbol=request.asset.symbol, qty=risk.approved_quantity, side=request.side,
@@ -506,6 +508,14 @@ class ExecutionGateway:
         await self._repositories.trade_intents.update(trade_intent_id, accepted, status=accepted.status.value)
 
         return await self._poll_and_settle(accepted)
+
+    async def _reject_before_submission(self, intent: TradeIntent, reason: str) -> ExecutionResult:
+        """No order was placed. Close the intent so has_in_flight_intent never
+        treats it as in flight -- a stranded RISK_APPROVED intent would block
+        every later order on the asset, protective exits included."""
+        rejected = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason=reason)
+        await self._repositories.trade_intents.update(intent.trade_intent_id, rejected, status=rejected.status.value)
+        return ExecutionResult("rejected", intent.trade_intent_id, [reason], Decimal("0"), None)
 
     async def _recover_unknown_submission(self, intent: TradeIntent, cause: Exception) -> ExecutionResult:
         """Called whenever a broker submission's outcome is ambiguous (see
