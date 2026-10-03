@@ -551,6 +551,7 @@ async def test_scan_action_crypto_never_checks_market_state(tmp_path, monkeypatc
     database = AsyncSQLiteDatabase(database_url)
     await database.initialize()
     repositories = PersistenceRepositories.create(database)
+    await save_session(repositories, TradingSession(SESSION_RECORD_ID, SessionState.ACTIVE, True, datetime.now(UTC)))
     alerts = TelegramAlerter(None, None)
     settings = _settings(database_url)
 
@@ -577,6 +578,7 @@ async def test_scan_action_confirmed_closed_skips_cycle_and_waits_full_interval(
     database = AsyncSQLiteDatabase(database_url)
     await database.initialize()
     repositories = PersistenceRepositories.create(database)
+    await save_session(repositories, TradingSession(SESSION_RECORD_ID, SessionState.ACTIVE, True, datetime.now(UTC)))
     alerts = TelegramAlerter(None, None)
     settings = _settings(database_url)
 
@@ -606,6 +608,7 @@ async def test_scan_action_indeterminate_market_state_uses_bounded_retry_not_ful
     database = AsyncSQLiteDatabase(database_url)
     await database.initialize()
     repositories = PersistenceRepositories.create(database)
+    await save_session(repositories, TradingSession(SESSION_RECORD_ID, SessionState.ACTIVE, True, datetime.now(UTC)))
     alerts = TelegramAlerter(None, None)
     settings = _settings(database_url)
 
@@ -796,9 +799,15 @@ async def test_run_trading_supervisor_genuine_concurrency_not_serial(tmp_path, m
     database = AsyncSQLiteDatabase(database_url)
     await database.initialize()
     repositories = PersistenceRepositories.create(database)
+    await save_session(repositories, TradingSession(SESSION_RECORD_ID, SessionState.ACTIVE, True, datetime.now(UTC)))
     alerts = TelegramAlerter(None, None)
     settings = _settings(database_url)
     settlement = SettlementProcessor(repositories, alerts)
+
+    async def _stub_reconcile(settings) -> int:
+        return 0
+
+    monkeypatch.setattr("tradepulse.cli._run_reconcile", _stub_reconcile)
 
     equity_blocked = asyncio.Event()
     equity_may_proceed = asyncio.Event()
@@ -854,6 +863,11 @@ async def test_run_trading_supervisor_settlement_fires_independently(tmp_path, m
     settings = _settings(database_url)
     settlement = SettlementProcessor(repositories, alerts)
 
+    async def _stub_reconcile(settings) -> int:
+        return 0
+
+    monkeypatch.setattr("tradepulse.cli._run_reconcile", _stub_reconcile)
+
     settle_calls = 0
 
     async def _stub_settle(*args, **kwargs):
@@ -899,9 +913,15 @@ async def test_run_trading_supervisor_lane_failure_is_isolated_and_recorded(tmp_
     database = AsyncSQLiteDatabase(database_url)
     await database.initialize()
     repositories = PersistenceRepositories.create(database)
+    await save_session(repositories, TradingSession(SESSION_RECORD_ID, SessionState.ACTIVE, True, datetime.now(UTC)))
     alerts = TelegramAlerter(None, None)
     settings = _settings(database_url)
     settlement = SettlementProcessor(repositories, alerts)
+
+    async def _stub_reconcile(settings) -> int:
+        return 0
+
+    monkeypatch.setattr("tradepulse.cli._run_reconcile", _stub_reconcile)
 
     other_activity: set[str] = set()
     equity_attempts = 0
@@ -1006,13 +1026,13 @@ async def test_run_application_lock_lifecycle_refuses_duplicate_and_releases_on_
     assert await acquire_lock(database, RUN_LOCK_KEY, "post-check", "run", ttl_seconds=60) is True
 
 
-async def test_run_application_never_starts_supervisor_when_session_activation_refused(tmp_path, monkeypatch) -> None:
-    """The second correction: a refused `run_start()` (RISK_STOPPED,
-    FINANCIAL_INTEGRITY_BLOCKED, broker unreachable, ...) must never launch
-    scan/monitor/settlement work, even though downstream execution gates
-    would separately also refuse orders -- honoring the refusal must not
-    depend on those gates catching it. The dashboard stays up regardless,
-    so an operator can see why and fix it."""
+async def test_run_application_still_starts_supervisor_when_session_activation_refused(tmp_path, monkeypatch) -> None:
+    """Rev.115: a refused `run_start()` (RISK_STOPPED, FINANCIAL_INTEGRITY_BLOCKED,
+    broker unreachable, ...) must never leave open positions without a monitor,
+    settlement or reconciliation, so the supervisor always starts. The scan
+    lanes idle on their own session check (_scan_lane_enabled), and honoring the
+    refusal no longer means starving protection. The dashboard stays up so an
+    operator can see why."""
     database_url = f"sqlite:///{tmp_path}/test.db"
     settings = _settings(database_url)
 
@@ -1041,7 +1061,7 @@ async def test_run_application_never_starts_supervisor_when_session_activation_r
 
     assert exit_code == 0  # the process itself doesn't fail -- the dashboard stays up for diagnosis
     assert dashboard_ran is True
-    assert supervisor_calls == 0
+    assert supervisor_calls == 1  # protection (monitor/settle/reconcile) must run; scan lanes idle until the session is active
 
 
 async def test_run_application_starts_supervisor_when_session_already_market_closed(tmp_path, monkeypatch) -> None:
@@ -1084,7 +1104,7 @@ async def test_run_application_starts_supervisor_when_session_already_market_clo
     assert supervisor_calls == 1  # crypto/monitor/settle must still get scheduled
 
 
-async def test_run_application_still_refuses_supervisor_from_a_fresh_disabled_session(tmp_path, monkeypatch) -> None:
+async def test_run_application_still_gates_activation_but_starts_supervisor_from_a_fresh_disabled_session(tmp_path, monkeypatch) -> None:
     """Symmetry check: the MARKET_CLOSED bypass above must not accidentally
     widen to every state -- a brand-new (DISABLED) session still goes
     through the real _run_start gate exactly as before."""
@@ -1116,4 +1136,4 @@ async def test_run_application_still_refuses_supervisor_from_a_fresh_disabled_se
 
     assert exit_code == 0
     assert run_start_calls == 1  # the real gate still runs for a non-MARKET_CLOSED session
-    assert supervisor_calls == 0
+    assert supervisor_calls == 1  # ...but its refusal no longer strands protection: scan lanes idle instead

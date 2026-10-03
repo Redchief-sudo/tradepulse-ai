@@ -81,7 +81,7 @@ from tradepulse.config import (
 )
 from tradepulse.config.logging import configure_logging
 from tradepulse.execution import ExecutionGateway
-from tradepulse.models import AssetClass, AuditEvent, SessionState
+from tradepulse.models import AssetClass, AuditEvent, SessionState, TradingSession
 from tradepulse.monitor import MonitorCycleSummary, run_position_monitor
 from tradepulse.persistence import (
     AsyncSQLiteDatabase,
@@ -156,6 +156,30 @@ OPTION_SCAN_INTERVAL_SECONDS = 1200
 MONITOR_INTERVAL_SECONDS = 120
 SETTLE_INTERVAL_SECONDS = 60
 VERIFICATION_RECONCILE_INTERVAL_SECONDS = 60
+RECONCILE_INTERVAL_SECONDS = 60
+SCAN_IDLE_POLL_SECONDS = 30
+_RESUMABLE_STATES = frozenset({SessionState.ACTIVE, SessionState.MARKET_CLOSED})
+
+
+def _scan_lane_enabled(session: TradingSession) -> bool:
+    """Scanning (AI calls, market data, new exposure) follows the session.
+    Every other lane only protects or accounts for existing exposure and runs
+    regardless -- protective exits are allowed in every halted state
+    (risk/session.py::execution_session_decision)."""
+    return session.state in _RESUMABLE_STATES and session.trading_active
+
+
+def _should_activate(state: SessionState, *, resume: bool) -> bool:
+    """`run --resume` (the supervised service) never activates a session an
+    operator stopped or a safety latch halted -- it only continues trading
+    that was already on. Interactive `run` keeps its existing behavior; the
+    hard-blocked states are still refused by _run_start itself."""
+    return state in _RESUMABLE_STATES if resume else True
+
+
+async def _reconcile_action(settings: Settings) -> float:
+    await _run_reconcile(settings)
+    return RECONCILE_INTERVAL_SECONDS
 # Bounded retry after an INDETERMINATE market-clock check (broker/network
 # trouble) -- distinct from a CONFIRMED-closed result, which correctly
 # waits the full lane interval instead (see _scan_action). Short enough to
@@ -619,6 +643,8 @@ async def _scan_action(
     check, then delegates the actual work to _run_scan_leg unchanged. Crypto
     is a continuous market -- no clock gating, matching scan's own standalone
     behavior."""
+    if not _scan_lane_enabled(await load_session(repositories)):
+        return SCAN_IDLE_POLL_SECONDS  # idle: no AI call, no market data, no scan record
     if asset_class != AssetClass.CRYPTO:
         market_state = await _check_market_state(broker)
         if market_state == "indeterminate":
@@ -809,10 +835,12 @@ async def _run_trading_supervisor(
         "monitor": lambda: _periodic_loop(lambda: _monitor_action(database, repositories, broker, market_data, gateway, alerts, settings), shutdown, sleep, **heartbeat('monitor')),
         "settle": lambda: _periodic_loop(lambda: _settle_action(database, repositories, settlement, alerts), shutdown, sleep, **heartbeat('settle')),
     }
-    if verification_enabled:
-        lanes["reconcile"] = lambda: _periodic_loop(
-            lambda: _verification_reconcile_action(settings, repositories, broker), shutdown, sleep, **heartbeat('reconcile'),
-        )
+    lanes["reconcile"] = (
+        (lambda: _periodic_loop(lambda: _verification_reconcile_action(settings, repositories, broker),
+                                shutdown, sleep, **heartbeat('reconcile')))
+        if verification_enabled else
+        (lambda: _periodic_loop(lambda: _reconcile_action(settings), shutdown, sleep))
+    )
     await asyncio.gather(*(_supervised_lane(name, factory, repositories, alerts, shutdown, sleep) for name, factory in lanes.items()))
 
 
@@ -863,7 +891,8 @@ async def _open_browser_when_ready(
         logger.warning("run_browser_open_failed", extra={"event": "run_browser_open_failed", "error": str(exc)})
 
 
-async def _run_application(settings: Settings, port: int, open_browser: bool, *, verification: Any | None = None) -> int:
+async def _run_application(settings: Settings, port: int, open_browser: bool, *, verification: Any | None = None,
+                           resume: bool = False) -> int:
     """`tradepulse run`: the normal one-command interactive startup -- opens
     the local dashboard, activates the trading session, and keeps the
     equity/crypto/option scan lanes, position monitor, and settlement
@@ -927,6 +956,10 @@ async def _run_application(settings: Settings, port: int, open_browser: bool, *,
         if current_session.state == SessionState.MARKET_CLOSED:
             logger.info("run_session_already_active_market_closed", extra={"event": "run_session_already_active_market_closed"})
             start_result = 0
+        elif not _should_activate(current_session.state, resume=resume):
+            logger.warning("run_resume_session_not_active", extra={"event": "run_resume_session_not_active",
+                                                                    "state": current_session.state.value})
+            start_result = 1
         else:
             start_result = await _run_start(settings)
         if start_result == 0 and verification is not None:
@@ -949,16 +982,15 @@ async def _run_application(settings: Settings, port: int, open_browser: bool, *,
         trading_task: asyncio.Task[None] | None = None
         if start_result != 0:
             logger.error("run_session_activation_failed", extra={"event": "run_session_activation_failed"})
-            # Dashboard still comes up -- an operator needs to SEE why
-            # activation failed (RISK_STOPPED? FINANCIAL_INTEGRITY_BLOCKED?
-            # broker unreachable?) and use its controls to fix it. But no
-            # scan/monitor/settlement task may start against a session the
-            # authoritative activation command just refused -- downstream
-            # execution gates are not a substitute for honoring that
-            # refusal. v1 does not auto-detect a later fix and auto-start
-            # the supervisor -- restart `tradepulse run` after correcting
-            # the condition.
-        else:
+            # The dashboard still comes up so an operator can see why.
+        if start_result == 0 or verification is None:
+            # Every lane always starts outside a verification generation: a
+            # refused activation must never leave open positions without a
+            # monitor, settlement or reconciliation. Scan lanes idle until the
+            # session is active (_scan_lane_enabled), so `tradepulse start`
+            # resumes scanning without a restart. Inside a verification
+            # generation a refused start still shuts the run down (the soak
+            # runner owns retries).
             trading_task = asyncio.create_task(
                 _run_trading_supervisor(
                     database, repositories, ai_provider, market_data, broker, gateway, settlement, settings, alerts,
@@ -1039,6 +1071,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--port", type=int, default=8000, help="port to bind the dashboard on 127.0.0.1 (default: 8000)")
     run_parser.add_argument("--no-browser", action="store_true", help="don't automatically open the dashboard in a browser")
+    run_parser.add_argument("--resume", action="store_true", help="supervised restart: continue only an already-active session; never re-activate a stopped or latched one")
     run_parser.add_argument("--verification-generation", help="require the frozen official paper-verification generation")
     from tradepulse.verification.commands import add_parser as add_verification_parser
     add_verification_parser(subparsers)
@@ -1165,9 +1198,9 @@ def main(argv: list[str] | None = None) -> int:
             if generation is not None:
                 return asyncio.run(run_official(
                     settings, generation,
-                    lambda verification: _run_application(settings, args.port, not args.no_browser, verification=verification),
+                    lambda verification: _run_application(settings, args.port, not args.no_browser, verification=verification, resume=args.resume),
                 ))
-            return asyncio.run(_run_application(settings, args.port, not args.no_browser))
+            return asyncio.run(_run_application(settings, args.port, not args.no_browser, resume=args.resume))
         return asyncio.run(_COMMANDS[args.command](settings))
     except (SettingsError, MarketDataCapabilityError) as exc:
         print(f"tradepulse: {exc}", file=sys.stderr)
