@@ -365,3 +365,35 @@ async def test_runner_pipeline_preserves_report_and_never_starts_official(runner
     assert command.call_args_list[0].args[0]["TRADEPULSE_EXECUTION_MODE"] == "paper"
     assert command.call_args_list[0].args[0]["TRADEPULSE_LIVE_TRADING_ENABLED"] == "false"
     assert (tmp_path / "report.runtime.log").stat().st_mode & 0o777 == 0o600
+
+
+def test_soak_lane_criteria_match_runtime_intervals():
+    from tradepulse import cli
+    from tradepulse.config.lanes import LANE_INTERVAL_SECONDS
+    from tradepulse.verification.soak import REQUIRED_LANES
+
+    assert REQUIRED_LANES == LANE_INTERVAL_SECONDS
+    assert (cli.EQUITY_SCAN_INTERVAL_SECONDS, cli.CRYPTO_SCAN_INTERVAL_SECONDS, cli.OPTION_SCAN_INTERVAL_SECONDS,
+            cli.MONITOR_INTERVAL_SECONDS, cli.SETTLE_INTERVAL_SECONDS, cli.RECONCILE_INTERVAL_SECONDS) == tuple(
+        LANE_INTERVAL_SECONDS[k] for k in ("equity", "crypto", "option", "monitor", "settle", "reconcile"))
+    assert cli.VERIFICATION_RECONCILE_INTERVAL_SECONDS == LANE_INTERVAL_SECONDS["reconcile"]
+    assert LANE_INTERVAL_SECONDS["monitor"] == 30
+
+
+def test_monitor_stall_over_two_minutes_breaks_continuity():
+    from tradepulse.config.lanes import LANE_MAX_GAP_SECONDS
+    from tradepulse.verification.soak import _lane_evidence
+
+    assert LANE_MAX_GAP_SECONDS["monitor"] == 120
+    assert LANE_MAX_GAP_SECONDS["reconcile"] == 2 * 60 + 120  # unchanged for other lanes
+    start = datetime(2026, 10, 2, 14, tzinfo=UTC)
+
+    def cycles(offsets):
+        return [{"event_type": "verification_lane_cycle", "details": {"lane": "monitor"},
+                 "occurred_at": (start + timedelta(seconds=s)).isoformat()} for s in offsets]
+
+    segment = [{"started_at": start.isoformat(), "ended_at": (start + timedelta(seconds=600)).isoformat()}]
+    healthy = _lane_evidence(cycles(range(30, 600, 30)), segment)["monitor"]
+    stalled = _lane_evidence(cycles([30, 60, 210, *range(240, 600, 30)]), segment)["monitor"]
+    assert healthy["continuous"] and healthy["maximum_permitted_gap_seconds"] == 120
+    assert not stalled["continuous"]  # a 150 s silence

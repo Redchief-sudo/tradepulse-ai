@@ -79,6 +79,7 @@ from tradepulse.config import (
     profile_id_for_equity,
     risk_limits_for_profile,
 )
+from tradepulse.config.lanes import LANE_INTERVAL_SECONDS
 from tradepulse.config.logging import configure_logging
 from tradepulse.execution import ExecutionGateway
 from tradepulse.models import AssetClass, AuditEvent, SessionState, TradingSession
@@ -150,13 +151,13 @@ RECONCILE_LOCK_TTL_SECONDS = 600
 # the README's own crontab example exactly -- not configurable in this pass.
 RUN_LOCK_KEY = "run"
 RUN_LOCK_TTL_SECONDS = 60
-EQUITY_SCAN_INTERVAL_SECONDS = 900
-CRYPTO_SCAN_INTERVAL_SECONDS = 600
-OPTION_SCAN_INTERVAL_SECONDS = 1200
-MONITOR_INTERVAL_SECONDS = 120
-SETTLE_INTERVAL_SECONDS = 60
-VERIFICATION_RECONCILE_INTERVAL_SECONDS = 60
-RECONCILE_INTERVAL_SECONDS = 60
+EQUITY_SCAN_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["equity"]
+CRYPTO_SCAN_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["crypto"]
+OPTION_SCAN_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["option"]
+MONITOR_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["monitor"]
+SETTLE_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["settle"]
+RECONCILE_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["reconcile"]
+VERIFICATION_RECONCILE_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["reconcile"]
 SCAN_IDLE_POLL_SECONDS = 30
 _RESUMABLE_STATES = frozenset({SessionState.ACTIVE, SessionState.MARKET_CLOSED})
 

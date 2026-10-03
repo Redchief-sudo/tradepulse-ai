@@ -154,11 +154,10 @@ async def _fetch_atr(market_data: AlpacaMarketDataProvider, asset: AssetIdentity
     200-day default sized for regime/composite scoring. None on ANY
     failure (ProviderError, insufficient history, or atr() itself
     returning None) -- see run_position_monitor's own docstring note: an
-    unguarded fetch here would propagate out of this module, out of
-    _periodic_loop, and PERMANENTLY end this lane's scheduling
-    (cli.py::_supervised_lane never restarts a lane after an unhandled
-    exception) -- the position-protection safety net going dark silently
-    for the rest of the run. Degrading to "skip the trailing update this
+    unguarded fetch here would propagate out of this module and out of
+    _periodic_loop, failing the whole monitor lane; cli.py::_supervised_lane
+    restarts it with capped backoff, but every position would go unchecked
+    until then. Degrading to "skip the trailing update this
     cycle, keep whatever stop is already in force" is the only acceptable
     failure mode here."""
     from decimal import InvalidOperation
@@ -174,10 +173,10 @@ async def _fetch_atr(market_data: AlpacaMarketDataProvider, asset: AssetIdentity
         # (a ProviderError), so the except ProviderError clause above should
         # already catch this in practice. Kept as a second layer -- same
         # redundant-guard precedent as _classify_lane_regime's own bare
-        # `except Exception` around classify_regime -- since _supervised_lane
-        # never restarts a lane after an unhandled exception, this one
-        # matters enough not to depend solely on the provider boundary
-        # staying correct forever.
+        # `except Exception` around classify_regime -- since a lane failure
+        # leaves every position unchecked until _supervised_lane's backoff
+        # restart, this one matters enough not to depend solely on the
+        # provider boundary staying correct forever.
         return None
     value = atr([float(c.high) for c in candles], [float(c.low) for c in candles], [float(c.close) for c in candles])
     return Decimal(str(value)) if value is not None else None

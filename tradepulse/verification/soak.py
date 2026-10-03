@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+from tradepulse.config.lanes import LANE_INTERVAL_SECONDS, LANE_MAX_GAP_SECONDS
 from tradepulse.time import aware_utc
 
 from .evidence import assess, number, snapshot_database
@@ -23,7 +24,7 @@ from .opening import database_identity, load_opening_checkpoint
 
 SOAK_SCHEMA = "tradepulse-accounting-soak-v1"
 AUTHORIZED_COSTS = {"fee_bps": "25", "slippage_bps": "15"}
-REQUIRED_LANES = {"equity": 900, "crypto": 600, "option": 1200, "monitor": 120, "settle": 60, "reconcile": 60}
+REQUIRED_LANES = LANE_INTERVAL_SECONDS
 MINIMUM_SECONDS = {1: 12 * 3600, 2: 24 * 3600}
 MINIMUM_RESTART_SECONDS = 30 * 60
 # Alpaca's server clock and the local receive clock are independent; observed
@@ -130,7 +131,7 @@ def _segments(events: list[dict], generation: str) -> tuple[list[dict], list[str
 
 def _lane_evidence(events: list[dict], segments: list[dict]) -> dict:
     result = {}
-    for lane, interval in REQUIRED_LANES.items():
+    for lane in REQUIRED_LANES:
         stamps = sorted(aware_utc(event["occurred_at"]) for event in events
                         if event["event_type"] == "verification_lane_cycle" and event["details"].get("lane") == lane)
         all_gaps = []
@@ -140,12 +141,12 @@ def _lane_evidence(events: list[dict], segments: list[dict]) -> dict:
             inside = [stamp for stamp in stamps if start <= stamp <= end]
             # A bounded extra cycle budget allows real work to finish; a lane
             # silent for more than two schedules plus two minutes is unproven.
-            maximum = 2 * interval + 120
+            maximum = LANE_MAX_GAP_SECONDS[lane]
             gaps = [(right - left).total_seconds() for left, right in zip([start, *inside], [*inside, end])]
             all_gaps.extend(gaps)
             covered = covered and bool(inside) and all(gap <= maximum for gap in gaps)
         result[lane] = {"completed_cycles": len(stamps), "maximum_gap_seconds": max(all_gaps) if all_gaps else None,
-                        "maximum_permitted_gap_seconds": 2 * interval + 120, "continuous": covered}
+                        "maximum_permitted_gap_seconds": LANE_MAX_GAP_SECONDS[lane], "continuous": covered}
     return result
 
 
