@@ -14,10 +14,13 @@ import os
 import signal
 import sqlite3
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Direct script execution retains the installed package as the authority.
-from tradepulse.verification.integrity import VerificationError
+from tradepulse.cli import _load_dotenv
+from tradepulse.verification.integrity import VerificationError, write_once
+from tradepulse.verification.opening import load_opening_checkpoint
 from tradepulse.verification.soak import MINIMUM_RESTART_SECONDS, MINIMUM_SECONDS, create_soak_report
 
 logger = logging.getLogger("tradepulse.accounting_soak")
@@ -32,6 +35,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--hours", type=float, default=None, help="may extend the minimum 12/24-hour uninterrupted session")
     result.add_argument("--restart-minutes", type=float, default=30, help="restart exercise duration; minimum 30 minutes")
     result.add_argument("--port", type=int, default=8765)
+    result.add_argument("--acknowledge-fee-day", action="append", metavar="YYYYMMDD",
+                        help="accept a trade day's fees as complete after checking the statement by hand; "
+                             "recorded in preflight.json")
     return result
 
 
@@ -115,18 +121,103 @@ async def _session(environment, log, database: Path, generation: str, port: int,
             await _graceful_stop(process)
 
 
+_FEE_EVIDENCE = (("equity_sell", "REG"), ("option", "OCC"))
+
+
+async def preflight(broker, *, now: datetime | None = None, lookback_days: int = 10,
+                    acknowledged: frozenset[str] = frozenset()) -> dict:
+    """Necessary opening conditions; the membership latch stays the sufficient backstop.
+
+    Alpaca posts fee rows in an end-of-day batch with a midnight-of-trade-date
+    id that sorts before the day's fills. A pre-generation fee that posts after
+    the opening classifies as unresolved membership and latches the integrity
+    block. Each recent trade day therefore needs explicit, expected fee
+    evidence and a completed end-of-day boundary, unless the operator
+    acknowledges that day after checking the account statement.
+    """
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    now = now or datetime.now(UTC)
+    eastern = now.astimezone(ZoneInfo("America/New_York"))
+    today = eastern.strftime("%Y%m%d")
+    earliest = (eastern - timedelta(days=lookback_days)).strftime("%Y%m%d")
+    account = await broker.get_account()
+    problems = []
+    if await broker.get_open_orders():
+        problems.append("OPEN_BROKER_ORDERS")
+    activities = [dict(a.raw) for a in await broker.get_activities(activity_type=None)]
+    fills = [r for r in activities if r.get("activity_type") == "FILL" and r["id"][:8] >= earliest]
+    if any(r["id"][:8] == today for r in fills):
+        problems.append("PRE_GENERATION_TRADE_TODAY")
+    fees = {(r["id"][:8], r.get("activity_sub_type")) for r in activities if r.get("activity_type") == "FEE"}
+    fee_days: dict[str, dict] = {}
+    for fill in fills:
+        symbol, day = str(fill.get("symbol", "")), fill["id"][:8]
+        kind = ("option" if len(symbol) > 12
+                else "equity_sell" if fill.get("side") == "sell" and "/" not in symbol else None)
+        if kind is not None:
+            fee_days.setdefault(day, {"kinds": set(), "acknowledged": day in acknowledged})["kinds"].add(kind)
+    for day in sorted(fee_days):
+        entry = fee_days[day]
+        if day >= today:  # never waivable: no end-of-day batch can have run yet
+            problems.append("FEE_DAY_NOT_CLOSED:" + day)
+            continue
+        if entry["acknowledged"]:
+            continue  # waives a missing fee subtype only, for a validated past day
+        problems.extend(f"FEE_EVIDENCE_MISSING:{day}:{subtype}" for kind, subtype in _FEE_EVIDENCE
+                        if kind in entry["kinds"] and (day, subtype) not in fees)
+    valid_ack = {day for day in fee_days if earliest <= day < today}
+    problems.extend(f"ACKNOWLEDGEMENT_INVALID:{value}" for value in sorted(acknowledged)
+                    if not (len(value) == 8 and value.isdigit() and value in valid_ack))
+    return {"problems": problems,
+            "fee_days": {day: {"kinds": sorted(e["kinds"]), "acknowledged": e["acknowledged"]} for day, e in fee_days.items()},
+            "account": {"account_id": account.account_id, "account_number": account.account_number}}
+
+
+async def _broker_preflight(environment: dict, report_dir: Path, acknowledged: frozenset[str]) -> dict:
+    """Build the broker from exactly the effective paper configuration the runtime receives."""
+    from tradepulse.config import Settings
+    from tradepulse.session_commands import build_broker
+
+    settings = Settings.from_env(environment)
+    if settings.execution_mode != "paper" or settings.live_trading_enabled:
+        raise VerificationError("soak_preflight_requires_paper_configuration")
+    broker = build_broker(settings)
+    try:
+        result = await preflight(broker, acknowledged=acknowledged)
+    finally:
+        await broker.aclose()
+    await asyncio.to_thread(write_once, report_dir / "preflight.json", result)  # write_once serializes canonical JSON itself
+    if result["problems"]:
+        raise VerificationError("soak_preflight_refused:" + ",".join(result["problems"]))
+    return result["account"]
+
+
+async def _verify_opening_account(database: Path, account: dict) -> None:
+    """The frozen opening checkpoint must be bound to the account the preflight inspected."""
+    from tradepulse.verification.integrity import canonical, digest
+
+    checkpoint = await asyncio.to_thread(load_opening_checkpoint, database)
+    if checkpoint is None or checkpoint["account_identity_digest"] != digest(canonical(account)):
+        raise VerificationError("soak_opening_account_mismatch")
+
+
 async def run(args) -> int:
     database, report, generation, duration = await asyncio.to_thread(configuration, args)
+    _load_dotenv()
     environment = dict(os.environ)
     environment.update(TRADEPULSE_DATABASE_URL=f"sqlite:///{database}", TRADEPULSE_EXECUTION_MODE="paper",
                        TRADEPULSE_LIVE_TRADING_ENABLED="false")
     await asyncio.to_thread(report.parent.mkdir, parents=True, exist_ok=True)
     log = await asyncio.to_thread(_private_log, report.parent / (report.stem + ".runtime.log"))
     try:
+        account = await _broker_preflight(environment, report.parent, frozenset(args.acknowledge_fee_day or ()))
         code = await _command(environment, log, "verification", "freeze", "--generation", generation,
                               "--fee-bps", "25", "--slippage-bps", "15")
         if code:
             raise VerificationError("soak_freeze_failed_see_private_runtime_log")
+        await _verify_opening_account(database, account)
         code = await _session(environment, log, database, generation, args.port, duration)
         if code == 0:
             # Standalone reconciliation runs only after the first supervisor

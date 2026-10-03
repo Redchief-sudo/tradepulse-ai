@@ -301,6 +301,10 @@ def runner():
     spec = importlib.util.spec_from_file_location("accounting_soak_runner", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    module._real_broker_preflight = module._broker_preflight
+    module._real_verify_opening_account = module._verify_opening_account
+    module._broker_preflight = AsyncMock()
+    module._verify_opening_account = AsyncMock()
     return module
 
 
@@ -397,3 +401,89 @@ def test_monitor_stall_over_two_minutes_breaks_continuity():
     stalled = _lane_evidence(cycles([30, 60, 210, *range(240, 600, 30)]), segment)["monitor"]
     assert healthy["continuous"] and healthy["maximum_permitted_gap_seconds"] == 120
     assert not stalled["continuous"]  # a 150 s silence
+
+
+def _preflight_broker(activities, open_orders=(), account_number="PA1"):
+    broker = AsyncMock()
+    broker.get_open_orders.return_value = list(open_orders)
+    broker.get_activities.return_value = [SimpleNamespace(raw=a) for a in activities]
+    broker.get_account.return_value = SimpleNamespace(account_id="acct-1", account_number=account_number)
+    return broker
+
+
+PREFLIGHT_NOW = datetime(2026, 10, 2, 14, tzinfo=UTC)  # 10:00 ET, 2026-10-02
+OPTION_BUY_0929 = {"id": "20260929135313600::a", "activity_type": "FILL", "symbol": "IWM261030C00286000", "side": "buy"}
+OCC_0929 = {"id": "20260929000000000::b", "activity_type": "FEE", "activity_sub_type": "OCC"}
+SELL_0929 = {"id": "20260929094227714::c", "activity_type": "FILL", "symbol": "AAPL", "side": "sell"}
+REG_0929 = {"id": "20260929000000000::d", "activity_type": "FEE", "activity_sub_type": "REG"}
+
+
+async def test_preflight_clear_with_complete_fee_evidence(runner):
+    result = await runner.preflight(_preflight_broker([OCC_0929, REG_0929, SELL_0929, OPTION_BUY_0929]), now=PREFLIGHT_NOW)
+    assert result["problems"] == []
+    assert result["account"] == {"account_id": "acct-1", "account_number": "PA1"}
+
+
+async def test_preflight_refuses_partial_fee_batch(runner):
+    # OCC posted, but REG for the same day's sell not yet: a partial batch
+    result = await runner.preflight(_preflight_broker([OCC_0929, SELL_0929, OPTION_BUY_0929]), now=PREFLIGHT_NOW)
+    assert result["problems"] == ["FEE_EVIDENCE_MISSING:20260929:REG"]
+
+
+async def test_preflight_refuses_older_unresolved_fee_day(runner):
+    old_sell = {"id": "20260924093005873::e", "activity_type": "FILL", "symbol": "GOOGL", "side": "sell"}
+    result = await runner.preflight(_preflight_broker([OCC_0929, REG_0929, SELL_0929, OPTION_BUY_0929, old_sell]),
+                                    now=PREFLIGHT_NOW)
+    assert result["problems"] == ["FEE_EVIDENCE_MISSING:20260924:REG"]
+
+
+async def test_preflight_refuses_a_day_whose_batch_cannot_have_run(runner):
+    # a late receipt for today's fills cannot exist yet: today is refused even with a REG row present
+    today_sell = {"id": "20261002094100000::f", "activity_type": "FILL", "symbol": "AAPL", "side": "sell"}
+    today_reg = {"id": "20261002000000000::g", "activity_type": "FEE", "activity_sub_type": "REG"}
+    result = await runner.preflight(_preflight_broker([today_reg, today_sell]), now=PREFLIGHT_NOW)
+    assert result["problems"] == ["PRE_GENERATION_TRADE_TODAY", "FEE_DAY_NOT_CLOSED:20261002"]
+
+
+async def test_preflight_acknowledged_day_is_recorded_not_refused(runner):
+    result = await runner.preflight(_preflight_broker([OCC_0929, SELL_0929, OPTION_BUY_0929]), now=PREFLIGHT_NOW,
+                                    acknowledged=frozenset({"20260929"}))
+    assert result["problems"] == []
+    assert result["fee_days"]["20260929"]["acknowledged"] is True
+
+
+async def test_acknowledgement_never_waives_today_or_same_day_trading(runner):
+    today_sell = {"id": "20261002094100000::f", "activity_type": "FILL", "symbol": "AAPL", "side": "sell"}
+    result = await runner.preflight(_preflight_broker([today_sell]), now=PREFLIGHT_NOW, acknowledged=frozenset({"20261002"}))
+    assert result["problems"] == ["PRE_GENERATION_TRADE_TODAY", "FEE_DAY_NOT_CLOSED:20261002",
+                                  "ACKNOWLEDGEMENT_INVALID:20261002"]
+
+
+async def test_acknowledgement_of_an_unknown_or_malformed_day_is_refused(runner):
+    result = await runner.preflight(_preflight_broker([OCC_0929, REG_0929, SELL_0929, OPTION_BUY_0929]), now=PREFLIGHT_NOW,
+                                    acknowledged=frozenset({"20260930", "2026-09-29"}))
+    assert result["problems"] == ["ACKNOWLEDGEMENT_INVALID:2026-09-29", "ACKNOWLEDGEMENT_INVALID:20260930"]
+
+
+async def test_preflight_json_is_the_result_object(runner, tmp_path, monkeypatch):
+    import json
+
+    broker = _preflight_broker([OCC_0929, REG_0929, SELL_0929, OPTION_BUY_0929])
+    monkeypatch.setattr("tradepulse.session_commands.build_broker", lambda settings: broker)
+    environment = {"TRADEPULSE_EXECUTION_MODE": "paper", "TRADEPULSE_LIVE_TRADING_ENABLED": "false",
+                   "ALPACA_API_KEY": "k", "ALPACA_API_SECRET": "s"}
+    account = await runner._real_broker_preflight(environment, tmp_path, frozenset())
+    stored = json.loads((tmp_path / "preflight.json").read_text())
+    assert isinstance(stored, dict) and stored["problems"] == [] and stored["account"] == account
+
+
+async def test_preflight_refuses_open_orders(runner):
+    result = await runner.preflight(_preflight_broker([], open_orders=[object()]), now=PREFLIGHT_NOW)
+    assert result["problems"] == ["OPEN_BROKER_ORDERS"]
+
+
+async def test_runner_refuses_opening_on_a_different_account(runner, tmp_path, monkeypatch):
+    checkpoint = {"account_identity_digest": digest(canonical({"account_id": "acct-2", "account_number": "PA2"}))}
+    monkeypatch.setattr(runner, "load_opening_checkpoint", lambda database: checkpoint)
+    with pytest.raises(runner.VerificationError, match="soak_opening_account_mismatch"):
+        await runner._real_verify_opening_account(tmp_path / "soak.db", {"account_id": "acct-1", "account_number": "PA1"})
