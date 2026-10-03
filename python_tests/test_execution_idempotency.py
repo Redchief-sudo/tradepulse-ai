@@ -120,7 +120,8 @@ async def test_in_flight_detection_is_correct_behind_a_large_non_blocking_backlo
         )
         await repositories.trade_intents.create_once(f"old-ti-{i}", intent, status=TradeIntentStatus.FILLED.value, unique_value=intent.idempotency_key)
 
-    await asyncio.gather(*(_seed(i) for i in range(1100)))  # same asset, non-blocking terminal status -- pure noise
+    for i in range(1100):  # sequential: the property under test is backlog size, not write concurrency
+        await _seed(i)  # same asset, non-blocking terminal status -- pure noise
     await _seed_intent(repositories, TradeIntentStatus.ACCEPTED)  # the one genuinely blocking intent, "ti-1"
 
     assert await has_in_flight_intent(repositories, _aapl()) is True

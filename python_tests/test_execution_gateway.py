@@ -1507,14 +1507,16 @@ async def test_concurrent_buys_for_different_symbols_serialize_through_portfolio
     max_total_exposure_pct if both read the same stale snapshot. Without
     the portfolio-risk lock, both could read $0 committed and both approve
     a large BUY; with it, exactly one proceeds to order placement and the
-    other is skipped."""
+    other is skipped. The first execution is parked inside the lock (on its
+    account fetch) with an event barrier while the second runs, so the
+    contention is forced rather than left to scheduler timing."""
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     # balanced profile's max_total_exposure_pct is well under 100% -- a
     # $100k-equity account with two simultaneous ~$60k BUYs (AAPL @ ~$199.60,
     # ~300 shares; BTC @ ~$60010, ~1 unit) would together blow it if both
     # were approved against the same starting snapshot.
-    _mock_account(cash="150000", equity="100000", last_equity="100000")
+    account_json = {"equity": "100000", "last_equity": "100000", "cash": "150000", "buying_power": "100000", "portfolio_value": "100000"}
     _mock_positions()
     _mock_quote()
     _mock_market_open()
@@ -1547,14 +1549,30 @@ async def test_concurrent_buys_for_different_symbols_serialize_through_portfolio
     aapl_request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("300"), strategy="test", confidence=Decimal("90"))
     btc_request = ExecutionRequest(asset=_btc(), side=Side.BUY, requested_quantity=Decimal("1"), strategy="test", confidence=Decimal("90"))
 
-    results = await asyncio.gather(gateway.execute_intent(aapl_request), gateway.execute_intent(btc_request))
+    inside_lock, release = asyncio.Event(), asyncio.Event()
+
+    async def account_route(request: httpx.Request) -> httpx.Response:
+        # The first execution parks here -- inside the portfolio-risk lock -- until released.
+        if not inside_lock.is_set():
+            inside_lock.set()
+            await release.wait()
+        return httpx.Response(200, json=account_json)
+
+    respx.get("https://paper-api.alpaca.markets/v2/account").mock(side_effect=account_route)
+
+    first = asyncio.create_task(gateway.execute_intent(aapl_request))
+    await asyncio.wait_for(inside_lock.wait(), timeout=10)
+    second = await gateway.execute_intent(btc_request)  # genuinely concurrent: the first holds the lock now
+    release.set()
+    winner = await asyncio.wait_for(first, timeout=30)
     await broker.aclose()
 
-    statuses = [r.status for r in results]
-    assert statuses.count("skipped") == 1
-    assert any(status in ("filled", "pending", "rejected") for status in statuses)  # the winner reached a real decision, not silently dropped
-    skipped = [r for r in results if r.status == "skipped"]
-    assert skipped[0].reasons == ["PORTFOLIO_RISK_EVALUATION_LOCKED"]
+    assert second.status == "skipped" and second.reasons == ["PORTFOLIO_RISK_EVALUATION_LOCKED"]
+    assert winner.status == "filled"
+    orders = [c.request for c in respx.calls if c.request.method == "POST" and c.request.url.path == "/v2/orders"]
+    assert len(orders) == 1 and b'"AAPL"' in orders[0].content  # one broker submission
+    intents = [row["payload"] for row in await repositories.trade_intents.list_all()]
+    assert [(i["asset"]["symbol"], i["status"]) for i in intents] == [("AAPL", "filled")]  # one approval
 
 
 @respx.mock
