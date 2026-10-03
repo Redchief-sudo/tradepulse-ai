@@ -37,6 +37,7 @@ fill; that case is recorded and alerted, never auto-corrected.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -74,6 +75,8 @@ from tradepulse.time import aware_utc
 
 from ..execution.fill_attribution import resolve_order_from_broker
 from .asset_fees import reconcile_asset_fees
+
+logger = logging.getLogger(__name__)
 
 _OPEN_LOT_STATUSES = ("open", "partially_closed")
 _FILL_MATCH_WINDOW_SECONDS = 300
@@ -525,27 +528,42 @@ async def _recover_stranded_intents(repositories, broker, alerts, now, lease_los
     for row in rows:
         if lease_lost is not None and lease_lost.is_set():
             break
-        candidate = hydrate("trade_intents", row["payload"])
-        if candidate.broker_order_id or (now - candidate.created_at).total_seconds() < STRANDED_INTENT_GRACE_SECONDS:
-            continue
-        token = str(uuid4())
-        if not await reserve_symbol_for_execution(database, candidate.asset, token):
-            continue  # a live execution owns this asset -- never race it
-        fence = asyncio.Event()
-
-        async def on_lost(fence=fence):
-            fence.set()
-
-        leases = [(execution_lock_key(candidate.asset), token), *([reconcile_lease] if reconcile_lease else [])]
+        subject_id = row["record_id"]
+        reserved = None  # (asset, token) once the reservation is ours
         try:
+            candidate = hydrate("trade_intents", row["payload"])
+            if candidate.broker_order_id or (now - candidate.created_at).total_seconds() < STRANDED_INTENT_GRACE_SECONDS:
+                continue
+            token = str(uuid4())
+            if not await reserve_symbol_for_execution(database, candidate.asset, token):
+                continue  # a live execution owns this asset -- never race it
+            reserved = (candidate.asset, token)
+            fence = asyncio.Event()
+
+            async def on_lost(fence=fence):
+                fence.set()
+
+            leases = [(execution_lock_key(candidate.asset), token), *([reconcile_lease] if reconcile_lease else [])]
             if await run_with_lock_renewal(
                 database, execution_lock_key(candidate.asset), token, ttl,
                 _resolve_stranded(repositories, broker, alerts, candidate.trade_intent_id, now, fence, leases),
                 on_renewal_failed=on_lost,
             ):
                 resolved += 1
+        except Exception as exc:  # noqa: BLE001 - one poisoned candidate must not abort the pass or the protective lanes after it
+            try:
+                await _record(repositories, reconciliation_type="order", subject_id=subject_id,
+                              outcome=ReconciliationOutcome.DRIFT_DETECTED,
+                              expected={"stranded_intent_resolved": True},
+                              actual={"error": f"STRANDED_SWEEP_FAILED: {exc}"}, occurred_at=now)
+            except Exception:  # noqa: BLE001 - evidence is best effort; the sweep must still continue
+                logger.exception("stranded_sweep_record_failed", extra={"trade_intent_id": subject_id})
         finally:
-            await release_symbol_reservation(database, candidate.asset, token)
+            if reserved is not None:
+                try:
+                    await release_symbol_reservation(database, reserved[0], reserved[1])
+                except Exception:  # noqa: BLE001 - a failed release expires by TTL; never abort the pass
+                    logger.exception("stranded_sweep_release_failed", extra={"trade_intent_id": subject_id})
     return resolved
 
 

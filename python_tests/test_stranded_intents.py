@@ -239,3 +239,94 @@ async def test_concurrent_status_change_is_never_overwritten(tmp_path):
     assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 0
     payload = await _payload(repositories)
     assert (payload["status"], payload["broker_order_id"]) == ("accepted", "order-live")
+
+
+ETH = AssetIdentity("ETH/USD", AssetClass.CRYPTO, "alpaca:ETH/USD")
+
+
+async def _second_stranded(repositories):
+    intent = TradeIntent("ti-2", "idem-2", "corr-2", ETH, Side.SELL, ExecutionMode.PAPER, "position_monitor",
+                         NOW - timedelta(minutes=10), requested_quantity=Decimal(1),
+                         status=TradeIntentStatus.RISK_APPROVED, risk_snapshot={"broker_account_number": "PA1"})
+    await repositories.trade_intents.create_once("ti-2", intent, status=intent.status.value, unique_value="idem-2")
+
+
+def _poison_btc_reservation(monkeypatch):
+    import tradepulse.execution as execution
+
+    real = execution.reserve_symbol_for_execution
+
+    async def reserve(database, asset, token, *args, **kwargs):
+        if asset == BTC:
+            raise RuntimeError("database is locked")
+        return await real(database, asset, token, *args, **kwargs)
+
+    monkeypatch.setattr(execution, "reserve_symbol_for_execution", reserve)
+
+
+async def test_one_failing_candidate_does_not_stop_the_next_and_leaves_drift_evidence(tmp_path, monkeypatch):
+    repositories = await _repositories(tmp_path)
+    await _stranded(repositories)
+    await _second_stranded(repositories)
+    _poison_btc_reservation(monkeypatch)
+    broker = _broker()
+    broker.get_order_by_client_order_id.return_value = None
+    assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 1
+    assert (await _payload(repositories))["status"] == "risk_approved"
+    assert (await repositories.trade_intents.get("ti-2"))["payload"]["status"] == "rejected"
+    drift = [r["payload"] for r in await repositories.reconciliation_records.list_all()
+             if r["payload"]["outcome"] == "drift_detected"]
+    assert [(r["subject_id"], "database is locked" in r["actual"]["error"]) for r in drift] == [("ti-1", True)]
+
+
+async def test_unhydratable_row_is_recorded_and_skipped(tmp_path, monkeypatch):
+    import tradepulse.reconciliation.coordinator as coordinator
+
+    repositories = await _repositories(tmp_path)
+    await _stranded(repositories)
+    await _second_stranded(repositories)
+    real = coordinator.hydrate
+
+    def hydrate_or_fail(table, payload):
+        if payload.get("trade_intent_id") == "ti-1":
+            raise ValueError("legacy row")
+        return real(table, payload)
+
+    monkeypatch.setattr(coordinator, "hydrate", hydrate_or_fail)
+    broker = _broker()
+    broker.get_order_by_client_order_id.return_value = None
+    assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 1
+
+
+async def test_release_failure_does_not_abort_the_sweep(tmp_path, monkeypatch):
+    import tradepulse.execution as execution
+
+    repositories = await _repositories(tmp_path)
+    await _stranded(repositories)
+    await _second_stranded(repositories)
+
+    async def broken_release(*args, **kwargs):
+        raise RuntimeError("release failed")
+
+    monkeypatch.setattr(execution, "release_symbol_reservation", broken_release)
+    broker = _broker()
+    broker.get_order_by_client_order_id.return_value = None
+    assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 2
+
+
+async def test_run_reconciliation_still_reaches_protective_lanes_when_the_sweep_hits_an_error(tmp_path, monkeypatch):
+    import pytest
+
+    import tradepulse.reconciliation.coordinator as coordinator
+
+    class Reached(Exception):
+        pass
+
+    repositories = await _repositories(tmp_path)
+    await _stranded(repositories)
+    _poison_btc_reservation(monkeypatch)
+    inflight = AsyncMock(side_effect=Reached)  # stops the pass once the next lane is reached
+    monkeypatch.setattr(coordinator, "_recover_inflight_orders", inflight)
+    with pytest.raises(Reached):
+        await coordinator.run_reconciliation(repositories, _broker(), None, _no_op_alerter(), clock=lambda: NOW)
+    inflight.assert_awaited_once()
