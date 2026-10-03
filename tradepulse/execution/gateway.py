@@ -329,6 +329,7 @@ class ExecutionGateway:
                 estimated_slippage_pct=quote.estimated_slippage_pct,
                 held_quantity=abs(held_quantity), available_cash=account.cash,
                 max_drawdown_breached=max_drawdown_breached,
+                held_notional=abs(held_position.market_value) if held_position is not None and request.side == Side.BUY else Decimal("0"),
             )
             risk = evaluate_risk(risk_input, snapshot, self._risk_limits, risk_opts)
             if not risk.approved:

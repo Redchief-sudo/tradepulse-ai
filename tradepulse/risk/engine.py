@@ -125,6 +125,7 @@ class RiskEvalOptions:
     max_drawdown_breached: bool = False
     skip_market_data_checks: bool = False
     held_quantity: Decimal = Decimal("0")
+    held_notional: Decimal = Decimal("0")
     available_cash: Decimal | None = None
     estimated_fees: Decimal = Decimal("0")
 
@@ -303,9 +304,11 @@ def evaluate_risk(
                     approved_qty = risk_based_qty
                     reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_RISK_BASED_SIZING")
 
-        max_position_notional = (limits.max_position_pct / 100) * total_equity
+        # The cap bounds the whole position: notional already held in this
+        # asset (broker market value, multiplier included) consumes it.
+        max_position_notional = (limits.max_position_pct / 100) * total_equity - opts.held_notional
         if approved_qty * notional_per_unit > max_position_notional:
-            approved_qty = _round_qty(max_position_notional / notional_per_unit, intent.asset_class)
+            approved_qty = _round_qty(max(max_position_notional, Decimal(0)) / notional_per_unit, intent.asset_class)
             reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_MAX_POSITION_PCT")
 
         current_sector = snapshot.sector_exposure.get(intent.sector, Decimal("0"))

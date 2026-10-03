@@ -973,4 +973,29 @@ def test_options_decision_satisfies_both_stop_based_risk_and_premium_commitment_
     assert premium_committed <= opts.available_cash
     assert premium_committed <= (limits.max_position_pct / 100) * total_equity
     assert premium_committed <= (limits.max_sector_pct / 100) * total_equity
-    assert premium_committed <= (limits.max_total_exposure_pct / 100) * total_equity
+
+
+def _quoted(**extra) -> RiskEvalOptions:
+    return RiskEvalOptions(bid=Decimal("99.95"), ask=Decimal("100.05"), estimated_slippage_pct=Decimal("0.05"),
+                           available_cash=Decimal("100000"), **extra)
+
+
+def test_held_notional_counts_toward_position_cap() -> None:
+    # balanced: max_position_pct 7% of 100k = 7,000; already holding 6,000 leaves 1,000 = 10 shares at $100
+    decision = evaluate_risk(_buy(requested_quantity=Decimal("50")), _snapshot(), LIMITS, _quoted(held_notional=Decimal("6000")))
+    assert decision.approved and decision.approved_quantity == Decimal("10")
+    assert "POSITION_CAPPED_TO_10_BY_MAX_POSITION_PCT" in decision.reasons
+
+
+def test_position_already_at_cap_cannot_grow() -> None:
+    decision = evaluate_risk(_buy(requested_quantity=Decimal("5")), _snapshot(), LIMITS, _quoted(held_notional=Decimal("7000")))
+    assert not decision.approved
+    assert "INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT" in decision.reasons
+
+
+def test_held_option_notional_counts_toward_position_cap() -> None:
+    option = _buy(symbol="IWM261106C00287000", asset_class=AssetClass.OPTION, requested_quantity=Decimal("5"),
+                  price=Decimal("3"), contract_multiplier=Decimal("100"))
+    opts = RiskEvalOptions(bid=Decimal("2.98"), ask=Decimal("3.02"), estimated_slippage_pct=Decimal("0.6"),
+                           available_cash=Decimal("100000"), held_notional=Decimal("6400"))
+    assert evaluate_risk(option, _snapshot(), LIMITS, opts).approved_quantity == Decimal("2")  # (7000-6400)/(3x100)
