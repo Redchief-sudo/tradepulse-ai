@@ -1,0 +1,21 @@
+[Unit]
+Description=TradePulse trading runtime (paper only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/tradepulse-ai
+# Process environment overrides .env: this unit can never trade live.
+Environment=TRADEPULSE_EXECUTION_MODE=paper TRADEPULSE_LIVE_TRADING_ENABLED=false
+# --resume: continue only an already-active session. An operator stop or a
+# safety latch stays in force across restarts, while monitor, settlement and
+# reconciliation keep protecting existing positions.
+ExecStart=%h/tradepulse-ai/.venv/bin/tradepulse run --no-browser --resume
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGINT
+TimeoutStopSec=900
+
+[Install]
+WantedBy=default.target
