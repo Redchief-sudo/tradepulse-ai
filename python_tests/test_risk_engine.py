@@ -973,6 +973,7 @@ def test_options_decision_satisfies_both_stop_based_risk_and_premium_commitment_
     assert premium_committed <= opts.available_cash
     assert premium_committed <= (limits.max_position_pct / 100) * total_equity
     assert premium_committed <= (limits.max_sector_pct / 100) * total_equity
+    assert premium_committed <= (limits.max_total_exposure_pct / 100) * total_equity
 
 
 def _quoted(**extra) -> RiskEvalOptions:
