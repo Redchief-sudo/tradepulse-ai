@@ -37,6 +37,7 @@ from tradepulse.execution import (
 from tradepulse.models import (
     AssetClass,
     AssetIdentity,
+    AuditEvent,
     Holding,
     PositionLot,
     RiskLimits,
@@ -59,6 +60,7 @@ class MonitorCycleSummary:
     exits_triggered: int
     execution_results: list[ExecutionResult] = field(default_factory=list)
     error: str | None = None
+    unmanaged_positions: int = 0
 
 
 def _breached(position: AlpacaPosition, holding: Holding) -> bool:
@@ -239,6 +241,24 @@ def _time_stopped(lots: list[PositionLot], today: date, max_hold_days: int) -> b
     return (today - oldest_lot.opened_at.date()).days >= max_hold_days
 
 
+async def _report_unmanaged_position(repositories: PersistenceRepositories, alerts: TelegramAlerter,
+                                     position: AlpacaPosition, now: datetime) -> None:
+    """A broker position with no local holding has no stop, target or time
+    stop. Alert on first sighting, then once per asset per UTC day: a
+    deterministic audit event id makes create_once the deduplication."""
+    key = asset_key_from_broker_symbol(position.asset_class, position.symbol)
+    event_id = f"unmanaged_position:{key}:{now.date().isoformat()}"
+    event = AuditEvent(
+        event_id=event_id, event_type="unmanaged_broker_position", severity="critical",
+        message=(f"UNMANAGED_POSITION: {position.symbol} qty {position.qty} has no local holding -- "
+                 "no stop, target or time stop protects it."),
+        occurred_at=now, entity_type="broker_position", entity_id=key,
+        details={"symbol": position.symbol, "asset_class": position.asset_class.value, "qty": str(position.qty)},
+    )
+    if await repositories.audit_events.create_once(event_id, event):
+        await alerts.send("critical", event.message, dict(event.details))
+
+
 async def run_position_monitor(
     repositories: PersistenceRepositories,
     broker: AlpacaClient,
@@ -276,6 +296,18 @@ async def run_position_monitor(
         lot = hydrate("position_lots", row["payload"])
         if lot.status in ("open", "partially_closed"):
             open_lots_by_asset.setdefault(asset_identity_key(lot.asset), []).append(lot)
+
+    # Detection pass first: an unprotected position is reported before any
+    # quote fetch, ratchet or (sequential, possibly slow) exit in this cycle.
+    from tradepulse.reconciliation.membership import opening_quantities
+    from tradepulse.verification.opening import load_bound_opening_checkpoint
+    opening = opening_quantities(await repositories.trade_intents.database.run(load_bound_opening_checkpoint))
+    unmanaged = 0
+    for position in positions:
+        key = asset_key_from_broker_symbol(position.asset_class, position.symbol)
+        if await repositories.holdings.get(key) is None and opening.get(key) != position.qty:
+            unmanaged += 1
+            await _report_unmanaged_position(repositories, alerts, position, clock())
 
     for position in positions:
         if lease_lost is not None and lease_lost.is_set():
@@ -329,4 +361,4 @@ async def run_position_monitor(
         finally:
             await release_symbol_reservation(database, holding.asset, owner_token)
 
-    return MonitorCycleSummary("ok", len(positions), exits_triggered, execution_results)
+    return MonitorCycleSummary("ok", len(positions), exits_triggered, execution_results, unmanaged_positions=unmanaged)
