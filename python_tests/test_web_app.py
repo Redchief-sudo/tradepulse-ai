@@ -49,7 +49,8 @@ async def _client_for(tmp_path, **extra: str):
     state = await build_app_state(settings)
     app = create_app(state)
     transport = httpx.ASGITransport(app=app)
-    client = httpx.AsyncClient(transport=transport, base_url="http://test")
+    client = httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8766",
+                               headers={"X-TradePulse-Control": "1"})
     return client, state
 
 
@@ -649,3 +650,30 @@ async def test_malformed_active_stop_is_visible_error(tmp_path) -> None:
     assert response.json()['detail'] == 'POSITION_DATA_INVALID: AAPL'
     await client.aclose()
     await state.broker.aclose()
+
+
+async def _raw_client(tmp_path, host="127.0.0.1"):
+    state = await build_app_state(_settings(f"sqlite:///{tmp_path}/test.db"))
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(state)), base_url=f"http://{host}:8766")
+
+
+async def test_mutation_without_control_header_is_refused(tmp_path):
+    response = await (await _raw_client(tmp_path)).post("/api/session/stop")
+    assert response.status_code == 403 and response.json()["detail"] == "CONTROL_HEADER_REQUIRED"
+
+
+async def test_cross_origin_mutation_is_refused_even_with_header(tmp_path):
+    response = await (await _raw_client(tmp_path)).post(
+        "/api/session/stop", headers={"X-TradePulse-Control": "1", "Origin": "https://evil.example"})
+    assert response.status_code == 403 and response.json()["detail"] == "ORIGIN_NOT_ALLOWED"
+
+
+async def test_rebound_host_is_refused_for_reads(tmp_path):
+    assert (await (await _raw_client(tmp_path, host="attacker.example")).get("/api/session")).status_code == 403
+
+
+async def test_local_reads_need_no_header_and_local_mutations_work(tmp_path):
+    client = await _raw_client(tmp_path)
+    assert (await client.get("/api/session")).status_code == 200
+    response = await client.post("/api/session/stop", headers={"X-TradePulse-Control": "1", "Origin": "http://127.0.0.1:8766"})
+    assert response.status_code == 200

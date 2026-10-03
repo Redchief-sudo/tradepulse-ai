@@ -39,7 +39,9 @@ async function get<T>(path: string): Promise<T> {
 async function post<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(path, {
     method: 'POST',
-    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    headers: body === undefined
+      ? { 'X-TradePulse-Control': '1' }
+      : { 'Content-Type': 'application/json', 'X-TradePulse-Control': '1' },
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   if (!response.ok) {

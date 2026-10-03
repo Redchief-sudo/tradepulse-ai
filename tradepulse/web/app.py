@@ -21,10 +21,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -40,6 +41,8 @@ from tradepulse.session_commands import build_broker, run_reset_integrity, run_r
 from tradepulse.valuation import marked_snapshot, observe_broker_valuation
 
 _CONFIRMATION_PHRASE = "RESET_FINANCIAL_INTEGRITY"
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost"})
+_CONTROL_HEADER = "X-TradePulse-Control"
 _ACCOUNT_CACHE_SECONDS = 5
 
 
@@ -88,6 +91,23 @@ class ResetIntegrityRequest(BaseModel):
 def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
     app = FastAPI(title="TradePulse Dashboard")
     app.state.tp = state
+
+    @app.middleware("http")
+    async def local_control_guard(request: Request, call_next):
+        """Localhost binding alone does not stop a page in the operator's own
+        browser. Host must be local on every request (defeats DNS rebinding).
+        Mutations also need a local or absent Origin plus a custom header,
+        which a cross-site page cannot send without a CORS preflight this app
+        never grants."""
+        if request.url.hostname not in _LOCAL_HOSTS:
+            return JSONResponse({"detail": "HOST_NOT_ALLOWED"}, status_code=403)
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            origin = request.headers.get("origin")
+            if origin is not None and urlsplit(origin).hostname not in _LOCAL_HOSTS:
+                return JSONResponse({"detail": "ORIGIN_NOT_ALLOWED"}, status_code=403)
+            if request.headers.get(_CONTROL_HEADER) != "1":
+                return JSONResponse({"detail": "CONTROL_HEADER_REQUIRED"}, status_code=403)
+        return await call_next(request)
 
     # ---- Ownership/build provenance ---------------------------------------
     # Pure metadata, never consulted by any trading/risk/session decision --
