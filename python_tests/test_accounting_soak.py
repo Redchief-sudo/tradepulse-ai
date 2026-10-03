@@ -472,9 +472,23 @@ async def test_preflight_json_is_the_result_object(runner, tmp_path, monkeypatch
     monkeypatch.setattr("tradepulse.session_commands.build_broker", lambda settings: broker)
     environment = {"TRADEPULSE_EXECUTION_MODE": "paper", "TRADEPULSE_LIVE_TRADING_ENABLED": "false",
                    "ALPACA_API_KEY": "k", "ALPACA_API_SECRET": "s"}
-    account = await runner._real_broker_preflight(environment, tmp_path, frozenset())
-    stored = json.loads((tmp_path / "preflight.json").read_text())
+    account = await runner._real_broker_preflight(environment, tmp_path / "soak-accounting-1.json", frozenset())
+    stored = json.loads((tmp_path / "soak-accounting-1.preflight.json").read_text())
     assert isinstance(stored, dict) and stored["problems"] == [] and stored["account"] == account
+
+
+async def test_two_reports_in_one_directory_each_get_preflight_evidence(runner, tmp_path, monkeypatch):
+    import json
+
+    broker = _preflight_broker([OCC_0929, REG_0929, SELL_0929, OPTION_BUY_0929])
+    monkeypatch.setattr("tradepulse.session_commands.build_broker", lambda settings: broker)
+    environment = {"TRADEPULSE_EXECUTION_MODE": "paper", "TRADEPULSE_LIVE_TRADING_ENABLED": "false",
+                   "ALPACA_API_KEY": "k", "ALPACA_API_SECRET": "s"}
+    for number in (1, 2):
+        await runner._real_broker_preflight(environment, tmp_path / f"soak-accounting-{number}.json", frozenset())
+    files = sorted(tmp_path.glob("*.preflight.json"))
+    assert [f.name for f in files] == ["soak-accounting-1.preflight.json", "soak-accounting-2.preflight.json"]
+    assert all(isinstance(json.loads(f.read_text()), dict) for f in files)
 
 
 async def test_preflight_refuses_open_orders(runner):

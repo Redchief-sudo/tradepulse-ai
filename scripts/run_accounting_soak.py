@@ -175,7 +175,7 @@ async def preflight(broker, *, now: datetime | None = None, lookback_days: int =
             "account": {"account_id": account.account_id, "account_number": account.account_number}}
 
 
-async def _broker_preflight(environment: dict, report_dir: Path, acknowledged: frozenset[str]) -> dict:
+async def _broker_preflight(environment: dict, report: Path, acknowledged: frozenset[str]) -> dict:
     """Build the broker from exactly the effective paper configuration the runtime receives."""
     from tradepulse.config import Settings
     from tradepulse.session_commands import build_broker
@@ -188,7 +188,7 @@ async def _broker_preflight(environment: dict, report_dir: Path, acknowledged: f
         result = await preflight(broker, acknowledged=acknowledged)
     finally:
         await broker.aclose()
-    await asyncio.to_thread(write_once, report_dir / "preflight.json", result)  # write_once serializes canonical JSON itself
+    await asyncio.to_thread(write_once, report.parent / (report.stem + ".preflight.json"), result)  # write_once serializes canonical JSON itself
     if result["problems"]:
         raise VerificationError("soak_preflight_refused:" + ",".join(result["problems"]))
     return result["account"]
@@ -212,7 +212,7 @@ async def run(args) -> int:
     await asyncio.to_thread(report.parent.mkdir, parents=True, exist_ok=True)
     log = await asyncio.to_thread(_private_log, report.parent / (report.stem + ".runtime.log"))
     try:
-        account = await _broker_preflight(environment, report.parent, frozenset(args.acknowledge_fee_day or ()))
+        account = await _broker_preflight(environment, report, frozenset(args.acknowledge_fee_day or ()))
         code = await _command(environment, log, "verification", "freeze", "--generation", generation,
                               "--fee-bps", "25", "--slippage-bps", "15")
         if code:
