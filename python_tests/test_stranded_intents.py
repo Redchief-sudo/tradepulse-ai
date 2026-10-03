@@ -330,3 +330,54 @@ async def test_run_reconciliation_still_reaches_protective_lanes_when_the_sweep_
     with pytest.raises(Reached):
         await coordinator.run_reconciliation(repositories, _broker(), None, _no_op_alerter(), clock=lambda: NOW)
     inflight.assert_awaited_once()
+
+
+def _recording_alerts():
+    return SimpleNamespace(send=AsyncMock())
+
+
+async def _audit_ids(repositories):
+    return [row["record_id"] for row in await repositories.audit_events.list_all()]
+
+
+async def test_unprovable_intent_alerts_once_per_utc_day_with_one_drift_record(tmp_path):
+    repositories = await _repositories(tmp_path)
+    await _stranded(repositories, account=None)  # pre-Rev.115 intent: no broker_account_number
+    broker = _broker()
+    alerts = _recording_alerts()
+    assert await _recover_stranded_intents(repositories, broker, alerts, NOW) == 0
+    assert await _recover_stranded_intents(repositories, broker, alerts, NOW + timedelta(minutes=1)) == 0
+    assert alerts.send.await_count == 1
+    severity, message = alerts.send.await_args.args[:2]
+    assert severity == "critical"
+    assert "protective exits" in message and "manual resolution" in message
+    assert await _audit_ids(repositories) == ["stranded_intent_unresolved:ti-1:2026-10-01"]
+    records = [r["payload"] for r in await repositories.reconciliation_records.list_all()]
+    assert [r["outcome"] for r in records] == ["drift_detected"]
+    assert records[0]["actual"]["error"] == "ACCOUNT_IDENTITY_UNPROVEN"
+
+
+async def test_unprovable_intent_alerts_again_on_a_later_utc_day(tmp_path):
+    repositories = await _repositories(tmp_path)
+    await _stranded(repositories, account=None)
+    broker = _broker()
+    alerts = _recording_alerts()
+    await _recover_stranded_intents(repositories, broker, alerts, NOW)
+    await _recover_stranded_intents(repositories, broker, alerts, NOW + timedelta(days=1))
+    assert alerts.send.await_count == 2
+    assert sorted(await _audit_ids(repositories)) == ["stranded_intent_unresolved:ti-1:2026-10-01",
+                                                     "stranded_intent_unresolved:ti-1:2026-10-02"]
+    assert len(await repositories.reconciliation_records.list_all()) == 2
+
+
+async def test_transient_lookup_error_keeps_per_pass_drift_and_sends_no_alert(tmp_path):
+    repositories = await _repositories(tmp_path)
+    await _stranded(repositories)
+    broker = _broker()
+    broker.get_order_by_client_order_id.side_effect = RuntimeError("503")
+    alerts = _recording_alerts()
+    await _recover_stranded_intents(repositories, broker, alerts, NOW)
+    await _recover_stranded_intents(repositories, broker, alerts, NOW + timedelta(minutes=1))
+    assert alerts.send.await_count == 0
+    assert await _audit_ids(repositories) == []
+    assert len(await repositories.reconciliation_records.list_all()) == 2

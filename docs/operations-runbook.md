@@ -26,7 +26,7 @@ After an operator stop, a risk stop or an integrity hold, a restart keeps tradin
 
 ## 3. Starting a soak
 
-Stop the service first, because a soak needs exclusive use of the account:
+Stop the service first, because a soak needs exclusive use of the account (the runner now enforces this and refuses with `SUPERVISED_SERVICE_ACTIVE` if the service is still running):
 
 ```
 systemctl --user stop tradepulse-run
@@ -43,6 +43,7 @@ setsid nohup systemd-inhibit --what=sleep:idle:handle-lid-switch:handle-power-ke
 
 The runner writes `<report stem>.preflight.json` beside the report (for example `soak-accounting-1.preflight.json`), an immutable record of its checks. Read it. Refusals:
 
+- `SUPERVISED_SERVICE_ACTIVE` (the runner runs `systemctl --user is-active --quiet tradepulse-run` and refuses before building a broker if the service is running; if `systemctl` is missing it proceeds and records `"service_check": "systemctl_unavailable"` in the evidence)
 - `OPEN_BROKER_ORDERS`
 - `PRE_GENERATION_TRADE_TODAY`
 - `FEE_DAY_NOT_CLOSED:<day>`

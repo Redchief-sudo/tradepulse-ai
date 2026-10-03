@@ -50,6 +50,7 @@ from tradepulse.broker import AlpacaActivity, AlpacaClient
 from tradepulse.models import (
     AssetClass,
     AssetIdentity,
+    AuditEvent,
     Fill,
     Holding,
     IntegrityHoldType,
@@ -499,6 +500,10 @@ async def _reverify_pending_holds(
 
 STRANDED_INTENT_GRACE_SECONDS = 120
 _STRANDED_STATUSES = (TradeIntentStatus.RISK_APPROVED, TradeIntentStatus.SUBMITTED)
+# Reasons no retry can clear without an operator; everything else is transient.
+_UNPROVABLE_STRANDED_REASONS = frozenset({
+    "ACCOUNT_IDENTITY_UNPROVEN", "STRANDED_ORDER_IDENTITY_MISMATCH", "STRANDED_INTENT_UNDER_INTEGRITY_HOLD",
+})
 
 
 async def _recover_stranded_intents(repositories, broker, alerts, now, lease_lost=None, *, lock_ttl_seconds=None,
@@ -570,10 +575,31 @@ async def _recover_stranded_intents(repositories, broker, alerts, now, lease_los
 async def _resolve_stranded(repositories, broker, alerts, trade_intent_id, now, fence, leases) -> bool:
     """Re-read under the reservation, prove account and order identity, then commit conditionally."""
     async def unresolved(intent, reason: str) -> bool:
-        if not fence.is_set():  # a lost lease writes nothing at all, not even evidence
-            await _record(repositories, reconciliation_type="order", subject_id=trade_intent_id,
-                          outcome=ReconciliationOutcome.DRIFT_DETECTED, expected={"stranded_intent_resolved": True},
-                          actual={"error": reason, "status": intent.status.value}, occurred_at=now)
+        # The fence suppresses evidence once it has tripped. A commit refused
+        # with STRANDED_RESERVATION_LOST before the fence trips still records drift.
+        if fence.is_set():
+            return False
+        if reason in _UNPROVABLE_STRANDED_REASONS:
+            # Permanent until an operator acts: alert once per intent per UTC day
+            # (deterministic audit id) and write drift only on that first sighting.
+            event_id = f"stranded_intent_unresolved:{trade_intent_id}:{now.date().isoformat()}"
+            event = AuditEvent(
+                event_id=event_id, event_type="stranded_intent_unresolved", severity="critical",
+                message=(f"STRANDED_INTENT_UNRESOLVED: {intent.asset.symbol} intent {trade_intent_id} ({reason}) cannot be "
+                         "proven or closed automatically -- the asset is blocked for all orders including protective "
+                         "exits and manual resolution is required."),
+                occurred_at=now, entity_type="trade_intent", entity_id=trade_intent_id,
+                details={"reason": reason, "status": intent.status.value, "symbol": intent.asset.symbol},
+            )
+            if await repositories.audit_events.create_once(event_id, event):
+                await _record(repositories, reconciliation_type="order", subject_id=trade_intent_id,
+                              outcome=ReconciliationOutcome.DRIFT_DETECTED, expected={"stranded_intent_resolved": True},
+                              actual={"error": reason, "status": intent.status.value}, occurred_at=now)
+                await alerts.send("critical", event.message, dict(event.details))
+            return False
+        await _record(repositories, reconciliation_type="order", subject_id=trade_intent_id,
+                      outcome=ReconciliationOutcome.DRIFT_DETECTED, expected={"stranded_intent_resolved": True},
+                      actual={"error": reason, "status": intent.status.value}, occurred_at=now)
         return False
 
     row = await repositories.trade_intents.get(trade_intent_id)

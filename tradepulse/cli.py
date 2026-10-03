@@ -44,9 +44,14 @@ failure.
 `tradepulse run` is the ONE deliberate, explicit exception to "no internal
 scheduling loop" above -- not a repeal of it. It's the normal interactive
 startup: resolves capabilities, opens the local dashboard, activates the
-session, then keeps independent equity/crypto/option scan lanes, the
-position monitor, and settlement cycling concurrently (one asyncio task
-per lane, genuinely parallel -- never a shared serial loop) until Ctrl+C.
+session, then keeps six independent lanes (equity/crypto/option scans, the
+position monitor, settlement and reconciliation) cycling concurrently (one
+asyncio task per lane, genuinely parallel -- never a shared serial loop) until
+Ctrl+C. Scan lanes idle until the session is ACTIVE (or MARKET_CLOSED with
+trading active), re-checking every 30 s, so `start` resumes scanning without a
+restart. A crashed lane is restarted by _supervised_lane with capped backoff.
+`run --resume` never re-activates a stopped or latched session. Cadences:
+config/lanes.py. See docs/operations-runbook.md.
 `scan`/`monitor`/`settle`/`reconcile` remain one-shot and cron-external;
 `run` just re-invokes their exact same per-cycle leg functions on a timer
 instead of a different execution path. See _run_application.
@@ -147,8 +152,8 @@ SETTLE_LOCK_TTL_SECONDS = 300
 RECONCILE_LOCK_TTL_SECONDS = 600
 
 # `tradepulse run` -- the whole supervisor's lifetime lease, distinct from
-# every per-cycle lock above (see _run_application). Cadences below match
-# the README's own crontab example exactly -- not configurable in this pass.
+# every per-cycle lock above (see _run_application). Cadences below come from
+# config/lanes.py (LANE_INTERVAL_SECONDS) -- not configurable in this pass.
 RUN_LOCK_KEY = "run"
 RUN_LOCK_TTL_SECONDS = 60
 EQUITY_SCAN_INTERVAL_SECONDS = LANE_INTERVAL_SECONDS["equity"]

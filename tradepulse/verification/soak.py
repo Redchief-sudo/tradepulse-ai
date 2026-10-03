@@ -140,7 +140,8 @@ def _lane_evidence(events: list[dict], segments: list[dict]) -> dict:
             start, end = aware_utc(segment["started_at"]), aware_utc(segment["ended_at"])
             inside = [stamp for stamp in stamps if start <= stamp <= end]
             # A bounded extra cycle budget allows real work to finish; a lane
-            # silent for more than two schedules plus two minutes is unproven.
+            # silent for longer than its LANE_MAX_GAP_SECONDS allowance (per lane,
+            # tradepulse/config/lanes.py) is unproven.
             maximum = LANE_MAX_GAP_SECONDS[lane]
             gaps = [(right - left).total_seconds() for left, right in zip([start, *inside], [*inside, end])]
             all_gaps.extend(gaps)

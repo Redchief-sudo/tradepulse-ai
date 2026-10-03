@@ -305,6 +305,8 @@ def runner():
     module._real_verify_opening_account = module._verify_opening_account
     module._broker_preflight = AsyncMock()
     module._verify_opening_account = AsyncMock()
+    module._service_active = AsyncMock(return_value="inactive")  # tests never call the real systemctl
+    module._load_dotenv = lambda *args, **kwargs: None  # never leak a real .env into the pytest process
     return module
 
 
@@ -501,3 +503,75 @@ async def test_runner_refuses_opening_on_a_different_account(runner, tmp_path, m
     monkeypatch.setattr(runner, "load_opening_checkpoint", lambda database: checkpoint)
     with pytest.raises(runner.VerificationError, match="soak_opening_account_mismatch"):
         await runner._real_verify_opening_account(tmp_path / "soak.db", {"account_id": "acct-1", "account_number": "PA1"})
+
+
+async def test_runner_fixture_never_loads_a_dotenv_into_the_pytest_environment(runner, monkeypatch, tmp_path):
+    monkeypatch.delenv("SOAK_FIXTURE_SENTINEL", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("SOAK_FIXTURE_SENTINEL=leaked\n", encoding="utf-8")
+    monkeypatch.setattr(runner, "_command", AsyncMock(return_value=0))
+    monkeypatch.setattr(runner, "_session", AsyncMock(return_value=0))
+    monkeypatch.setattr(runner, "create_soak_report", lambda *_a, **_k: {"sha256": "a" * 64, "analysis": {"status": "NOT_PASSED"}})
+    args = runner.parser().parse_args(["--run-number", "2", "--database", str(tmp_path / "new.db"),
+                                       "--report", str(tmp_path / "report.json")])
+    await runner.run(args)
+    assert "SOAK_FIXTURE_SENTINEL" not in os.environ
+
+
+_PAPER_ENV = {"TRADEPULSE_EXECUTION_MODE": "paper", "TRADEPULSE_LIVE_TRADING_ENABLED": "false",
+              "ALPACA_API_KEY": "k", "ALPACA_API_SECRET": "s"}
+
+
+async def test_preflight_refuses_when_the_supervised_service_is_active(runner, tmp_path, monkeypatch):
+    import json
+
+    built = []
+    monkeypatch.setattr("tradepulse.session_commands.build_broker", lambda settings: built.append(settings))
+    runner._service_active = AsyncMock(return_value="active")
+    with pytest.raises(VerificationError, match="soak_preflight_refused:SUPERVISED_SERVICE_ACTIVE"):
+        await runner._real_broker_preflight(dict(_PAPER_ENV), tmp_path / "soak-accounting-1.json", frozenset())
+    stored = json.loads((tmp_path / "soak-accounting-1.preflight.json").read_text())
+    assert stored["problems"] == ["SUPERVISED_SERVICE_ACTIVE"]
+    assert built == []  # refused before any broker was built
+
+
+async def test_preflight_proceeds_when_the_supervised_service_is_inactive(runner, tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setattr("tradepulse.session_commands.build_broker",
+                        lambda settings: _preflight_broker([OCC_0929, REG_0929, SELL_0929, OPTION_BUY_0929]))
+    account = await runner._real_broker_preflight(dict(_PAPER_ENV), tmp_path / "soak-accounting-1.json", frozenset())
+    stored = json.loads((tmp_path / "soak-accounting-1.preflight.json").read_text())
+    assert stored["problems"] == [] and stored["account"] == account and stored["service_check"] == "inactive"
+
+
+async def test_preflight_proceeds_with_evidence_note_when_systemctl_is_missing(runner, tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setattr("tradepulse.session_commands.build_broker",
+                        lambda settings: _preflight_broker([OCC_0929, REG_0929, SELL_0929, OPTION_BUY_0929]))
+    runner._service_active = AsyncMock(return_value="systemctl_unavailable")
+    await runner._real_broker_preflight(dict(_PAPER_ENV), tmp_path / "soak-accounting-1.json", frozenset())
+    stored = json.loads((tmp_path / "soak-accounting-1.preflight.json").read_text())
+    assert stored["problems"] == [] and stored["service_check"] == "systemctl_unavailable"
+
+
+async def test_service_active_maps_systemctl_results_without_running_it(runner, monkeypatch):
+    real = importlib.util.module_from_spec(importlib.util.spec_from_file_location(
+        "soak_real", Path(runner.__file__)))
+    real.__spec__.loader.exec_module(real)
+
+    def fake(returncode=None, missing=False):
+        async def spawn(*args, **kwargs):
+            if missing:
+                raise FileNotFoundError("systemctl")
+            assert args == ("systemctl", "--user", "is-active", "--quiet", "tradepulse-run")
+            return SimpleNamespace(wait=AsyncMock(return_value=returncode))
+        return spawn
+
+    monkeypatch.setattr(real.asyncio, "create_subprocess_exec", fake(0))
+    assert await real._service_active() == "active"
+    monkeypatch.setattr(real.asyncio, "create_subprocess_exec", fake(3))
+    assert await real._service_active() == "inactive"
+    monkeypatch.setattr(real.asyncio, "create_subprocess_exec", fake(missing=True))
+    assert await real._service_active() == "systemctl_unavailable"

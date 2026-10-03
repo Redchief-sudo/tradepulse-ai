@@ -175,6 +175,24 @@ async def preflight(broker, *, now: datetime | None = None, lookback_days: int =
             "account": {"account_id": account.account_id, "account_number": account.account_number}}
 
 
+SERVICE_UNIT = "tradepulse-run"
+
+
+async def _service_active() -> str:
+    """"active", "inactive" or "systemctl_unavailable" for the supervised service.
+
+    Two runtimes on one paper account recreate the two-writer integrity lock,
+    so a running service refuses the soak. Tests replace this coroutine; they
+    never call the real systemctl."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "systemctl", "--user", "is-active", "--quiet", SERVICE_UNIT,
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    except FileNotFoundError:
+        return "systemctl_unavailable"  # no systemd user session on this host
+    return "active" if await process.wait() == 0 else "inactive"
+
+
 async def _broker_preflight(environment: dict, report: Path, acknowledged: frozenset[str]) -> dict:
     """Build the broker from exactly the effective paper configuration the runtime receives."""
     from tradepulse.config import Settings
@@ -183,12 +201,18 @@ async def _broker_preflight(environment: dict, report: Path, acknowledged: froze
     settings = Settings.from_env(environment)
     if settings.execution_mode != "paper" or settings.live_trading_enabled:
         raise VerificationError("soak_preflight_requires_paper_configuration")
+    evidence_path = report.parent / (report.stem + ".preflight.json")
+    service_check = await _service_active()
+    if service_check == "active":
+        await asyncio.to_thread(write_once, evidence_path, {"problems": ["SUPERVISED_SERVICE_ACTIVE"], "service_check": service_check})
+        raise VerificationError("soak_preflight_refused:SUPERVISED_SERVICE_ACTIVE")
     broker = build_broker(settings)
     try:
         result = await preflight(broker, acknowledged=acknowledged)
     finally:
         await broker.aclose()
-    await asyncio.to_thread(write_once, report.parent / (report.stem + ".preflight.json"), result)  # write_once serializes canonical JSON itself
+    result["service_check"] = service_check
+    await asyncio.to_thread(write_once, evidence_path, result)  # write_once serializes canonical JSON itself
     if result["problems"]:
         raise VerificationError("soak_preflight_refused:" + ",".join(result["problems"]))
     return result["account"]
