@@ -70,3 +70,31 @@ async def test_unmanaged_detection_precedes_exit_work(tmp_path):
     gateway.execute_intent.side_effect = execute
     await _run(repositories, broker, alerts, gateway)
     assert alerts_sent_at_first_exit == [1]
+
+
+async def _breached_msft_setup(tmp_path):
+    repositories = await _repositories(tmp_path)
+    msft = AssetIdentity("MSFT", AssetClass.EQUITY, "alpaca:MSFT")
+    await repositories.holdings.create_once(asset_identity_key(msft), Holding(
+        msft, Decimal(5), Decimal(300), NOW, stop_loss=Decimal(250)))
+    broker, alerts, gateway = AsyncMock(), AsyncMock(), AsyncMock()
+    broker.get_positions.return_value = [_position("MSFT", "5", "240"), _position()]
+    gateway.execute_intent.return_value = SimpleNamespace(status="rejected")
+    return repositories, broker, alerts, gateway
+
+
+async def test_checkpoint_loader_failure_does_not_block_exits(tmp_path, monkeypatch):
+    def boom(_):
+        raise RuntimeError("generation_binding_mismatch")
+    monkeypatch.setattr("tradepulse.verification.opening.load_bound_opening_checkpoint", boom)
+    repositories, broker, alerts, gateway = await _breached_msft_setup(tmp_path)
+    summary = await _run(repositories, broker, alerts, gateway)
+    gateway.execute_intent.assert_awaited()
+    assert summary.unmanaged_positions == 1 and alerts.send.await_count == 1
+
+
+async def test_detection_failure_does_not_block_exits(tmp_path, monkeypatch):
+    repositories, broker, alerts, gateway = await _breached_msft_setup(tmp_path)
+    monkeypatch.setattr(repositories.audit_events, "create_once", AsyncMock(side_effect=RuntimeError("database is locked")))
+    await _run(repositories, broker, alerts, gateway)
+    gateway.execute_intent.assert_awaited()

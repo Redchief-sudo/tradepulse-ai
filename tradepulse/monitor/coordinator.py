@@ -15,6 +15,7 @@ the sole execution boundary.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
@@ -49,6 +50,8 @@ from tradepulse.models import (
 from tradepulse.persistence import PersistenceRepositories, hydrate, paginate_all_rows, run_with_lock_renewal
 from tradepulse.providers import AlpacaMarketDataProvider, ProviderError
 from tradepulse.strategy import atr
+
+logger = logging.getLogger(__name__)
 
 MonitorStatus = Literal["ok", "degraded"]
 
@@ -299,15 +302,25 @@ async def run_position_monitor(
 
     # Detection pass first: an unprotected position is reported before any
     # quote fetch, ratchet or (sequential, possibly slow) exit in this cycle.
+    # Detection only reports: nothing here may raise into the exit loop below.
     from tradepulse.reconciliation.membership import opening_quantities
     from tradepulse.verification.opening import load_bound_opening_checkpoint
-    opening = opening_quantities(await repositories.trade_intents.database.run(load_bound_opening_checkpoint))
+    try:
+        opening = opening_quantities(await repositories.trade_intents.database.run(load_bound_opening_checkpoint))
+    except Exception:  # noqa: BLE001 - a bad verification artifact must never block protective exits
+        # Opening inventory unknown: fail closed for alerting only, so every
+        # unheld broker position is reported rather than skipped.
+        logger.error("monitor_opening_inventory_unavailable", exc_info=True)
+        opening = {}
     unmanaged = 0
     for position in positions:
-        key = asset_key_from_broker_symbol(position.asset_class, position.symbol)
-        if await repositories.holdings.get(key) is None and opening.get(key) != position.qty:
-            unmanaged += 1
-            await _report_unmanaged_position(repositories, alerts, position, clock())
+        try:
+            key = asset_key_from_broker_symbol(position.asset_class, position.symbol)
+            if await repositories.holdings.get(key) is None and opening.get(key) != position.qty:
+                unmanaged += 1
+                await _report_unmanaged_position(repositories, alerts, position, clock())
+        except Exception:  # noqa: BLE001 - detection failure on one position must never block exits
+            logger.error("monitor_unmanaged_detection_failed symbol=%s", position.symbol, exc_info=True)
 
     for position in positions:
         if lease_lost is not None and lease_lost.is_set():
