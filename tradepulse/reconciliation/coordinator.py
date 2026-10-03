@@ -54,6 +54,7 @@ from tradepulse.models import (
     IntegrityHoldType,
     ReconciliationOutcome,
     ReconciliationRecord,
+    TradeIntentStatus,
     asset_identity_key,
     asset_key_from_broker_symbol,
 )
@@ -493,6 +494,147 @@ async def _reverify_pending_holds(
     return reverified
 
 
+STRANDED_INTENT_GRACE_SECONDS = 120
+_STRANDED_STATUSES = (TradeIntentStatus.RISK_APPROVED, TradeIntentStatus.SUBMITTED)
+
+
+async def _recover_stranded_intents(repositories, broker, alerts, now, lease_lost=None, *, lock_ttl_seconds=None,
+                                    reconcile_lease=None) -> int:
+    """Intents approved or marked submitted but never given a broker order id.
+
+    A crash or early return between RISK_APPROVED and broker acceptance leaves
+    an intent has_in_flight_intent treats as in flight forever, blocking every
+    later order on its asset -- protective exits included. A missing broker id
+    proves nothing about submission. Each candidate is re-read and resolved
+    under the asset's execution reservation, held and renewed throughout. A
+    lost lease stops further work, and the commit transaction re-verifies both
+    the reservation and the parent reconciliation lease (owner token and
+    expiry) before a conditional, full-payload-compared write. The grace
+    period only keeps the sweep away from fresh intents -- it is not a
+    finality proof.
+    """
+    from tradepulse.execution import (
+        SYMBOL_LOCK_TTL_SECONDS, execution_lock_key, release_symbol_reservation, reserve_symbol_for_execution,
+    )
+    from tradepulse.persistence import run_with_lock_renewal
+
+    ttl = lock_ttl_seconds or SYMBOL_LOCK_TTL_SECONDS
+    database = repositories.trade_intents.database
+    rows = await list_all_by_statuses(repositories.trade_intents, [status.value for status in _STRANDED_STATUSES])
+    resolved = 0
+    for row in rows:
+        if lease_lost is not None and lease_lost.is_set():
+            break
+        candidate = hydrate("trade_intents", row["payload"])
+        if candidate.broker_order_id or (now - candidate.created_at).total_seconds() < STRANDED_INTENT_GRACE_SECONDS:
+            continue
+        token = str(uuid4())
+        if not await reserve_symbol_for_execution(database, candidate.asset, token):
+            continue  # a live execution owns this asset -- never race it
+        fence = asyncio.Event()
+
+        async def on_lost(fence=fence):
+            fence.set()
+
+        leases = [(execution_lock_key(candidate.asset), token), *([reconcile_lease] if reconcile_lease else [])]
+        try:
+            if await run_with_lock_renewal(
+                database, execution_lock_key(candidate.asset), token, ttl,
+                _resolve_stranded(repositories, broker, alerts, candidate.trade_intent_id, now, fence, leases),
+                on_renewal_failed=on_lost,
+            ):
+                resolved += 1
+        finally:
+            await release_symbol_reservation(database, candidate.asset, token)
+    return resolved
+
+
+async def _resolve_stranded(repositories, broker, alerts, trade_intent_id, now, fence, leases) -> bool:
+    """Re-read under the reservation, prove account and order identity, then commit conditionally."""
+    async def unresolved(intent, reason: str) -> bool:
+        if not fence.is_set():  # a lost lease writes nothing at all, not even evidence
+            await _record(repositories, reconciliation_type="order", subject_id=trade_intent_id,
+                          outcome=ReconciliationOutcome.DRIFT_DETECTED, expected={"stranded_intent_resolved": True},
+                          actual={"error": reason, "status": intent.status.value}, occurred_at=now)
+        return False
+
+    row = await repositories.trade_intents.get(trade_intent_id)
+    if row is None:
+        return False
+    original_payload = row["payload"]
+    intent = hydrate("trade_intents", original_payload)
+    if (intent.status not in _STRANDED_STATUSES or intent.broker_order_id
+            or (now - intent.created_at).total_seconds() < STRANDED_INTENT_GRACE_SECONDS):
+        return False  # resolved or advanced by someone else since the scan -- nothing to do
+    approved_on = intent.risk_snapshot.get("broker_account_number")
+    try:
+        account = await broker.get_account()
+        if approved_on is None or account.account_number != approved_on:
+            return await unresolved(intent, "ACCOUNT_IDENTITY_UNPROVEN")
+        order = await broker.get_order_by_client_order_id(intent.trade_intent_id)
+    except Exception as exc:  # noqa: BLE001 - an unavailable lookup proves nothing; retry next pass
+        return await unresolved(intent, str(exc))
+    if order is not None and (order.raw.get("client_order_id") != intent.trade_intent_id
+                              or order.symbol != intent.asset.symbol or order.side != intent.side):
+        return await unresolved(intent, "STRANDED_ORDER_IDENTITY_MISMATCH")
+    if fence.is_set():
+        return False  # lease lost while waiting on the broker: ownership is unproven, write nothing
+    if order is not None:
+        updated = replace(intent, status=TradeIntentStatus.ACCEPTED, broker_order_id=order.broker_order_id,
+                          client_order_id=intent.trade_intent_id)
+        action = "adopted the broker order Alpaca holds for this client_order_id"
+    else:
+        updated = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason="STRANDED_BEFORE_SUBMISSION")
+        action = "closed: Alpaca returned a definitive not-found for this client_order_id"
+    record = ReconciliationRecord(
+        str(uuid4()), "order", intent.trade_intent_id, ReconciliationOutcome.CORRECTED,
+        expected={"stranded_intent_resolved": True},
+        actual={"previous_status": intent.status.value, "status": updated.status.value,
+                "broker_order_id": updated.broker_order_id, "account_number": approved_on},
+        occurred_at=now, corrective_action=action,
+    )
+    outcome = await repositories.trade_intents.database.run(
+        lambda connection: _commit_stranded(connection, original_payload, intent, updated, record, now, leases),
+        write=True)
+    if outcome != "committed":
+        return await unresolved(intent, outcome)
+    await alerts.send("warning", f"Stranded {intent.status.value} intent for {intent.asset.symbol} resolved: {action}",
+                      {"trade_intent_id": intent.trade_intent_id})
+    return True
+
+
+def _commit_stranded(connection, original_payload, intent, updated, record, now, leases) -> str:
+    """One BEGIN IMMEDIATE transaction. Every lease this decision relies on must
+    still be ours and unexpired; the stored payload must equal the re-read one
+    in full; and no integrity hold may reference the intent or the adopted
+    order."""
+    from datetime import UTC, datetime as _datetime
+
+    from tradepulse.persistence.codec import decode_payload, encode_payload
+
+    wall_clock = _datetime.now(UTC).isoformat()
+    for lock_key, owner_token in leases:
+        lock = connection.execute("SELECT owner_token, expires_at FROM locks WHERE lock_key=?", (lock_key,)).fetchone()
+        if lock is None or lock["owner_token"] != owner_token or lock["expires_at"] <= wall_clock:
+            return "STRANDED_RESERVATION_LOST"
+    row = connection.execute("SELECT status, payload FROM trade_intents WHERE record_id=?",
+                             (intent.trade_intent_id,)).fetchone()
+    if row is None or row["status"] != intent.status.value or decode_payload(row["payload"]) != original_payload:
+        return "STRANDED_INTENT_CHANGED_CONCURRENTLY"
+    held = connection.execute(
+        "SELECT 1 FROM integrity_holds WHERE json_extract(payload,'$.trade_intent_id')=? OR record_id=?",
+        (intent.trade_intent_id, updated.broker_order_id or ""),
+    ).fetchone()
+    if held:
+        return "STRANDED_INTENT_UNDER_INTEGRITY_HOLD"
+    connection.execute("UPDATE trade_intents SET status=?, payload=?, updated_at=? WHERE record_id=?",
+                       (updated.status.value, encode_payload(updated), now.isoformat(), intent.trade_intent_id))
+    connection.execute("INSERT INTO reconciliation_records(record_id,payload,created_at) VALUES(?,?,?)",
+                       (record.record_id, encode_payload(record), now.isoformat()))
+    return "committed"
+
+
+
 async def _recover_inflight_orders(repositories, broker, settlement, alerts, now, lease_lost=None):
     """Known unresolved orders do not expire out of the activity lookback.
 
@@ -545,6 +687,7 @@ async def run_reconciliation(
     fill_lookback: timedelta = timedelta(days=1),
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     lease_lost: asyncio.Event | None = None,
+    reconcile_lease: tuple[str, str] | None = None,
 ) -> ReconciliationSummary:
     now = aware_utc(clock(), field_name='reconciliation_observed_at')
     generation_membership = None
@@ -575,6 +718,7 @@ async def run_reconciliation(
     except Exception as exc:
         projection_error = 'CANONICAL_ACCOUNTING_REPLAY_FAILED:' + str(exc)
         await latch_financial_integrity_block(repositories, projection_error, clock=lambda: now)
+    await _recover_stranded_intents(repositories, broker, alerts, now, lease_lost, reconcile_lease=reconcile_lease)
     await _recover_inflight_orders(repositories, broker, settlement, alerts, now, lease_lost)
     fee_error = None
     try:

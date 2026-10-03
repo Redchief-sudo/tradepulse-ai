@@ -516,7 +516,8 @@ async def _run_reconcile(settings: Settings) -> int:
             lease_lost, on_lease_lost = _lease_lost_signal(alerts, RECONCILE_LOCK_KEY, owner_token)
             summary = await run_with_lock_renewal(
                 database, RECONCILE_LOCK_KEY, owner_token, RECONCILE_LOCK_TTL_SECONDS,
-                run_reconciliation(repositories, broker, settlement, alerts, lease_lost=lease_lost),
+                run_reconciliation(repositories, broker, settlement, alerts, lease_lost=lease_lost,
+                                   reconcile_lease=(RECONCILE_LOCK_KEY, owner_token)),
                 on_renewal_failed=on_lease_lost,
             )
             from tradepulse.verification.opening import load_bound_opening_checkpoint
