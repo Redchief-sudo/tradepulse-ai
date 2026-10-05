@@ -520,7 +520,12 @@ async def test_resolve_risk_profile_id_fails_closed_to_most_conservative_tier_on
     assert len(failures) == 1
 
 
-async def _wait_until(predicate: Callable[[], bool], timeout: float = 2.0, interval: float = 0.01) -> None:
+# Hang guard only: a passing wait returns as soon as its condition holds. A
+# tight wall-clock limit fails on a loaded machine without proving anything.
+HANG_GUARD_SECONDS = 30.0
+
+
+async def _wait_until(predicate: Callable[[], bool], timeout: float = HANG_GUARD_SECONDS, interval: float = 0.01) -> None:
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
     while not predicate():
@@ -839,8 +844,8 @@ async def test_run_trading_supervisor_genuine_concurrency_not_serial(tmp_path, m
         )
     )
     try:
-        await asyncio.wait_for(equity_blocked.wait(), timeout=2.0)
-        await _wait_until(lambda: AssetClass.CRYPTO in started and AssetClass.OPTION in started, timeout=2.0)
+        await asyncio.wait_for(equity_blocked.wait(), timeout=HANG_GUARD_SECONDS)
+        await _wait_until(lambda: AssetClass.CRYPTO in started and AssetClass.OPTION in started, timeout=HANG_GUARD_SECONDS)
 
         # Equity is STILL blocked (never proceeded) while crypto and option
         # have already started -- proves siblings don't wait behind a slow
@@ -851,7 +856,7 @@ async def test_run_trading_supervisor_genuine_concurrency_not_serial(tmp_path, m
     finally:
         equity_may_proceed.set()
         shutdown.set()
-        await asyncio.wait_for(task, timeout=2.0)
+        await asyncio.wait_for(task, timeout=HANG_GUARD_SECONDS)
 
 
 async def test_run_trading_supervisor_settlement_fires_independently(tmp_path, monkeypatch) -> None:
@@ -896,9 +901,9 @@ async def test_run_trading_supervisor_settlement_fires_independently(tmp_path, m
             sleep=fake_sleep,
         )
     )
-    await _wait_until(lambda: settle_calls >= 1, timeout=2.0)
+    await _wait_until(lambda: settle_calls >= 1, timeout=HANG_GUARD_SECONDS)
     shutdown.set()
-    await asyncio.wait_for(task, timeout=2.0)
+    await asyncio.wait_for(task, timeout=HANG_GUARD_SECONDS)
 
     assert settle_calls >= 1
 
@@ -962,9 +967,9 @@ async def test_run_trading_supervisor_lane_failure_is_isolated_and_recorded(tmp_
     )
     # "equity" only ever lands in other_activity once the lane has actually
     # recovered -- proving the restart, not just the isolation, worked.
-    await _wait_until(lambda: {"equity", "crypto", "option", "monitor", "settle"} <= other_activity, timeout=2.0)
+    await _wait_until(lambda: {"equity", "crypto", "option", "monitor", "settle"} <= other_activity, timeout=HANG_GUARD_SECONDS)
     shutdown.set()
-    await asyncio.wait_for(task, timeout=2.0)
+    await asyncio.wait_for(task, timeout=HANG_GUARD_SECONDS)
 
     # >= 3, not == -- once recovered, the lane's own periodic_loop may complete
     # further successful cycles (fake_sleep makes its interval wait near-instant)
@@ -1137,3 +1142,34 @@ async def test_run_application_still_gates_activation_but_starts_supervisor_from
     assert exit_code == 0
     assert run_start_calls == 1  # the real gate still runs for a non-MARKET_CLOSED session
     assert supervisor_calls == 1  # ...but its refusal no longer strands protection: scan lanes idle instead
+
+
+async def test_verification_reconcile_tick_records_rate_limit_headroom(tmp_path, monkeypatch) -> None:
+    """Each reconcile tick's broker-clock evidence carries the account-wide
+    X-RateLimit headroom and cumulative 429s, so a soak measures API load."""
+    from types import SimpleNamespace
+
+    from tradepulse.broker.types import AlpacaRateLimitSnapshot
+    from tradepulse.cli import _verification_reconcile_action
+
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    database = AsyncSQLiteDatabase(database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+
+    async def _stub_reconcile(settings) -> int:
+        return 0
+
+    monkeypatch.setattr("tradepulse.cli._run_reconcile", _stub_reconcile)
+    now = datetime.now(UTC)
+
+    async def get_clock() -> AlpacaClock:
+        return AlpacaClock(is_open=True, next_open=now + timedelta(days=1), next_close=now + timedelta(hours=1), timestamp=now)
+
+    broker = SimpleNamespace(get_clock=get_clock, rate_limited_responses=3,
+                             rate_limit_snapshot=AlpacaRateLimitSnapshot(limit=200, remaining=140, reset_at=None, observed_at=now))
+    await _verification_reconcile_action(_settings(database_url), repositories, broker)
+
+    [row] = await repositories.audit_events.list_all()
+    details = hydrate("audit_events", row["payload"]).details
+    assert (details["rate_limit_limit"], details["rate_limit_remaining"], details["rate_limited_responses"]) == (200, 140, 3)

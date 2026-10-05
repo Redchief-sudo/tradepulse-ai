@@ -775,10 +775,20 @@ async def _verification_reconcile_action(settings: Settings, repositories: Persi
             'next_open': aware_utc(broker_clock.next_open, field_name='broker_clock_next_open').isoformat(),
             'next_close': aware_utc(broker_clock.next_close, field_name='broker_clock_next_close').isoformat(),
             'received_at': received_at.isoformat(),
+            # Account-wide X-RateLimit headroom and this runtime's cumulative
+            # 429s, sampled every reconcile tick as soak evidence of API load.
+            **_rate_limit_details(broker),
         },
     )
     await repositories.audit_events.create_once(event.event_id, event)
     return VERIFICATION_RECONCILE_INTERVAL_SECONDS
+
+
+def _rate_limit_details(broker: AlpacaClient) -> dict:
+    snapshot = broker.rate_limit_snapshot
+    return {'rate_limit_limit': snapshot.limit if snapshot is not None else None,
+            'rate_limit_remaining': snapshot.remaining if snapshot is not None else None,
+            'rate_limited_responses': broker.rate_limited_responses}
 
 
 async def _verification_cycle(repositories: PersistenceRepositories, lane: str) -> None:

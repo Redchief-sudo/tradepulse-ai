@@ -736,3 +736,52 @@ async def test_known_accepted_order_recovers_fill_older_than_daily_lookback(tmp_
     await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
     assert len(await repositories.fills.list_all()) == 1
     await broker.aclose()
+
+
+class _RecordingAlerts(TelegramAlerter):
+    def __init__(self) -> None:
+        super().__init__(None, None)
+        self.sent: list[tuple[str, str]] = []
+
+    async def send(self, severity, message, details=None) -> bool:
+        self.sent.append((severity, message))
+        return True
+
+
+@respx.mock
+async def test_persistent_accounting_drift_alerts_once_per_utc_day(tmp_path) -> None:
+    """Reconciliation runs every minute; a drift that persists until an
+    operator acts must alert once per day, not on every pass, while every
+    pass still records its drift evidence."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    await _seed_lot(repositories, lot_id="lot-1", fill_id="fill-1", quantity="5", price="150")
+    await _seed_holding(repositories, quantity="5")
+    _mock_positions([_position_json("10")])
+    _mock_activities([])
+    alerts = _RecordingAlerts()
+
+    for clock_time in (NOW, NOW + timedelta(minutes=1), NOW + timedelta(hours=2), NOW + timedelta(days=1)):
+        await run_reconciliation(repositories, broker, _settlement(repositories), alerts, clock=lambda t=clock_time: t)
+    await broker.aclose()
+
+    drift_alerts = [m for s, m in alerts.sent if "ACCOUNTING DRIFT" in m]
+    assert len(drift_alerts) == 2  # first sighting on each UTC day
+    records = [hydrate("reconciliation_records", r["payload"]) for r in await repositories.reconciliation_records.list_all()]
+    assert sum(r.reconciliation_type == "position_accounting" for r in records) == 4
+
+
+@respx.mock
+async def test_broker_outage_alerts_once_per_utc_hour(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(side_effect=httpx.ConnectError("connection refused"))
+    alerts = _RecordingAlerts()
+
+    for clock_time in (NOW, NOW + timedelta(minutes=1), NOW + timedelta(minutes=59), NOW + timedelta(hours=1)):
+        summary = await run_reconciliation(repositories, broker, _settlement(repositories), alerts, clock=lambda t=clock_time: t)
+        assert summary.status == "degraded"
+    await broker.aclose()
+
+    outage_alerts = [m for s, m in alerts.sent if "positions unavailable" in m]
+    assert len(outage_alerts) == 2

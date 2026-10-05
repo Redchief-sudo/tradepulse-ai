@@ -784,17 +784,28 @@ async def run_scan_cycle(
             if not contracts:
                 await _reject(candidate.symbol, "NO_ELIGIBLE_OPTION_CONTRACT")
                 continue
+            # A contract held before the run is never opened into, but its
+            # neighbours stay eligible (Rev.119).
+            option_assets = [(option, _option_asset(option)) for option in contracts]
+            held = [asset.symbol for _, asset in option_assets if asset_identity_key(asset) in opening_inventory]
+            option_assets = [(option, asset) for option, asset in option_assets if asset_identity_key(asset) not in opening_inventory]
+            if not option_assets:
+                await _reject(candidate.symbol, "OPENING_INVENTORY_INSTRUMENT", instrument=",".join(held))
+                continue
             # Quote the strikes nearest the target and trade the nearest one
             # whose spread is executable (Rev.113); a wide target strike no
-            # longer discards a liquid neighbour.
+            # longer discards a liquid neighbour. One request quotes them all.
+            try:
+                option_quotes = await market_data.fetch_option_quotes([asset for _, asset in option_assets])
+            except ProviderError as exc:
+                await _reject(candidate.symbol, "OPTION_QUOTE_FETCH_FAILED", error=str(exc))
+                continue
             quoted_contracts = []
             quote_errors = []
-            for option in contracts:
-                option_asset = _option_asset(option)
-                try:
-                    option_quote = await market_data.fetch_quote(option_asset)
-                except ProviderError as exc:
-                    quote_errors.append(str(exc))
+            for option, option_asset in option_assets:
+                option_quote = option_quotes[option_asset.symbol]
+                if isinstance(option_quote, ProviderError):
+                    quote_errors.append(str(option_quote))
                     continue
                 quoted_contracts.append((option, option_quote.bid, option_quote.ask, option_asset, option_quote))
             chosen = choose_liquid_contract([row[:3] for row in quoted_contracts],

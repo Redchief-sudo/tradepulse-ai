@@ -6,6 +6,14 @@ Paper-trading runtime. The supervised unit is `deploy/tradepulse-run.service`; i
 
 Protection (monitor, settlement, reconciliation) runs only while the process runs. Use an always-on, mains-powered host.
 
+Database: the service uses `tradepulse-service.db`, never `tradepulse.db` (the legacy database is FINANCIAL_INTEGRITY_BLOCKED and preserved as evidence). Set it in `.env`, so the service and every operator command (`tradepulse start`, `stop`, `status`, `reconcile`) read the same database:
+
+```
+TRADEPULSE_DATABASE_URL=sqlite:///tradepulse-service.db
+```
+
+The unit's `ExecStartPre` refuses to start unless `.env` contains exactly that line. Only the soaks' opening checkpoint knows about positions held before a run, so start the service with a flat paper account: any pre-existing broker position is accounting drift to a fresh database and latches FINANCIAL_INTEGRITY_BLOCKED on the first reconciliation.
+
 Install:
 
 ```
@@ -43,7 +51,7 @@ setsid nohup systemd-inhibit --what=sleep:idle:handle-lid-switch:handle-power-ke
 
 The runner writes `<report stem>.preflight.json` beside the report (for example `soak-accounting-1.preflight.json`), an immutable record of its checks. Read it. Refusals:
 
-- `SUPERVISED_SERVICE_ACTIVE` (the runner runs `systemctl --user is-active --quiet tradepulse-run` and refuses before building a broker if the service is running; if `systemctl` is missing it proceeds and records `"service_check": "systemctl_unavailable"` in the evidence)
+- `SUPERVISED_SERVICE_ACTIVE` (the runner runs `systemctl --user is-active tradepulse-run` and refuses before building a broker if the service is running). `SUPERVISED_SERVICE_UNVERIFIABLE`: the check fails closed, so any answer other than `inactive` or `failed` (an unreachable user bus, a unit still starting or stopping) also refuses. If `systemctl` is missing it proceeds and records `"service_check": "systemctl_unavailable"` in the evidence.
 - `OPEN_BROKER_ORDERS`
 - `PRE_GENERATION_TRADE_TODAY`
 - `FEE_DAY_NOT_CLOSED:<day>`

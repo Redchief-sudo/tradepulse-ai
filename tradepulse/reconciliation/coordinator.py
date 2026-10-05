@@ -103,6 +103,32 @@ async def _record(repositories: PersistenceRepositories, **kwargs) -> None:
     await repositories.reconciliation_records.create_once(record.record_id, record)
 
 
+async def _alert_once(repositories: PersistenceRepositories, alerts: TelegramAlerter, *, event_type: str, subject: str,
+                      window: str, severity: str, message: str, details: dict, now: datetime) -> bool:
+    """Send an alert at most once per (event_type, subject, window).
+
+    Reconciliation runs every minute, so a condition that persists until an
+    operator acts would otherwise re-alert on every pass. The deterministic
+    audit id makes the first sighting in each window the only one sent;
+    ``window`` is a UTC date or date-hour string. Reconciliation records are
+    still written on every pass."""
+    event_id = f"{event_type}:{subject}:{window}"
+    event = AuditEvent(event_id=event_id, event_type=event_type, severity=severity, message=message,
+                       occurred_at=now, entity_type="reconciliation", entity_id=subject, details=details)
+    if not await repositories.audit_events.create_once(event_id, event):
+        return False
+    await alerts.send(severity, message, details)
+    return True
+
+
+def _utc_day(now: datetime) -> str:
+    return now.astimezone(UTC).date().isoformat()
+
+
+def _utc_hour(now: datetime) -> str:
+    return now.astimezone(UTC).strftime("%Y-%m-%dT%H")
+
+
 async def _rebuild_holding_from_lots(
     repositories: PersistenceRepositories, asset: AssetIdentity, now: datetime
 ) -> Holding | None:
@@ -260,11 +286,11 @@ async def _reconcile_positions(
                 expected={"lots_qty": str(lots_qty)}, actual={"broker_qty": str(broker_qty), "holding_qty": str(holding_qty)},
                 occurred_at=now,
             )
-            await alerts.send(
-                "critical",
-                f"Reconciliation: ACCOUNTING DRIFT for {display_symbol} -- local position_lots disagree with Alpaca's real "
-                f"position (broker={broker_qty}, lots={lots_qty}). NOT auto-corrected -- investigate missing/duplicate fills.",
-                {"symbol": display_symbol, "broker_qty": str(broker_qty), "lots_qty": str(lots_qty)},
+            await _alert_once(
+                repositories, alerts, event_type="accounting_drift", subject=key, window=_utc_day(now), severity="critical",
+                message=(f"Reconciliation: ACCOUNTING DRIFT for {display_symbol} -- local position_lots disagree with Alpaca's real "
+                         f"position (broker={broker_qty}, lots={lots_qty}). NOT auto-corrected -- investigate missing/duplicate fills."),
+                details={"symbol": display_symbol, "broker_qty": str(broker_qty), "lots_qty": str(lots_qty)}, now=now,
             )
             if asset_by_key[key].asset_class == AssetClass.CRYPTO:
                 from .epochs import block_asset
@@ -377,12 +403,14 @@ async def _reconcile_fills(
                     },
                     occurred_at=now,
                 )
-                await alerts.send(
-                    "critical",
-                    f"Reconciliation: AMBIGUOUS BROKER_ORDER_ID -- {order_id} matches {len(candidate_intents)} local "
-                    f"TradeIntents for activity {activity.activity_id} ({activity.symbol}); late-fill recovery skipped, "
-                    "human investigation required.",
-                    {"activity_id": activity.activity_id, "order_id": order_id, "match_count": len(candidate_intents)},
+                await _alert_once(
+                    repositories, alerts, event_type="ambiguous_broker_order_id", subject=activity.activity_id,
+                    window=_utc_day(now), severity="critical",
+                    message=(f"Reconciliation: AMBIGUOUS BROKER_ORDER_ID -- {order_id} matches {len(candidate_intents)} local "
+                             f"TradeIntents for activity {activity.activity_id} ({activity.symbol}); late-fill recovery skipped, "
+                             "human investigation required."),
+                    details={"activity_id": activity.activity_id, "order_id": order_id, "match_count": len(candidate_intents)},
+                    now=now,
                 )
                 await latch_financial_integrity_block(
                     repositories, f"Ambiguous broker_order_id {order_id} matches multiple local TradeIntents", clock=lambda: now,
@@ -423,10 +451,11 @@ async def _reconcile_fills(
             },
             occurred_at=now,
         )
-        await alerts.send(
-            "critical",
-            f"Reconciliation: MISSED FILL -- Alpaca activity {activity.activity_id} ({activity.symbol}) has no matching local Fill record.",
-            {"activity_id": activity.activity_id, "symbol": activity.symbol, "qty": str(activity.qty), "price": str(activity.price)},
+        await _alert_once(
+            repositories, alerts, event_type="missed_fill", subject=activity.activity_id, window=_utc_day(now), severity="critical",
+            message=f"Reconciliation: MISSED FILL -- Alpaca activity {activity.activity_id} ({activity.symbol}) has no matching local Fill record.",
+            details={"activity_id": activity.activity_id, "symbol": activity.symbol, "qty": str(activity.qty), "price": str(activity.price)},
+            now=now,
         )
         # Unrecoverable, not merely late: a successfully recovered fill
         # (late_fills_recovered above) never reaches here at all. An
@@ -769,14 +798,16 @@ async def run_reconciliation(
         if not await reconcile_asset_fees(repositories, broker, now=now, lease_lost=lease_lost, clock=clock):
             fee_error = "ASSET_FEE_RECONCILIATION_FAILED"
     except Exception as exc:  # noqa: BLE001 - preserve other instruments and reconciliation work
-        await alerts.send("critical", f"Asset-fee reconciliation unavailable: {exc}", {})
+        await _alert_once(repositories, alerts, event_type="reconciliation_degraded", subject="asset_fees", window=_utc_hour(now),
+                          severity="critical", message=f"Asset-fee reconciliation unavailable: {exc}", details={"error": str(exc)}, now=now)
         fee_error = f"ASSET_FEE_RECONCILIATION_UNAVAILABLE: {exc}"
     try:
         positions_checked, view_drift_corrected, accounting_drift_detected = await _reconcile_positions(
             repositories, broker, alerts, now, lease_lost
         )
     except Exception as exc:  # noqa: BLE001 - a broker outage here must fail this pass cleanly, not crash the caller
-        await alerts.send("critical", f"Reconciliation degraded -- Alpaca positions unavailable: {exc}", {})
+        await _alert_once(repositories, alerts, event_type="reconciliation_degraded", subject="positions", window=_utc_hour(now),
+                          severity="critical", message=f"Reconciliation degraded -- Alpaca positions unavailable: {exc}", details={"error": str(exc)}, now=now)
         return ReconciliationSummary("degraded", error=f"BROKER_POSITIONS_UNAVAILABLE: {exc}")
 
     try:
@@ -784,7 +815,8 @@ async def run_reconciliation(
             repositories, broker, settlement, alerts, now, fill_lookback, lease_lost, generation_membership
         )
     except Exception as exc:  # noqa: BLE001 - same principle for the activities call
-        await alerts.send("critical", f"Reconciliation degraded -- Alpaca activities unavailable: {exc}", {})
+        await _alert_once(repositories, alerts, event_type="reconciliation_degraded", subject="activities", window=_utc_hour(now),
+                          severity="critical", message=f"Reconciliation degraded -- Alpaca activities unavailable: {exc}", details={"error": str(exc)}, now=now)
         return ReconciliationSummary(
             "degraded", positions_checked, view_drift_corrected, accounting_drift_detected,
             error=f"BROKER_ACTIVITIES_UNAVAILABLE: {exc}",
@@ -793,7 +825,8 @@ async def run_reconciliation(
     try:
         verification_holds_reverified = await _reverify_pending_holds(repositories, broker, settlement, alerts, now, lease_lost)
     except Exception as exc:  # noqa: BLE001 - a broker outage here must fail this pass cleanly, not crash the caller
-        await alerts.send("critical", f"Reconciliation degraded -- verification-hold re-check unavailable: {exc}", {})
+        await _alert_once(repositories, alerts, event_type="reconciliation_degraded", subject="verification_holds", window=_utc_hour(now),
+                          severity="critical", message=f"Reconciliation degraded -- verification-hold re-check unavailable: {exc}", details={"error": str(exc)}, now=now)
         return ReconciliationSummary(
             "degraded", positions_checked, view_drift_corrected, accounting_drift_detected,
             fills_checked, missed_fills_detected, late_fills_recovered,

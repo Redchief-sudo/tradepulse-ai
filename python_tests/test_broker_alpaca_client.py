@@ -407,6 +407,7 @@ async def test_429_then_200_retries_transparently_and_succeeds() -> None:
     assert route.call_count == 2
     assert len(sleep_calls) == 1
     assert sleep_calls[0] >= RATE_LIMIT_BASE_BACKOFF_SECONDS
+    assert client.rate_limited_responses == 1  # soak evidence of API load
 
 
 @respx.mock
@@ -566,3 +567,19 @@ async def test_live_paper_account_clock_is_reachable() -> None:
     finally:
         await client.aclose()
     assert isinstance(clock.is_open, bool)
+
+
+@respx.mock
+async def test_get_latest_option_quotes_batches_symbols_into_one_request() -> None:
+    client = AlpacaClient("key", "secret", "paper", 10)
+    route = respx.get("https://data.alpaca.markets/v1beta1/options/quotes/latest").mock(return_value=httpx.Response(200, json={
+        "quotes": {"AAPL260918C00205000": {"bp": 2.0, "ap": 2.05, "t": "2026-08-24T15:00:00Z"}}}))
+
+    quotes = await client.get_latest_option_quotes(["aapl260918c00205000", "AAPL260918C00210000"])
+    await client.aclose()
+
+    assert route.call_count == 1
+    assert route.calls[0].request.url.params["symbols"] == "AAPL260918C00205000,AAPL260918C00210000"
+    assert quotes["AAPL260918C00205000"].bid == Decimal("2.0")
+    missing = quotes["AAPL260918C00210000"]  # no quote returned: present but unusable, rejected downstream
+    assert missing.bid is None and missing.ask is None

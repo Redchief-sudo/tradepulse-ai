@@ -151,6 +151,19 @@ def _lane_evidence(events: list[dict], segments: list[dict]) -> dict:
     return result
 
 
+def _broker_rate_limit(events: list[dict]) -> dict:
+    """API-load evidence from the reconcile lane's broker-clock samples.
+
+    Reported, not an invariant: it shows how close the runtime came to
+    Alpaca's per-account request limit and whether any 429 occurred."""
+    samples = [event["details"] for event in events if event["event_type"] == "verification_broker_clock"]
+    remaining = [sample["rate_limit_remaining"] for sample in samples if sample.get("rate_limit_remaining") is not None]
+    limits = [sample["rate_limit_limit"] for sample in samples if sample.get("rate_limit_limit") is not None]
+    return {"samples": len(remaining), "limit": max(limits) if limits else None,
+            "minimum_remaining": min(remaining) if remaining else None,
+            "rate_limited_responses": max((sample.get("rate_limited_responses") or 0 for sample in samples), default=0)}
+
+
 def _complete_market_session(events: list[dict], segments: list[dict], lanes: dict) -> dict:
     clocks = []
     for event in events:
@@ -338,6 +351,7 @@ def analyze_soak_database(database: Path, *, run_number: int) -> dict:
                        "integrity_incidents": len(incidents), "restart_events": max(0, len(segments) - 1),
                        "checkpoint_supersessions": len(supersessions)},
             "incidents": incidents, "asset_classes": by_class, "slippage": slippage,
+            "broker_rate_limit": _broker_rate_limit(rows["audit_events"]),
             "performance": {key: assessment[key] for key in ("modeled_trade_net", "observed_generation_net", "observed_generation_bridge")},
             "assessment_errors": assessment["errors"], "invariants": invariants,
             "status": "PASSED" if all(invariants.values()) else "NOT_PASSED"}

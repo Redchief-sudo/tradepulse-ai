@@ -11,6 +11,10 @@ Environment=TRADEPULSE_EXECUTION_MODE=paper TRADEPULSE_LIVE_TRADING_ENABLED=fals
 # --resume: continue only an already-active session. An operator stop or a
 # safety latch stays in force across restarts, while monitor, settlement and
 # reconciliation keep protecting existing positions.
+# The service and every operator command (`tradepulse start/stop/status`)
+# read the database from .env. Refuse to start unless it names the dedicated
+# service database: tradepulse.db is preserved legacy evidence.
+ExecStartPre=/bin/grep -qx "TRADEPULSE_DATABASE_URL=sqlite:///tradepulse-service.db" %h/tradepulse-ai/.env
 ExecStart=%h/tradepulse-ai/.venv/bin/tradepulse run --no-browser --resume
 Restart=on-failure
 RestartSec=30

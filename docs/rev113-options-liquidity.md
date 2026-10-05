@@ -20,7 +20,7 @@ Three accounting soaks attempted about ten option buys. Only one passed the shar
 - `option_candidates` returns the five strikes nearest the OTM target within the same midpoint expiry. Its first element is exactly the previous `select_contract` choice, which is kept unchanged.
 - The scanner quotes those strikes. `choose_liquid_contract` trades the nearest one whose spread is within the option limit. If none qualifies, it chooses the tightest, so the risk engine evaluates a real contract and records the rejection. An `option_contract_selected` log line lists every considered contract's spread.
 
-With `balanced`, 3 of the 7 observed rejections would have passed on the new limit alone, before any gain from choosing a tighter neighbouring strike.
+With `balanced`, 2 of the 7 observed rejections (1.87% and 1.93%) would have passed on the new limit alone, before any gain from choosing a tighter neighbouring strike.
 
 Stop placement, sizing, the expiry window, the OTM target and every equity/crypto rule are unchanged. Because protected source changed, both soaks must be run again from Rev.113.
 

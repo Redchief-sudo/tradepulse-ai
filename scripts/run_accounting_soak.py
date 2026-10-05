@@ -179,18 +179,27 @@ SERVICE_UNIT = "tradepulse-run"
 
 
 async def _service_active() -> str:
-    """"active", "inactive" or "systemctl_unavailable" for the supervised service.
+    """"active", "inactive", "systemctl_unavailable" or "unverifiable" for the supervised service.
 
     Two runtimes on one paper account recreate the two-writer integrity lock,
-    so a running service refuses the soak. Tests replace this coroutine; they
-    never call the real systemctl."""
+    so a running service refuses the soak. Fail closed: only systemctl's own
+    "inactive" or "failed" answer proves the service is stopped. A user bus it
+    cannot reach, a transitional state or any other output is "unverifiable"
+    and also refuses. Tests replace this coroutine; they never call the real
+    systemctl."""
     try:
         process = await asyncio.create_subprocess_exec(
-            "systemctl", "--user", "is-active", "--quiet", SERVICE_UNIT,
-            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            "systemctl", "--user", "is-active", SERVICE_UNIT,
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     except FileNotFoundError:
-        return "systemctl_unavailable"  # no systemd user session on this host
-    return "active" if await process.wait() == 0 else "inactive"
+        return "systemctl_unavailable"  # no systemd on this host, so no supervised service can exist
+    stdout, _ = await process.communicate()
+    state = stdout.decode(errors="replace").strip()
+    if process.returncode == 0:
+        return "active"
+    if state in ("inactive", "failed"):
+        return "inactive"
+    return "unverifiable"
 
 
 async def _broker_preflight(environment: dict, report: Path, acknowledged: frozenset[str]) -> dict:
@@ -203,9 +212,10 @@ async def _broker_preflight(environment: dict, report: Path, acknowledged: froze
         raise VerificationError("soak_preflight_requires_paper_configuration")
     evidence_path = report.parent / (report.stem + ".preflight.json")
     service_check = await _service_active()
-    if service_check == "active":
-        await asyncio.to_thread(write_once, evidence_path, {"problems": ["SUPERVISED_SERVICE_ACTIVE"], "service_check": service_check})
-        raise VerificationError("soak_preflight_refused:SUPERVISED_SERVICE_ACTIVE")
+    service_problem = {"active": "SUPERVISED_SERVICE_ACTIVE", "unverifiable": "SUPERVISED_SERVICE_UNVERIFIABLE"}.get(service_check)
+    if service_problem is not None:
+        await asyncio.to_thread(write_once, evidence_path, {"problems": [service_problem], "service_check": service_check})
+        raise VerificationError("soak_preflight_refused:" + service_problem)
     broker = build_broker(settings)
     try:
         result = await preflight(broker, acknowledged=acknowledged)

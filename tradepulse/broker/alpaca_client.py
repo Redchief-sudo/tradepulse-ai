@@ -94,6 +94,7 @@ class AlpacaClient:
         self._option_feed = option_feed
         self._sleep = sleep
         self._rate_limit: AlpacaRateLimitSnapshot | None = None
+        self.rate_limited_responses = 0  # cumulative 429s this client has received
         self.last_positions_received_at: datetime | None = None
 
     def set_market_data_feeds(self, *, equity_feed: Literal["iex", "sip"], option_feed: Literal["indicative", "opra"]) -> None:
@@ -168,6 +169,8 @@ class AlpacaClient:
         while True:
             response = await self._client.request(method, url, headers=self._headers, **kwargs)
             self._record_rate_limit(response)  # always captured, even when retry is skipped below
+            if response.status_code == 429:
+                self.rate_limited_responses += 1
             if response.status_code != 429 or not retry_on_rate_limit or attempt >= RATE_LIMIT_MAX_RETRIES:
                 return response
             wait_seconds = self._rate_limit_backoff_seconds(response, attempt)
@@ -311,6 +314,26 @@ class AlpacaClient:
             timestamp=_parse_timestamp(quote.get("t")),
             source=source,
         )
+
+    async def get_latest_option_quotes(self, symbols: list[str]) -> dict[str, RawQuote]:
+        """Latest quotes for several OCC symbols in ONE request -- the same
+        endpoint and feed as get_latest_quote's option branch, which accepts a
+        comma-separated symbol list. A symbol Alpaca returns no quote for maps
+        to a RawQuote with no bid/ask, which the provider rejects like any
+        other invalid quote."""
+        normalized = [str(symbol).upper() for symbol in symbols]
+        url = f"{DATA_BASE}/v1beta1/options/quotes/latest"
+        response = await self._request("GET", url, params={"symbols": ",".join(normalized), "feed": self._option_feed})
+        if not response.is_success:
+            raise_alpaca_error(response, "getLatestOptionQuotes")
+        quotes = response.json().get("quotes") or {}
+        source = f"alpaca_{self._option_feed}"
+        result: dict[str, RawQuote] = {}
+        for symbol in normalized:
+            quote = quotes.get(symbol) or {}
+            result[symbol] = RawQuote(symbol=symbol, bid=_decimal_or_none(quote.get("bp")), ask=_decimal_or_none(quote.get("ap")),
+                                      timestamp=_parse_timestamp(quote.get("t")), source=source)
+        return result
 
     async def get_options_chain(
         self, underlying_symbol: str, expiration_gte: str, expiration_lte: str

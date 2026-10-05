@@ -10,10 +10,11 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import InvalidOperation
 
 from tradepulse.broker import AlpacaClient, AlpacaError
+from tradepulse.broker.types import RawQuote
 from tradepulse.models import AssetIdentity, Candle, MarketQuote
 from tradepulse.strategy.options_selection import OptionContractSummary
 
-from .errors import ProviderDataFailure, ProviderHttpFailure
+from .errors import ProviderDataFailure, ProviderError, ProviderHttpFailure
 
 MIN_CANDLES = 30
 
@@ -28,27 +29,26 @@ class AlpacaMarketDataProvider:
         except AlpacaError as exc:
             raise ProviderHttpFailure("alpaca", asset.symbol, "fetch_quote", exc.status_code, exc.message) from exc
 
-        if raw.bid is None or raw.ask is None or raw.bid <= 0 or raw.ask <= 0 or raw.ask < raw.bid:
-            raise ProviderDataFailure(
-                "alpaca", asset.symbol, "fetch_quote", "ALPACA_QUOTE_INVALID",
-                f"invalid bid/ask for {asset.symbol}: bid={raw.bid} ask={raw.ask}", retryable=True,
-            )
-        if raw.timestamp is None:
-            raise ProviderDataFailure(
-                "alpaca", asset.symbol, "fetch_quote", "ALPACA_QUOTE_MISSING_TIMESTAMP",
-                f"missing quote timestamp for {asset.symbol}", retryable=True,
-            )
+        return _market_quote(asset, raw, "fetch_quote")
 
-        return MarketQuote(
-            asset=asset,
-            price=(raw.bid + raw.ask) / 2,
-            observed_at=raw.timestamp,
-            received_at=datetime.now(UTC),
-            provider=raw.source,
-            market_generation=0,
-            bid=raw.bid,
-            ask=raw.ask,
-        )
+    async def fetch_option_quotes(self, assets: list[AssetIdentity]) -> dict[str, MarketQuote | ProviderError]:
+        """Quote several option contracts with one Alpaca request.
+
+        A transport failure raises for the whole batch. Each contract's quote
+        is validated exactly as fetch_quote validates it; an invalid one maps
+        to its ProviderDataFailure so the caller can still use the rest."""
+        try:
+            raw_quotes = await self._client.get_latest_option_quotes([asset.symbol for asset in assets])
+        except AlpacaError as exc:
+            symbols = ",".join(asset.symbol for asset in assets)
+            raise ProviderHttpFailure("alpaca", symbols, "fetch_option_quotes", exc.status_code, exc.message) from exc
+        result: dict[str, MarketQuote | ProviderError] = {}
+        for asset in assets:
+            try:
+                result[asset.symbol] = _market_quote(asset, raw_quotes[asset.symbol.upper()], "fetch_option_quotes")
+            except ProviderError as exc:
+                result[asset.symbol] = exc
+        return result
 
     async def fetch_candles(self, asset: AssetIdentity, lookback_days: int = 200) -> list[Candle]:
         """Every failure path here raises ProviderError -- including
@@ -129,3 +129,27 @@ class AlpacaMarketDataProvider:
                 )
             )
         return summaries
+
+
+def _market_quote(asset: AssetIdentity, raw: RawQuote, operation: str) -> MarketQuote:
+    if raw.bid is None or raw.ask is None or raw.bid <= 0 or raw.ask <= 0 or raw.ask < raw.bid:
+        raise ProviderDataFailure(
+            "alpaca", asset.symbol, operation, "ALPACA_QUOTE_INVALID",
+            f"invalid bid/ask for {asset.symbol}: bid={raw.bid} ask={raw.ask}", retryable=True,
+        )
+    if raw.timestamp is None:
+        raise ProviderDataFailure(
+            "alpaca", asset.symbol, operation, "ALPACA_QUOTE_MISSING_TIMESTAMP",
+            f"missing quote timestamp for {asset.symbol}", retryable=True,
+        )
+
+    return MarketQuote(
+        asset=asset,
+        price=(raw.bid + raw.ask) / 2,
+        observed_at=raw.timestamp,
+        received_at=datetime.now(UTC),
+        provider=raw.source,
+        market_generation=0,
+        bid=raw.bid,
+        ask=raw.ask,
+    )

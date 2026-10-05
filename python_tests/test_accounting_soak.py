@@ -535,6 +535,19 @@ async def test_preflight_refuses_when_the_supervised_service_is_active(runner, t
     assert built == []  # refused before any broker was built
 
 
+async def test_preflight_refuses_when_the_supervised_service_state_is_unverifiable(runner, tmp_path, monkeypatch):
+    import json
+
+    built = []
+    monkeypatch.setattr("tradepulse.session_commands.build_broker", lambda settings: built.append(settings))
+    runner._service_active = AsyncMock(return_value="unverifiable")
+    with pytest.raises(VerificationError, match="soak_preflight_refused:SUPERVISED_SERVICE_UNVERIFIABLE"):
+        await runner._real_broker_preflight(dict(_PAPER_ENV), tmp_path / "soak-accounting-1.json", frozenset())
+    stored = json.loads((tmp_path / "soak-accounting-1.preflight.json").read_text())
+    assert stored["problems"] == ["SUPERVISED_SERVICE_UNVERIFIABLE"]
+    assert built == []
+
+
 async def test_preflight_proceeds_when_the_supervised_service_is_inactive(runner, tmp_path, monkeypatch):
     import json
 
@@ -561,17 +574,43 @@ async def test_service_active_maps_systemctl_results_without_running_it(runner, 
         "soak_real", Path(runner.__file__)))
     real.__spec__.loader.exec_module(real)
 
-    def fake(returncode=None, missing=False):
+    def fake(returncode=None, output=b"", missing=False):
         async def spawn(*args, **kwargs):
             if missing:
                 raise FileNotFoundError("systemctl")
-            assert args == ("systemctl", "--user", "is-active", "--quiet", "tradepulse-run")
-            return SimpleNamespace(wait=AsyncMock(return_value=returncode))
+            assert args == ("systemctl", "--user", "is-active", "tradepulse-run")
+            process = SimpleNamespace(returncode=None)
+
+            async def communicate():
+                process.returncode = returncode
+                return output, b""
+            process.communicate = communicate
+            return process
         return spawn
 
-    monkeypatch.setattr(real.asyncio, "create_subprocess_exec", fake(0))
+    monkeypatch.setattr(real.asyncio, "create_subprocess_exec", fake(0, b"active\n"))
     assert await real._service_active() == "active"
-    monkeypatch.setattr(real.asyncio, "create_subprocess_exec", fake(3))
-    assert await real._service_active() == "inactive"
+    for state in (b"inactive\n", b"failed\n"):
+        monkeypatch.setattr(real.asyncio, "create_subprocess_exec", fake(3, state))
+        assert await real._service_active() == "inactive"
+    # Fail closed: a bus error, a transitional state or empty output never counts as stopped.
+    for returncode, output in ((1, b""), (3, b"activating\n"), (3, b"deactivating\n"), (4, b"")):
+        monkeypatch.setattr(real.asyncio, "create_subprocess_exec", fake(returncode, output))
+        assert await real._service_active() == "unverifiable"
     monkeypatch.setattr(real.asyncio, "create_subprocess_exec", fake(missing=True))
     assert await real._service_active() == "systemctl_unavailable"
+
+
+def test_broker_rate_limit_evidence_summarizes_reconcile_samples():
+    from tradepulse.verification.soak import _broker_rate_limit
+
+    def clock(**details):
+        return {"event_type": "verification_broker_clock", "details": details}
+
+    events = [clock(rate_limit_limit=200, rate_limit_remaining=180, rate_limited_responses=0),
+              clock(rate_limit_limit=200, rate_limit_remaining=95, rate_limited_responses=2),
+              clock(rate_limit_limit=None, rate_limit_remaining=None, rate_limited_responses=2),
+              clock(),  # a sample recorded before this evidence existed
+              {"event_type": "verification_lane_cycle", "details": {"rate_limit_remaining": 1}}]
+    assert _broker_rate_limit(events) == {"samples": 2, "limit": 200, "minimum_remaining": 95, "rate_limited_responses": 2}
+    assert _broker_rate_limit([]) == {"samples": 0, "limit": None, "minimum_remaining": None, "rate_limited_responses": 0}

@@ -433,7 +433,9 @@ async def test_reset_integrity_refuses_while_accounting_drift_persists(tmp_path)
     assert exit_code == 1
     session = await load_session(repositories)
     assert session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED
-    assert (await _audit_events(repositories)) == []
+    # No session transition; the pre-reset reconciliation's once-per-day drift
+    # alert (Rev.119) is its only audit event.
+    assert [event.event_type for event in await _audit_events(repositories)] == ["accounting_drift"]
 
 
 @respx.mock
