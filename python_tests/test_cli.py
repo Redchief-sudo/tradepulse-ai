@@ -1144,32 +1144,51 @@ async def test_run_application_still_gates_activation_but_starts_supervisor_from
     assert supervisor_calls == 1  # ...but its refusal no longer strands protection: scan lanes idle instead
 
 
+@respx.mock
 async def test_verification_reconcile_tick_records_rate_limit_headroom(tmp_path, monkeypatch) -> None:
     """Each reconcile tick's broker-clock evidence carries the account-wide
-    X-RateLimit headroom and cumulative 429s, so a soak measures API load."""
+    X-RateLimit headroom and the cumulative 429s of every Alpaca client in
+    the process -- including the separate client reconciliation builds for
+    itself (Rev.120), which the runtime client's own counter never saw."""
     from types import SimpleNamespace
 
-    from tradepulse.broker.types import AlpacaRateLimitSnapshot
+    from tradepulse.broker import AlpacaClient
+    from tradepulse.broker.alpaca_client import process_rate_limit_evidence
     from tradepulse.cli import _verification_reconcile_action
 
     database_url = f"sqlite:///{tmp_path}/test.db"
     database = AsyncSQLiteDatabase(database_url)
     await database.initialize()
     repositories = PersistenceRepositories.create(database)
+    respx.get("https://paper-api.alpaca.markets/v2/clock").mock(side_effect=[
+        httpx.Response(429),
+        httpx.Response(200, headers={"x-ratelimit-limit": "200", "x-ratelimit-remaining": "140"},
+                       json={"is_open": True, "timestamp": "2026-10-05T15:00:00Z",
+                             "next_open": "2026-10-06T13:30:00Z", "next_close": "2026-10-05T20:00:00Z"}),
+    ])
 
-    async def _stub_reconcile(settings) -> int:
+    async def _reconcile_with_its_own_client(settings) -> int:
+        async def no_sleep(seconds: float) -> None:
+            return None
+
+        client = AlpacaClient("key", "secret", "paper", 10, sleep=no_sleep)
+        try:
+            await client.get_clock()  # 429, retried, then 200
+        finally:
+            await client.aclose()
         return 0
 
-    monkeypatch.setattr("tradepulse.cli._run_reconcile", _stub_reconcile)
+    monkeypatch.setattr("tradepulse.cli._run_reconcile", _reconcile_with_its_own_client)
+    _, before = process_rate_limit_evidence()
     now = datetime.now(UTC)
 
     async def get_clock() -> AlpacaClock:
         return AlpacaClock(is_open=True, next_open=now + timedelta(days=1), next_close=now + timedelta(hours=1), timestamp=now)
 
-    broker = SimpleNamespace(get_clock=get_clock, rate_limited_responses=3,
-                             rate_limit_snapshot=AlpacaRateLimitSnapshot(limit=200, remaining=140, reset_at=None, observed_at=now))
-    await _verification_reconcile_action(_settings(database_url), repositories, broker)
+    runtime_broker = SimpleNamespace(get_clock=get_clock)  # its own counters never see reconciliation's 429
+    await _verification_reconcile_action(_settings(database_url), repositories, runtime_broker)
 
     [row] = await repositories.audit_events.list_all()
     details = hydrate("audit_events", row["payload"]).details
-    assert (details["rate_limit_limit"], details["rate_limit_remaining"], details["rate_limited_responses"]) == (200, 140, 3)
+    assert (details["rate_limit_limit"], details["rate_limit_remaining"]) == (200, 140)
+    assert details["rate_limited_responses"] == before + 1

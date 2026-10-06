@@ -35,9 +35,12 @@ from tradepulse.settlement import SettlementProcessor
         ("done_for_day", Decimal("4"), Decimal("10"), TradeIntentStatus.PARTIALLY_FILLED),
         ("done_for_day", Decimal("10"), Decimal("10"), TradeIntentStatus.FILLED),
         ("done_for_day", Decimal("0"), Decimal("10"), None),
-        # Broker failure statuses map to their OWN distinct TradeIntentStatus
-        # when nothing was attributed, not a single generic REJECTED.
-        ("canceled", Decimal("4"), Decimal("10"), TradeIntentStatus.PARTIALLY_FILLED),
+        # Broker failure statuses map to their OWN distinct TradeIntentStatus,
+        # not a single generic REJECTED -- and are terminal even after a
+        # partial fill (Rev.120): the order is finished at the broker, and a
+        # non-terminal PARTIALLY_FILLED would block the symbol forever.
+        ("canceled", Decimal("4"), Decimal("10"), TradeIntentStatus.CANCELED),
+        ("expired", Decimal("4"), Decimal("10"), TradeIntentStatus.EXPIRED),
         ("canceled", Decimal("0"), Decimal("10"), TradeIntentStatus.CANCELED),
         ("expired", Decimal("0"), Decimal("10"), TradeIntentStatus.EXPIRED),
         ("rejected", Decimal("0"), Decimal("10"), TradeIntentStatus.REJECTED),

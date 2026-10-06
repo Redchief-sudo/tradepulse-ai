@@ -12,11 +12,13 @@ Environment=TRADEPULSE_EXECUTION_MODE=paper TRADEPULSE_LIVE_TRADING_ENABLED=fals
 # safety latch stays in force across restarts, while monitor, settlement and
 # reconciliation keep protecting existing positions.
 # The service and every operator command (`tradepulse start/stop/status`)
-# read the database from .env. Refuse to start unless it names the dedicated
-# service database: tradepulse.db is preserved legacy evidence.
-ExecStartPre=/bin/grep -qx "TRADEPULSE_DATABASE_URL=sqlite:///tradepulse-service.db" %h/tradepulse-ai/.env
-ExecStart=%h/tradepulse-ai/.venv/bin/tradepulse run --no-browser --resume
+# read the database from .env. --require-database refuses to start (exit 78)
+# unless the database the runtime actually resolved -- process environment
+# first, then .env -- is the dedicated service database: tradepulse.db is
+# preserved legacy evidence.
+ExecStart=%h/tradepulse-ai/.venv/bin/tradepulse run --no-browser --resume --require-database sqlite:///tradepulse-service.db
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=30
 KillSignal=SIGINT
 TimeoutStopSec=900

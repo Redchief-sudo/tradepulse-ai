@@ -21,6 +21,12 @@ class TelegramAlerter:
         self._chat_id = chat_id
         self._timeout_seconds = timeout_seconds
 
+    @property
+    def configured(self) -> bool:
+        """False when no bot token or chat id is set: send() then skips every
+        alert by design, which is not a delivery failure to retry."""
+        return bool(self._bot_token and self._chat_id)
+
     async def send(self, severity: Severity, message: str, details: Mapping[str, Any] | None = None) -> bool:
         """Alerting is optional infrastructure -- its absence or failure must
         never block or fail a trading cycle, so this always returns a bool

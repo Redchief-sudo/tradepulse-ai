@@ -45,7 +45,7 @@ from decimal import Decimal
 from typing import Literal
 from uuid import uuid4
 
-from tradepulse.alerts import TelegramAlerter
+from tradepulse.alerts import TelegramAlerter, alert_once
 from tradepulse.broker import AlpacaActivity, AlpacaClient
 from tradepulse.models import (
     AssetClass,
@@ -74,7 +74,7 @@ from tradepulse.settlement import SettlementProcessor
 from tradepulse.settlement.stages import retry_delay_seconds
 from tradepulse.time import aware_utc
 
-from ..execution.fill_attribution import resolve_order_from_broker
+from ..execution.fill_attribution import order_matches_intent, resolve_order_from_broker
 from .asset_fees import reconcile_asset_fees
 
 logger = logging.getLogger(__name__)
@@ -109,16 +109,14 @@ async def _alert_once(repositories: PersistenceRepositories, alerts: TelegramAle
 
     Reconciliation runs every minute, so a condition that persists until an
     operator acts would otherwise re-alert on every pass. The deterministic
-    audit id makes the first sighting in each window the only one sent;
-    ``window`` is a UTC date or date-hour string. Reconciliation records are
-    still written on every pass."""
+    audit id makes the first delivered alert in each window the only one
+    (a failed send is retried next pass, see alert_once); ``window`` is a UTC
+    date or date-hour string. Reconciliation records are still written on
+    every pass."""
     event_id = f"{event_type}:{subject}:{window}"
     event = AuditEvent(event_id=event_id, event_type=event_type, severity=severity, message=message,
                        occurred_at=now, entity_type="reconciliation", entity_id=subject, details=details)
-    if not await repositories.audit_events.create_once(event_id, event):
-        return False
-    await alerts.send(severity, message, details)
-    return True
+    return await alert_once(repositories.audit_events, alerts, event)
 
 
 def _utc_day(now: datetime) -> str:
@@ -610,7 +608,8 @@ async def _resolve_stranded(repositories, broker, alerts, trade_intent_id, now, 
             return False
         if reason in _UNPROVABLE_STRANDED_REASONS:
             # Permanent until an operator acts: alert once per intent per UTC day
-            # (deterministic audit id) and write drift only on that first sighting.
+            # (deterministic audit id, recorded once delivered) and write drift
+            # only until that alert is recorded.
             event_id = f"stranded_intent_unresolved:{trade_intent_id}:{now.date().isoformat()}"
             event = AuditEvent(
                 event_id=event_id, event_type="stranded_intent_unresolved", severity="critical",
@@ -620,11 +619,11 @@ async def _resolve_stranded(repositories, broker, alerts, trade_intent_id, now, 
                 occurred_at=now, entity_type="trade_intent", entity_id=trade_intent_id,
                 details={"reason": reason, "status": intent.status.value, "symbol": intent.asset.symbol},
             )
-            if await repositories.audit_events.create_once(event_id, event):
+            if await repositories.audit_events.get(event_id) is None:
                 await _record(repositories, reconciliation_type="order", subject_id=trade_intent_id,
                               outcome=ReconciliationOutcome.DRIFT_DETECTED, expected={"stranded_intent_resolved": True},
                               actual={"error": reason, "status": intent.status.value}, occurred_at=now)
-                await alerts.send("critical", event.message, dict(event.details))
+                await alert_once(repositories.audit_events, alerts, event)
             return False
         await _record(repositories, reconciliation_type="order", subject_id=trade_intent_id,
                       outcome=ReconciliationOutcome.DRIFT_DETECTED, expected={"stranded_intent_resolved": True},
@@ -642,13 +641,14 @@ async def _resolve_stranded(repositories, broker, alerts, trade_intent_id, now, 
     approved_on = intent.risk_snapshot.get("broker_account_number")
     try:
         account = await broker.get_account()
-        if approved_on is None or account.account_number != approved_on:
+        # Blank on either side proves nothing: two empty strings are equal
+        # without identifying any account.
+        if not approved_on or not account.account_number or account.account_number != approved_on:
             return await unresolved(intent, "ACCOUNT_IDENTITY_UNPROVEN")
         order = await broker.get_order_by_client_order_id(intent.trade_intent_id)
     except Exception as exc:  # noqa: BLE001 - an unavailable lookup proves nothing; retry next pass
         return await unresolved(intent, str(exc))
-    if order is not None and (order.raw.get("client_order_id") != intent.trade_intent_id
-                              or order.symbol != intent.asset.symbol or order.side != intent.side):
+    if order is not None and not order_matches_intent(order, intent):
         return await unresolved(intent, "STRANDED_ORDER_IDENTITY_MISMATCH")
     if fence.is_set():
         return False  # lease lost while waiting on the broker: ownership is unproven, write nothing

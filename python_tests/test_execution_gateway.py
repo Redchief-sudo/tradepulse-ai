@@ -94,6 +94,15 @@ def _order_json(status: str, filled_qty: str, filled_avg_price: str | None) -> d
     }
 
 
+def _client_order_lookup(qty: str = "5", order_type: str = "market"):
+    """GET /v2/orders:by_client_order_id as Alpaca answers it: the order
+    carries the client_order_id it was looked up by, plus its qty and type."""
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={**_order_json("accepted", "0", None), "qty": qty, "type": order_type,
+                                         "client_order_id": request.url.params["client_order_id"]})
+    return respond
+
+
 def _fill_activity(
     activity_id: str, order_id: str = "order-1", *,
     symbol: str = "AAPL", side: str = "buy", qty: str = "5", price: str = "199.60", transaction_time: str = QUOTE_TS,
@@ -1245,7 +1254,7 @@ async def test_ambiguous_submission_error_recovers_via_client_order_id_lookup(tm
     _mock_market_open()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=httpx.ConnectError("connection refused"))
     lookup_route = respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(
-        return_value=httpx.Response(200, json=_order_json("accepted", "0", None))
+        side_effect=_client_order_lookup()
     )
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
     _mock_fill_activities(_fill_activity("act-1"))
@@ -1261,6 +1270,32 @@ async def test_ambiguous_submission_error_recovers_via_client_order_id_lookup(tm
 
 
 @respx.mock
+async def test_unknown_submission_never_adopts_an_order_that_is_not_its_own(tmp_path) -> None:
+    """Rev.120: the client-order-id lookup finds an order whose quantity is
+    not what this intent submitted. It is never adopted (no fills attributed
+    from it); the intent stays SUBMISSION_UNKNOWN for an operator."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_market_open()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=httpx.ConnectError("connection refused"))
+    respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(side_effect=_client_order_lookup(qty="50"))
+    order_route = respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
+        return_value=httpx.Response(200, json=_order_json("filled", "50", "199.60")))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "pending" and "BROKER_ORDER_IDENTITY_MISMATCH" in result.reasons[0]
+    assert order_route.call_count == 0  # never polled as if it were ours
+    [row] = await repositories.trade_intents.list_all()
+    assert (row["status"], row["payload"]["broker_order_id"]) == ("submission_unknown", None)
+
+
+@respx.mock
 async def test_definitive_rejection_ends_rejected_without_recovery_lookup(tmp_path) -> None:
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
@@ -1272,7 +1307,7 @@ async def test_definitive_rejection_ends_rejected_without_recovery_lookup(tmp_pa
         return_value=httpx.Response(422, json={"message": "invalid order", "code": 40010001})
     )
     lookup_route = respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(
-        return_value=httpx.Response(200, json=_order_json("accepted", "0", None))
+        side_effect=_client_order_lookup()
     )
 
     request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
@@ -1296,7 +1331,7 @@ async def test_ambiguous_5xx_error_routes_through_recovery_not_straight_to_rejec
         return_value=httpx.Response(500, json={"message": "internal error"})
     )
     lookup_route = respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(
-        return_value=httpx.Response(200, json=_order_json("accepted", "0", None))
+        side_effect=_client_order_lookup()
     )
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
     _mock_fill_activities(_fill_activity("act-1"))
@@ -1325,7 +1360,7 @@ async def test_ambiguous_429_error_from_place_order_routes_through_recovery_not_
     _mock_market_open()
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(429))
     lookup_route = respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(
-        return_value=httpx.Response(200, json=_order_json("accepted", "0", None))
+        side_effect=_client_order_lookup()
     )
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
     _mock_fill_activities(_fill_activity("act-1"))
@@ -1573,6 +1608,83 @@ async def test_concurrent_buys_for_different_symbols_serialize_through_portfolio
     assert len(orders) == 1 and b'"AAPL"' in orders[0].content  # one broker submission
     intents = [row["payload"] for row in await repositories.trade_intents.list_all()]
     assert [(i["asset"]["symbol"], i["status"]) for i in intents] == [("AAPL", "filled")]  # one approval
+
+
+@respx.mock
+async def test_a_lapsed_portfolio_lease_never_commits_an_overlapping_approval(tmp_path) -> None:
+    """Rev.120: the first BUY stalls inside the portfolio-risk window (on its
+    account fetch) until its lease expires. A second BUY then takes the
+    lease, is approved and fills. When the first resumes, its approval was
+    made against a snapshot the second already spent, so the fenced
+    RISK_APPROVED write must refuse it: one broker submission, not two."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    # balanced profile's max_total_exposure_pct is well under 100% -- a
+    # $100k-equity account with two simultaneous ~$60k BUYs (AAPL @ ~$199.60,
+    # ~300 shares; BTC @ ~$60010, ~1 unit) would together blow it if both
+    # were approved against the same starting snapshot.
+    account_json = {"equity": "100000", "last_equity": "100000", "cash": "150000", "buying_power": "100000", "portfolio_value": "100000"}
+    _mock_positions()
+    _mock_quote()
+    _mock_market_open()
+    respx.get("https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes").mock(
+        return_value=httpx.Response(200, json={"quotes": {"BTC/USD": {"bp": 60000.0, "ap": 60010.0, "t": QUOTE_TS}}})
+    )
+
+    def _aapl_order(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "order-aapl", "status": "filled", "symbol": "AAPL", "side": "buy",
+            "filled_qty": "300", "filled_avg_price": "199.60", "submitted_at": QUOTE_TS,
+        })
+
+    def _btc_order(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "order-btc", "status": "filled", "symbol": "BTC/USD", "side": "buy",
+            "filled_qty": "1", "filled_avg_price": "60010", "submitted_at": QUOTE_TS,
+        })
+
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=lambda request: (
+        _aapl_order(request) if b'"AAPL"' in request.content else _btc_order(request)
+    ))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-aapl").mock(side_effect=_aapl_order)
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-btc").mock(side_effect=_btc_order)
+    respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(return_value=httpx.Response(200, json=[
+        {"id": "act-aapl-1", "activity_type": "FILL", "symbol": "AAPL", "side": "buy", "qty": "300", "price": "199.60", "transaction_time": QUOTE_TS, "order_id": "order-aapl"},
+        {"id": "act-btc-1", "activity_type": "FILL", "symbol": "BTC/USD", "side": "buy", "qty": "1", "price": "60010", "transaction_time": QUOTE_TS, "order_id": "order-btc"},
+    ]))
+
+    aapl_request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("300"), strategy="test", confidence=Decimal("90"))
+    btc_request = ExecutionRequest(asset=_btc(), side=Side.BUY, requested_quantity=Decimal("1"), strategy="test", confidence=Decimal("90"))
+
+    inside_lock, release = asyncio.Event(), asyncio.Event()
+
+    async def account_route(request: httpx.Request) -> httpx.Response:
+        # The first execution parks here -- inside the portfolio-risk lock -- until released.
+        if not inside_lock.is_set():
+            inside_lock.set()
+            await release.wait()
+        return httpx.Response(200, json=account_json)
+
+    respx.get("https://paper-api.alpaca.markets/v2/account").mock(side_effect=account_route)
+
+    first = asyncio.create_task(gateway.execute_intent(aapl_request))
+    await asyncio.wait_for(inside_lock.wait(), timeout=10)
+
+    def expire(connection) -> None:  # the stalled holder's lease lapses
+        connection.execute("UPDATE locks SET expires_at='2000-01-01T00:00:00+00:00' WHERE lock_key=?", (PORTFOLIO_RISK_LOCK_KEY,))
+
+    await repositories.trade_intents.database.run(expire, write=True)
+    second = await gateway.execute_intent(btc_request)  # takes over the lapsed lease
+    release.set()
+    first_result = await asyncio.wait_for(first, timeout=30)
+    await broker.aclose()
+
+    assert second.status == "filled"
+    assert first_result.status == "skipped" and first_result.reasons == ["PORTFOLIO_RISK_LOCK_LOST"]
+    orders = [c.request for c in respx.calls if c.request.method == "POST" and c.request.url.path == "/v2/orders"]
+    assert len(orders) == 1 and b'"BTC/USD"' in orders[0].content  # one broker submission
+    statuses = sorted((row["payload"]["asset"]["symbol"], row["payload"]["status"]) for row in await repositories.trade_intents.list_all())
+    assert statuses == [("AAPL", "rejected"), ("BTC/USD", "filled")]
 
 
 @respx.mock

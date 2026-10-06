@@ -15,7 +15,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from tradepulse.alerts import TelegramAlerter
-from tradepulse.broker import AlpacaActivity, AlpacaClient, AlpacaError
+from tradepulse.broker import AlpacaActivity, AlpacaClient, AlpacaError, AlpacaOrderResponse
 from tradepulse.models import (
     AssetClass,
     Fill,
@@ -36,13 +36,17 @@ TERMINAL_STATUSES = frozenset(
 TERMINAL_FAILURE_ORDER_STATUSES = frozenset({"rejected", "canceled", "expired", "replaced"})
 TERMINAL_ORDER_STATUSES = frozenset({"filled", "done_for_day"} | TERMINAL_FAILURE_ORDER_STATUSES)
 
-# The local TradeIntentStatus each broker failure status maps to when NO
-# quantity was actually attributed -- distinct enum values, not a single
-# generic REJECTED, so the persisted state reflects Alpaca's own vocabulary.
+# The local TradeIntentStatus each terminal broker failure status maps to,
+# with or without partial fills (Rev.120: a canceled order that filled part of
+# its quantity is finished at the broker; PARTIALLY_FILLED would keep it "in
+# flight" forever, blocking protective exits and reserving exposure). The
+# filled part lives in its Fill records and filled_quantity. Distinct enum
+# values, not a single generic REJECTED, so the persisted state reflects
+# Alpaca's own vocabulary.
 # "replaced" (this codebase never issues a replace-order request itself,
 # but a terminal order could still arrive in this state) has no closer
 # existing match than CANCELED: the order was superseded, not "rejected".
-_ZERO_FILL_TERMINAL_STATUS: dict[str, TradeIntentStatus] = {
+_FAILURE_TERMINAL_STATUS: dict[str, TradeIntentStatus] = {
     "rejected": TradeIntentStatus.REJECTED,
     "canceled": TradeIntentStatus.CANCELED,
     "expired": TradeIntentStatus.EXPIRED,
@@ -77,9 +81,7 @@ def terminal_status_for_order(
     if requested_quantity is not None and requested_quantity > 0 and attributed_qty >= requested_quantity:
         return TradeIntentStatus.FILLED
     if order_status in TERMINAL_FAILURE_ORDER_STATUSES:
-        if attributed_qty > 0:
-            return TradeIntentStatus.PARTIALLY_FILLED
-        return _ZERO_FILL_TERMINAL_STATUS.get(order_status, TradeIntentStatus.REJECTED)
+        return _FAILURE_TERMINAL_STATUS.get(order_status, TradeIntentStatus.REJECTED)
     if order_status == "done_for_day":
         return TradeIntentStatus.PARTIALLY_FILLED if attributed_qty > 0 else None
     return None  # order_status == "filled" but attributed_qty hasn't reached requested_quantity
@@ -437,12 +439,35 @@ async def resolve_order_from_broker(
     return attributed
 
 
+def order_matches_intent(order: AlpacaOrderResponse, intent: TradeIntent) -> bool:
+    """True only for the order this intent would have submitted: same client
+    order id, symbol, side, order type and quantity (or notional). Recovery
+    (stranded intents, unknown submissions) adopts an order found by client
+    order id only when this holds; anything else is someone else's order or
+    a different decision, and is left for an operator."""
+    raw = order.raw
+    if (raw.get("client_order_id") != intent.trade_intent_id or order.symbol != intent.asset.symbol
+            or order.side != intent.side):
+        return False
+    if str(raw.get("type") or raw.get("order_type") or "").lower() != intent.order_type.lower():
+        return False
+    try:
+        if intent.requested_quantity is not None:
+            return raw.get("qty") is not None and Decimal(str(raw["qty"])) == intent.requested_quantity
+        if intent.requested_notional is not None:
+            return raw.get("notional") is not None and Decimal(str(raw["notional"])) == intent.requested_notional
+    except (ArithmeticError, ValueError):
+        return False
+    return False
+
+
 __all__ = [
     "TERMINAL_FAILURE_ORDER_STATUSES",
     "TERMINAL_ORDER_STATUSES",
     "TERMINAL_STATUSES",
     "AttributedFills",
     "attribute_order_fills",
+    "order_matches_intent",
     "resolve_order_from_broker",
     "terminal_status_for_order",
 ]

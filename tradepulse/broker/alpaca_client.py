@@ -75,6 +75,19 @@ def _decimal_or_none(value: object) -> Decimal | None:
     return None if value is None else Decimal(str(value))
 
 
+# Process-wide API-load evidence. The runtime and the one-shot clients its
+# lanes build (reconciliation creates its own each tick) share one Alpaca
+# account limit, so evidence must cover every client in the process.
+_process_rate_limited_responses = 0
+_process_rate_limit: AlpacaRateLimitSnapshot | None = None
+
+
+def process_rate_limit_evidence() -> tuple[AlpacaRateLimitSnapshot | None, int]:
+    """The latest X-RateLimit snapshot seen by any AlpacaClient in this
+    process, and the cumulative 429 count across all of them."""
+    return _process_rate_limit, _process_rate_limited_responses
+
+
 class AlpacaClient:
     def __init__(
         self, api_key: str, api_secret: str, mode: Literal["paper", "live"], timeout_seconds: int,
@@ -135,6 +148,7 @@ class AlpacaClient:
             # 429 responses -- leave the last-known snapshot in place
             # rather than blanking out otherwise-good telemetry.
             return
+        global _process_rate_limit
         try:
             self._rate_limit = AlpacaRateLimitSnapshot(
                 limit=int(limit) if limit is not None else None,
@@ -142,6 +156,7 @@ class AlpacaClient:
                 reset_at=datetime.fromtimestamp(int(reset), tz=UTC) if reset is not None else None,
                 observed_at=datetime.now(UTC),
             )
+            _process_rate_limit = self._rate_limit
         except (ValueError, OSError):
             pass  # malformed header value -- never let telemetry parsing break a real request
 
@@ -170,7 +185,9 @@ class AlpacaClient:
             response = await self._client.request(method, url, headers=self._headers, **kwargs)
             self._record_rate_limit(response)  # always captured, even when retry is skipped below
             if response.status_code == 429:
+                global _process_rate_limited_responses
                 self.rate_limited_responses += 1
+                _process_rate_limited_responses += 1
             if response.status_code != 429 or not retry_on_rate_limit or attempt >= RATE_LIMIT_MAX_RETRIES:
                 return response
             wait_seconds = self._rate_limit_backoff_seconds(response, attempt)

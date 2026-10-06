@@ -12,7 +12,7 @@ Database: the service uses `tradepulse-service.db`, never `tradepulse.db` (the l
 TRADEPULSE_DATABASE_URL=sqlite:///tradepulse-service.db
 ```
 
-The unit's `ExecStartPre` refuses to start unless `.env` contains exactly that line. Only the soaks' opening checkpoint knows about positions held before a run, so start the service with a flat paper account: any pre-existing broker position is accounting drift to a fresh database and latches FINANCIAL_INTEGRITY_BLOCKED on the first reconciliation.
+The unit runs `tradepulse run --require-database sqlite:///tradepulse-service.db`, which refuses to start (exit 78, not restarted) unless the database the runtime actually resolved is that file. The check uses the resolved value, so an exported `TRADEPULSE_DATABASE_URL` or an earlier duplicate line in `.env` (the first one wins) cannot silently open another database. Only the soaks' opening checkpoint knows about positions held before a run, so start the service with a flat paper account: any pre-existing broker position is accounting drift to a fresh database and latches FINANCIAL_INTEGRITY_BLOCKED on the first reconciliation.
 
 Install:
 

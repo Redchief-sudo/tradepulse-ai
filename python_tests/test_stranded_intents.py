@@ -32,7 +32,8 @@ def _broker(account_number="PA1"):
 
 
 def _order(**overrides):
-    fields = {"broker_order_id": "order-9", "symbol": "BTC/USD", "side": Side.SELL, "raw": {"client_order_id": "ti-1"}}
+    fields = {"broker_order_id": "order-9", "symbol": "BTC/USD", "side": Side.SELL,
+              "raw": {"client_order_id": "ti-1", "qty": "1", "type": "market"}}
     return SimpleNamespace(**{**fields, **overrides})
 
 
@@ -75,7 +76,7 @@ async def test_sweep_adopts_matching_order_alpaca_did_receive(tmp_path):
 
 
 async def test_sweep_refuses_when_account_identity_is_unproven(tmp_path):
-    for recorded, current in ((None, "PA1"), ("PA1", "PA2")):
+    for recorded, current in ((None, "PA1"), ("PA1", "PA2"), ("", ""), ("PA1", ""), ("", "PA1")):
         repositories = await _repositories(tmp_path / f"{recorded}-{current}")
         await _stranded(repositories, account=recorded)
         broker = _broker(account_number=current)
@@ -86,7 +87,13 @@ async def test_sweep_refuses_when_account_identity_is_unproven(tmp_path):
 
 
 async def test_sweep_refuses_to_adopt_an_order_that_does_not_match(tmp_path):
-    for i, mismatch in enumerate(({"symbol": "ETH/USD"}, {"side": Side.BUY}, {"raw": {"client_order_id": "someone-else"}})):
+    mismatches = ({"symbol": "ETH/USD"}, {"side": Side.BUY},
+                  {"raw": {"client_order_id": "someone-else", "qty": "1", "type": "market"}},
+                  {"raw": {"client_order_id": "ti-1", "qty": "2", "type": "market"}},     # Rev.120: quantity
+                  {"raw": {"client_order_id": "ti-1", "qty": "1", "type": "limit"}},      # Rev.120: order type
+                  {"raw": {"client_order_id": "ti-1", "notional": "1", "type": "market"}},  # no qty at all
+                  {"raw": {"client_order_id": "ti-1", "qty": "abc", "type": "market"}})   # malformed
+    for i, mismatch in enumerate(mismatches):
         repositories = await _repositories(tmp_path / f"case-{i}")
         await _stranded(repositories)
         broker = _broker()

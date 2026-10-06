@@ -23,7 +23,7 @@ from decimal import Decimal
 from typing import Literal
 from uuid import uuid4
 
-from tradepulse.alerts import TelegramAlerter
+from tradepulse.alerts import TelegramAlerter, alert_once
 from tradepulse.broker import AlpacaClient, AlpacaPosition
 from tradepulse.execution import (
     SYMBOL_LOCK_TTL_SECONDS,
@@ -247,7 +247,8 @@ async def _report_unmanaged_position(repositories: PersistenceRepositories, aler
                                      position: AlpacaPosition, now: datetime) -> None:
     """A broker position with no local holding has no stop, target or time
     stop. Alert on first sighting, then once per asset per UTC day: a
-    deterministic audit event id makes create_once the deduplication."""
+    deterministic audit event id, recorded once the alert is delivered, is
+    the deduplication (see alert_once)."""
     key = asset_key_from_broker_symbol(position.asset_class, position.symbol)
     event_id = f"unmanaged_position:{key}:{now.date().isoformat()}"
     event = AuditEvent(
@@ -257,8 +258,7 @@ async def _report_unmanaged_position(repositories: PersistenceRepositories, aler
         occurred_at=now, entity_type="broker_position", entity_id=key,
         details={"symbol": position.symbol, "asset_class": position.asset_class.value, "qty": str(position.qty)},
     )
-    if await repositories.audit_events.create_once(event_id, event):
-        await alerts.send("critical", event.message, dict(event.details))
+    await alert_once(repositories.audit_events, alerts, event)
 
 
 async def run_position_monitor(

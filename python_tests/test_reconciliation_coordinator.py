@@ -785,3 +785,57 @@ async def test_broker_outage_alerts_once_per_utc_hour(tmp_path) -> None:
 
     outage_alerts = [m for s, m in alerts.sent if "positions unavailable" in m]
     assert len(outage_alerts) == 2
+
+
+@respx.mock
+async def test_canceled_partial_fill_is_finalized_and_no_longer_blocks_the_symbol(tmp_path) -> None:
+    """Rev.120: an order canceled after a partial fill is finished at the
+    broker. Recovery finalizes the intent as CANCELED with the filled part
+    recorded, so it stops counting as in flight -- before, it stayed
+    PARTIALLY_FILLED forever and blocked every later order on the symbol,
+    protective exits included. An intent already stuck in that state (Rev.119
+    data) is healed the same way on the next reconciliation."""
+    from tradepulse.execution import has_in_flight_intent
+
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    await _seed_intent(repositories, trade_intent_id="ti-5", broker_order_id="order-5", status=TradeIntentStatus.PARTIALLY_FILLED)
+    assert await has_in_flight_intent(repositories, _aapl()) is True
+    _mock_positions([])
+    _mock_activities([_activity_json("activity-5", "3", "150", order_id="order-5")])  # requested 5, 3 filled, rest canceled
+    _mock_order("order-5", "canceled", "3", "150")
+
+    await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    await broker.aclose()
+
+    intent = hydrate("trade_intents", (await repositories.trade_intents.get("ti-5"))["payload"])
+    assert intent.status == TradeIntentStatus.CANCELED
+    assert intent.filled_quantity == Decimal("3")
+    assert await has_in_flight_intent(repositories, _aapl()) is False
+
+
+@respx.mock
+async def test_drift_alert_that_fails_to_deliver_is_resent_next_pass(tmp_path) -> None:
+    """Rev.120: a failed Telegram delivery must not consume the day's alert."""
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    await _seed_lot(repositories, lot_id="lot-1", fill_id="fill-1", quantity="5", price="150")
+    await _seed_holding(repositories, quantity="5")
+    _mock_positions([_position_json("10")])
+    _mock_activities([])
+    outcomes = [False, True]
+    attempts: list[str] = []
+
+    class _FlakyAlerts(TelegramAlerter):
+        async def send(self, severity, message, details=None) -> bool:
+            if "ACCOUNTING DRIFT" not in message:
+                return True
+            attempts.append(message)
+            return outcomes.pop(0) if outcomes else True
+
+    alerts = _FlakyAlerts("token", "chat")
+    for clock_time in (NOW, NOW + timedelta(minutes=1), NOW + timedelta(minutes=2)):
+        await run_reconciliation(repositories, broker, _settlement(repositories), alerts, clock=lambda t=clock_time: t)
+    await broker.aclose()
+
+    assert len(attempts) == 2  # failed, retried and delivered, then deduplicated

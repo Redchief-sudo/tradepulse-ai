@@ -91,6 +91,7 @@ from tradepulse.models import AssetClass, AuditEvent, SessionState, TradingSessi
 from tradepulse.monitor import MonitorCycleSummary, run_position_monitor
 from tradepulse.persistence import (
     AsyncSQLiteDatabase,
+    DatabaseError,
     PersistenceRepositories,
     acquire_lock,
     release_lock,
@@ -775,20 +776,22 @@ async def _verification_reconcile_action(settings: Settings, repositories: Persi
             'next_open': aware_utc(broker_clock.next_open, field_name='broker_clock_next_open').isoformat(),
             'next_close': aware_utc(broker_clock.next_close, field_name='broker_clock_next_close').isoformat(),
             'received_at': received_at.isoformat(),
-            # Account-wide X-RateLimit headroom and this runtime's cumulative
-            # 429s, sampled every reconcile tick as soak evidence of API load.
-            **_rate_limit_details(broker),
+            # Account-wide X-RateLimit headroom and the cumulative 429s of
+            # every Alpaca client in this process (reconciliation's own
+            # included), sampled every reconcile tick as soak evidence.
+            **_rate_limit_details(),
         },
     )
     await repositories.audit_events.create_once(event.event_id, event)
     return VERIFICATION_RECONCILE_INTERVAL_SECONDS
 
 
-def _rate_limit_details(broker: AlpacaClient) -> dict:
-    snapshot = broker.rate_limit_snapshot
+def _rate_limit_details() -> dict:
+    from tradepulse.broker.alpaca_client import process_rate_limit_evidence
+    snapshot, rate_limited = process_rate_limit_evidence()
     return {'rate_limit_limit': snapshot.limit if snapshot is not None else None,
             'rate_limit_remaining': snapshot.remaining if snapshot is not None else None,
-            'rate_limited_responses': broker.rate_limited_responses}
+            'rate_limited_responses': rate_limited}
 
 
 async def _verification_cycle(repositories: PersistenceRepositories, lane: str) -> None:
@@ -1088,6 +1091,8 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--port", type=int, default=8000, help="port to bind the dashboard on 127.0.0.1 (default: 8000)")
     run_parser.add_argument("--no-browser", action="store_true", help="don't automatically open the dashboard in a browser")
     run_parser.add_argument("--resume", action="store_true", help="supervised restart: continue only an already-active session; never re-activate a stopped or latched one")
+    run_parser.add_argument("--require-database", metavar="URL",
+                            help="refuse to start unless the resolved TRADEPULSE_DATABASE_URL names this same database file")
     run_parser.add_argument("--verification-generation", help="require the frozen official paper-verification generation")
     from tradepulse.verification.commands import add_parser as add_verification_parser
     add_verification_parser(subparsers)
@@ -1111,6 +1116,19 @@ _COMMANDS: dict[str, Any] = {
     "monitor": _run_monitor, "settle": _run_settle, "reconcile": _run_reconcile,
     "start": _run_start, "stop": _run_stop, "status": _run_status, "reset-risk": _run_reset_risk,
 }
+
+
+# EX_CONFIG: a configuration error a restart cannot fix. The service unit
+# lists it in RestartPreventExitStatus so systemd does not retry it.
+EXIT_DATABASE_NOT_REQUIRED = 78
+
+
+def _same_database(database_url: str, required_url: str) -> bool:
+    """Both URLs name the same SQLite file once resolved against the cwd."""
+    try:
+        return AsyncSQLiteDatabase(database_url).path == AsyncSQLiteDatabase(required_url).path
+    except DatabaseError:
+        return False
 
 
 def _load_dotenv(path: Path = Path(".env")) -> None:
@@ -1191,6 +1209,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"tradepulse: {exc}", file=sys.stderr)
         return 1
     configure_logging(settings.log_level)
+
+    required = getattr(args, "require_database", None)
+    if required is not None and not _same_database(settings.database_url, required):
+        # Checked on the URL the runtime actually resolved (process environment
+        # first, then .env), so a stray exported value or a duplicate .env line
+        # cannot open a different database than the one the operator named.
+        print(f"tradepulse: refusing to start: database is {settings.database_url}, required {required}", file=sys.stderr)
+        return EXIT_DATABASE_NOT_REQUIRED
 
     from tradepulse.verification.commands import command as verification_command
     from tradepulse.verification.commands import permit_command, run_official

@@ -52,6 +52,7 @@ from tradepulse.models import (
 from tradepulse.persistence import (
     AsyncSQLiteDatabase,
     PersistenceRepositories,
+    RepositoryLeaseLostError,
     acquire_lock,
     hydrate,
     release_lock,
@@ -75,6 +76,7 @@ from .fill_attribution import (
     TERMINAL_STATUSES,
     AttributedFills,
     attribute_order_fills,
+    order_matches_intent,
     terminal_status_for_order,
 )
 from .idempotency import (
@@ -89,7 +91,7 @@ from .quotes import fetch_authoritative_quote
 
 
 @asynccontextmanager
-async def _portfolio_risk_lock(database: AsyncSQLiteDatabase, needed: bool) -> AsyncIterator[bool]:
+async def _portfolio_risk_lock(database: AsyncSQLiteDatabase, needed: bool) -> AsyncIterator[tuple[bool, tuple[str, str] | None]]:
     """Serializes the fetch-account/build-snapshot/evaluate_risk/persist-
     RISK_APPROVED segment of execute_intent across DIFFERENT symbols -- two
     concurrent calls for different symbols would otherwise both read the
@@ -101,14 +103,19 @@ async def _portfolio_risk_lock(database: AsyncSQLiteDatabase, needed: bool) -> A
     Non-blocking (fails fast if already held, same semantics as
     reserve_symbol_for_execution): a losing concurrent call gets `False` and
     must skip this candidate for now rather than wait, since there's no
-    forward-progress benefit to blocking on a decision window this short."""
+    forward-progress benefit to blocking on a decision window this short.
+
+    Yields (acquired, lease). The window makes broker calls, so it can
+    outlive the TTL; the RISK_APPROVED write is fenced on ``lease`` so a
+    holder whose lease lapsed never commits a decision made against a
+    snapshot another caller may already have spent."""
     if not needed:
-        yield True
+        yield True, None
         return
     owner_token = str(uuid4())
     acquired = await acquire_lock(database, PORTFOLIO_RISK_LOCK_KEY, owner_token, "execute_intent", PORTFOLIO_RISK_LOCK_TTL_SECONDS)
     try:
-        yield acquired
+        yield acquired, ((PORTFOLIO_RISK_LOCK_KEY, owner_token) if acquired else None)
     finally:
         if acquired:
             await release_lock(database, PORTFOLIO_RISK_LOCK_KEY, owner_token)
@@ -256,7 +263,7 @@ class ExecutionGateway:
         # don't need cross-symbol serialization.
         database = self._repositories.trade_intents.database
         needs_portfolio_lock = request.side == Side.BUY and not protective_exit
-        async with _portfolio_risk_lock(database, needed=needs_portfolio_lock) as acquired:
+        async with _portfolio_risk_lock(database, needed=needs_portfolio_lock) as (acquired, portfolio_lease):
             if not acquired:
                 return ExecutionResult("skipped", None, ["PORTFOLIO_RISK_EVALUATION_LOCKED"], Decimal("0"), None)
 
@@ -401,7 +408,16 @@ class ExecutionGateway:
                 intent, status=TradeIntentStatus.RISK_APPROVED, requested_quantity=risk.approved_quantity,
                 risk_snapshot=risk_snapshot,
             )
-            await self._repositories.trade_intents.update(trade_intent_id, approved, status=approved.status.value)
+            try:
+                await self._repositories.trade_intents.update(trade_intent_id, approved, status=approved.status.value,
+                                                              lease=portfolio_lease)
+            except RepositoryLeaseLostError:
+                # Another caller may have approved capital against the same
+                # snapshot after this lease lapsed. Close the intent unsubmitted.
+                reason = "PORTFOLIO_RISK_LOCK_LOST"
+                rejected = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason=reason)
+                await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
+                return ExecutionResult("skipped", trade_intent_id, [reason], Decimal("0"), None)
 
         # External quote/account/risk calls may take long enough for an
         # operator to have stopped trading. Revalidate immediately before
@@ -528,6 +544,12 @@ class ExecutionGateway:
         try:
             order = await self._broker.get_order_by_client_order_id(intent.trade_intent_id)
         except Exception:  # noqa: BLE001 - the recovery lookup itself failing is ALSO ambiguous, not "not found"
+            order = None
+
+        if order is not None and not order_matches_intent(order, intent):
+            # An order under this client id that is not the one this intent
+            # would have submitted (Rev.120): never adopt it; a human decides.
+            cause = RuntimeError(f"BROKER_ORDER_IDENTITY_MISMATCH: order {order.broker_order_id}")
             order = None
 
         if order is not None:
@@ -663,7 +685,7 @@ class ExecutionGateway:
                 await self._settlement.process_pending()
                 result_status: Literal["filled", "partially_filled", "rejected"] = (
                     "filled" if terminal_status == TradeIntentStatus.FILLED
-                    else "partially_filled" if terminal_status == TradeIntentStatus.PARTIALLY_FILLED
+                    else "partially_filled" if attributed_qty > 0  # incl. a canceled order's filled part
                     else "rejected"
                 )
                 return ExecutionResult(result_status, current.trade_intent_id, [], attributed_qty, current.filled_avg_price)

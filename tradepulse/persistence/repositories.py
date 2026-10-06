@@ -60,6 +60,24 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+class RepositoryLeaseLostError(RuntimeError):
+    """A lease-fenced write found its lease expired or owned by another caller."""
+
+
+def _check_lease(connection: sqlite3.Connection, lease: tuple[str, str] | None) -> None:
+    """Fence a write on a still-held lease, inside the write's own BEGIN
+    IMMEDIATE transaction. A lease that expired while its holder was
+    stalled (a slow broker call, say) may already have let another caller
+    make the decision the lease exists to serialize; that holder's write
+    must then not commit."""
+    if lease is None:
+        return
+    lock_key, owner_token = lease
+    row = connection.execute("SELECT owner_token, expires_at FROM locks WHERE lock_key=?", (lock_key,)).fetchone()
+    if row is None or row["owner_token"] != owner_token or row["expires_at"] <= utc_now():
+        raise RepositoryLeaseLostError(f"LEASE_LOST: {lock_key}")
+
+
 def _check_integrity_hold(connection: sqlite3.Connection, guard_table: str | None, guard_key: str | None) -> None:
     """Shared by mutate/create_once/update's optional guard_table/guard_key
     kwargs -- checked as the FIRST statement inside the SAME op(connection)
@@ -161,8 +179,11 @@ class RecordRepository:
 
     async def update(
         self, record_id: str, payload: Any, *, status: str | None = None,
-        guard_table: str | None = None, guard_key: str | None = None,
+        guard_table: str | None = None, guard_key: str | None = None, lease: tuple[str, str] | None = None,
     ) -> bool:
+        """``lease`` (lock_key, owner_token) fences the write: it raises
+        RepositoryLeaseLostError, writing nothing, unless that lease is still
+        held and unexpired when the write's transaction runs."""
         now = utc_now()
         if self.table in STATUS_TABLES:
             if status is None:
@@ -176,6 +197,7 @@ class RecordRepository:
             raise ValueError(f"immutable repository cannot update: {self.table}")
 
         def execute(connection: sqlite3.Connection) -> bool:
+            _check_lease(connection, lease)
             _check_integrity_hold(connection, guard_table, guard_key)
             return connection.execute(sql, values).rowcount == 1
 
