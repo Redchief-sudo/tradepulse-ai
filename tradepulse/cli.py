@@ -787,11 +787,11 @@ async def _verification_reconcile_action(settings: Settings, repositories: Persi
 
 
 def _rate_limit_details() -> dict:
-    from tradepulse.broker.alpaca_client import process_rate_limit_evidence
+    from tradepulse.broker.alpaca_client import RATE_LIMIT_PROCESS_ID, process_rate_limit_evidence
     snapshot, rate_limited = process_rate_limit_evidence()
     return {'rate_limit_limit': snapshot.limit if snapshot is not None else None,
             'rate_limit_remaining': snapshot.remaining if snapshot is not None else None,
-            'rate_limited_responses': rate_limited}
+            'rate_limited_responses': rate_limited, 'rate_limit_process_id': RATE_LIMIT_PROCESS_ID}
 
 
 async def _verification_cycle(repositories: PersistenceRepositories, lane: str) -> None:

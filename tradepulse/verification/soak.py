@@ -155,13 +155,24 @@ def _broker_rate_limit(events: list[dict]) -> dict:
     """API-load evidence from the reconcile lane's broker-clock samples.
 
     Reported, not an invariant: it shows how close the runtime came to
-    Alpaca's per-account request limit and whether any 429 occurred."""
+    Alpaca's per-account request limit and whether any 429 occurred. Each
+    sample's 429 count is cumulative within one process and restarts at zero
+    with it, so the total sums each process's highest count; samples without
+    a process id (pre-Rev.121) form one group."""
     samples = [event["details"] for event in events if event["event_type"] == "verification_broker_clock"]
     remaining = [sample["rate_limit_remaining"] for sample in samples if sample.get("rate_limit_remaining") is not None]
     limits = [sample["rate_limit_limit"] for sample in samples if sample.get("rate_limit_limit") is not None]
     return {"samples": len(remaining), "limit": max(limits) if limits else None,
             "minimum_remaining": min(remaining) if remaining else None,
-            "rate_limited_responses": max((sample.get("rate_limited_responses") or 0 for sample in samples), default=0)}
+            "rate_limited_responses": sum(_per_process_maximum(samples).values())}
+
+
+def _per_process_maximum(samples: list[dict]) -> dict:
+    highest: dict = {}
+    for sample in samples:
+        process = sample.get("rate_limit_process_id")
+        highest[process] = max(highest.get(process, 0), sample.get("rate_limited_responses") or 0)
+    return highest
 
 
 def _complete_market_session(events: list[dict], segments: list[dict], lanes: dict) -> dict:

@@ -614,3 +614,17 @@ def test_broker_rate_limit_evidence_summarizes_reconcile_samples():
               {"event_type": "verification_lane_cycle", "details": {"rate_limit_remaining": 1}}]
     assert _broker_rate_limit(events) == {"samples": 2, "limit": 200, "minimum_remaining": 95, "rate_limited_responses": 2}
     assert _broker_rate_limit([]) == {"samples": 0, "limit": None, "minimum_remaining": None, "rate_limited_responses": 0}
+
+
+def test_broker_rate_limit_total_spans_runtime_restarts():
+    """Rev.121: the 429 counter restarts at zero with each process. Five 429s
+    before a restart and seven after total twelve, not seven."""
+    from tradepulse.verification.soak import _broker_rate_limit
+
+    def clock(process, count):
+        return {"event_type": "verification_broker_clock",
+                "details": {"rate_limit_limit": 200, "rate_limit_remaining": 150,
+                            "rate_limited_responses": count, "rate_limit_process_id": process}}
+
+    events = [clock("first", 2), clock("first", 5), clock("second", 0), clock("second", 7)]
+    assert _broker_rate_limit(events)["rate_limited_responses"] == 12

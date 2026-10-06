@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
+from uuid import uuid4
 
 import httpx
 
@@ -80,6 +81,9 @@ def _decimal_or_none(value: object) -> Decimal | None:
 # account limit, so evidence must cover every client in the process.
 _process_rate_limited_responses = 0
 _process_rate_limit: AlpacaRateLimitSnapshot | None = None
+# Identifies this process's counter: it restarts at zero with the process,
+# so restart-wide totals sum each process's final count (Rev.121).
+RATE_LIMIT_PROCESS_ID = str(uuid4())
 
 
 def process_rate_limit_evidence() -> tuple[AlpacaRateLimitSnapshot | None, int]:

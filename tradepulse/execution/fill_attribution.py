@@ -444,8 +444,12 @@ def order_matches_intent(order: AlpacaOrderResponse, intent: TradeIntent) -> boo
     order id, symbol, side, order type and quantity (or notional). Recovery
     (stranded intents, unknown submissions) adopts an order found by client
     order id only when this holds; anything else is someone else's order or
-    a different decision, and is left for an operator."""
+    a different decision, and is left for an operator. An order without a
+    broker order id is never adopted (Rev.121): the intent would become
+    ACCEPTED with nothing to poll, invisible to both recovery sweeps."""
     raw = order.raw
+    if not str(order.broker_order_id or "").strip():
+        return False
     if (raw.get("client_order_id") != intent.trade_intent_id or order.symbol != intent.asset.symbol
             or order.side != intent.side):
         return False

@@ -92,7 +92,8 @@ async def test_sweep_refuses_to_adopt_an_order_that_does_not_match(tmp_path):
                   {"raw": {"client_order_id": "ti-1", "qty": "2", "type": "market"}},     # Rev.120: quantity
                   {"raw": {"client_order_id": "ti-1", "qty": "1", "type": "limit"}},      # Rev.120: order type
                   {"raw": {"client_order_id": "ti-1", "notional": "1", "type": "market"}},  # no qty at all
-                  {"raw": {"client_order_id": "ti-1", "qty": "abc", "type": "market"}})   # malformed
+                  {"raw": {"client_order_id": "ti-1", "qty": "abc", "type": "market"}},   # malformed
+                  {"broker_order_id": ""}, {"broker_order_id": None})                     # Rev.121: no order id
     for i, mismatch in enumerate(mismatches):
         repositories = await _repositories(tmp_path / f"case-{i}")
         await _stranded(repositories)
@@ -340,7 +341,7 @@ async def test_run_reconciliation_still_reaches_protective_lanes_when_the_sweep_
 
 
 def _recording_alerts():
-    return SimpleNamespace(send=AsyncMock())
+    return SimpleNamespace(send=AsyncMock(return_value=True), configured=True)
 
 
 async def _audit_ids(repositories):
@@ -358,7 +359,8 @@ async def test_unprovable_intent_alerts_once_per_utc_day_with_one_drift_record(t
     severity, message = alerts.send.await_args.args[:2]
     assert severity == "critical"
     assert "protective exits" in message and "manual resolution" in message
-    assert await _audit_ids(repositories) == ["stranded_intent_unresolved:ti-1:2026-10-01"]
+    assert await _audit_ids(repositories) == ["stranded_intent_unresolved:ti-1:2026-10-01",
+                                              "stranded_intent_unresolved:ti-1:2026-10-01:delivered"]
     records = [r["payload"] for r in await repositories.reconciliation_records.list_all()]
     assert [r["outcome"] for r in records] == ["drift_detected"]
     assert records[0]["actual"]["error"] == "ACCOUNT_IDENTITY_UNPROVEN"
@@ -373,7 +375,9 @@ async def test_unprovable_intent_alerts_again_on_a_later_utc_day(tmp_path):
     await _recover_stranded_intents(repositories, broker, alerts, NOW + timedelta(days=1))
     assert alerts.send.await_count == 2
     assert sorted(await _audit_ids(repositories)) == ["stranded_intent_unresolved:ti-1:2026-10-01",
-                                                     "stranded_intent_unresolved:ti-1:2026-10-02"]
+                                                     "stranded_intent_unresolved:ti-1:2026-10-01:delivered",
+                                                     "stranded_intent_unresolved:ti-1:2026-10-02",
+                                                     "stranded_intent_unresolved:ti-1:2026-10-02:delivered"]
     assert len(await repositories.reconciliation_records.list_all()) == 2
 
 

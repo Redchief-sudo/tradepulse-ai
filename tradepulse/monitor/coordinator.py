@@ -246,9 +246,9 @@ def _time_stopped(lots: list[PositionLot], today: date, max_hold_days: int) -> b
 async def _report_unmanaged_position(repositories: PersistenceRepositories, alerts: TelegramAlerter,
                                      position: AlpacaPosition, now: datetime) -> None:
     """A broker position with no local holding has no stop, target or time
-    stop. Alert on first sighting, then once per asset per UTC day: a
-    deterministic audit event id, recorded once the alert is delivered, is
-    the deduplication (see alert_once)."""
+    stop. One critical audit event per asset per UTC day (deterministic id),
+    recorded whether or not Telegram is reachable, and its alert delivered
+    once (see alert_once)."""
     key = asset_key_from_broker_symbol(position.asset_class, position.symbol)
     event_id = f"unmanaged_position:{key}:{now.date().isoformat()}"
     event = AuditEvent(

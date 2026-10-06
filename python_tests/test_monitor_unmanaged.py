@@ -30,7 +30,25 @@ async def test_unmanaged_position_alerts_once_per_day(tmp_path):
     first, second = await _run(repositories, broker, alerts), await _run(repositories, broker, alerts)
     assert (first.unmanaged_positions, second.unmanaged_positions) == (1, 1)
     assert alerts.send.await_count == 1 and alerts.send.await_args.args[0] == "critical"
-    assert [r["payload"]["event_type"] for r in await repositories.audit_events.list_all()] == ["unmanaged_broker_position"]
+    assert [r["payload"]["event_type"] for r in await repositories.audit_events.list_all()] == [
+        "unmanaged_broker_position", "alert_delivered"]
+
+
+async def test_unmanaged_position_evidence_survives_a_failed_delivery(tmp_path):
+    """Rev.121: Telegram down must not leave the sighting without a local
+    critical audit event; delivery is retried on the next monitor cycle."""
+    repositories = await _repositories(tmp_path)
+    broker, alerts = AsyncMock(), AsyncMock()
+    alerts.configured = True
+    alerts.send.side_effect = [False, True]
+    broker.get_positions.return_value = [_position()]
+    await _run(repositories, broker, alerts)
+    events = [r["payload"] for r in await repositories.audit_events.list_all()]
+    assert [(e["event_type"], e["severity"]) for e in events] == [("unmanaged_broker_position", "critical")]
+    await _run(repositories, broker, alerts)
+    assert alerts.send.await_count == 2
+    assert [r["payload"]["event_type"] for r in await repositories.audit_events.list_all()] == [
+        "unmanaged_broker_position", "alert_delivered"]
 
 
 async def test_opening_inventory_at_opening_quantity_is_not_unmanaged(tmp_path, monkeypatch):

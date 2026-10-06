@@ -1192,3 +1192,5 @@ async def test_verification_reconcile_tick_records_rate_limit_headroom(tmp_path,
     details = hydrate("audit_events", row["payload"]).details
     assert (details["rate_limit_limit"], details["rate_limit_remaining"]) == (200, 140)
     assert details["rate_limited_responses"] == before + 1
+    from tradepulse.broker.alpaca_client import RATE_LIMIT_PROCESS_ID
+    assert details["rate_limit_process_id"] == RATE_LIMIT_PROCESS_ID

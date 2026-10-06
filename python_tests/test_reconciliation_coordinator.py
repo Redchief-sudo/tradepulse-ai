@@ -740,7 +740,7 @@ async def test_known_accepted_order_recovers_fill_older_than_daily_lookback(tmp_
 
 class _RecordingAlerts(TelegramAlerter):
     def __init__(self) -> None:
-        super().__init__(None, None)
+        super().__init__("token", "chat")  # configured: alert_once only sends when it is
         self.sent: list[tuple[str, str]] = []
 
     async def send(self, severity, message, details=None) -> bool:

@@ -109,7 +109,7 @@ async def _alert_once(repositories: PersistenceRepositories, alerts: TelegramAle
 
     Reconciliation runs every minute, so a condition that persists until an
     operator acts would otherwise re-alert on every pass. The deterministic
-    audit id makes the first delivered alert in each window the only one
+    audit id records each window's evidence once and delivers its alert once
     (a failed send is retried next pass, see alert_once); ``window`` is a UTC
     date or date-hour string. Reconciliation records are still written on
     every pass."""
@@ -607,9 +607,9 @@ async def _resolve_stranded(repositories, broker, alerts, trade_intent_id, now, 
         if fence.is_set():
             return False
         if reason in _UNPROVABLE_STRANDED_REASONS:
-            # Permanent until an operator acts: alert once per intent per UTC day
-            # (deterministic audit id, recorded once delivered) and write drift
-            # only until that alert is recorded.
+            # Permanent until an operator acts: one audit event per intent per
+            # UTC day (deterministic id), delivered until Telegram accepts it,
+            # and drift written only on that first sighting.
             event_id = f"stranded_intent_unresolved:{trade_intent_id}:{now.date().isoformat()}"
             event = AuditEvent(
                 event_id=event_id, event_type="stranded_intent_unresolved", severity="critical",
@@ -619,11 +619,10 @@ async def _resolve_stranded(repositories, broker, alerts, trade_intent_id, now, 
                 occurred_at=now, entity_type="trade_intent", entity_id=trade_intent_id,
                 details={"reason": reason, "status": intent.status.value, "symbol": intent.asset.symbol},
             )
-            if await repositories.audit_events.get(event_id) is None:
+            if await alert_once(repositories.audit_events, alerts, event):
                 await _record(repositories, reconciliation_type="order", subject_id=trade_intent_id,
                               outcome=ReconciliationOutcome.DRIFT_DETECTED, expected={"stranded_intent_resolved": True},
                               actual={"error": reason, "status": intent.status.value}, occurred_at=now)
-                await alert_once(repositories.audit_events, alerts, event)
             return False
         await _record(repositories, reconciliation_type="order", subject_id=trade_intent_id,
                       outcome=ReconciliationOutcome.DRIFT_DETECTED, expected={"stranded_intent_resolved": True},
