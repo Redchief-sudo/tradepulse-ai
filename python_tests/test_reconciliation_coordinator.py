@@ -839,3 +839,36 @@ async def test_drift_alert_that_fails_to_deliver_is_resent_next_pass(tmp_path) -
     await broker.aclose()
 
     assert len(attempts) == 2  # failed, retried and delivered, then deduplicated
+
+
+@respx.mock
+async def test_inflight_order_survives_a_failed_lookup_and_finalizes_on_broker_evidence(tmp_path) -> None:
+    """Rev.123 recovery scenario: a known ACCEPTED order whose status lookup
+    fails stays in flight (a failure or timeout alone never clears an
+    uncertain order); a later pass that sees Alpaca report it filled
+    finalizes it from the fill evidence."""
+    from tradepulse.execution import has_in_flight_intent
+
+    repositories = await _repositories(tmp_path)
+    broker = _broker()
+    await _seed_intent(repositories, trade_intent_id="ti-6", broker_order_id="order-6", status=TradeIntentStatus.ACCEPTED)
+    _mock_positions([])
+    order_route = respx.get("https://paper-api.alpaca.markets/v2/orders/order-6").mock(side_effect=[
+        httpx.Response(503, json={"message": "unavailable"}),
+        httpx.Response(200, json={**_order_json("filled", "5", "150", order_id="order-6"), "client_order_id": "ti-6"}),
+        httpx.Response(200, json={**_order_json("filled", "5", "150", order_id="order-6"), "client_order_id": "ti-6"}),
+        httpx.Response(200, json={**_order_json("filled", "5", "150", order_id="order-6"), "client_order_id": "ti-6"}),
+    ])
+    activities = respx.get("https://paper-api.alpaca.markets/v2/account/activities").mock(return_value=httpx.Response(200, json=[]))
+
+    await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW)
+    assert (await repositories.trade_intents.get("ti-6"))["status"] == "accepted"
+    assert await has_in_flight_intent(repositories, _aapl()) is True
+
+    activities.mock(return_value=httpx.Response(200, json=[_activity_json("activity-6", "5", "150", order_id="order-6")]))
+    await run_reconciliation(repositories, broker, _settlement(repositories), _alerts(), clock=lambda: NOW + timedelta(minutes=1))
+    await broker.aclose()
+
+    assert order_route.call_count >= 2
+    assert (await repositories.trade_intents.get("ti-6"))["status"] == "filled"
+    assert await has_in_flight_intent(repositories, _aapl()) is False

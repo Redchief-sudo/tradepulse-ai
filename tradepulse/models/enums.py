@@ -70,7 +70,8 @@ class TradeIntentStatus(StrEnum):
     # Broker submission outcome could not be established (network/timeout/
     # 5xx/429 -- anything short of a definitive rejection). Never treat this
     # as a rejection or silently resubmit; it requires recovery via
-    # get_order_by_client_order_id before any further action.
+    # get_order_by_client_order_id before any further action. Reconciliation's
+    # stranded sweep retries that lookup every pass (Rev.123).
     SUBMISSION_UNKNOWN = "submission_unknown"
 
 

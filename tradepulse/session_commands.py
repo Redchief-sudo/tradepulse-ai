@@ -189,6 +189,10 @@ async def run_status(settings: Settings) -> int:
             "updated_at": session.updated_at.isoformat(),
         },
     )
+    from tradepulse.blockers import collect_blockers, format_blockers, last_reconciliation_at
+    blockers = await collect_blockers(repositories)
+    print(f"Session: {session.state.value} (trading {'active' if session.trading_active else 'inactive'})")
+    print(format_blockers(blockers, await last_reconciliation_at(repositories), datetime.now(UTC)))
     return 0
 
 

@@ -45,6 +45,22 @@ export interface TradingSession {
   process_started_at: string
 }
 
+export interface Blocker {
+  kind: string
+  subject: string
+  cause: string
+  blocks: string
+  since: string | null
+  last_checked: string | null
+  automatic: boolean
+  resolution: string
+}
+
+export interface BlockerReport {
+  last_reconciliation_at: string | null
+  blockers: Blocker[]
+}
+
 export interface SessionActionResult {
   exit_code: number
   session: TradingSession

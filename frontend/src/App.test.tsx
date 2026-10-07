@@ -6,6 +6,7 @@ import { api } from './api'
 vi.mock('./api', () => ({
   api: {
     getSession: vi.fn(),
+    getBlockers: vi.fn(),
     getMarketDataCapability: vi.fn(),
     getAccount: vi.fn(),
     getProvenance: vi.fn(),
@@ -33,6 +34,7 @@ function stubEverythingEmpty() {
     financial_integrity_reason: null, financial_integrity_manual_reenable_required: false,
     execution_mode: 'paper', live_trading_enabled: false, process_started_at: '2026-01-01T00:00:00Z',
   })
+  vi.mocked(api.getBlockers).mockResolvedValue({ last_reconciliation_at: null, blockers: [] })
   vi.mocked(api.getMarketDataCapability).mockResolvedValue({})
   vi.mocked(api.getAccount).mockResolvedValue({ equity: '100000', last_equity: '99000', cash: '50000', buying_power: '100000', portfolio_value: '100000' })
   vi.mocked(api.getProvenance).mockResolvedValue({

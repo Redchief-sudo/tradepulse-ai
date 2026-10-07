@@ -526,7 +526,10 @@ async def _reverify_pending_holds(
 
 
 STRANDED_INTENT_GRACE_SECONDS = 120
-_STRANDED_STATUSES = (TradeIntentStatus.RISK_APPROVED, TradeIntentStatus.SUBMITTED)
+# SUBMISSION_UNKNOWN without a broker order id (Rev.123): an ambiguous
+# submission whose own recovery lookup also failed. Nothing else revisits it
+# and it blocks the asset, so the sweep retries its lookup the same way.
+_STRANDED_STATUSES = (TradeIntentStatus.RISK_APPROVED, TradeIntentStatus.SUBMITTED, TradeIntentStatus.SUBMISSION_UNKNOWN)
 # Reasons no retry can clear without an operator; everything else is transient.
 _UNPROVABLE_STRANDED_REASONS = frozenset({
     "ACCOUNT_IDENTITY_UNPROVEN", "STRANDED_ORDER_IDENTITY_MISMATCH", "STRANDED_INTENT_UNDER_INTEGRITY_HOLD",
@@ -656,7 +659,9 @@ async def _resolve_stranded(repositories, broker, alerts, trade_intent_id, now, 
                           client_order_id=intent.trade_intent_id)
         action = "adopted the broker order Alpaca holds for this client_order_id"
     else:
-        updated = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason="STRANDED_BEFORE_SUBMISSION")
+        reason = ("BROKER_NEVER_RECEIVED" if intent.status == TradeIntentStatus.SUBMISSION_UNKNOWN
+                  else "STRANDED_BEFORE_SUBMISSION")
+        updated = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason=reason)
         action = "closed: Alpaca returned a definitive not-found for this client_order_id"
     record = ReconciliationRecord(
         str(uuid4()), "order", intent.trade_intent_id, ReconciliationOutcome.CORRECTED,

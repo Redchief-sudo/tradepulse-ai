@@ -32,6 +32,20 @@ Deploy step: after deploying, rebuild the frontend (`cd frontend && npm run buil
 
 After an operator stop, a risk stop or an integrity hold, a restart keeps trading off: every lane starts, the scan lanes idle (no AI call, no market data, no scan record) while monitor, settlement and reconciliation keep running. Clear the condition with the existing reset commands, then run `tradepulse start`; scanning resumes within 30 s, with no restart.
 
+## 2a. When something is blocked
+
+`tradepulse status` (and the dashboard's Blockers panel, `GET /api/blockers`) lists everything currently stopping trading. Each entry shows what it blocks, why, since when, when reconciliation last checked it, and whether it clears automatically or needs you.
+
+| Kind | Clears automatically when | Needs you when |
+|---|---|---|
+| `session_latch` | never | always: follow the printed command (`reset-integrity`, `reset-risk` or `start`) |
+| `integrity_hold` | verification pending: reconciliation re-verifies the order | a fill-quantity dispute is proven |
+| `accounting_epoch` | Alpaca's fee activities post and the epoch finalizes | it is `integrity_blocked`, or finalization keeps failing with the reason shown |
+| `order_in_flight` | Alpaca reports the order final (reconciliation fetches it every pass) | never by time alone |
+| `stranded_intent` | the sweep proves the order by client order id, or Alpaca returns a definitive not-found | the order cannot be proven (account, identity or integrity hold) |
+
+A timeout or a failed broker lookup never clears an uncertain order; only broker evidence does.
+
 ## 3. Starting a soak
 
 Stop the service first, because a soak needs exclusive use of the account (the runner now enforces this and refuses with `SUPERVISED_SERVICE_ACTIVE` if the service is still running):

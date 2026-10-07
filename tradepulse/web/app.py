@@ -156,6 +156,16 @@ def create_app(state: AppState, frontend_dist: Path | None = None) -> FastAPI:
             "process_started_at": s.process_started_at,
         })
 
+    @app.get("/api/blockers")
+    async def get_blockers(request: Request) -> Response:
+        """Everything currently stopping trading, each with its cause, what it
+        blocks, when it was last checked and how it clears (read-only)."""
+        from tradepulse.blockers import collect_blockers, last_reconciliation_at
+        s = _state(request)
+        blockers = await collect_blockers(s.repositories)
+        return _json({"last_reconciliation_at": await last_reconciliation_at(s.repositories),
+                      "blockers": [blocker.as_dict() for blocker in blockers]})
+
     @app.post("/api/session/start")
     async def post_start(request: Request) -> Response:
         s = _state(request)

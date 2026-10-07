@@ -677,3 +677,18 @@ async def test_local_reads_need_no_header_and_local_mutations_work(tmp_path):
     assert (await client.get("/api/session")).status_code == 200
     response = await client.post("/api/session/stop", headers={"X-TradePulse-Control": "1", "Origin": "http://127.0.0.1:8766"})
     assert response.status_code == 200
+
+
+async def test_blockers_endpoint_reports_the_session_latch_and_its_resolution(tmp_path) -> None:
+    client, state = await _client_for(tmp_path)
+    await save_session(state.repositories, TradingSession(
+        "session", SessionState.FINANCIAL_INTEGRITY_BLOCKED, False, datetime.now(UTC), financial_integrity_reason="drift",
+        financial_integrity_manual_reenable_required=True))
+    response = await client.get("/api/blockers")
+    await client.aclose()
+    assert response.status_code == 200
+    body = response.json()
+    assert body["last_reconciliation_at"] is None
+    [blocker] = body["blockers"]
+    assert (blocker["kind"], blocker["cause"], blocker["automatic"]) == ("session_latch", "drift", False)
+    assert "reset-integrity" in blocker["resolution"]

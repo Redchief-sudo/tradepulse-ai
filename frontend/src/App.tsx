@@ -1,6 +1,7 @@
 import { AccountPanel } from './components/AccountPanel'
 import { ActivityFeed } from './components/ActivityFeed'
 import { AlertsPanel } from './components/AlertsPanel'
+import { BlockersPanel } from './components/BlockersPanel'
 import { CapabilityPanel } from './components/CapabilityPanel'
 import { CommandBar } from './components/CommandBar'
 import { EquityCurveChart } from './components/EquityCurveChart'
@@ -62,6 +63,7 @@ function App() {
         />
 
         <SessionPanel />
+        <BlockersPanel />
         <AccountPanel />
         <PnlPanel />
         <CapabilityPanel />

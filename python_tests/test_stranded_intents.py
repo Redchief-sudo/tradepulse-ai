@@ -401,3 +401,38 @@ async def test_transient_lookup_error_keeps_per_pass_drift_and_sends_no_alert(tm
     assert alerts.send.await_count == 0
     assert await _audit_ids(repositories) == []
     assert len(await repositories.reconciliation_records.list_all()) == 2
+
+
+async def test_sweep_retries_a_submission_unknown_intent_and_adopts_its_order(tmp_path):
+    """Rev.123: an ambiguous submission whose recovery lookup also failed is
+    SUBMISSION_UNKNOWN with no broker order id. Nothing else revisits it, and
+    it blocks the asset (protective exits included), so the stranded sweep
+    must retry the client-order-id lookup and adopt the proven order."""
+    repositories = await _repositories(tmp_path)
+    await _stranded(repositories, status=TradeIntentStatus.SUBMISSION_UNKNOWN)
+    assert await has_in_flight_intent(repositories, BTC) is True
+    broker = _broker()
+    broker.get_order_by_client_order_id.return_value = _order()
+    assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 1
+    payload = await _payload(repositories)
+    assert (payload["status"], payload["broker_order_id"]) == ("accepted", "order-9")
+
+
+async def test_sweep_closes_a_submission_unknown_intent_alpaca_never_received(tmp_path):
+    repositories = await _repositories(tmp_path)
+    await _stranded(repositories, status=TradeIntentStatus.SUBMISSION_UNKNOWN)
+    broker = _broker()
+    broker.get_order_by_client_order_id.return_value = None  # definitive not-found, past the grace period
+    assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 1
+    assert (await _payload(repositories))["status"] == "rejected"
+    assert await has_in_flight_intent(repositories, BTC) is False
+
+
+async def test_sweep_leaves_a_submission_unknown_intent_when_the_lookup_fails_again(tmp_path):
+    """A timeout or failed lookup alone never clears an uncertain order."""
+    repositories = await _repositories(tmp_path)
+    await _stranded(repositories, status=TradeIntentStatus.SUBMISSION_UNKNOWN)
+    broker = _broker()
+    broker.get_order_by_client_order_id.side_effect = RuntimeError("503")
+    assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 0
+    assert (await _payload(repositories))["status"] == "submission_unknown"

@@ -570,7 +570,9 @@ class ExecutionGateway:
         await self._repositories.trade_intents.update(intent.trade_intent_id, unknown, status=unknown.status.value)
         await self._alerts.send(
             "critical",
-            f"Broker submission outcome unknown for {intent.asset.symbol} {intent.side.value} {intent.requested_quantity} -- requires manual review",
+            f"Broker submission outcome unknown for {intent.asset.symbol} {intent.side.value} {intent.requested_quantity} -- "
+            "reconciliation retries the client-order-id lookup each pass; the asset stays blocked until Alpaca proves "
+            "the order's outcome, and a mismatch needs manual review",
             {"trade_intent_id": intent.trade_intent_id, "cause": str(cause)},
         )
         return ExecutionResult("pending", intent.trade_intent_id, [unknown.rejection_reason], Decimal("0"), None)

@@ -2,6 +2,7 @@ import type {
   AiResponse,
   AlpacaAccount,
   AuditEvent,
+  BlockerReport,
   EnrichedPosition,
   Fill,
   MarketDataCapabilityByLane,
@@ -53,6 +54,7 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
 
 export const api = {
   getSession: () => get<TradingSession>('/api/session'),
+  getBlockers: () => get<BlockerReport>('/api/blockers'),
   start: () => post<SessionActionResult>('/api/session/start'),
   stop: () => post<SessionActionResult>('/api/session/stop'),
   resetRisk: () => post<SessionActionResult>('/api/session/reset-risk'),
