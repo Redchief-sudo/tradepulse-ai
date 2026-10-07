@@ -518,6 +518,12 @@ class ExecutionGateway:
             # from this error alone. Never assume rejection or resubmit.
             return await self._recover_unknown_submission(submitted, exc)
 
+        if not placed.broker_order_id:
+            # A success response without a usable order id proves nothing
+            # about which order Alpaca holds (Rev.122). Recover by client
+            # order id exactly as for an ambiguous submission; never resubmit.
+            return await self._recover_unknown_submission(submitted, RuntimeError("BROKER_ORDER_ID_MISSING"))
+
         accepted = replace(
             submitted, status=TradeIntentStatus.ACCEPTED, broker_order_id=placed.broker_order_id,
             client_order_id=trade_intent_id, submitted_at=placed.submitted_at or self._clock(),

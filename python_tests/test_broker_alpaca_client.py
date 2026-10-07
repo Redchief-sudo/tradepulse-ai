@@ -583,3 +583,13 @@ async def test_get_latest_option_quotes_batches_symbols_into_one_request() -> No
     assert quotes["AAPL260918C00205000"].bid == Decimal("2.0")
     missing = quotes["AAPL260918C00210000"]  # no quote returned: present but unusable, rejected downstream
     assert missing.bid is None and missing.ask is None
+
+
+def test_order_id_that_is_not_a_string_parses_as_no_id() -> None:
+    """Rev.122: JSON null, numbers, booleans and objects are not Alpaca order
+    ids; they must never become "None", "123" or "True"."""
+    client = AlpacaClient("key", "secret", "paper", 10)
+    for raw_id in (None, 123, True, {"a": 1}, ["x"], "  "):
+        order = client._parse_order_data({"id": raw_id, "status": "accepted", "symbol": "AAPL", "side": "buy"}, request_id=None)
+        assert order.broker_order_id == ""
+    assert client._parse_order_data({"id": " order-1 ", "status": "new"}, request_id=None).broker_order_id == "order-1"

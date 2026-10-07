@@ -94,14 +94,17 @@ def _order_json(status: str, filled_qty: str, filled_avg_price: str | None) -> d
     }
 
 
-def _client_order_lookup(qty: str = "5", order_type: str = "market", *, without_id: bool = False):
+def _client_order_lookup(qty: str = "5", order_type: str = "market", *, time_in_force: str = "day",
+                         without_id: bool = False, order_id: object = "order-1"):
     """GET /v2/orders:by_client_order_id as Alpaca answers it: the order
     carries the client_order_id it was looked up by, plus its qty and type."""
     def respond(request: httpx.Request) -> httpx.Response:
-        body = {**_order_json("accepted", "0", None), "qty": qty, "type": order_type,
+        body = {**_order_json("accepted", "0", None), "qty": qty, "type": order_type, "time_in_force": time_in_force,
                 "client_order_id": request.url.params["client_order_id"]}
         if without_id:
             body.pop("id")
+        else:
+            body["id"] = order_id
         return httpx.Response(200, json=body)
     return respond
 
@@ -1322,6 +1325,105 @@ async def test_unknown_submission_never_adopts_an_order_without_a_broker_order_i
     assert order_route.call_count == 0  # never polled as if it were ours
     [row] = await repositories.trade_intents.list_all()
     assert (row["status"], row["payload"]["broker_order_id"]) == ("submission_unknown", None)
+
+
+@respx.mock
+async def test_unknown_submission_never_adopts_an_order_with_another_time_in_force(tmp_path) -> None:
+    """Rev.122: the gateway submits equities as `day`; a `gtc` order under this client id is not ours."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_market_open()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=httpx.ConnectError("connection refused"))
+    respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(side_effect=_client_order_lookup(time_in_force="gtc"))
+    order_route = respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
+        return_value=httpx.Response(200, json=_order_json("filled", "50", "199.60")))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "pending" and "BROKER_ORDER_IDENTITY_MISMATCH" in result.reasons[0]
+    assert order_route.call_count == 0  # never polled as if it were ours
+    [row] = await repositories.trade_intents.list_all()
+    assert (row["status"], row["payload"]["broker_order_id"]) == ("submission_unknown", None)
+
+
+@respx.mock
+async def test_unknown_submission_never_adopts_a_numeric_broker_order_id(tmp_path) -> None:
+    """Rev.122: a numeric id is not an Alpaca order id."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_market_open()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=httpx.ConnectError("connection refused"))
+    respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(side_effect=_client_order_lookup(order_id=123))
+    order_route = respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
+        return_value=httpx.Response(200, json=_order_json("filled", "50", "199.60")))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "pending" and "BROKER_ORDER_IDENTITY_MISMATCH" in result.reasons[0]
+    assert order_route.call_count == 0  # never polled as if it were ours
+    [row] = await repositories.trade_intents.list_all()
+    assert (row["status"], row["payload"]["broker_order_id"]) == ("submission_unknown", None)
+
+
+@respx.mock
+async def test_unknown_submission_never_adopts_a_null_broker_order_id(tmp_path) -> None:
+    """Rev.122: `id: null` must not become the order id "None"."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_market_open()
+    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=httpx.ConnectError("connection refused"))
+    respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(side_effect=_client_order_lookup(order_id=None))
+    order_route = respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
+        return_value=httpx.Response(200, json=_order_json("filled", "50", "199.60")))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "pending" and "BROKER_ORDER_IDENTITY_MISMATCH" in result.reasons[0]
+    assert order_route.call_count == 0  # never polled as if it were ours
+    [row] = await repositories.trade_intents.list_all()
+    assert (row["status"], row["payload"]["broker_order_id"]) == ("submission_unknown", None)
+
+
+@respx.mock
+async def test_placement_response_without_an_order_id_recovers_by_client_order_id(tmp_path) -> None:
+    """Rev.122: a 200 from place_order whose id is null is not an accepted
+    order with id "None". It goes through client-order-id recovery, which
+    adopts the real order, and is never resubmitted."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    _mock_market_open()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(
+        return_value=httpx.Response(200, json={**_order_json("accepted", "0", None), "id": None}))
+    lookup_route = respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(side_effect=_client_order_lookup())
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(return_value=httpx.Response(200, json=_order_json("filled", "5", "199.60")))
+    _mock_fill_activities(_fill_activity("act-1"))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "filled"
+    assert order_route.call_count == 1 and lookup_route.call_count == 1
+    [row] = await repositories.trade_intents.list_all()
+    assert row["payload"]["broker_order_id"] == "order-1"
 
 
 @respx.mock

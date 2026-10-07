@@ -592,8 +592,12 @@ class AlpacaClient:
     def _parse_order_data(self, data: dict, *, request_id: str | None) -> AlpacaOrderResponse:
         side_raw = str(data.get("side") or "").lower()
         side = Side.BUY if side_raw == "buy" else Side.SELL if side_raw == "sell" else None
+        order_id = data.get("id")
         return AlpacaOrderResponse(
-            broker_order_id=str(data.get("id", "")),
+            # Alpaca order ids are strings. Anything else (null, a number, a
+            # bool, an object) is no id at all -- never str()-ed into "None"
+            # or "123" and mistaken for one (Rev.122).
+            broker_order_id=order_id.strip() if isinstance(order_id, str) else "",
             status=str(data.get("status", "")),
             symbol=str(data.get("symbol", "")),
             side=side,

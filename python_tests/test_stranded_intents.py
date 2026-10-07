@@ -33,7 +33,7 @@ def _broker(account_number="PA1"):
 
 def _order(**overrides):
     fields = {"broker_order_id": "order-9", "symbol": "BTC/USD", "side": Side.SELL,
-              "raw": {"client_order_id": "ti-1", "qty": "1", "type": "market"}}
+              "raw": {"id": "order-9", "client_order_id": "ti-1", "qty": "1", "type": "market", "time_in_force": "gtc"}}
     return SimpleNamespace(**{**fields, **overrides})
 
 
@@ -87,13 +87,22 @@ async def test_sweep_refuses_when_account_identity_is_unproven(tmp_path):
 
 
 async def test_sweep_refuses_to_adopt_an_order_that_does_not_match(tmp_path):
+    good = _order().raw
     mismatches = ({"symbol": "ETH/USD"}, {"side": Side.BUY},
-                  {"raw": {"client_order_id": "someone-else", "qty": "1", "type": "market"}},
-                  {"raw": {"client_order_id": "ti-1", "qty": "2", "type": "market"}},     # Rev.120: quantity
-                  {"raw": {"client_order_id": "ti-1", "qty": "1", "type": "limit"}},      # Rev.120: order type
-                  {"raw": {"client_order_id": "ti-1", "notional": "1", "type": "market"}},  # no qty at all
-                  {"raw": {"client_order_id": "ti-1", "qty": "abc", "type": "market"}},   # malformed
-                  {"broker_order_id": ""}, {"broker_order_id": None})                     # Rev.121: no order id
+                  {"raw": {**good, "client_order_id": "someone-else"}},
+                  {"raw": {**good, "qty": "2"}},                    # Rev.120: quantity
+                  {"raw": {**good, "type": "limit"}},               # Rev.120: order type
+                  {"raw": {**{k: v for k, v in good.items() if k != "qty"}, "notional": "1"}},  # no qty at all
+                  {"raw": {**good, "qty": "abc"}},                  # malformed
+                  {"broker_order_id": ""}, {"broker_order_id": None},  # Rev.121: no order id
+                  # Rev.122: the raw id must be a non-blank string, the one parsed
+                  {"broker_order_id": "None", "raw": {**good, "id": None}},
+                  {"broker_order_id": "123", "raw": {**good, "id": 123}},
+                  {"broker_order_id": "True", "raw": {**good, "id": True}},
+                  {"broker_order_id": "{'a': 1}", "raw": {**good, "id": {"a": 1}}},
+                  {"raw": {**good, "id": "order-other"}},
+                  {"raw": {**good, "time_in_force": "day"}},         # Rev.122: crypto submits gtc
+                  {"raw": {k: v for k, v in good.items() if k != "time_in_force"}})
     for i, mismatch in enumerate(mismatches):
         repositories = await _repositories(tmp_path / f"case-{i}")
         await _stranded(repositories)

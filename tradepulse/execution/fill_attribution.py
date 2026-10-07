@@ -16,6 +16,7 @@ from decimal import Decimal
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaActivity, AlpacaClient, AlpacaError, AlpacaOrderResponse
+from tradepulse.broker.symbols import default_time_in_force
 from tradepulse.models import (
     AssetClass,
     Fill,
@@ -445,10 +446,16 @@ def order_matches_intent(order: AlpacaOrderResponse, intent: TradeIntent) -> boo
     (stranded intents, unknown submissions) adopts an order found by client
     order id only when this holds; anything else is someone else's order or
     a different decision, and is left for an operator. An order without a
-    broker order id is never adopted (Rev.121): the intent would become
-    ACCEPTED with nothing to poll, invisible to both recovery sweeps."""
+    real broker order id -- the raw ``id`` must be a non-blank string -- is
+    never adopted (Rev.121/122): the intent would become ACCEPTED with no
+    provable order to poll, invisible to both recovery sweeps. Time in force
+    must be the gateway's own submission policy for the asset class
+    (Rev.122)."""
     raw = order.raw
-    if not str(order.broker_order_id or "").strip():
+    raw_id = raw.get("id")
+    if not isinstance(raw_id, str) or not raw_id.strip() or order.broker_order_id != raw_id.strip():
+        return False
+    if str(raw.get("time_in_force") or "").lower() != default_time_in_force(intent.asset.asset_class):
         return False
     if (raw.get("client_order_id") != intent.trade_intent_id or order.symbol != intent.asset.symbol
             or order.side != intent.side):
