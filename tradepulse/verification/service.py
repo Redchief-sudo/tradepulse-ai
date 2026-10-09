@@ -374,10 +374,24 @@ class Verification:
             if owns_broker and broker is not None:
                 await broker.aclose()
 
+    # Integrity (protected source, binding, configuration) is checked every
+    # tick; the full evidence assessment, which reads and assesses the whole
+    # database, only every WATCH_REPORT_SECONDS (Rev.124). Running the full
+    # report every 5 s kept one thread permanently busy on a large database
+    # and starved the trading lanes' database writes.
+    WATCH_CHECK_SECONDS = 5
+    WATCH_REPORT_SECONDS = 300
+
     async def watch(self, shutdown: asyncio.Event) -> None:
+        loop = asyncio.get_running_loop()
+        next_report = loop.time()
         while not shutdown.is_set():
             try:
-                result = await asyncio.to_thread(self.report)
+                if loop.time() >= next_report:
+                    result = await asyncio.to_thread(self.report)
+                    next_report = loop.time() + self.WATCH_REPORT_SECONDS
+                else:
+                    result = {"status": None, "integrity": await asyncio.to_thread(self.check)}
                 if not result["integrity"]["integrity_valid"] or result["status"] == "PROVE_EDGE_PASSED":
                     logger.warning("paper_verification_stopping", extra={"event": "paper_verification_stopping", "result": result})
                     shutdown.set()
@@ -387,7 +401,7 @@ class Verification:
                 shutdown.set()
                 return
             try:
-                await asyncio.wait_for(shutdown.wait(), timeout=5)
+                await asyncio.wait_for(shutdown.wait(), timeout=self.WATCH_CHECK_SECONDS)
             except TimeoutError:
                 pass
 

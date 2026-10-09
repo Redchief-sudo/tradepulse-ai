@@ -535,3 +535,33 @@ def test_unverified_forced_integrity_reset_cannot_hide_incident():
     rows["audit_events"] = [{"event_id": "forced", "occurred_at": NOW.isoformat(), "details": {"action": "reset_integrity_forced"}}]
     result = assess(rows, START.isoformat(), NOW, COSTS)
     assert result["status"] == "PROVE_EDGE_FAILED_INTEGRITY"
+
+
+async def test_watch_checks_integrity_every_tick_but_assesses_only_on_its_interval(generation, monkeypatch):
+    """Rev.124: the full report reads and assesses the whole database, so the
+    watcher runs it on WATCH_REPORT_SECONDS; protected-source integrity is
+    still checked every tick, and a change is caught on the next one."""
+    assert await generation.start()
+    monkeypatch.setattr(generation, "WATCH_CHECK_SECONDS", 0.01)
+    monkeypatch.setattr(generation, "WATCH_REPORT_SECONDS", 3600)
+    calls = {"report": 0, "check": 0}
+    report, check = generation.report, generation.check
+
+    def counted_report(*args, **kwargs):
+        calls["report"] += 1
+        return report(*args, **kwargs)
+
+    def counted_check():
+        calls["check"] += 1
+        if calls["check"] == 5:
+            (generation.root / "tradepulse/policy.py").write_text("changed")
+        return check()
+
+    monkeypatch.setattr(generation, "report", counted_report)
+    monkeypatch.setattr(generation, "check", counted_check)
+    shutdown = asyncio.Event()
+    await asyncio.wait_for(generation.watch(shutdown), timeout=30)
+    assert shutdown.is_set()
+    assert calls["report"] == 1  # once at start, not every tick
+    assert calls["check"] >= 5   # the source change was caught by a per-tick check
+    generation.release()

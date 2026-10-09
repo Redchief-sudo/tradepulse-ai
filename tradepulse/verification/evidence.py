@@ -574,8 +574,11 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     expectancy = net / count if count and net is not None else None
     snapshots = sorted(rows["equity_snapshots"], key=lambda row: (timestamp(row["as_of"]), row["snapshot_id"]))
     drawdown = None
+    adjustments = generation_adjustment_records(rows) if checkpoint else None
+
     def observed_equity(row):
-        return observed_generation_equity(row, rows, checkpoint) if checkpoint else number(row['total_equity'])
+        return (observed_generation_equity(row, rows, checkpoint, adjustments) if checkpoint
+                else number(row['total_equity']))
     if snapshots and checkpoint:
         try:
             for row in snapshots:
@@ -781,7 +784,13 @@ def observed_generation_result(rows, fills, native_receipts, valid_native_receip
     return (None if errors else observed), bridge, errors
 
 
-def observed_generation_equity(snapshot, rows, checkpoint):
+def generation_adjustment_records(rows) -> list[dict]:
+    """The generation-adjustment reconciliation records, found once per assessment."""
+    return [record for record in rows['reconciliation_records']
+            if record['record_id'].startswith('generation_adjustment:')]
+
+
+def observed_generation_equity(snapshot, rows, checkpoint, adjustments=None):
     """Broker-observed curve independent of asynchronous projection completion.
 
     All observations remain in the drawdown population. Pending settlement
@@ -830,9 +839,10 @@ def observed_generation_equity(snapshot, rows, checkpoint):
         opening_change += qty * number(position['market_value']) / number(position['qty']) - number(old['market_value'])
     entries = {row['entry_id']: row for row in rows['cash_ledger']}
     capital = Decimal(0)
-    for record in rows['reconciliation_records']:
-        if not record['record_id'].startswith('generation_adjustment:'):
-            continue
+    # Callers assessing many snapshots pass the adjustments found once
+    # (Rev.124): scanning every reconciliation record per snapshot made the
+    # assessment quadratic in run length.
+    for record in adjustments if adjustments is not None else generation_adjustment_records(rows):
         adjustment = validate_generation_adjustment(record, entries[record['actual']['cash_entry_id']], checkpoint=checkpoint)
         if adjustment['economic_type'] != 'capital_flow' or adjustment['occurred_at'] > received:
             continue
