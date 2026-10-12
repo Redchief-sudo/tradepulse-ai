@@ -99,7 +99,16 @@ from tradepulse.valuation import marked_snapshot, observe_broker_valuation, reco
 logger = logging.getLogger(__name__)
 
 _ACTIONABLE_RECOMMENDATIONS = frozenset({"STRONG_BUY", "BUY"})
-_DETERMINISTIC_ACTIONABLE_SIGNALS = frozenset({"STRONG_BUY", "BUY"})
+# Entry agreement (Rev.125): the deterministic composite must exceed this,
+# just under the BUY band's 65, while AI confidence must still reach the
+# profile's min_confidence. Soak 1 showed equity and option candidates the AI
+# rated >= 80 averaging composites of about 61 against the 65 cut-off. Entries
+# only: no exit path uses the composite.
+ENTRY_COMPOSITE_THRESHOLD = Decimal("62.5")
+
+
+def entry_composite_agrees(composite: Decimal) -> bool:
+    return composite > ENTRY_COMPOSITE_THRESHOLD
 
 # Provenance for every Opportunity -- which Alpaca feed actually produced
 # the quote a trade decision was based on, so paper-trading results can
@@ -723,7 +732,7 @@ async def run_scan_cycle(
             continue
         composite = weighted_composite(scores, effective_weights)
         deterministic_signal = signal_from_composite(composite)
-        if deterministic_signal not in _DETERMINISTIC_ACTIONABLE_SIGNALS:
+        if not entry_composite_agrees(composite):
             await _reject(
                 candidate.symbol, "DETERMINISTIC_SIGNAL_DISAGREED", ai_recommendation=candidate.recommendation,
                 deterministic_signal=deterministic_signal, composite_score=str(composite),

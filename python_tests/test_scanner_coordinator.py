@@ -2334,3 +2334,15 @@ async def test_options_scan_trades_a_neighbour_when_the_target_strike_is_opening
     assert order_route.call_count == 1 and summary.orders_submitted == 1
     opportunity = hydrate("opportunities", (await repositories.opportunities.list_all())[0]["payload"])
     assert opportunity.asset.symbol == occ["210"]
+
+
+def test_entry_composite_threshold_is_just_under_the_buy_band() -> None:
+    """Rev.125: entries need a composite above 62.5 (the BUY label starts above
+    65); AI confidence still has to reach the profile's min_confidence."""
+    from tradepulse.scanner.coordinator import ENTRY_COMPOSITE_THRESHOLD, entry_composite_agrees
+
+    assert ENTRY_COMPOSITE_THRESHOLD == Decimal("62.5")
+    assert not entry_composite_agrees(Decimal("62.5"))
+    assert entry_composite_agrees(Decimal("62.51"))
+    assert entry_composite_agrees(Decimal("64"))  # labelled HOLD, now an eligible entry
+    assert not entry_composite_agrees(Decimal("57"))  # soak 1's best crypto composite stays out
