@@ -324,10 +324,21 @@ class ExecutionGateway:
                 drawdown = await check_max_drawdown(self._repositories, snapshot.total_equity, self._risk_limits)
                 max_drawdown_breached = drawdown.breached
 
+            # An add-on to a held long is protected by the holding's enforced
+            # stop (the first entry's, PROTECTIVE_THRESHOLD_POLICY), not by
+            # this request's own. Size against the looser of the two so the
+            # add-on never risks more than its budget (Rev.126). The intent
+            # still records its own stop.
+            sizing_stop = request.stop_loss
+            if request.side == Side.BUY and held_quantity > 0 and request.stop_loss is not None:
+                holding_row = await self._repositories.holdings.get(asset_identity_key(request.asset))
+                enforced_stop = hydrate("holdings", holding_row["payload"]).stop_loss if holding_row else None
+                if enforced_stop is not None and enforced_stop < request.stop_loss:
+                    sizing_stop = enforced_stop
             risk_input = RiskCheckInput(
                 symbol=request.asset.symbol, asset_class=request.asset.asset_class, side=request.side,
                 requested_quantity=request.requested_quantity, price=quote.price,
-                confidence=request.confidence, stop_loss=request.stop_loss, sector=request.sector or "Other",
+                confidence=request.confidence, stop_loss=sizing_stop, sector=request.sector or "Other",
                 contract_multiplier=contract_multiplier_of(request.asset),
                 regime_multiplier=request.regime_multiplier,
             )

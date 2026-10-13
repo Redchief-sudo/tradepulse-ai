@@ -1848,3 +1848,34 @@ async def test_crypto_protective_exit_position_reread_failure_closes_the_intent(
     assert intent["status"] == "rejected"
     assert "broker_account_number" in intent["risk_snapshot"]
     assert await has_in_flight_intent(repositories, _btc()) is False
+
+
+@respx.mock
+async def test_add_on_buy_is_sized_against_the_holdings_enforced_stop(tmp_path) -> None:
+    """Rev.126: a holding is protected by its first entry's stop. An add-on
+    whose own stop is tighter is sized against that looser enforced stop, so
+    stopping out never loses more than the add-on's risk budget. The intent
+    keeps its own stop for the record."""
+    repositories, broker, gateway = await _setup(tmp_path)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    holding = Holding(_aapl(), Decimal("5"), Decimal("150"), NOW, sector="Technology", stop_loss=Decimal("150"))
+    await repositories.holdings.create_once(asset_identity_key(_aapl()), holding)
+    _mock_account()
+    _mock_positions(_position_json(qty="5", current_price="199.55"))
+    _mock_quote()
+    _mock_market_open()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=httpx.ConnectError("refused"))
+    respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(return_value=httpx.Response(404))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("300"), strategy="test",
+                               confidence=Decimal("100"), stop_loss=Decimal("195"), sector="Technology")
+    await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert order_route.call_count == 1
+    [row] = await repositories.trade_intents.list_all()
+    intent = row["payload"]
+    # Budget 0.30% of 100,000 = 300. Against the enforced 150 stop the unit
+    # risk is ~49.55, so ~6 shares -- not the ~65 its own 195 stop implies.
+    assert Decimal(intent["requested_quantity"]) <= Decimal("6.06")
+    assert Decimal(intent["stop_loss"]) == Decimal("195")

@@ -102,23 +102,33 @@ def _generation_invariants(connection, account, positions):
     aware_utc(account.received_at, field_name='account_response_received_at')
     for position in positions:
         aware_utc(position.received_at, field_name='position_response_received_at')
-    records = [decode_payload(r['payload']) for r in connection.execute('SELECT payload FROM reconciliation_records ORDER BY rowid')]
-    populations = [r for r in records if r['reconciliation_type'] == 'generation_membership']
-    if not populations:
+    # Only the newest membership record and the fee/adjustment records it
+    # names are needed. Rev.126: selecting them in SQL replaces decoding the
+    # whole reconciliation table on every valuation, a cost that grew with
+    # every reconciliation pass of a long run.
+    latest_row = connection.execute(
+        "SELECT payload FROM reconciliation_records WHERE json_extract(payload,'$.reconciliation_type')="
+        "'generation_membership' ORDER BY rowid DESC LIMIT 1").fetchone()
+    if latest_row is None:
         raise ValueError('generation_activity_population_missing')
-    latest = populations[-1]
+    latest = decode_payload(latest_row['payload'])
     classifications = verify_membership_record(opening, latest)
     if any(s == 'unresolved_generation_membership' for s in classifications.values()):
         raise ValueError('unresolved_generation_membership')
-    by_record = {r['record_id']: r for r in records}
+    def record(record_id: str) -> dict:
+        row = connection.execute('SELECT payload FROM reconciliation_records WHERE record_id=?', (record_id,)).fetchone()
+        if row is None:
+            raise KeyError(record_id)
+        return decode_payload(row['payload'])
+
     entries = {r['record_id']: decode_payload(r['payload']) for r in connection.execute('SELECT record_id,payload FROM cash_ledger')}
     eligible = [a for a in latest['actual']['activities'] if classifications[a['id']] in {'in_generation', 'late_arriving_in_generation'}]
     for raw in eligible:
         if cash_fee_receipt(raw) is not None:
-            validate_generation_fee(by_record['generation_fee:' + raw['id']], entries['broker:fee:' + raw['id']],
+            validate_generation_fee(record('generation_fee:' + raw['id']), entries['broker:fee:' + raw['id']],
                                     raw=raw, checkpoint=opening)
         if adjustment_receipt(raw) is not None:
-            validate_generation_adjustment(by_record['generation_adjustment:' + raw['id']],
+            validate_generation_adjustment(record('generation_adjustment:' + raw['id']),
                                            entries['broker:adjustment:' + raw['id']], raw=raw, checkpoint=opening)
     cash_movement = sum((broker_settled_cash(r) for r in entries.values()), Decimal(0))
     if any(r['currency'] != 'USD' for r in entries.values()):
