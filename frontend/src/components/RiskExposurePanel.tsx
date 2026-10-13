@@ -80,7 +80,7 @@ export function RiskExposurePanel() {
             <dd>{data.open_positions}</dd>
             <dt>Outstanding orders</dt>
             <dd>{data.outstanding_orders}</dd>
-            <dt>Trades today</dt>
+            <dt>Buys today (daily cap)</dt>
             <dd>{data.trades_today}</dd>
             <dt>Daily P&amp;L</dt>
             <dd className={Number(data.daily_pnl_pct) >= 0 ? 'positive' : 'negative'}>{pct(data.daily_pnl_pct)}</dd>

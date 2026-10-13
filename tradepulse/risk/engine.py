@@ -531,8 +531,10 @@ async def build_portfolio_snapshot(
     fills = [hydrate("fills", row["payload"]) for row in fill_rows]
     # Distinct trades, not fill rows -- a single order can fill in several
     # partial broker fills, which must count once against max_daily_trades,
-    # not once per fill.
-    trades_today = len({f.trade_intent_id for f in fills})
+    # not once per fill. Entries only (Rev.127): TradePulse opens long
+    # positions only, so its BUYs are entries and its SELLs are exits; an
+    # exit must not use up the day's allowance for new positions.
+    trades_today = len({f.trade_intent_id for f in fills if f.side == Side.BUY})
 
     if broker_prev_close_equity and broker_prev_close_equity > 0 and account_equity and account_equity > 0:
         daily_pnl_pct = ((account_equity - broker_prev_close_equity) / broker_prev_close_equity) * 100

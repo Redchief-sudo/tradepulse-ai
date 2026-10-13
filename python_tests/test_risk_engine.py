@@ -672,9 +672,10 @@ async def test_build_portfolio_snapshot_catches_an_unsettled_fill_on_an_already_
     assert snapshot.sector_exposure["Tech"] == Decimal("1010")
 
 
-async def _seed_fill(repositories: PersistenceRepositories, *, fill_id: str, trade_intent_id: str, quantity: Decimal, filled_at: datetime) -> None:
+async def _seed_fill(repositories: PersistenceRepositories, *, fill_id: str, trade_intent_id: str, quantity: Decimal,
+                     filled_at: datetime, side: Side = Side.BUY) -> None:
     fill = Fill(
-        fill_id, trade_intent_id, f"order-{fill_id}", _aapl(), Side.BUY, ExecutionMode.PAPER,
+        fill_id, trade_intent_id, f"order-{fill_id}", _aapl(), side, ExecutionMode.PAPER,
         quantity, Decimal("100"), Decimal("0"), Decimal("0"), filled_at,
     )
     await repositories.fills.create_once(fill_id, fill, unique_value=None)
@@ -701,6 +702,19 @@ async def test_trades_today_counts_each_distinct_trade_intent(tmp_path) -> None:
     snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
 
     assert snapshot.trades_today == 2
+
+
+async def test_trades_today_counts_entries_not_exits(tmp_path) -> None:
+    """Rev.127: max_daily_trades limits new positions. Exits (SELLs, in this
+    long-only system) never use up the day's entry allowance."""
+    repositories = await _repositories(tmp_path)
+    await _seed_fill(repositories, fill_id="fill-1", trade_intent_id="ti-buy", quantity=Decimal("5"), filled_at=NOW)
+    await _seed_fill(repositories, fill_id="fill-2", trade_intent_id="ti-stop-out", quantity=Decimal("5"), filled_at=NOW, side=Side.SELL)
+    await _seed_fill(repositories, fill_id="fill-3", trade_intent_id="ti-time-stop", quantity=Decimal("2"), filled_at=NOW, side=Side.SELL)
+
+    snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
+
+    assert snapshot.trades_today == 1
 
 
 async def test_trades_today_excludes_fills_from_a_prior_day(tmp_path) -> None:

@@ -298,7 +298,7 @@ async def marked_snapshot(
         snapshot_id=str(uuid4()), as_of=now, total_equity=account.equity,
         cash_balance=account.cash, holdings_value=market, sector_exposure=sectors,
         open_positions=len(positions), outstanding_orders=len(pending),
-        trades_today=len({r['payload']['trade_intent_id'] for r in fills}),
+        trades_today=len({r['payload']['trade_intent_id'] for r in fills if r['payload']['side'] == 'buy'}),  # entries only
         daily_pnl_pct=(account.equity-account.last_equity)/account.last_equity*100,
         source='broker', valuation_version=2,
         holdings_cost_basis=None if any(e.startswith('cost_basis_missing:') for e in errors) else cost,
