@@ -862,3 +862,80 @@ async def test_a_scaled_out_position_is_never_scaled_out_again(tmp_path) -> None
 
     assert summary.exits_triggered == 0
     assert order_route.call_count == 0
+
+
+def _mock_clock(is_open: bool) -> None:
+    respx.get("https://paper-api.alpaca.markets/v2/clock").mock(return_value=httpx.Response(200, json={
+        "is_open": is_open, "timestamp": QUOTE_TS, "next_open": QUOTE_TS, "next_close": QUOTE_TS}))
+
+
+@respx.mock
+async def test_stock_breach_outside_market_hours_is_alerted_and_deferred_not_sold(tmp_path) -> None:
+    """Found in the Rev.127 soak: SPY's overnight print went below its stop,
+    no executable quote existed, and every exit was skipped silently. Stocks
+    are now managed on regular-session prices only: an out-of-session breach
+    is recorded and alerted once per day, nothing is sold or ratcheted, and
+    the next in-session cycle decides."""
+    repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
+    await _seed_holding(repositories)
+    await _seed_lot(repositories, mfe_price="150")
+    _mock_clock(is_open=False)
+    _mock_positions(qty="10", current_price="135")  # below stop_loss=140
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(
+        return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+
+    first = await run_position_monitor(repositories, broker, market_data, gateway, alerts, LIMITS, clock=lambda: NOW)
+    second = await run_position_monitor(repositories, broker, market_data, gateway, alerts, LIMITS,
+                                        clock=lambda: NOW + timedelta(minutes=1))
+    await broker.aclose()
+
+    assert (first.deferred_exits, first.exits_triggered, second.deferred_exits) == (1, 0, 1)
+    assert order_route.call_count == 0
+    events = [hydrate("audit_events", r["payload"]) for r in await repositories.audit_events.list_all()]
+    assert [e.event_type for e in events] == ["exit_deferred_market_closed"]  # once per symbol per day
+    assert (await _get_lot(repositories, "lot-1")).mae_price is None  # out-of-session prints are not folded
+
+
+@respx.mock
+async def test_stock_breach_in_session_still_exits(tmp_path) -> None:
+    repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
+    await _seed_holding(repositories)
+    _mock_clock(is_open=True)
+    _mock_positions(qty="10", current_price="135")
+    _mock_account()
+    _mock_quote()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(
+        return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
+        return_value=httpx.Response(200, json=_order_json("filled", "10", "135")))
+    _mock_fill_activities("act-1", "10", "135")
+
+    summary = await run_position_monitor(repositories, broker, market_data, gateway, alerts, LIMITS, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert (summary.exits_triggered, summary.deferred_exits) == (1, 0)
+    assert order_route.call_count == 1
+
+
+@respx.mock
+async def test_crypto_is_managed_around_the_clock(tmp_path) -> None:
+    repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
+    btc = AssetIdentity("BTC/USD", AssetClass.CRYPTO, "alpaca:BTC/USD")
+    holding = Holding(asset=btc, quantity=Decimal("0.1"), average_price=Decimal("60000"), updated_at=NOW,
+                      stop_loss=Decimal("58000"))
+    await repositories.holdings.create_once(asset_identity_key(btc), holding)
+    _mock_clock(is_open=False)  # the stock market is closed; crypto is not
+    respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[{
+        "symbol": "BTCUSD", "asset_class": "crypto", "qty": "0.1", "avg_entry_price": "60000",
+        "market_value": "0", "current_price": "57000", "unrealized_pl": "0"}]))
+    _mock_account()
+    respx.get("https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes").mock(return_value=httpx.Response(200, json={
+        "quotes": {"BTC/USD": {"bp": 56990.0, "ap": 57010.0, "t": QUOTE_TS}}}))
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(side_effect=httpx.ConnectError("refused"))
+    respx.get("https://paper-api.alpaca.markets/v2/orders:by_client_order_id").mock(return_value=httpx.Response(404))
+
+    summary = await run_position_monitor(repositories, broker, market_data, gateway, alerts, LIMITS, clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.deferred_exits == 0
+    assert order_route.call_count == 1  # an exit was attempted despite the closed stock market

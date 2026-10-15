@@ -65,6 +65,9 @@ class MonitorCycleSummary:
     execution_results: list[ExecutionResult] = field(default_factory=list)
     error: str | None = None
     unmanaged_positions: int = 0
+    # Stock/option exits found while the market is closed: alerted, then
+    # re-evaluated at the open (see _defer_exit_outside_market_hours).
+    deferred_exits: int = 0
 
 
 def _breached(position: AlpacaPosition, holding: Holding) -> bool:
@@ -330,6 +333,40 @@ async def _report_unmanaged_position(repositories: PersistenceRepositories, aler
     await alert_once(repositories.audit_events, alerts, event)
 
 
+async def _equity_market_open(broker: AlpacaClient) -> bool | None:
+    """Alpaca's clock for the US stock/option session; None if unavailable."""
+    try:
+        return (await broker.get_clock()).is_open
+    except Exception:  # noqa: BLE001 - an unknown session must not stop the monitor
+        logger.warning("monitor_market_clock_unavailable", exc_info=True)
+        return None
+
+
+async def _defer_exit_outside_market_hours(repositories: PersistenceRepositories, alerts: TelegramAlerter,
+                                           position: AlpacaPosition, holding: Holding, now: datetime) -> bool:
+    """Stock and option exits act on regular-session prices only. Outside
+    the session Alpaca's position price keeps moving with overnight trading,
+    but no executable quote exists, so an exit cannot be placed and a thin
+    overnight print is not a reason to sell. A breach seen then is recorded
+    and alerted once per symbol per UTC day; the next in-session cycle exits
+    if the price is still beyond the stop. Returns True when a breach was seen."""
+    if (holding.stop_loss is None and holding.target_price is None) or not _breached(position, holding):
+        return False
+    key = asset_identity_key(holding.asset)
+    stop = holding.current_stop if holding.current_stop is not None else holding.stop_loss
+    event = AuditEvent(
+        event_id=f"exit_deferred_market_closed:{key}:{now.date().isoformat()}", event_type="exit_deferred_market_closed",
+        severity="warning",
+        message=(f"EXIT_DEFERRED_MARKET_CLOSED: {position.symbol} at {position.current_price} is past its exit level "
+                 f"(stop {stop}, target {holding.target_price}) outside regular market hours. It will be sold at the "
+                 "open if it is still past it."),
+        occurred_at=now, entity_type="holding", entity_id=key,
+        details={"symbol": position.symbol, "price": str(position.current_price), "stop": str(stop)},
+    )
+    await alert_once(repositories.audit_events, alerts, event)
+    return True
+
+
 async def run_position_monitor(
     repositories: PersistenceRepositories,
     broker: AlpacaClient,
@@ -349,6 +386,13 @@ async def run_position_monitor(
 
     execution_results: list[ExecutionResult] = []
     exits_triggered = 0
+    deferred_exits = 0
+    # Stocks and options are managed on regular-session prices only; crypto
+    # trades around the clock. None (clock unavailable) keeps the previous
+    # behaviour: evaluate, and let the gateway refuse a stale quote.
+    equity_market_open = None
+    if any(p.asset_class != AssetClass.CRYPTO for p in positions):
+        equity_market_open = await _equity_market_open(broker)
 
     # Outcome Attribution -- one pre-fetch of ALL open/partially-closed lots,
     # grouped by asset, rather than a per-position table scan. A symbol can
@@ -397,6 +441,11 @@ async def run_position_monitor(
         if holding_row is None:
             continue  # nothing on file (e.g. opened outside this system) -- no threshold to check
         holding = hydrate("holdings", holding_row["payload"])
+        if holding.asset.asset_class != AssetClass.CRYPTO and equity_market_open is False:
+            # No ratchet, no extreme folding, no exit on out-of-session prints.
+            if await _defer_exit_outside_market_hours(repositories, alerts, position, holding, clock()):
+                deferred_exits += 1
+            continue
         matching_lots = open_lots_by_asset.get(asset_identity_key(holding.asset), [])
         if matching_lots:
             await _fold_lot_extrema(repositories, matching_lots, position.current_price)
@@ -458,4 +507,5 @@ async def run_position_monitor(
         finally:
             await release_symbol_reservation(database, holding.asset, owner_token)
 
-    return MonitorCycleSummary("ok", len(positions), exits_triggered, execution_results, unmanaged_positions=unmanaged)
+    return MonitorCycleSummary("ok", len(positions), exits_triggered, execution_results, unmanaged_positions=unmanaged,
+                               deferred_exits=deferred_exits)

@@ -21,6 +21,12 @@ The stop is moved and `scaled_out` recorded in one atomic holdings mutation **be
 
 Break-even win rate before costs: about 40% for a 1.5R full exit against a 1R stop. Scale-out ladders typically need 35–45%, depending on how far the remainder runs. "Sell on any profit" would need about 88% with a 0.5% target against a 3.5% stop.
 
+## Exits act on regular-session prices (stocks and options)
+
+Found in the Rev.127 soak. On 2026-10-15 from about 03:00 UTC, SPY's overnight print was below its $766.21 stop (as low as $765.76) for 122 consecutive snapshots. Alpaca's position price keeps moving with overnight trading, but there was no fresh executable quote, so every exit the monitor attempted was refused by the gateway's 30-second quote-age check. This was silent, with no alert, and SPY was back above its stop by the open.
+
+Now, while Alpaca's clock says the stock market is closed, stock and option holdings are not ratcheted, their price extremes are not updated, and no exit is attempted. A breach seen then is recorded and alerted once per symbol per UTC day (`exit_deferred_market_closed`, through `alert_once`, so it is recorded even if Telegram is down), and counted in `MonitorCycleSummary.deferred_exits`. The first in-session cycle sells if the price is still past the stop. Crypto is managed around the clock. If the clock cannot be read, the previous behaviour applies.
+
 ## Entry limits (`risk/engine.py::evaluate_risk`)
 
 | Setting (`balanced`) | Before | Now |
