@@ -28,7 +28,10 @@ from tradepulse.settlement import SettlementProcessor
 
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)
 QUOTE_TS = NOW.isoformat().replace("+00:00", "Z")
-LIMITS = risk_limits_for_profile("balanced")
+# These tests cover stops, ratchets, expiry and the time stop on their own;
+# the Phase 1 exit ladder is switched off here and tested in test_exit_ladder.py.
+LIMITS = replace(risk_limits_for_profile("balanced"), scale_out_r=Decimal("0"), final_target_r=Decimal("0"),
+                 single_unit_target_r=Decimal("0"), stall_exit_days=0)
 
 
 def _aapl() -> AssetIdentity:
@@ -808,3 +811,54 @@ async def test_open_lot_mfe_still_updates_behind_more_than_one_page_of_other_ass
     lot = await _get_lot(repositories, "lot-1")
     assert lot.mfe_price == Decimal("155")  # proves the real lot was found and updated, not silently skipped
     assert lot.mae_price == Decimal("155")
+
+
+@respx.mock
+async def test_scale_out_at_one_r_sells_half_after_locking_break_even(tmp_path) -> None:
+    """Phase 1 exit ladder end to end: at +1R (R = 150 - 140 = 10, price 160)
+    the monitor records the scale-out and moves the stop to break-even
+    BEFORE selling, then submits a SELL for half the position."""
+    repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
+    await _seed_holding(repositories, target_price=None)
+    await _seed_lot(repositories)
+    _mock_positions(qty="10", current_price="160")
+    _mock_bars()
+    _mock_account()
+    _mock_quote(bid="159.90", ask="160.10")
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(
+        return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
+        return_value=httpx.Response(200, json=_order_json("filled", "5", "160")))
+    _mock_fill_activities("act-1", "5", "160")
+
+    summary = await run_position_monitor(repositories, broker, market_data, gateway, alerts,
+                                         risk_limits_for_profile("balanced"), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.exits_triggered == 1
+    assert order_route.call_count == 1
+    body = order_route.calls[0].request.content
+    assert b'"side":"sell"' in body and b'"qty":"5"' in body
+    holding = await _get_holding(repositories)
+    assert holding.scaled_out is True
+    assert holding.current_stop is not None and holding.current_stop >= Decimal("150")  # at least break-even
+
+
+@respx.mock
+async def test_a_scaled_out_position_is_never_scaled_out_again(tmp_path) -> None:
+    repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
+    holding = Holding(asset=_aapl(), quantity=Decimal("5"), average_price=Decimal("150"), updated_at=NOW,
+                      stop_loss=Decimal("140"), current_stop=Decimal("150"), scaled_out=True)
+    await repositories.holdings.create_once(asset_identity_key(_aapl()), holding)
+    await _seed_lot(repositories, quantity="10", remaining_quantity="5")
+    _mock_positions(qty="5", current_price="165")  # +1.5R: above the scale-out rung, below the 3R target
+    _mock_bars()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(
+        return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+
+    summary = await run_position_monitor(repositories, broker, market_data, gateway, alerts,
+                                         risk_limits_for_profile("balanced"), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.exits_triggered == 0
+    assert order_route.call_count == 0

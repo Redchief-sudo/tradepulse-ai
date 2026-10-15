@@ -8,6 +8,8 @@ from .engine import (
     check_cash_sufficiency,
     check_max_drawdown,
     evaluate_risk,
+    open_portfolio_risk,
+    symbol_entries_today,
 )
 from .session import (
     SESSION_RECORD_ID,
@@ -37,7 +39,9 @@ __all__ = [
     "latch_financial_integrity_block",
     "latch_risk_stop",
     "load_session",
+    "open_portfolio_risk",
     "save_session",
+    "symbol_entries_today",
     "sync_market_session",
     "transition_session",
 ]

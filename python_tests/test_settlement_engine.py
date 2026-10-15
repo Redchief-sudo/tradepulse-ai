@@ -800,7 +800,7 @@ async def test_current_stop_survives_settlement_rebuild_across_governing_lot_cha
     assert holding.current_stop is None  # nothing has ratcheted yet
 
     # Simulate the monitor having already ratcheted a stop this cycle.
-    ratcheted = replace(holding, current_stop=Decimal("102"))
+    ratcheted = replace(holding, current_stop=Decimal("102"), scaled_out=True)
     await repositories.holdings.update(asset_identity_key(asset()), ratcheted)
 
     # Close lot 1 (the governing lot) fully -- FIFO closes oldest first.
@@ -813,6 +813,7 @@ async def test_current_stop_survives_settlement_rebuild_across_governing_lot_cha
     holding = hydrate("holdings", holding_row["payload"])
     assert holding.stop_loss == Decimal("95")  # governing lot changed to lot 2 -- proves the edge case is real, not a no-op
     assert holding.current_stop == Decimal("102")  # carried forward unchanged despite the rebuild
+    assert holding.scaled_out is True  # Phase 1: a position is scaled out at most once, across rebuilds
 
 
 async def test_process_pending_still_sees_a_new_pending_event_behind_a_large_completed_backlog(tmp_path) -> None:

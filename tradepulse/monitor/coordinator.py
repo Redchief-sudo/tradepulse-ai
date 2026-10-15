@@ -45,6 +45,7 @@ from tradepulse.models import (
     Side,
     asset_identity_key,
     asset_key_from_broker_symbol,
+    contract_multiplier_of,
     fold_price_extremum,
 )
 from tradepulse.persistence import PersistenceRepositories, hydrate, paginate_all_rows, run_with_lock_renewal
@@ -231,6 +232,74 @@ async def _ratchet_stop(
     return await repositories.holdings.mutate(asset_identity_key(holding.asset), _decide)
 
 
+@dataclass(frozen=True, slots=True)
+class LadderExit:
+    """One exit-ladder decision: sell `quantity` for `reason`. `scale_out`
+    marks the partial profit-take that also moves the stop to break-even."""
+
+    quantity: Decimal
+    reason: str
+    scale_out: bool = False
+
+
+def _scale_out_quantity(holding: Holding, position_qty: Decimal, price: Decimal, risk_limits: RiskLimits) -> Decimal | None:
+    """The partial-exit quantity, or None when the position cannot be split:
+    a single option contract, or either part below the order precision or
+    the minimum lot notional."""
+    from tradepulse.risk.engine import round_quantity
+
+    asset_class = holding.asset.asset_class
+    part = round_quantity(position_qty * risk_limits.scale_out_fraction, asset_class)
+    rest = position_qty - part
+    notional_per_unit = price * contract_multiplier_of(holding.asset)
+    if part <= 0 or rest <= 0:
+        return None
+    if part * notional_per_unit < risk_limits.min_lot_notional or rest * notional_per_unit < risk_limits.min_lot_notional:
+        return None
+    return part
+
+
+def plan_ladder_exit(holding: Holding, lots: list[PositionLot], position_qty: Decimal, price: Decimal,
+                     today: date, risk_limits: RiskLimits) -> LadderExit | None:
+    """Profit-aware exits measured in R, the position's own risk per unit
+    (average_price - stop_loss, the governing first-entry stop). Long
+    positions only -- TradePulse never opens a short.
+
+    - final_target_r: exit everything.
+    - Not yet scaled out and splittable: at scale_out_r, sell
+      scale_out_fraction (the caller first moves the stop to break-even).
+    - Not splittable: exit everything at single_unit_target_r.
+    - Not yet scaled out and held stall_exit_days without its best price
+      ever reaching stall_min_r: exit everything; the trade is not working.
+
+    Stops, the trailing stop, option expiry and max_hold_days are decided
+    before this and take precedence."""
+    if holding.stop_loss is None or holding.quantity <= 0 or position_qty <= 0:
+        return None
+    risk_unit = holding.average_price - holding.stop_loss
+    if risk_unit <= 0:
+        return None
+    gain_r = (price - holding.average_price) / risk_unit
+    if risk_limits.final_target_r and gain_r >= risk_limits.final_target_r:
+        return LadderExit(position_qty, "target_r")
+    if holding.scaled_out:
+        return None
+    part = _scale_out_quantity(holding, position_qty, price, risk_limits)
+    if part is None:
+        if risk_limits.single_unit_target_r and gain_r >= risk_limits.single_unit_target_r:
+            return LadderExit(position_qty, "target_r_single_unit")
+    elif risk_limits.scale_out_r and gain_r >= risk_limits.scale_out_r:
+        return LadderExit(part, "scale_out", scale_out=True)
+    if risk_limits.stall_exit_days and lots:
+        oldest = min(lots, key=lambda lot: lot.opened_at)
+        if (today - oldest.opened_at.date()).days >= risk_limits.stall_exit_days:
+            extremes = [lot.mfe_price for lot in lots if lot.mfe_price is not None]
+            best = max([price, *extremes])
+            if (best - holding.average_price) / risk_unit < risk_limits.stall_min_r:
+                return LadderExit(position_qty, "stall")
+    return None
+
+
 def _time_stopped(lots: list[PositionLot], today: date, max_hold_days: int) -> bool:
     """Deliberately stateless and NOT preserved across a governing-lot
     change -- recomputed fresh every cycle from whichever lot is currently
@@ -344,9 +413,11 @@ async def run_position_monitor(
             )
         expiring = _near_expiry(holding, clock().date(), risk_limits.options_forced_close_days_before_expiry)
         time_stopped = _time_stopped(matching_lots, clock().date(), risk_limits.max_hold_days)
-        if holding.stop_loss is None and holding.target_price is None and not expiring and not time_stopped:
-            continue
-        if not _breached(position, holding) and not expiring and not time_stopped:
+        breached = (holding.stop_loss is not None or holding.target_price is not None) and _breached(position, holding)
+        ladder = (None if breached or expiring or time_stopped
+                  else plan_ladder_exit(holding, matching_lots, abs(position.qty), position.current_price,
+                                        clock().date(), risk_limits))
+        if not (breached or expiring or time_stopped or ladder):
             continue
 
         database = repositories.trade_intents.database
@@ -359,9 +430,23 @@ async def run_position_monitor(
 
             is_long = position.qty > 0
             exit_side = Side.SELL if is_long else Side.BUY
+            if ladder is not None and ladder.scale_out:
+                # Lock the stop at break-even and record the scale-out BEFORE
+                # selling: if the sale then fails, the position is still
+                # protected and is never scaled out twice.
+                def _mark(current: Holding) -> Holding | None:
+                    if current.scaled_out:
+                        return None
+                    floor = current.average_price if current.current_stop is None else max(current.current_stop, current.average_price)
+                    return replace(current, scaled_out=True, current_stop=floor)
+                marked = await repositories.holdings.mutate(asset_identity_key(holding.asset), _mark)
+                if marked is None or not marked.scaled_out:
+                    continue  # holding gone, or another writer already scaled it out
             request = ExecutionRequest(
-                asset=holding.asset, side=exit_side, requested_quantity=abs(position.qty),
-                strategy="position_monitor", decision_id=f"monitor-{position.symbol}-{clock().isoformat()}",
+                asset=holding.asset, side=exit_side,
+                requested_quantity=ladder.quantity if ladder is not None else abs(position.qty),
+                strategy="position_monitor",
+                decision_id=f"monitor-{ladder.reason if ladder else 'exit'}-{position.symbol}-{clock().isoformat()}",
                 symbol_lock_owner_token=owner_token,
             )
             result = await run_with_lock_renewal(

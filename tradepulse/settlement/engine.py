@@ -317,7 +317,7 @@ async def _project_holding(repositories: PersistenceRepositories, event: Settlem
         # A plain update() here would read-then-overwrite with a stale
         # pre-ratchet value, silently reverting a just-advanced ratchet.
         def _decide(current: Holding) -> Holding:
-            return replace(holding, current_stop=current.current_stop)
+            return replace(holding, current_stop=current.current_stop, scaled_out=current.scaled_out)
         await repositories.holdings.mutate(record_id, _decide, guard_table="integrity_holds", guard_key=event.broker_order_id)
     else:
         # current_stop defaults None -- no ratchet history yet

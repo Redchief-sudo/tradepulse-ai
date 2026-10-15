@@ -68,6 +68,8 @@ from tradepulse.risk import (
     execution_session_decision,
     latch_risk_stop,
     load_session,
+    open_portfolio_risk,
+    symbol_entries_today,
 )
 from tradepulse.settlement import SettlementProcessor
 
@@ -342,7 +344,11 @@ class ExecutionGateway:
                 contract_multiplier=contract_multiplier_of(request.asset),
                 regime_multiplier=request.regime_multiplier,
             )
+            new_exposure = request.side == Side.BUY and not protective_exit
             risk_opts = RiskEvalOptions(
+                open_risk=await open_portfolio_risk(self._repositories) if new_exposure else Decimal("0"),
+                symbol_entries_today=(await symbol_entries_today(self._repositories, request.asset, now)
+                                      if new_exposure else 0),
                 protective_exit=protective_exit, bid=quote.bid, ask=quote.ask,
                 estimated_slippage_pct=quote.estimated_slippage_pct,
                 held_quantity=abs(held_quantity), available_cash=account.cash,

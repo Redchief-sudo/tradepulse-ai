@@ -318,11 +318,11 @@ def test_buy_sizes_down_when_requested_size_exceeds_remaining_total_exposure() -
     """Total-exposure headroom is the binding constraint -- must size DOWN
     to whatever remains, never reject outright while capacity still exists.
     Existing holdings already consume most of the balanced profile's 40% of
-    $100k = $40k exposure budget, leaving only $2k of headroom -- well under
+    $100k = $60k exposure budget (balanced, Phase 1), leaving only $2k of headroom -- well under
     what max_position_pct ($7k) alone would allow, so exposure is what
     actually binds here."""
     opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("100000"))
-    snapshot = _snapshot(holdings_value=Decimal("38000"))
+    snapshot = _snapshot(holdings_value=Decimal("58000"))
     decision = evaluate_risk(_buy(requested_quantity=Decimal("50"), price=Decimal("100")), snapshot, LIMITS, opts)
     assert decision.approved
     assert decision.approved_quantity * Decimal("100") <= Decimal("2000")
@@ -334,7 +334,7 @@ def test_buy_rejected_when_no_total_exposure_capacity_remains() -> None:
     rejected via the generic minimum-lot floor, not a separate
     exposure-specific early reject."""
     opts = RiskEvalOptions(skip_market_data_checks=True, available_cash=Decimal("100000"))
-    snapshot = _snapshot(holdings_value=Decimal("40000"))  # already at the 40% cap -- zero headroom
+    snapshot = _snapshot(holdings_value=Decimal("60000"))  # already at the 60% cap -- zero headroom
     decision = evaluate_risk(_buy(requested_quantity=Decimal("50"), price=Decimal("100")), snapshot, LIMITS, opts)
     assert not decision.approved
     assert any("INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT" in reason for reason in decision.reasons)
@@ -1014,3 +1014,82 @@ def test_held_option_notional_counts_toward_position_cap() -> None:
     opts = RiskEvalOptions(bid=Decimal("2.98"), ask=Decimal("3.02"), estimated_slippage_pct=Decimal("0.6"),
                            available_cash=Decimal("100000"), held_notional=Decimal("6400"))
     assert evaluate_risk(option, _snapshot(), LIMITS, opts).approved_quantity == Decimal("2")  # (7000-6400)/(3x100)
+
+
+# ---- Phase 1 entry limits ----------------------------------------------------
+
+def _quoted(**overrides) -> RiskEvalOptions:
+    defaults = dict(bid=Decimal("99.99"), ask=Decimal("100.01"), estimated_slippage_pct=Decimal("0.01"))
+    defaults.update(overrides)
+    return RiskEvalOptions(**defaults)
+
+
+def test_open_risk_cap_sizes_a_buy_into_the_remaining_risk_room() -> None:
+    """3% of 100,000 = 3,000 combined risk. 2,900 is already at risk, so a
+    buy risking 3 per share (stop 97) gets 100 / 3 = 33.333 shares, not the
+    75 its own risk budget allows."""
+    decision = evaluate_risk(_buy(requested_quantity=Decimal("500"), stop_loss=Decimal("97")), _snapshot(), LIMITS,
+                             _quoted(open_risk=Decimal("2900")))
+    assert decision.approved and decision.approved_quantity == Decimal("33.333")
+    assert "POSITION_CAPPED_TO_33.333_BY_MAX_OPEN_RISK" in decision.reasons
+
+
+def test_no_open_risk_room_means_no_buy() -> None:
+    decision = evaluate_risk(_buy(stop_loss=Decimal("97")), _snapshot(), LIMITS, _quoted(open_risk=Decimal("3000")))
+    assert not decision.approved and "INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT" in decision.reasons
+
+
+def test_per_symbol_daily_entries_are_limited() -> None:
+    assert evaluate_risk(_buy(stop_loss=Decimal("97")), _snapshot(), LIMITS, _quoted(symbol_entries_today=1)).approved
+    decision = evaluate_risk(_buy(stop_loss=Decimal("97")), _snapshot(), LIMITS, _quoted(symbol_entries_today=2))
+    assert not decision.approved and "MAX_ENTRIES_PER_SYMBOL_REACHED (2/2)" in decision.reasons
+
+
+def test_cost_rule_rejects_a_trade_whose_costs_eat_its_edge() -> None:
+    """R = 1% (stop 99). Crypto: 0.10% spread + 2 x 0.25% fees = 0.60%,
+    over 10% of R (0.10%). An equity with a 0.05% spread fits."""
+    crypto = evaluate_risk(_buy(asset_class=AssetClass.CRYPTO, symbol="BTC/USD", stop_loss=Decimal("99")), _snapshot(),
+                           LIMITS, _quoted(bid=Decimal("99.95"), ask=Decimal("100.05")))
+    assert not crypto.approved and any(r.startswith("COST_EXCEEDS_RISK_FRACTION") for r in crypto.reasons)
+    equity = evaluate_risk(_buy(stop_loss=Decimal("99")), _snapshot(), LIMITS,
+                           _quoted(bid=Decimal("99.975"), ask=Decimal("100.025")))
+    assert not any(r.startswith("COST_EXCEEDS_RISK_FRACTION") for r in equity.reasons)
+
+
+def test_protective_exits_ignore_every_entry_limit() -> None:
+    decision = evaluate_risk(_buy(side=Side.SELL, stop_loss=Decimal("99")), _snapshot(), LIMITS,
+                             _quoted(protective_exit=True, open_risk=Decimal("99999"), symbol_entries_today=9))
+    assert decision.approved
+
+
+async def test_open_portfolio_risk_counts_unprotected_holdings_and_pending_buys(tmp_path) -> None:
+    from tradepulse.risk import open_portfolio_risk
+
+    repositories = await _repositories(tmp_path)
+    msft = AssetIdentity("MSFT", AssetClass.EQUITY, "alpaca:MSFT")
+    at_risk = Holding(_aapl(), Decimal("10"), Decimal("100"), NOW, stop_loss=Decimal("97"))               # 3 x 10 = 30
+    protected = Holding(msft, Decimal("10"), Decimal("100"), NOW, stop_loss=Decimal("95"),
+                        current_stop=Decimal("105"))                                                       # stop above cost: 0
+    await repositories.holdings.create_once(asset_identity_key(_aapl()), at_risk)
+    await repositories.holdings.create_once(asset_identity_key(msft), protected)
+    pending = TradeIntent("ti-p", "idem-p", "corr-p", msft, Side.BUY, ExecutionMode.PAPER, "ai_scan", NOW,
+                          requested_quantity=Decimal("5"), filled_quantity=Decimal("2"), stop_loss=Decimal("95"),
+                          status=TradeIntentStatus.PARTIALLY_FILLED, risk_snapshot={"entry_price": "100"})  # 5 x 3 unfilled = 15
+    await repositories.trade_intents.create_once("ti-p", pending, status=pending.status.value, unique_value="idem-p")
+
+    assert await open_portfolio_risk(repositories) == Decimal("45")
+
+
+async def test_symbol_entries_today_counts_this_symbols_buys_only(tmp_path) -> None:
+    from tradepulse.risk import symbol_entries_today
+
+    repositories = await _repositories(tmp_path)
+    msft = AssetIdentity("MSFT", AssetClass.EQUITY, "alpaca:MSFT")
+    for fill_id, intent_id, asset, side in (("f1", "buy-1", _aapl(), Side.BUY), ("f2", "buy-1", _aapl(), Side.BUY),
+                                            ("f3", "buy-2", _aapl(), Side.BUY), ("f4", "exit-1", _aapl(), Side.SELL),
+                                            ("f5", "buy-3", msft, Side.BUY)):
+        fill = Fill(fill_id, intent_id, f"order-{fill_id}", asset, side, ExecutionMode.PAPER,
+                    Decimal("1"), Decimal("100"), Decimal("0"), Decimal("0"), NOW)
+        await repositories.fills.create_once(fill_id, fill, unique_value=None)
+
+    assert await symbol_entries_today(repositories, _aapl(), NOW) == 2

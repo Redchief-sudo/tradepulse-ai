@@ -58,11 +58,11 @@ RISK_PROFILES: dict[str, RiskLimits] = {
     "balanced": RiskLimits(
         profile_id="balanced",
         max_position_pct=Decimal("7"), max_sector_pct=Decimal("20"), min_confidence=Decimal("80"),
-        max_daily_trades=3, stop_loss_pct=Decimal("8"), max_drawdown_pct=Decimal("15"),
-        max_open_positions=5, max_daily_loss_pct=Decimal("1.0"),
+        max_daily_trades=10, stop_loss_pct=Decimal("8"), max_drawdown_pct=Decimal("15"),
+        max_open_positions=8, max_daily_loss_pct=Decimal("1.0"),
         spread_limit_pct=Decimal("1.5"), slippage_limit_pct=Decimal("1"),
         options_spread_limit_pct=Decimal("2.5"), options_slippage_limit_pct=Decimal("1.25"),
-        max_risk_per_trade_pct=Decimal("0.30"), max_total_exposure_pct=Decimal("40"),
+        max_risk_per_trade_pct=Decimal("0.30"), max_total_exposure_pct=Decimal("60"),
         max_simultaneous_orders=2, min_position_size_multiplier=Decimal("0.5"),
         options_premium_stop_pct=Decimal("35"), options_expiry_min_days=21, options_expiry_max_days=45,
         options_target_otm_pct=Decimal("3"), options_forced_close_days_before_expiry=2,
@@ -70,6 +70,9 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         # ~p90 -- catches JPM/BAC-level (0.82) sector concentration
         max_correlation_threshold=Decimal("0.65"),
         max_correlation_threshold_crypto=Decimal("0.80"),
+        # Phase 1 (2026-10-15): many smaller decisions, capped by combined
+        # risk rather than a count -- see docs/phase1-exit-ladder-and-open-risk.md.
+        max_open_risk_pct=Decimal("3"), max_entries_per_symbol_per_day=2, max_cost_to_risk_pct=Decimal("10"),
     ),
     "conservative": RiskLimits(
         profile_id="conservative",

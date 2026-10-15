@@ -109,7 +109,7 @@ def test_modeled_overlay_and_observed_actual_expense_are_separate():
     assert result['errors'] == []
     assert Decimal(result['modeled_trade_net']) == Decimal('2') - Decimal('202') * Decimal('0.004')
     assert Decimal(result['observed_generation_net']) == Decimal('1.50')
-    assert result['criteria']['win_rate_pct']['actual'] == '100'
+    assert result['win_rate_pct'] == '100'
     assert result['observed_generation_bridge']['modeled_overlay_deducted'] is False
     assert Decimal(result['accounting_breakdown'][0]['modeled_cost_overlay']) == Decimal('0.808')
 

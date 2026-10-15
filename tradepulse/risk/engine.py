@@ -64,6 +64,11 @@ def _round_qty(qty: Decimal, asset_class: AssetClass) -> Decimal:
     return floored / precision
 
 
+def round_quantity(qty: Decimal, asset_class: AssetClass) -> Decimal:
+    """Public name for _round_qty: floor to the asset class's order precision."""
+    return _round_qty(qty, asset_class)
+
+
 def _minimum_quantity(asset_class: AssetClass) -> Decimal:
     if asset_class == AssetClass.CRYPTO:
         return Decimal("0.00000001")
@@ -128,6 +133,16 @@ class RiskEvalOptions:
     held_notional: Decimal = Decimal("0")
     available_cash: Decimal | None = None
     estimated_fees: Decimal = Decimal("0")
+    # Combined risk to stop of open positions and pending buys (open_portfolio_risk).
+    open_risk: Decimal = Decimal("0")
+    # Filled BUY intents for this symbol in the current risk day (symbol_entries_today).
+    symbol_entries_today: int = 0
+
+
+# Estimated taker fee per side, % of notional, used by the cost rule. Alpaca
+# charges crypto 0.15-0.25% per side by volume tier (0.25% at the entry tier);
+# US equity and option regulatory fees are a negligible fraction of R.
+_FEE_PCT_PER_SIDE = {AssetClass.CRYPTO: Decimal("0.25")}
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +223,19 @@ def evaluate_risk(
     if intent.side == Side.BUY and not opts.protective_exit and opts.max_drawdown_breached:
         reasons.append("MAX_DRAWDOWN_BREACHED")
 
+    # Cost rule: a buy's estimated round-trip cost (full spread plus a fee
+    # each side) must be a small fraction of the trade's own risk R, or the
+    # edge is paid away in friction -- the same test at any account size.
+    if (intent.side == Side.BUY and not opts.protective_exit and limits.max_cost_to_risk_pct
+            and intent.stop_loss is not None and price > 0 and price > intent.stop_loss
+            and opts.bid is not None and opts.ask is not None and not opts.skip_market_data_checks):
+        mid = (opts.bid + opts.ask) / 2
+        if mid > 0:
+            cost_pct = (opts.ask - opts.bid) / mid * 100 + 2 * _FEE_PCT_PER_SIDE.get(intent.asset_class, Decimal("0"))
+            risk_pct = (price - intent.stop_loss) / price * 100
+            if cost_pct > limits.max_cost_to_risk_pct / 100 * risk_pct:
+                reasons.append(f"COST_EXCEEDS_RISK_FRACTION ({cost_pct:.2f}% > {limits.max_cost_to_risk_pct}% of R {risk_pct:.2f}%)")
+
     if opts.protective_exit:
         if reasons:
             return RiskDecision(False, Decimal("0"), reasons)
@@ -251,6 +279,9 @@ def evaluate_risk(
     # block below -- it already computes remaining_exposure and shrinks
     # approved_qty into it; zero remaining headroom naturally floors to a
     # zero-ish quantity, caught by the final minimum-lot/notional check.
+
+    if limits.max_entries_per_symbol_per_day and opts.symbol_entries_today >= limits.max_entries_per_symbol_per_day:
+        reasons.append(f"MAX_ENTRIES_PER_SYMBOL_REACHED ({opts.symbol_entries_today}/{limits.max_entries_per_symbol_per_day})")
 
     if limits.max_simultaneous_orders and snapshot.outstanding_orders >= limits.max_simultaneous_orders:
         reasons.append(
@@ -303,6 +334,16 @@ def evaluate_risk(
                 if risk_based_qty < approved_qty:
                     approved_qty = risk_based_qty
                     reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_RISK_BASED_SIZING")
+                # Combined open risk: what every open position and pending buy
+                # stands to lose at its stop, plus this buy's, stays within
+                # max_open_risk_pct of equity. Positions protected at or above
+                # break-even contribute nothing, which frees room for new trades.
+                if limits.max_open_risk_pct:
+                    remaining_risk = (limits.max_open_risk_pct / 100) * total_equity - opts.open_risk
+                    capped_by_risk = _round_qty(max(remaining_risk, Decimal(0)) / unit_risk, intent.asset_class)
+                    if capped_by_risk < approved_qty:
+                        approved_qty = capped_by_risk
+                        reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_MAX_OPEN_RISK")
 
         # The cap bounds the whole position: notional already held in this
         # asset (broker market value, multiplier included) consumes it.
@@ -350,6 +391,47 @@ def evaluate_risk(
     if approved_qty >= qty:
         reasons.append("OK")
     return RiskDecision(True, max(Decimal("0"), approved_qty), reasons)
+
+
+_PENDING_BUY_STATUSES = (
+    TradeIntentStatus.RISK_APPROVED.value, TradeIntentStatus.SUBMITTED.value, TradeIntentStatus.ACCEPTED.value,
+    TradeIntentStatus.PARTIALLY_FILLED.value, TradeIntentStatus.SUBMISSION_UNKNOWN.value,
+)
+
+
+async def open_portfolio_risk(repositories: PersistenceRepositories) -> Decimal:
+    """What the account stands to lose if every open long and every pending
+    buy hit its stop: sum of max(0, average_price - effective stop) x
+    quantity x contract multiplier over holdings, plus the unfilled part of
+    each pending BUY at (entry_price - stop_loss). A holding whose effective
+    stop (current_stop if set, else stop_loss) is at or above its average
+    price risks nothing; a holding with no stop counts its whole notional."""
+    total = Decimal(0)
+    for row in await paginate_all_rows(repositories.holdings):
+        holding = hydrate("holdings", row["payload"])
+        if holding.quantity <= 0:
+            continue
+        stop = holding.current_stop if holding.current_stop is not None else holding.stop_loss
+        per_unit = holding.average_price - (stop if stop is not None else Decimal(0))
+        total += max(per_unit, Decimal(0)) * holding.quantity * contract_multiplier_of(holding.asset)
+    for row in await list_all_by_statuses(repositories.trade_intents, list(_PENDING_BUY_STATUSES)):
+        intent = hydrate("trade_intents", row["payload"])
+        entry = intent.risk_snapshot.get("entry_price") if intent.risk_snapshot else None
+        if intent.side != Side.BUY or intent.stop_loss is None or entry is None or intent.requested_quantity is None:
+            continue
+        unfilled = intent.requested_quantity - (intent.filled_quantity or Decimal(0))
+        per_unit = Decimal(str(entry)) - intent.stop_loss
+        total += max(per_unit, Decimal(0)) * max(unfilled, Decimal(0)) * contract_multiplier_of(intent.asset)
+    return total
+
+
+async def symbol_entries_today(repositories: PersistenceRepositories, asset, now: datetime) -> int:
+    """Distinct BUY intents with a fill in the current NY risk day for this asset."""
+    start, end = _risk_day_bounds(now)
+    key = asset_identity_key(asset)
+    rows = await list_all_by_json_time_range(repositories.fills, "filled_at", start, end)
+    fills = [hydrate("fills", row["payload"]) for row in rows]
+    return len({f.trade_intent_id for f in fills if f.side == Side.BUY and asset_identity_key(f.asset) == key})
 
 
 async def build_portfolio_snapshot(

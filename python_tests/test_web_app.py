@@ -433,8 +433,8 @@ async def test_get_risk_limits_returns_the_active_profiles_limits(tmp_path) -> N
         "max_daily_trades", "max_open_positions", "max_drawdown_pct", "max_daily_loss_pct",
     }
     assert body["profile_id"] == "balanced"
-    assert body["max_total_exposure_pct"] == "40"
-    assert body["max_daily_trades"] == 3
+    assert body["max_total_exposure_pct"] == "60"
+    assert body["max_daily_trades"] == 10
 
 
 @respx.mock

@@ -34,6 +34,10 @@ class Holding:
     # monitor/coordinator.py::_breached treats this as the EFFECTIVE stop
     # whenever set, overriding stop_loss -- never the other way around.
     current_stop: Decimal | None = None
+    # Exit ladder: True once the monitor has taken this position's partial
+    # profit at scale_out_r. Carried forward by settlement like current_stop,
+    # so a position is scaled out at most once.
+    scaled_out: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "quantity", decimal_value(self.quantity, "quantity"))

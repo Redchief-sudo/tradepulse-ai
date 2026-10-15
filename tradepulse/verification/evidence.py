@@ -15,12 +15,17 @@ from .integrity import VerificationError, canonical, digest
 
 @dataclass(frozen=True, slots=True)
 class VerificationPolicy:
+    # Phase 1 (2026-10-15): judged on a statistically meaningful sample of
+    # the strategy actually run -- a swing strategy cannot close 200 round
+    # trips in 60 days -- and on the 95% lower bound of net expectancy rather
+    # than a fixed win rate (an R-ladder can profit below 50% wins). Win rate
+    # is still reported.
     minimum_days: int = 60
-    minimum_round_trips: int = 200
-    minimum_win_rate_pct: str = "55.0"
+    minimum_round_trips: int = 100
     maximum_drawdown_pct: str = "10.0"
     minimum_net_pnl_exclusive: str = "0"
     minimum_expectancy_exclusive: str = "0"
+    minimum_expectancy_lower_95_exclusive: str = "0"
     maximum_unresolved: int = 0
 
     def as_dict(self) -> dict:
@@ -572,6 +577,10 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     net = sum(net_results, Decimal(0)) if costs_available else None
     win_rate = Decimal(sum(value > 0 for value in net_results)) / count * 100 if count and costs_available else None
     expectancy = net / count if count and net is not None else None
+    expectancy_lower_95 = None
+    if expectancy is not None and count >= 2:
+        variance = sum(((value - expectancy) ** 2 for value in net_results), Decimal(0)) / (count - 1)
+        expectancy_lower_95 = expectancy - Decimal("1.96") * variance.sqrt() / Decimal(count).sqrt()
     snapshots = sorted(rows["equity_snapshots"], key=lambda row: (timestamp(row["as_of"]), row["snapshot_id"]))
     drawdown = None
     adjustments = generation_adjustment_records(rows) if checkpoint else None
@@ -621,11 +630,11 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
 
     criterion("duration_days", (now - start).days, ">=", policy.minimum_days)
     criterion("eligible_round_trips", count, ">=", policy.minimum_round_trips)
-    criterion("win_rate_pct", win_rate, ">=", number(policy.minimum_win_rate_pct))
     criterion("maximum_drawdown_pct", drawdown, "<=", number(policy.maximum_drawdown_pct))
     criterion("net_realized_pnl", net, ">", number(policy.minimum_net_pnl_exclusive))
     criterion("observed_generation_net", observed, ">", number(policy.minimum_net_pnl_exclusive))
     criterion("net_expectancy", expectancy, ">", number(policy.minimum_expectancy_exclusive))
+    criterion("net_expectancy_lower_95", expectancy_lower_95, ">", number(policy.minimum_expectancy_lower_95_exclusive))
     criterion("reconciliation_issues", reconciliation_issues if latest else None, "==", policy.maximum_unresolved)
     criterion("settlement_issues", settlement_issues, "==", policy.maximum_unresolved)
     criterion("integrity_issues", integrity_issues, "==", policy.maximum_unresolved)
@@ -644,6 +653,7 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     else:
         status = "PROVE_EDGE_THRESHOLD_NOT_MET"
     return {"status": status, "criteria": criteria, "errors": sorted(set(problems)),
+            "win_rate_pct": str(win_rate) if win_rate is not None else None,
             "population": population, "evidence_sha256": digest(canonical(rows)),
             "assessed_at": now.isoformat(), "cost_model": costs,
             "provisional_population": provisional, "accounting_breakdown": accounting_breakdown,

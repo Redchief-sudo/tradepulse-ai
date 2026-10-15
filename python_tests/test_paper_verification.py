@@ -329,10 +329,11 @@ def test_each_instrument_is_eligible_with_receipts_and_canonical_overlay(asset_c
     assert result['observed_generation_bridge']['modeled_overlay_deducted'] is False
 
 
-@pytest.mark.parametrize("defect", ["sample", "duration", "win_rate", "drawdown", "zero_pnl", "negative_pnl",
+@pytest.mark.parametrize("defect", ["sample", "duration", "expectancy_lower_bound", "drawdown", "zero_pnl", "negative_pnl",
                                     "reconciliation", "settlement", "integrity", "missing", "duplicate", "costs"])
 def test_each_failed_gate_prevents_pass(defect):
-    rows = passing_rows(199 if defect == "sample" else 200, 109 if defect == "win_rate" else 120)
+    # 80 wins of 200: positive mean net expectancy, but its 95% lower bound is not.
+    rows = passing_rows(99 if defect == "sample" else 200, 80 if defect == "expectancy_lower_bound" else 120)
     now, costs = NOW, COSTS
     if defect == "duration":
         # Move the actual start rather than creating future-dated fixture evidence.
@@ -362,15 +363,18 @@ def test_each_failed_gate_prevents_pass(defect):
         costs = None
     result = assess(rows, START.isoformat(), now, costs)
     assert result["status"] != "PROVE_EDGE_PASSED"
+    if defect == "expectancy_lower_bound":
+        assert result["criteria"]["net_expectancy"]["passed"]
+        assert not result["criteria"]["net_expectancy_lower_95"]["passed"]
     if defect in {"zero_pnl", "negative_pnl"}:
         assert not result["criteria"]["net_realized_pnl"]["passed"]
         assert not result["criteria"]["net_expectancy"]["passed"]
 
 
 def test_partial_closures_and_open_lots_are_not_completed_trades():
-    rows = passing_rows(partial_first=True)
+    rows = passing_rows(count=100, wins=60, partial_first=True)
     result = assess(rows, START.isoformat(), NOW, COSTS)
-    assert result["criteria"]["eligible_round_trips"]["actual"] == 199
+    assert result["criteria"]["eligible_round_trips"]["actual"] == 99
     assert result["status"] != "PROVE_EDGE_PASSED"
 
 

@@ -76,6 +76,28 @@ class RiskLimits:
     # option. None falls back to the shared limits.
     options_spread_limit_pct: Decimal | None = None
     options_slippage_limit_pct: Decimal | None = None
+    # Exit ladder (monitor/coordinator.py::plan_ladder_exit), in multiples of
+    # R = average_price - stop_loss, the governing first-entry risk per unit.
+    # At scale_out_r, sell scale_out_fraction and move the stop to break-even;
+    # a position that cannot be split exits whole at single_unit_target_r; the
+    # rest exits at final_target_r or on the trailing stop; a position that
+    # has not reached stall_min_r within stall_exit_days is closed. 0 disables
+    # each rung.
+    scale_out_r: Decimal = Decimal("1")
+    scale_out_fraction: Decimal = Decimal("0.5")
+    final_target_r: Decimal = Decimal("3")
+    single_unit_target_r: Decimal = Decimal("1.5")
+    stall_exit_days: int = 7
+    stall_min_r: Decimal = Decimal("0.5")
+    # Entry limits (risk/engine.py::evaluate_risk). 0 disables each.
+    # max_open_risk_pct: combined risk to stop of open positions and pending
+    # buys, as % of equity; a position whose stop is at or above its average
+    # price contributes nothing. max_entries_per_symbol_per_day: filled BUYs
+    # per symbol per risk day (one entry plus add-ons). max_cost_to_risk_pct:
+    # estimated round-trip cost (spread + fees) as % of the trade's own R.
+    max_open_risk_pct: Decimal = Decimal("0")
+    max_entries_per_symbol_per_day: int = 0
+    max_cost_to_risk_pct: Decimal = Decimal("0")
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "profile_id", require_text(self.profile_id, "profile_id"))
@@ -86,7 +108,8 @@ class RiskLimits:
             "atr_stop_multiplier", "min_stop_distance_pct", "max_stop_distance_pct",
             "options_premium_stop_pct", "options_target_otm_pct",
             "break_even_trigger_pct", "trailing_atr_multiplier", "max_correlation_threshold",
-            "max_correlation_threshold_crypto",
+            "max_correlation_threshold_crypto", "scale_out_r", "final_target_r", "single_unit_target_r",
+            "stall_min_r", "max_open_risk_pct", "max_cost_to_risk_pct",
         ):
             object.__setattr__(self, name, decimal_value(getattr(self, name), name, nonnegative=True))
         for name in ("options_spread_limit_pct", "options_slippage_limit_pct"):
@@ -100,7 +123,11 @@ class RiskLimits:
         object.__setattr__(self, "min_position_size_multiplier", decimal_value(self.min_position_size_multiplier, "min_position_size_multiplier"))
         if not (0 < self.min_position_size_multiplier <= 1):
             raise ValueError("min_position_size_multiplier must be between 0 (exclusive) and 1 (inclusive)")
-        for name in ("options_expiry_min_days", "options_expiry_max_days", "options_forced_close_days_before_expiry", "max_hold_days"):
+        object.__setattr__(self, "scale_out_fraction", decimal_value(self.scale_out_fraction, "scale_out_fraction"))
+        if not (0 < self.scale_out_fraction < 1):
+            raise ValueError("scale_out_fraction must be between 0 and 1 (both exclusive)")
+        for name in ("options_expiry_min_days", "options_expiry_max_days", "options_forced_close_days_before_expiry",
+                     "max_hold_days", "stall_exit_days", "max_entries_per_symbol_per_day"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be nonnegative")
         if self.options_expiry_min_days > self.options_expiry_max_days:
