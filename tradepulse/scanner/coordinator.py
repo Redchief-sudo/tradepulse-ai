@@ -94,6 +94,7 @@ from tradepulse.strategy import (
     spread_pct,
     weighted_composite,
 )
+from tradepulse.strategy.factors import factor_snapshot
 from tradepulse.valuation import marked_snapshot, observe_broker_valuation, record_valuation
 
 logger = logging.getLogger(__name__)
@@ -736,6 +737,8 @@ async def run_scan_cycle(
             await _reject(
                 candidate.symbol, "DETERMINISTIC_SIGNAL_DISAGREED", ai_recommendation=candidate.recommendation,
                 deterministic_signal=deterministic_signal, composite_score=str(composite),
+                confidence=str(candidate.confidence), factor_scores=factor_snapshot(scores),
+                weights_version=effective_weights.version,
             )
             continue  # AI proposed it, but the deterministic technical/momentum/risk read disagrees, on the UNDERLYING's own technicals
 
@@ -897,6 +900,7 @@ async def run_scan_cycle(
                         str(scores.relative_strength_score) if scores.relative_strength_score is not None else None
                     ),
                     "factor_breakdown": factor_breakdown(scores),
+                    "factor_scores": factor_snapshot(scores),  # full inputs, for learning data
                     "regime_weight_profile": effective_weights.version,
                     "composite_rank": rank, "candidates_ranked_total": len(ranked),
                     # Portfolio Optimization -- sector (real, once

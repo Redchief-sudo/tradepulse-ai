@@ -169,3 +169,12 @@ def compute_real_factors(
         risk_quality_score=_dec(risk_quality_score),
         relative_strength_score=relative_strength_score,
     )
+
+
+def factor_snapshot(scores: FactorScores) -> dict[str, str | None]:
+    """Every FactorScores field, as strings, for durable learning data: the
+    candidate's price and all factor inputs exactly as scored at decision
+    time, so later analysis need not recompute them under different code."""
+    from dataclasses import fields
+
+    return {f.name: (None if getattr(scores, f.name) is None else str(getattr(scores, f.name))) for f in fields(scores)}

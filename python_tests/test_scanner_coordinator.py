@@ -1225,6 +1225,12 @@ async def test_deterministic_gate_rejects_ai_buy_when_composite_disagrees(tmp_pa
     assert len(rejected) == 1
     assert rejected[0].reason == "DETERMINISTIC_SIGNAL_DISAGREED"
     assert rejected[0].ai_recommendation == "BUY"
+    # Learning data: the full factor inputs and the weights version are stored with the rejection.
+    [row] = await repositories.rejected_candidates.list_all()
+    context = row["payload"]["context"]
+    assert set(context["factor_scores"]) >= {"price", "technical_score", "momentum_score", "risk_score", "rsi", "ma50", "ma200"}
+    assert context["factor_scores"]["price"] is not None and context["weights_version"]
+    assert Decimal(context["confidence"]) == Decimal("90")
 
 
 @respx.mock
@@ -1759,6 +1765,7 @@ async def test_regime_classification_no_longer_conditions_factor_weights(tmp_pat
     assert "liquidity_score" in opportunity.metadata
     assert "risk_quality_score" in opportunity.metadata
     assert opportunity.metadata["factor_breakdown"]["relative_strength"] != "unavailable"  # SPY benchmark was available this cycle
+    assert opportunity.metadata["factor_scores"]["price"] is not None  # full factor inputs kept for learning data
 
 
 @respx.mock

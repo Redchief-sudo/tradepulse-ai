@@ -53,6 +53,16 @@ Protective exits bypass every entry limit.
 
 A scaled-out position is one round trip: assessment already groups all of an opening intent's lots and closures.
 
+## Learning data
+
+Scored candidates now keep every factor input exactly as scored (`strategy/factors.py::factor_snapshot`: price, trend, momentum and risk scores, RSI, 50- and 200-day averages, liquidity, risk quality, relative strength):
+- on `DETERMINISTIC_SIGNAL_DISAGREED` rejections, with the AI confidence and the weights version;
+- in each opportunity's metadata, as `factor_scores`.
+
+Candidates rejected before scoring (AI recommendation or confidence) keep their AI fields. Their factors are deterministic functions of price history and can be recomputed offline.
+
+This data is for offline analysis between proof runs, for example whether AI confidence or the composite predicts forward returns. Nothing learns or changes behaviour during a run: prove-edge proves one frozen strategy.
+
 ## Validation
 
 - `test_exit_ladder.py`: every rung, fractional rounding, option splitting, the minimum-lot single-unit case, the stall boundary, and disabling each rung.
