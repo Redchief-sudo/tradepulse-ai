@@ -94,3 +94,26 @@ def test_each_rung_can_be_disabled():
                   single_unit_target_r=Decimal("0"), stall_exit_days=0)
     old = OPENED - timedelta(days=30)
     assert _plan(_holding(), "120", lots=[_lot(opened=old)], limits=off) is None
+
+
+def test_exit_reason_names_the_rule_that_fired():
+    from types import SimpleNamespace
+
+    from tradepulse.monitor.coordinator import LadderExit, _exit_reason
+
+    def pos(price):
+        return SimpleNamespace(qty=Decimal("10"), current_price=Decimal(price))
+
+    base = _holding()  # average 100, stop 97
+    assert _exit_reason(pos("96"), base, breached=True, expiring=False, time_stopped=False, ladder=None) == "stop_loss"
+    even = _holding(current_stop=Decimal("100"))
+    assert _exit_reason(pos("99.9"), even, breached=True, expiring=False, time_stopped=False, ladder=None) == "break_even_stop"
+    trail = _holding(current_stop=Decimal("104"))
+    assert _exit_reason(pos("103.9"), trail, breached=True, expiring=False, time_stopped=False, ladder=None) == "trailing_stop"
+    target = _holding(target_price=Decimal("110"))
+    assert _exit_reason(pos("110"), target, breached=True, expiring=False, time_stopped=False, ladder=None) == "target_price"
+    assert _exit_reason(pos("100"), base, breached=False, expiring=True, time_stopped=False, ladder=None) == "option_expiry"
+    assert _exit_reason(pos("100"), base, breached=False, expiring=False, time_stopped=True, ladder=None) == "time_stop"
+    for reason in ("scale_out", "target_r", "target_r_single_unit", "stall"):
+        assert _exit_reason(pos("103"), base, breached=False, expiring=False, time_stopped=False,
+                            ladder=LadderExit(Decimal("5"), reason)) == reason

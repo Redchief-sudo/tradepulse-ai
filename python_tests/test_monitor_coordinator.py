@@ -514,6 +514,8 @@ async def test_long_position_breaching_stop_triggers_sell(tmp_path) -> None:
     request_body = order_route.calls[0].request.content
     assert b'"side":"sell"' in request_body
     assert b'"qty":"10"' in request_body
+    [intent_row] = await repositories.trade_intents.list_all()
+    assert intent_row["payload"]["risk_snapshot"]["exit_reason"] == "stop_loss"  # authoritative exit reason recorded
 
 
 @respx.mock
@@ -939,3 +941,30 @@ async def test_crypto_is_managed_around_the_clock(tmp_path) -> None:
 
     assert summary.deferred_exits == 0
     assert order_route.call_count == 1  # an exit was attempted despite the closed stock market
+
+
+@respx.mock
+async def test_a_scale_out_whose_sale_is_skipped_is_retried_next_cycle(tmp_path) -> None:
+    """If the half-sale is skipped with nothing filled (here a stale quote),
+    the scale-out mark is cleared so the next cycle retries; the break-even
+    stop set with it stays."""
+    repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
+    await _seed_holding(repositories, target_price=None)
+    await _seed_lot(repositories)
+    _mock_positions(qty="10", current_price="160")  # +1R
+    _mock_bars()
+    _mock_account()
+    stale = (NOW - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+    respx.get("https://data.alpaca.markets/v2/stocks/AAPL/quotes/latest").mock(
+        return_value=httpx.Response(200, json={"symbol": "AAPL", "quote": {"bp": 159.9, "ap": 160.1, "t": stale}}))
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(
+        return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+
+    summary = await run_position_monitor(repositories, broker, market_data, gateway, alerts,
+                                         risk_limits_for_profile("balanced"), clock=lambda: NOW)
+    await broker.aclose()
+
+    assert summary.exits_triggered == 0 and order_route.call_count == 0
+    holding = await _get_holding(repositories)
+    assert holding.scaled_out is False  # will retry
+    assert holding.current_stop is not None and holding.current_stop >= Decimal("150")  # break-even kept

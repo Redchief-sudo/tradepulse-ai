@@ -262,6 +262,24 @@ def _scale_out_quantity(holding: Holding, position_qty: Decimal, price: Decimal,
     return part
 
 
+def _exit_reason(position: AlpacaPosition, holding: Holding, *, breached: bool, expiring: bool,
+                 time_stopped: bool, ladder: LadderExit | None) -> str:
+    """Why the monitor is exiting, in the order the decision was made."""
+    if breached:
+        is_long = position.qty > 0
+        if holding.target_price is not None and (
+                position.current_price >= holding.target_price if is_long else position.current_price <= holding.target_price):
+            return "target_price"
+        if holding.current_stop is not None and holding.stop_loss is not None and holding.current_stop != holding.stop_loss:
+            return "break_even_stop" if holding.current_stop == holding.average_price else "trailing_stop"
+        return "stop_loss"
+    if expiring:
+        return "option_expiry"
+    if time_stopped:
+        return "time_stop"
+    return ladder.reason if ladder is not None else "other"
+
+
 def plan_ladder_exit(holding: Holding, lots: list[PositionLot], position_qty: Decimal, price: Decimal,
                      today: date, risk_limits: RiskLimits) -> LadderExit | None:
     """Profit-aware exits measured in R, the position's own risk per unit
@@ -497,11 +515,20 @@ async def run_position_monitor(
                 strategy="position_monitor",
                 decision_id=f"monitor-{ladder.reason if ladder else 'exit'}-{position.symbol}-{clock().isoformat()}",
                 symbol_lock_owner_token=owner_token,
+                exit_reason=_exit_reason(position, holding, breached=breached, expiring=expiring,
+                                         time_stopped=time_stopped, ladder=ladder),
             )
             result = await run_with_lock_renewal(
                 database, execution_lock_key(holding.asset), owner_token, SYMBOL_LOCK_TTL_SECONDS, gateway.execute_intent(request),
             )
             execution_results.append(result)
+            if ladder is not None and ladder.scale_out and result.status in ("rejected", "skipped") and not result.filled_quantity:
+                # Nothing was sold (a stale quote at the open, say): clear the
+                # scale-out mark so the next cycle retries. The break-even stop
+                # set with it stays.
+                def _unmark(current: Holding) -> Holding | None:
+                    return replace(current, scaled_out=False) if current.scaled_out else None
+                await repositories.holdings.mutate(asset_identity_key(holding.asset), _unmark)
             if result.status not in ("rejected", "skipped"):
                 exits_triggered += 1
         finally:

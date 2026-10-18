@@ -130,6 +130,13 @@ class ExecutionRequest:
     requested_quantity: Decimal
     strategy: str
     decision_id: str | None = None
+    # Why an exit was placed (monitor/coordinator.py: stop_loss,
+    # trailing_stop, break_even_stop, target_price, option_expiry, time_stop,
+    # scale_out, target_r, target_r_single_unit, stall). Recorded on the
+    # closing intent's risk_snapshot as the authoritative exit reason;
+    # attribution's after-the-fact inference cannot see ratcheted stops or
+    # the exit ladder.
+    exit_reason: str | None = None
     signal_timestamp: str | None = None
     confidence: Decimal | None = None
     stop_loss: Decimal | None = None
@@ -419,6 +426,8 @@ class ExecutionGateway:
             # a provenance-dict defect, not a sizing/safety one (sizing
             # already happened correctly via the separate, independently
             # validated regime_multiplier field).
+            if request.exit_reason is not None:
+                risk_snapshot["exit_reason"] = request.exit_reason
             for key, value in (request.regime_snapshot or {}).items():
                 risk_snapshot.setdefault(key, value)
             approved = replace(
