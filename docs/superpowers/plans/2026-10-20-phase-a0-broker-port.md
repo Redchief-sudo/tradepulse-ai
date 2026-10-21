@@ -1,4 +1,4 @@
-# Phase A0: Broker Port, Simulated Broker and Conformance Kit — Implementation Plan (rev. 3)
+# Phase A0: Broker Port, Simulated Broker and Conformance Kit — Implementation Plan (rev. 4)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -16,6 +16,28 @@
 **Revision history:**
 - **rev. 2** applied the first external review.
 - **rev. 3** applies the second review (findings A0-R2-01…05 and three ambiguities) and corrects one rev. 2 error found while verifying them: Alpaca FILL activity IDs carry **New York local** time, not UTC.
+- **rev. 4** (operator, 2026-10-21): each task ships as its own Rev, reviewed by the operator before it merges to main. The 24-hour verification run happens once, after every task has merged.
+
+## Rev per task
+
+| Task | Rev |
+|---|---|
+| 1. Broker port, neutral names, AccountRef, static typing | Rev.130 |
+| 2. Identity semantics | Rev.131 |
+| 3. Modules depend on the port | Rev.132 |
+| 4. Simulator foundation | Rev.133 |
+| 5. Simulator orders and activities | Rev.134 |
+| 6. Simulator fault injection | Rev.135 |
+| 7. Account lease | Rev.136 |
+| 8. Conformance kit | Rev.137 |
+| 9. Whole runtime against the simulator | Rev.138 |
+| 10. Verification tooling, whole-phase review, 24-hour run | Rev.139 |
+
+For each Rev:
+1. The task is built and committed on the `phase-a0` worktree branch, with the commit subject ending `(Rev.NNN)`.
+2. Work stops and the operator gets a review summary: what changed, the test, ruff and mypy results, and anything the task report must list (omitted behaviours, unconfirmed docs items).
+3. Only after the operator approves: fast-forward main to the branch, push, cut the zip. Fixes requested in review are made on the branch first and approved again.
+4. A merge never happens while a soak or verification generation runs from the main checkout (see the soak source guard).
 
 Every factual claim below is marked as one of:
 - **[verified: source]:** checked against code or preserved soak evidence while writing this revision;
@@ -62,7 +84,8 @@ Every factual claim below is marked as one of:
   - the full suite green;
   - `ruff check` adding no new findings in changed files;
   - `mypy` clean on `tradepulse/broker/` and `tradepulse/runtime_lease.py`;
-  - a signed commit on the `phase-a0` worktree branch.
+  - a signed commit on the `phase-a0` worktree branch;
+  - the operator's review and approval before the Rev merges to main (see **Rev per task**).
 
 ## Acceptance Gates
 
@@ -70,7 +93,7 @@ Every factual claim below is marked as one of:
 2. **Simulator correctness** (Tasks 4–6).
 3. **Operational isolation** (Tasks 7–8).
 4. **End-to-end accounting** (Task 9).
-5. **Rev.130 verification** (Task 10).
+5. **Phase A0 verification** (Task 10, Rev.139).
 
 ## Review Focus
 
@@ -441,7 +464,7 @@ Every factual claim below is marked as one of:
 ### Task 10: Merge and the 24-hour verification run
 
 **Files:**
-- Create: `scripts/a0_order_census.py`, `scripts/a0_verification_window.py`, `docs/rev130-phase-a0.md`
+- Create: `scripts/a0_order_census.py`, `scripts/a0_verification_window.py`, `docs/rev139-phase-a0.md`
 - Modify: `docs/multi-broker-ibkr-design.md` (A0 status), `docs/operations-runbook.md`
 
 **Interfaces:**
@@ -456,9 +479,9 @@ Every factual claim below is marked as one of:
     - `duplicate_orders`: more than one broker order per intent;
     - `unauthorized_orders`: a broker order with no intent.
 
-- [ ] **Step 1:** Whole-branch review; address its findings.
-- [ ] **Step 2:** Merge `phase-a0` into main as Rev.130: suites pass, mypy is clean, signed, pushed, zip cut.
-- [ ] **Step 3: The 24-hour run.** It needs operator approval. Account positions are flat, or a deliberate inherited state recorded beforehand. `a0_verification_window.py` must pass for the chosen start. Then:
+- [ ] **Step 1:** Write the two scripts with tests; whole-phase review of Rev.130–Rev.138 plus these scripts; address its findings.
+- [ ] **Step 2:** Operator review, then merge as Rev.139: suites pass, mypy is clean, signed, pushed, zip cut.
+- [ ] **Step 3: The 24-hour run**, the only one in Phase A0, run once every task has merged. It needs operator approval. Account positions are flat, or a deliberate inherited state recorded beforehand. `a0_verification_window.py` must pass for the chosen start. Then:
   ```
   .venv/bin/python scripts/run_accounting_soak.py --run-number 1 --hours 24 \
     --database data/soaks/<UTC stamp>-a0-check/soak-accounting-1.db \
@@ -469,7 +492,7 @@ Every factual claim below is marked as one of:
      - zero records at level `ERROR` or `CRITICAL`;
      - `WARNING` records are counted by event and listed in the report;
      - `alpaca_rate_limited_retrying` stays at or below 5;
-     - any other warning event not seen in the Rev.129 baseline is investigated and explained in `docs/rev130-phase-a0.md` before the run counts as passed.
+     - any other warning event not seen in the Rev.129 baseline is investigated and explained in `docs/rev139-phase-a0.md` before the run counts as passed.
   2. Zero `trading_supervisor_lane_failed`; `all_lanes_continuous` is true.
   3. Zero `reconciliation_issues`. The only `drift_detected` allowed is an `asset_fee` supersession with reason `new_accounting_evidence`.
   4. One completed settlement per fill; `missing_attributions == duplicate_attributions == 0`.
@@ -485,4 +508,4 @@ Every factual claim below is marked as one of:
   11. The start and end met the verified window; the report is preserved with its SHA-256 recorded.
 
   Coverage invariants (`all_asset_classes_exercised`, `slippage_*`, round-trip counts) are recorded, not gating.
-- [ ] **Step 5:** Record each criterion's outcome in `docs/rev130-phase-a0.md`. Phase A starts only when all hold.
+- [ ] **Step 5:** Record each criterion's outcome in `docs/rev139-phase-a0.md`. Phase A starts only when all hold.
