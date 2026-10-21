@@ -48,3 +48,4 @@ data/calibration/*
 # runtime evidence, preserved locally, not source.
 /data/soaks/
 /tradepulse.db.legacy-evidence/
+data/research/
