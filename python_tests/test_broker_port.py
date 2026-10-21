@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from tradepulse.broker import AlpacaClient
 from tradepulse.broker.port import AccountRef, BrokerPort, account_ref
+from tradepulse.models import AssetClass
+from tradepulse.models.market import VENUES, asset_key_from_broker_symbol, canonical_venue
 
 ROOT = Path(__file__).resolve().parent.parent
 PORT_MEMBERS = {
@@ -100,7 +104,61 @@ async def test_account_ref_raises_on_missing_or_invalid_account_number(number: o
 
 def test_mypy_accepts_the_port_assignments() -> None:
     result = subprocess.run(
-        [sys.executable, "-m", "mypy", "python_tests/typing/port_conformance.py"],
+        [sys.executable, "-m", "mypy"],
         cwd=ROOT, capture_output=True, text=True, check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_account_ref_rejects_non_string_account_number() -> None:
+    class _Broker:
+        venue = "alpaca"
+        implementation = "alpaca_http"
+
+        async def get_account(self) -> SimpleNamespace:
+            return SimpleNamespace(account_number=12345)
+
+    with pytest.raises(ValueError):
+        asyncio.run(account_ref(_Broker()))  # type: ignore[arg-type]
+
+
+def test_default_venue_reproduces_existing_keys() -> None:
+    assert asset_key_from_broker_symbol(AssetClass.EQUITY, "AAPL") == "equity:default:alpaca:AAPL"
+    assert asset_key_from_broker_symbol(AssetClass.CRYPTO, "BTC/USD") == "crypto:default:alpaca:BTC/USD"
+    assert (
+        asset_key_from_broker_symbol(AssetClass.OPTION, "AAPL261120C00200000")
+        == "option:default:alpaca:AAPL261120C00200000"
+    )
+
+
+def test_other_venues_never_collide_with_alpaca() -> None:
+    ibkr = asset_key_from_broker_symbol(AssetClass.EQUITY, "AAPL", venue="ibkr")
+    assert ibkr == "equity:ibkr:ibkr:AAPL"
+    assert ibkr != asset_key_from_broker_symbol(AssetClass.EQUITY, "AAPL")
+
+
+def test_other_venue_keys_ignore_symbol_case() -> None:
+    assert asset_key_from_broker_symbol(AssetClass.EQUITY, "aapl", venue="ibkr") == "equity:ibkr:ibkr:AAPL"
+
+
+def test_venue_spelling_is_canonical_and_alpaca_keys_unchanged() -> None:
+    assert asset_key_from_broker_symbol(AssetClass.EQUITY, "AAPL", venue="IBKR") == "equity:ibkr:ibkr:AAPL"
+    assert asset_key_from_broker_symbol(AssetClass.EQUITY, "AAPL", venue=" Ibkr ") == "equity:ibkr:ibkr:AAPL"
+    assert asset_key_from_broker_symbol(AssetClass.EQUITY, "AAPL", venue="ALPACA") == "equity:default:alpaca:AAPL"
+
+
+@pytest.mark.parametrize("venue", ["", "   ", "ibkr2", "default", None, 7])
+def test_empty_or_unknown_venue_is_rejected(venue: object) -> None:
+    with pytest.raises(ValueError):
+        asset_key_from_broker_symbol(AssetClass.EQUITY, "AAPL", venue=venue)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        AccountRef(venue, "PA123")  # type: ignore[arg-type]
+
+
+def test_account_ref_venue_is_canonical() -> None:
+    assert AccountRef("ALPACA", "PA9") == AccountRef("alpaca", "PA9")
+    assert AccountRef(" Alpaca ", "PA9").key == "alpaca:PA9"
+
+
+def test_every_venue_is_already_canonical() -> None:
+    assert all(canonical_venue(v) == v for v in VENUES)

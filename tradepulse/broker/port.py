@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from tradepulse.models import AssetClass
+from tradepulse.models.market import canonical_venue
 
 from .types import (
     AlpacaAccount,
@@ -95,16 +96,16 @@ class BrokerPort(Protocol):
 
 @dataclass(frozen=True)
 class AccountRef:
-    """Identifies one broker account; both parts become a lease file name."""
+    """Identifies one broker account; both parts become a lease file name.
+    The venue is canonicalized, so two spellings of one venue share a lease."""
 
     venue: str
     account_number: str
 
     def __post_init__(self) -> None:
-        for name in ("venue", "account_number"):
-            value = getattr(self, name)
-            if not isinstance(value, str) or not _REF_PART.fullmatch(value):
-                raise ValueError(f"invalid account reference {name}: {value!r}")
+        object.__setattr__(self, "venue", canonical_venue(self.venue))
+        if not isinstance(self.account_number, str) or not _REF_PART.fullmatch(self.account_number):
+            raise ValueError(f"invalid account reference account_number: {self.account_number!r}")
 
     @property
     def key(self) -> str:
@@ -114,6 +115,6 @@ class AccountRef:
 async def account_ref(broker: BrokerPort) -> AccountRef:
     account = await broker.get_account()
     number = account.account_number
-    if not number or not number.strip():
+    if not isinstance(number, str) or not number.strip():
         raise ValueError("broker account has no account_number")
     return AccountRef(broker.venue, number)

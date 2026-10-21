@@ -78,6 +78,20 @@ It never connects to anything, and cannot be selected in paper or live mode: set
 - **Order of adoption:** IBKR first, because one adapter covers stocks, options, futures and forex. If IBKR is unavailable: Tastytrade (stocks, options, futures, with a sandbox), then OANDA for spot forex if wanted. Others only for a concrete reason: lower lane costs, an asset IBKR lacks, or redundancy.
 - **Failover is not automatic.** If a lane's broker is down, that lane stops opening positions and alerts; it never silently routes to another broker. Positions are always managed by the broker that holds them.
 
+### 3.7 Identity: venue, account, implementation
+
+Three identities stay distinct:
+
+- **Venue** (`alpaca`, `ibkr`): the market-access provider. It appears in asset keys. `asset_key_from_broker_symbol(asset_class, symbol, venue="alpaca")` returns exactly today's Alpaca key for the default venue; any other venue returns `asset_identity_key` of an identity whose venue is that venue and whose native ID is `{venue}:{SYMBOL}` (upper-cased, as for Alpaca), for example `equity:ibkr:ibkr:AAPL`. Keys from different venues therefore never collide. Venues are canonicalized at the boundary (`canonical_venue`): lower-case, trimmed, and one of a closed set (`VENUES`, today `alpaca` and `ibkr`); an empty or unknown venue is rejected. A new adapter adds its venue to that set.
+- **Account** (`AccountRef`: venue plus account number): the account that holds cash and positions. It names the lease (3.8) and is never part of an asset key.
+- **Implementation** (`alpaca_http`, `simulated`): which code talks to the venue. It is provenance only and never part of any key.
+
+Account-scoped positions, reservations, reconciliation and risk are a later-phase migration. In A0 they stay keyed as they are today.
+
+### 3.8 Account ownership across hosts
+
+A0's lease is host-local (A0 Task 7): it stops a second process on the same host from using the same account. Before any second host may hold credentials for the same account (for example the Oracle server), a cross-host ownership mechanism must exist. Until then the rule is one host per account. The existing reconciliation integrity lock **detects** out-of-band fills after the fact; it does not prevent them.
+
 ## 4. IBKR adapter (Phase A: stocks and options)
 
 **Runtime:**
