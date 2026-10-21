@@ -93,6 +93,9 @@ def process_rate_limit_evidence() -> tuple[AlpacaRateLimitSnapshot | None, int]:
 
 
 class AlpacaClient:
+    venue = "alpaca"
+    implementation = "alpaca_http"
+
     def __init__(
         self, api_key: str, api_secret: str, mode: Literal["paper", "live"], timeout_seconds: int,
         equity_feed: Literal["iex", "sip"] = "iex", option_feed: Literal["indicative", "opra"] = "indicative",
