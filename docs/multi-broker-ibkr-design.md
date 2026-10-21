@@ -44,6 +44,40 @@ A `BrokerPort` protocol in `tradepulse/broker/port.py` takes the calls in sectio
 | Idempotency and recovery | `client_order_id` lookup | `orderRef` = `trade_intent_id`, recovered with `reqOpenOrders` / `reqCompletedOrders` / `reqExecutions` filtered by `orderRef`; `permId` is the broker order id. The Rev.120–123 identity checks (`order_matches_intent`) need an IBKR version. |
 | Cash | One USD balance | Per-currency balances (forex creates them), plus futures variation margin moving cash daily. |
 
+### 3.4 Broker conformance kit
+
+Adding a broker must not depend on remembering each broker's quirks. A shared test suite, `python_tests/broker_conformance/`, defines the behaviour every `BrokerPort` adapter must show. Each adapter runs it against its own **paper** account, behind an opt-in `integration` marker, plus against the simulated broker (3.5) in the normal suite.
+
+| Area | Each adapter must prove |
+|---|---|
+| Identity | Symbol to native id to `asset_identity_key` round-trips; futures expiries and option contracts stay distinct |
+| Orders | Market and limit, buy and sell, accepted with the broker's id; a rejection classified as definitive or ambiguous |
+| Fills | Full fill, partial fill, multiple fills per order, cancel after a partial fill (terminal, Rev.120), with exact quantity and price |
+| Recovery | Look up an order by our own id (`client_order_id` / `orderRef`) after a crash, matched by `order_matches_intent` rules (id, symbol, side, type, time in force, quantity); not-found is definitive; a failed lookup is not |
+| Fees | Every fill's fees captured exactly once, in currency, with their evidence id |
+| History | Fills and fees older than the session recoverable from the broker's history source, complete, without duplicates (pagination proof) |
+| Account and positions | Cash, equity and positions reconcile with the broker's own totals to the cent |
+| Sessions | The adapter's session calendar matches the broker's: open, closed, early close, the futures daily break |
+| Outages | Disconnect and reconnect, rate limiting and gateway restarts leave no stranded or duplicated orders |
+
+**Merge gate:** a new adapter merges only when the kit passes, both on the simulator and on paper. Its soak then proves it in continuous operation.
+
+### 3.5 Simulated broker
+
+`tradepulse/broker/simulated.py` implements `BrokerPort` in memory: a deterministic order book driven by scripted quotes, with configurable partial fills, rejections, latency, fee schedules, session calendars and injected faults (timeouts, disconnects, ambiguous submissions, a crash between submit and acknowledge). Uses:
+
+1. Run the conformance kit without network access, as part of every test run.
+2. Test the whole runtime end to end (scanner, risk, gateway, monitor, settlement, reconciliation) across venues, including multi-broker routing, with no live connection.
+3. Give the shadow-mode challengers in the intelligence roadmap (item 3) a fill model.
+
+It never connects to anything, and cannot be selected in paper or live mode: settings refuse it outside tests.
+
+### 3.6 Broker selection policy
+
+- **One broker per lane**, configured. Capital is held separately at each broker, so splitting a lane splits its capital. Risk limits, open risk and the daily-loss limit stay account-wide in USD across all brokers.
+- **Order of adoption:** IBKR first, because one adapter covers stocks, options, futures and forex. If IBKR is unavailable: Tastytrade (stocks, options, futures, with a sandbox), then OANDA for spot forex if wanted. Others only for a concrete reason: lower lane costs, an asset IBKR lacks, or redundancy.
+- **Failover is not automatic.** If a lane's broker is down, that lane stops opening positions and alerts; it never silently routes to another broker. Positions are always managed by the broker that holds them.
+
 ## 4. IBKR adapter (Phase A: stocks and options)
 
 **Runtime:**
@@ -96,8 +130,8 @@ Spot forex (later, optional) needs multi-currency cash in the ledger, P&L in the
 
 | Phase | Content | Rough effort | Gate |
 |---|---|---|---|
-| A0 | `BrokerPort` extraction, Alpaca wrapped unchanged | 1 week | Full suite and an Alpaca soak, byte-identical behaviour |
-| A | IBKR adapter, stocks and options, IBKR evidence (executions, commission reports, Flex), IB Gateway and IBC on the server | 3–5 weeks | IBKR paper soak |
+| A0 | `BrokerPort` extraction (Alpaca wrapped unchanged), conformance kit (3.4), simulated broker (3.5) | 2 weeks | Full suite; the kit passes on the simulator and on Alpaca paper; an Alpaca soak with byte-identical behaviour |
+| A | IBKR adapter, stocks and options, IBKR evidence (executions, commission reports, Flex), IB Gateway and IBC on the server | 3–5 weeks | Conformance kit passes on IBKR paper; IBKR paper soak |
 | B | Futures lane (micros), contract model, rolls, Globex calendar, margin cap, variation-margin reconciliation, futures factors | 3–4 weeks | Futures paper soak, including a roll |
 | C | Forex through micro FX futures (universe and factors) | about 1 week on top of B | FX futures paper soak |
 | C2 (optional) | Spot forex, multi-currency ledger | 3–4 weeks | Spot FX paper soak |
@@ -121,6 +155,8 @@ The estimates are for working sessions like the ones so far, including tests and
 5. **Flex Web Service:** create a token and Activity and Trade Confirmation Flex queries for the paper account.
 
 ## 10. Open questions for review
+
+0. The conformance kit's area list (3.4): anything missing that a broker has broken for you before?
 
 1. A broker port with a venue registry (proposed), or a separate runtime per broker?
 2. Forex through micro FX futures first (proposed), or spot from the start?
