@@ -29,7 +29,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from tradepulse.broker import AlpacaClient, AlpacaError
+from tradepulse.broker import AlpacaError, BrokerPort
 from tradepulse.config import Settings, risk_limits_for_profile
 from tradepulse.models import asset_key_from_broker_symbol
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
@@ -50,7 +50,7 @@ _ACCOUNT_CACHE_SECONDS = 5
 class AppState:
     settings: Settings
     repositories: PersistenceRepositories
-    broker: AlpacaClient
+    broker: BrokerPort
     market_data: AlpacaMarketDataProvider
     account_cache: tuple[float, Any] | None = None
     # Wall-clock time this process came up -- pure display metadata (dashboard

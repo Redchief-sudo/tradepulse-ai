@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
-from tradepulse.broker import AlpacaClient, AlpacaError
+from tradepulse.broker import AlpacaError, BrokerPort
 from tradepulse.models import AssetClass
 
 _PROBE_EQUITY_SYMBOL = "SPY"
@@ -53,7 +53,7 @@ class MarketDataCapabilityError(RuntimeError):
     failure, never a silent downgrade."""
 
 
-async def _probe_sip(broker: AlpacaClient) -> bool:
+async def _probe_sip(broker: BrokerPort) -> bool:
     try:
         quote = await broker.get_latest_quote(_PROBE_EQUITY_SYMBOL, AssetClass.EQUITY, feed_override="sip")
     except AlpacaError as exc:
@@ -67,7 +67,7 @@ async def _probe_sip(broker: AlpacaClient) -> bool:
     return True
 
 
-async def _probe_opra(broker: AlpacaClient) -> bool:
+async def _probe_opra(broker: BrokerPort) -> bool:
     now = datetime.now(UTC).date()
     gte = now.isoformat()
     lte = (now + timedelta(days=_PROBE_CHAIN_WINDOW_DAYS)).isoformat()
@@ -90,7 +90,7 @@ async def _probe_opra(broker: AlpacaClient) -> bool:
     return True
 
 
-async def resolve_market_data_capabilities(broker: AlpacaClient, requested_tier: str) -> MarketDataCapabilities:
+async def resolve_market_data_capabilities(broker: BrokerPort, requested_tier: str) -> MarketDataCapabilities:
     if requested_tier == "basic":
         return MarketDataCapabilities("iex", "indicative")  # explicit no-probe override
 

@@ -46,7 +46,7 @@ from typing import Literal
 from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter, alert_once
-from tradepulse.broker import AlpacaActivity, AlpacaClient
+from tradepulse.broker import AlpacaActivity, BrokerPort
 from tradepulse.models import (
     AssetClass,
     AssetIdentity,
@@ -164,7 +164,7 @@ async def _rebuild_holding_from_lots(
 
 
 async def _reconcile_positions(
-    repositories: PersistenceRepositories, broker: AlpacaClient, alerts: TelegramAlerter, now: datetime,
+    repositories: PersistenceRepositories, broker: BrokerPort, alerts: TelegramAlerter, now: datetime,
     lease_lost: asyncio.Event | None = None,
 ) -> tuple[int, int, int]:
     from tradepulse.verification.opening import load_bound_opening_checkpoint
@@ -330,7 +330,7 @@ def _find_heuristic_match(activity: AlpacaActivity, local_fills: list[Fill], alr
 
 
 async def _reconcile_fills(
-    repositories: PersistenceRepositories, broker: AlpacaClient, settlement: SettlementProcessor,
+    repositories: PersistenceRepositories, broker: BrokerPort, settlement: SettlementProcessor,
     alerts: TelegramAlerter, now: datetime, lookback: timedelta,
     lease_lost: asyncio.Event | None = None,
     generation_membership=None,
@@ -472,7 +472,7 @@ async def _reconcile_fills(
 
 
 async def _reverify_pending_holds(
-    repositories: PersistenceRepositories, broker: AlpacaClient, settlement: SettlementProcessor,
+    repositories: PersistenceRepositories, broker: BrokerPort, settlement: SettlementProcessor,
     alerts: TelegramAlerter, now: datetime, lease_lost: asyncio.Event | None = None,
 ) -> int:
     """FIN-095-01's actual retry mechanism for a verification_pending hold.
@@ -757,7 +757,7 @@ async def _recover_inflight_orders(repositories, broker, settlement, alerts, now
 
 async def run_reconciliation(
     repositories: PersistenceRepositories,
-    broker: AlpacaClient,
+    broker: BrokerPort,
     settlement: SettlementProcessor,
     alerts: TelegramAlerter,
     *,

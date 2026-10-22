@@ -75,7 +75,7 @@ from uuid import uuid4
 import httpx
 
 from tradepulse.alerts import TelegramAlerter
-from tradepulse.broker import AlpacaClient, AlpacaError
+from tradepulse.broker import AlpacaError, BrokerPort
 from tradepulse.config import (
     EQUITY_PROFILE_LADDER_TOP_PROFILE_ID,
     Settings,
@@ -218,7 +218,7 @@ def _build_ai_provider(settings: Settings) -> AIProvider:
     return AnthropicAIProvider(settings.anthropic_api_key, settings.anthropic_model, settings.ai_timeout_seconds, settings.anthropic_base_url)
 
 
-async def _resolve_and_apply_market_data_feeds(broker: AlpacaClient, settings: Settings) -> MarketDataCapabilities:
+async def _resolve_and_apply_market_data_feeds(broker: BrokerPort, settings: Settings) -> MarketDataCapabilities:
     """Resolves which Alpaca feeds this account is entitled to (see
     providers/market_data_capability.py) and applies them to `broker`
     ONCE, before any market-data work starts -- called from both
@@ -271,7 +271,7 @@ def _lease_lost_signal(
     return lease_lost, on_lease_lost
 
 
-async def _resolve_risk_profile_id(settings: Settings, broker: AlpacaClient) -> str:
+async def _resolve_risk_profile_id(settings: Settings, broker: BrokerPort) -> str:
     """TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY, opt-in and off by default. Off
     -- a pure, zero-cost passthrough to the configured static profile, no
     broker call at all (existing behavior is byte-for-byte unchanged). On --
@@ -317,7 +317,7 @@ async def _resolve_risk_profile_id(settings: Settings, broker: AlpacaClient) -> 
 
 async def _run_scan_leg(
     database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, ai_provider: AIProvider,
-    market_data: AlpacaMarketDataProvider, broker: AlpacaClient, gateway: ExecutionGateway,
+    market_data: AlpacaMarketDataProvider, broker: BrokerPort, gateway: ExecutionGateway,
     settings: Settings, alerts: TelegramAlerter, asset_class: AssetClass,
     capabilities: MarketDataCapabilities | None = None,
 ) -> ScanCycleSummary | None:
@@ -344,7 +344,7 @@ async def _run_scan_leg(
 
 
 async def _run_monitor_leg(
-    database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, broker: AlpacaClient,
+    database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, broker: BrokerPort,
     market_data: AlpacaMarketDataProvider, gateway: ExecutionGateway, alerts: TelegramAlerter, settings: Settings,
 ) -> MonitorCycleSummary | None:
     owner_token = str(uuid4())
@@ -624,7 +624,7 @@ async def _run_dashboard(settings: Settings, port: int) -> int:
     return 0
 
 
-async def _check_market_state(broker: AlpacaClient) -> Literal["open", "closed", "indeterminate"]:
+async def _check_market_state(broker: BrokerPort) -> Literal["open", "closed", "indeterminate"]:
     """The same live broker.get_clock() call the execution gateway's own
     submission-boundary gate already relies on, but returning a TRI-STATE
     result instead of a bool -- a broker/network failure is `"indeterminate"`,
@@ -642,7 +642,7 @@ async def _check_market_state(broker: AlpacaClient) -> Literal["open", "closed",
 
 async def _scan_action(
     asset_class: AssetClass, interval: int, database: AsyncSQLiteDatabase, repositories: PersistenceRepositories,
-    ai_provider: AIProvider, market_data: AlpacaMarketDataProvider, broker: AlpacaClient, gateway: ExecutionGateway,
+    ai_provider: AIProvider, market_data: AlpacaMarketDataProvider, broker: BrokerPort, gateway: ExecutionGateway,
     settings: Settings, alerts: TelegramAlerter, capabilities: MarketDataCapabilities,
 ) -> float:
     """One tick of a supervised scan lane under `tradepulse run` -- decides
@@ -664,7 +664,7 @@ async def _scan_action(
 
 
 async def _monitor_action(
-    database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, broker: AlpacaClient,
+    database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, broker: BrokerPort,
     market_data: AlpacaMarketDataProvider, gateway: ExecutionGateway, alerts: TelegramAlerter, settings: Settings,
 ) -> float:
     await _run_monitor_leg(database, repositories, broker, market_data, gateway, alerts, settings)
@@ -760,7 +760,7 @@ async def _supervised_lane(
 
 
 async def _verification_reconcile_action(settings: Settings, repositories: PersistenceRepositories,
-                                         broker: AlpacaClient) -> float:
+                                         broker: BrokerPort) -> float:
     # The supervisor already holds the generation lease. Reuse the sole
     # one-shot reconciliation implementation and its independent DB lease.
     await _run_reconcile(settings)
@@ -806,7 +806,7 @@ async def _verification_cycle(repositories: PersistenceRepositories, lane: str) 
 
 async def _run_trading_supervisor(
     database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, ai_provider: AIProvider,
-    market_data: AlpacaMarketDataProvider, broker: AlpacaClient, gateway: ExecutionGateway,
+    market_data: AlpacaMarketDataProvider, broker: BrokerPort, gateway: ExecutionGateway,
     settlement: SettlementProcessor, settings: Settings, alerts: TelegramAlerter, shutdown: asyncio.Event,
     capabilities: MarketDataCapabilities, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     *, verification_enabled: bool = False,

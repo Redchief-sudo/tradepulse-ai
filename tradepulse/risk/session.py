@@ -27,7 +27,7 @@ from uuid import uuid4
 
 import httpx
 
-from tradepulse.broker import AlpacaClient, AlpacaError
+from tradepulse.broker import AlpacaError, BrokerPort
 from tradepulse.models import AssetClass, AuditEvent, SessionState, Side, TradingSession, is_continuous_market
 from tradepulse.persistence import PersistenceRepositories, hydrate
 from tradepulse.persistence.codec import decode_payload, encode_payload
@@ -220,7 +220,7 @@ async def latch_financial_integrity_block(
 
 
 async def sync_market_session(
-    repositories: PersistenceRepositories, broker: AlpacaClient, clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    repositories: PersistenceRepositories, broker: BrokerPort, clock: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> TradingSession | None:
     """Keep the session's ACTIVE/MARKET_CLOSED distinction synchronized with
     Alpaca's own authoritative market clock -- equities must never be gated

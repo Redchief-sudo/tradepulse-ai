@@ -162,3 +162,28 @@ def test_account_ref_venue_is_canonical() -> None:
 
 def test_every_venue_is_already_canonical() -> None:
     assert all(canonical_venue(v) == v for v in VENUES)
+
+
+def test_only_construction_sites_import_alpaca_client() -> None:
+    # Any code reference counts (import or annotation); docstrings do not.
+    allowed = {"tradepulse/broker/__init__.py", "tradepulse/broker/alpaca_client.py", "tradepulse/session_commands.py"}
+    importers: set[str] = set()
+    for path in sorted((ROOT / "tradepulse").rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            imported = isinstance(node, ast.ImportFrom) and any(a.name == "AlpacaClient" for a in node.names)
+            if imported or (isinstance(node, ast.Name) and node.id == "AlpacaClient"):
+                importers.add(path.relative_to(ROOT).as_posix())
+                break
+    assert importers == allowed, f"unexpected AlpacaClient users: {sorted(importers - allowed)}"
+
+
+def test_session_commands_uses_alpaca_client_only_in_build_broker() -> None:
+    tree = ast.parse((ROOT / "tradepulse/session_commands.py").read_text())
+    users = {
+        fn.name
+        for fn in ast.walk(tree)
+        if isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef)
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Name) and node.id == "AlpacaClient"
+    }
+    assert users == {"build_broker"}

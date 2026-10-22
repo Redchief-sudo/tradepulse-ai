@@ -28,11 +28,11 @@ import httpx
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import (
-    AlpacaClient,
     AlpacaDataIntegrityError,
     AlpacaError,
     AlpacaOrderRequest,
     AlpacaPosition,
+    BrokerPort,
     default_time_in_force,
     is_definitive_rejection,
 )
@@ -177,7 +177,7 @@ class ExecutionGateway:
     def __init__(
         self,
         repositories: PersistenceRepositories,
-        broker: AlpacaClient,
+        broker: BrokerPort,
         market_data: AlpacaMarketDataProvider,
         settlement: SettlementProcessor,
         alerts: TelegramAlerter,

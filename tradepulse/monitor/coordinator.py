@@ -24,7 +24,7 @@ from typing import Literal
 from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter, alert_once
-from tradepulse.broker import AlpacaClient, AlpacaPosition
+from tradepulse.broker import AlpacaPosition, BrokerPort
 from tradepulse.execution import (
     SYMBOL_LOCK_TTL_SECONDS,
     ExecutionGateway,
@@ -351,7 +351,7 @@ async def _report_unmanaged_position(repositories: PersistenceRepositories, aler
     await alert_once(repositories.audit_events, alerts, event)
 
 
-async def _equity_market_open(broker: AlpacaClient) -> bool | None:
+async def _equity_market_open(broker: BrokerPort) -> bool | None:
     """Alpaca's clock for the US stock/option session; None if unavailable."""
     try:
         return (await broker.get_clock()).is_open
@@ -387,7 +387,7 @@ async def _defer_exit_outside_market_hours(repositories: PersistenceRepositories
 
 async def run_position_monitor(
     repositories: PersistenceRepositories,
-    broker: AlpacaClient,
+    broker: BrokerPort,
     market_data: AlpacaMarketDataProvider,
     gateway: ExecutionGateway,
     alerts: TelegramAlerter,

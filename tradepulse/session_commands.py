@@ -17,7 +17,7 @@ from uuid import uuid4
 import httpx
 
 from tradepulse.alerts import TelegramAlerter
-from tradepulse.broker import AlpacaClient, AlpacaError
+from tradepulse.broker import AlpacaClient, AlpacaError, BrokerPort
 from tradepulse.config import Settings, SettingsError, risk_limits_for_profile
 from tradepulse.execution import ExecutionGateway
 from tradepulse.models import AuditEvent, ExecutionMode, ReconciliationOutcome, SessionState, TradingSession
@@ -60,7 +60,7 @@ def build_broker(settings: Settings) -> AlpacaClient:
 
 
 def build_gateway(
-    settings: Settings, repositories: PersistenceRepositories, broker: AlpacaClient,
+    settings: Settings, repositories: PersistenceRepositories, broker: BrokerPort,
     market_data: AlpacaMarketDataProvider, alerts: TelegramAlerter,
 ) -> ExecutionGateway:
     settlement = SettlementProcessor(repositories, alerts)

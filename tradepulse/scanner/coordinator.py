@@ -31,7 +31,7 @@ from decimal import ROUND_FLOOR, Decimal
 from typing import Any
 from uuid import uuid4
 
-from tradepulse.broker import AlpacaClient
+from tradepulse.broker import BrokerPort
 from tradepulse.config import default_strategy_weights, sector_for_symbol
 from tradepulse.execution import (
     SYMBOL_LOCK_TTL_SECONDS,
@@ -501,7 +501,7 @@ async def run_scan_cycle(
     repositories: PersistenceRepositories,
     ai_provider: AIProvider,
     market_data: AlpacaMarketDataProvider,
-    broker: AlpacaClient,
+    broker: BrokerPort,
     gateway: ExecutionGateway,
     universe: ExecutableUniverse,
     risk_limits: RiskLimits,

@@ -15,7 +15,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from tradepulse.alerts import TelegramAlerter
-from tradepulse.broker import AlpacaActivity, AlpacaClient, AlpacaError, AlpacaOrderResponse
+from tradepulse.broker import AlpacaActivity, AlpacaError, AlpacaOrderResponse, BrokerPort
 from tradepulse.broker.symbols import default_time_in_force
 from tradepulse.models import (
     AssetClass,
@@ -153,7 +153,7 @@ def _reference_evidence(current: TradeIntent) -> tuple[Decimal | None, Decimal |
 
 
 async def attribute_order_fills(
-    repositories: PersistenceRepositories, broker: AlpacaClient, alerts: TelegramAlerter,
+    repositories: PersistenceRepositories, broker: BrokerPort, alerts: TelegramAlerter,
     current: TradeIntent, clock: Callable[[], datetime], *, verify_order_filled_qty: bool = False,
 ) -> AttributedFills:
     """Fetch this order's real FILL activities from Alpaca and create a
@@ -370,7 +370,7 @@ async def attribute_order_fills(
 
 
 async def resolve_order_from_broker(
-    repositories: PersistenceRepositories, broker: AlpacaClient, settlement: SettlementProcessor,
+    repositories: PersistenceRepositories, broker: BrokerPort, settlement: SettlementProcessor,
     alerts: TelegramAlerter, intent: TradeIntent, clock: Callable[[], datetime],
 ) -> AttributedFills:
     """One-shot recovery for an order the live poll window already gave up

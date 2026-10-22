@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from decimal import InvalidOperation
 
-from tradepulse.broker import AlpacaClient, AlpacaError
+from tradepulse.broker import AlpacaError, BrokerPort
 from tradepulse.broker.types import RawQuote
 from tradepulse.models import AssetIdentity, Candle, MarketQuote
 from tradepulse.strategy.options_selection import OptionContractSummary
@@ -20,7 +20,7 @@ MIN_CANDLES = 30
 
 
 class AlpacaMarketDataProvider:
-    def __init__(self, client: AlpacaClient) -> None:
+    def __init__(self, client: BrokerPort) -> None:
         self._client = client
 
     async def fetch_quote(self, asset: AssetIdentity) -> MarketQuote:
