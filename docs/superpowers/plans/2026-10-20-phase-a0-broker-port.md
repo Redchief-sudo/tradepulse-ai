@@ -187,7 +187,8 @@ Every factual claim below is marked as one of:
     - `is_open(at) -> bool`, `next_open(at) -> datetime | None`, `next_close(at) -> datetime | None`, `trade_date(at) -> date` (the New York calendar date).
     - Constructors: `from_exchange_calendar(code: str, start: date, end: date)` (exchange_calendars; `"XNYS"`), `always_open()` and `explicit(sessions)`.
   - **`class SimulatedBroker`** (satisfies `BrokerPort`):
-    - `__init__(*, clock: ManualClock, session: SimSession, venue: str = "alpaca", implementation: str = "simulated", cash: Decimal = Decimal("100000"), account_number: str = "SIM0001", fee_scenario: FeeScenario | None = None)`. It raises `RuntimeError` when `TRADEPULSE_EXECUTION_MODE == "live"`.
+    - `__init__(*, clock: ManualClock, session: SimSession, venue: str = "alpaca", implementation: str = "simulated", cash: Decimal = Decimal("100000"), account_number: str = "SIM0001")`. It raises `RuntimeError` when `TRADEPULSE_EXECUTION_MODE == "live"`. The `fee_scenario: FeeScenario | None = None` parameter is added in Task 5, together with `FeeScenario` (rev. 4: Rev.133 shipped without it, since nothing in Task 4 can charge a fee).
+    - Scripted data is validated (rev. 4, audit TP133-01/02): a crossed quote is rejected unless `allow_crossed=True`, and an equity or option bar must fall on a session in the configured calendar.
     - Market data is a **time series**: `set_quote(symbol, asset_class, bid, ask, at: datetime)` appends. Lookups return the latest quote with `at <= clock()`, or for a fill, `<= event time`. `set_bars`, `set_option_chain`.
     - An unscripted quote returns `RawQuote(bid=None, ask=None, timestamp=None)`.
     - `get_clock` reflects the session (`is_open`, `next_open`, `next_close`); crypto is always tradable.
