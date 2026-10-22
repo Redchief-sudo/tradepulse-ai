@@ -525,88 +525,112 @@ class AlpacaClient:
         self, activity_type: str | None = "FILL", since: datetime | None = None, page_size: int = 100,
         *, after_id: str | None = None, page_evidence: list | None = None,
     ) -> list[AlpacaActivity]:
-        activities: list[AlpacaActivity] = []
-        page_token: str | None = after_id
-        seen_tokens: set[str] = {after_id} if after_id else set()
-        seen_ids: set[str] = set()
-        if not 1 <= page_size <= 100:
-            raise ValueError("invalid activity page size")
-        while True:
-            params: dict[str, str] = {"page_size": str(page_size), "direction": "asc"}
-            if activity_type is not None:
-                params["activity_types"] = activity_type
-            if since is not None:
-                params["after"] = since.isoformat()
-            if page_token:
-                params["page_token"] = page_token
+        async def fetch_page(params: dict[str, str]) -> Any:
             response = await self._request("GET", f"{self._trading_base}/account/activities", params=params)
             if not response.is_success:
                 raise_alpaca_error(response, "getActivities")
-            page = response.json()
-            received_at = datetime.now(UTC)
-            if not isinstance(page, list):
-                raise AlpacaDataIntegrityError("activities response is not a list")
-            if len(page) > page_size:
-                raise AlpacaDataIntegrityError("oversized activities page")
-            if any(not isinstance(row, dict) for row in page):
-                raise AlpacaDataIntegrityError("invalid activity object")
-            if page_evidence is not None:
-                from hashlib import sha256
+            return response.json()
 
-                from tradepulse.persistence.codec import encode_payload
-                page_evidence.append({'request': params, 'activity_ids': [r.get('id') for r in page],
-                                      'received_at': received_at.isoformat(),
-                                      'response_hash': sha256(encode_payload(page).encode()).hexdigest(),
-                                      'terminal': len(page) < page_size})
-            for row in page:
-                if not isinstance(row, dict) or not isinstance(row.get('id'), str) or not row['id'] or row['id'] in seen_ids:
-                    raise AlpacaDataIntegrityError("missing or repeated activity identity")
-                seen_ids.add(row['id'])
-                side_raw = str(row.get("side") or "").lower()
-                side = Side.BUY if side_raw in ("buy", "buy_to_cover") else Side.SELL if side_raw in ("sell", "sell_short") else None
-                raw_symbol = str(row.get("symbol", ""))
-                # Activities responses don't carry an asset_class field the
-                # way positions do -- infer it from the ticker shape (same
-                # helper used wherever a caller only has a bare symbol).
-                inferred_class = infer_alpaca_asset_class(raw_symbol)
-                activities.append(
-                    AlpacaActivity(
-                        activity_id=str(row.get("id", "")),
-                        activity_type=str(row.get("activity_type", "")),
-                        symbol=normalize_alpaca_symbol(raw_symbol, inferred_class),
-                        side=side,
-                        qty=_decimal_or_none(row.get("qty")),
-                        price=_decimal_or_none(row.get("price")),
-                        transaction_time=_parse_timestamp(row.get("transaction_time")),
-                        raw=row,
-                    )
-                )
-            if len(page) < page_size:
-                break
-            page_token = str(page[-1].get("id") or "")
-            if not page_token or page_token in seen_tokens:
-                raise AlpacaDataIntegrityError("activities pagination is incomplete or repeated")
-            seen_tokens.add(page_token)
-        return activities
+        return await paginate_activities(
+            fetch_page, lambda: datetime.now(UTC), activity_type, since, page_size,
+            after_id=after_id, page_evidence=page_evidence,
+        )
 
     def _parse_order_response(self, response: httpx.Response) -> AlpacaOrderResponse:
         return self._parse_order_data(response.json(), request_id=extract_request_id(response))
 
     def _parse_order_data(self, data: dict, *, request_id: str | None) -> AlpacaOrderResponse:
-        side_raw = str(data.get("side") or "").lower()
-        side = Side.BUY if side_raw == "buy" else Side.SELL if side_raw == "sell" else None
-        order_id = data.get("id")
-        return AlpacaOrderResponse(
-            # Alpaca order ids are strings. Anything else (null, a number, a
-            # bool, an object) is no id at all -- never str()-ed into "None"
-            # or "123" and mistaken for one (Rev.122).
-            broker_order_id=order_id.strip() if isinstance(order_id, str) else "",
-            status=str(data.get("status", "")),
-            symbol=str(data.get("symbol", "")),
-            side=side,
-            filled_qty=_decimal(data.get("filled_qty") or "0"),
-            filled_avg_price=_decimal_or_none(data.get("filled_avg_price")),
-            submitted_at=_parse_timestamp(data.get("submitted_at")),
-            request_id=request_id,
-            raw=data,
-        )
+        return parse_order_data(data, request_id=request_id)
+
+
+def parse_order_data(data: dict, *, request_id: str | None) -> AlpacaOrderResponse:
+    side_raw = str(data.get("side") or "").lower()
+    side = Side.BUY if side_raw == "buy" else Side.SELL if side_raw == "sell" else None
+    order_id = data.get("id")
+    return AlpacaOrderResponse(
+        # Alpaca order ids are strings. Anything else (null, a number, a
+        # bool, an object) is no id at all -- never str()-ed into "None"
+        # or "123" and mistaken for one (Rev.122).
+        broker_order_id=order_id.strip() if isinstance(order_id, str) else "",
+        status=str(data.get("status", "")),
+        symbol=str(data.get("symbol", "")),
+        side=side,
+        filled_qty=_decimal(data.get("filled_qty") or "0"),
+        filled_avg_price=_decimal_or_none(data.get("filled_avg_price")),
+        submitted_at=_parse_timestamp(data.get("submitted_at")),
+        request_id=request_id,
+        raw=data,
+    )
+
+
+def parse_activity_row(row: dict) -> AlpacaActivity:
+    side_raw = str(row.get("side") or "").lower()
+    side = Side.BUY if side_raw in ("buy", "buy_to_cover") else Side.SELL if side_raw in ("sell", "sell_short") else None
+    raw_symbol = str(row.get("symbol", ""))
+    # Activities responses don't carry an asset_class field the
+    # way positions do -- infer it from the ticker shape (same
+    # helper used wherever a caller only has a bare symbol).
+    inferred_class = infer_alpaca_asset_class(raw_symbol)
+    return AlpacaActivity(
+        activity_id=str(row.get("id", "")),
+        activity_type=str(row.get("activity_type", "")),
+        symbol=normalize_alpaca_symbol(raw_symbol, inferred_class),
+        side=side,
+        qty=_decimal_or_none(row.get("qty")),
+        price=_decimal_or_none(row.get("price")),
+        transaction_time=_parse_timestamp(row.get("transaction_time")),
+        raw=row,
+    )
+
+
+async def paginate_activities(
+    fetch_page: Callable[[dict[str, str]], Awaitable[Any]], now: Callable[[], datetime],
+    activity_type: str | None = "FILL", since: datetime | None = None, page_size: int = 100,
+    *, after_id: str | None = None, page_evidence: list | None = None,
+) -> list[AlpacaActivity]:
+    """GET /account/activities, ascending, every page. ``fetch_page`` sends one
+    request and returns the decoded page; AlpacaClient and SimulatedBroker
+    share this loop, so their paging, integrity checks and page evidence are
+    the same code."""
+    activities: list[AlpacaActivity] = []
+    page_token: str | None = after_id
+    seen_tokens: set[str] = {after_id} if after_id else set()
+    seen_ids: set[str] = set()
+    if not 1 <= page_size <= 100:
+        raise ValueError("invalid activity page size")
+    while True:
+        params: dict[str, str] = {"page_size": str(page_size), "direction": "asc"}
+        if activity_type is not None:
+            params["activity_types"] = activity_type
+        if since is not None:
+            params["after"] = since.isoformat()
+        if page_token:
+            params["page_token"] = page_token
+        page = await fetch_page(params)
+        received_at = now()
+        if not isinstance(page, list):
+            raise AlpacaDataIntegrityError("activities response is not a list")
+        if len(page) > page_size:
+            raise AlpacaDataIntegrityError("oversized activities page")
+        if any(not isinstance(row, dict) for row in page):
+            raise AlpacaDataIntegrityError("invalid activity object")
+        if page_evidence is not None:
+            from hashlib import sha256
+
+            from tradepulse.persistence.codec import encode_payload
+            page_evidence.append({'request': params, 'activity_ids': [r.get('id') for r in page],
+                                  'received_at': received_at.isoformat(),
+                                  'response_hash': sha256(encode_payload(page).encode()).hexdigest(),
+                                  'terminal': len(page) < page_size})
+        for row in page:
+            if not isinstance(row, dict) or not isinstance(row.get('id'), str) or not row['id'] or row['id'] in seen_ids:
+                raise AlpacaDataIntegrityError("missing or repeated activity identity")
+            seen_ids.add(row['id'])
+            activities.append(parse_activity_row(row))
+        if len(page) < page_size:
+            break
+        page_token = str(page[-1].get("id") or "")
+        if not page_token or page_token in seen_tokens:
+            raise AlpacaDataIntegrityError("activities pagination is incomplete or repeated")
+        seen_tokens.add(page_token)
+    return activities

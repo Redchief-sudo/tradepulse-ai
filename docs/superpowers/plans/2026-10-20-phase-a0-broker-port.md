@@ -298,6 +298,23 @@ Every factual claim below is marked as one of:
 - [ ] **Step 4:** Run. Expected: PASS.
 - [ ] **Step 5:** Commit: `feat(broker): scheduled simulator execution, Alpaca-exact activity identity, fee scenarios (A0.5)`.
 
+**Rev.134 report (2026-10-22).** Sources are cited in `tradepulse/broker/simulated.py`'s module docstring. Where the docs or soak evidence differed from this task, the implementation follows them:
+- **Initial status** is `new` in session and `accepted` when queued outside it (Alpaca's order-status table), not `accepted` → `partially_filled`.
+- **Day-order end status** is a flag, `day_order_end_status`, default `expired`. The docs say "automatically canceled"; a user report shows `expired`.
+- **Cancelling a terminal order** is a 422 (documented). Flag `paper_cancel_terminal_returns_204` reproduces the paper bug Alpaca staff confirmed.
+- **Duplicate `client_order_id`** is not documented. Flag `duplicate_client_order_id_status`, default 422.
+- **`since`** filters `created_at` for FEE and CFEE (documented: `after` filters creation time) and `transaction_time` for FILL, which has no `created_at`.
+- **A `page_token` that is not an activity ID** is treated as a lexicographic bound; still to be checked read-only on paper in Task 8.
+- **Fee shape** follows the soak evidence rather than one posting time:
+  - `FeeScenario.observed_alpaca_2026(rates, posting: FeePosting)`;
+  - equity REG/TAF/CAT post at a New York evening time on the trade date;
+  - option REG/TAF ("OPT …") and ORF post the same afternoon;
+  - OCC follows each option fill, with `execution_id` = the fill ID's UUID;
+  - CFEE is in the coin on crypto buys and in USD on crypto sells;
+  - amounts are rounded with `FeeRates.rounding` (the evidence fits ROUND_UP).
+- **Shared paging code:** `AlpacaClient.get_activities`' paging loop and row parsers moved, unchanged, into `paginate_activities`, `parse_activity_row` and `parse_order_data` in `alpaca_client.py`. The simulator calls the same code.
+- **Not modelled (refused):** stop, stop-limit and trailing orders; time in force other than `day`/`gtc`; extended hours; replace; buying-power checks on buys.
+
 ### Task 6: Simulator fault injection
 
 **Files:**
