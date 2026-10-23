@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import signal
 import sys
@@ -76,6 +77,7 @@ import httpx
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaError, BrokerPort
+from tradepulse.broker.port import account_ref
 from tradepulse.config import (
     EQUITY_PROFILE_LADDER_TOP_PROFILE_ID,
     Settings,
@@ -109,6 +111,7 @@ from tradepulse.providers import (
 )
 from tradepulse.reconciliation import run_reconciliation
 from tradepulse.risk import load_session
+from tradepulse.runtime_lease import AccountLease, AccountLeaseHeld, account_lease
 from tradepulse.scanner import ScanCycleSummary, run_scan_cycle
 from tradepulse.session_commands import (
     build_broker as _build_broker,
@@ -404,6 +407,25 @@ def _log_monitor_result(result: MonitorCycleSummary | BaseException | None) -> b
     return False
 
 
+async def _enter_account_lease(stack: contextlib.ExitStack, broker: BrokerPort, holder: str) -> AccountLease | None:
+    """Every order-capable command's startup, in order: the broker is built,
+    its account resolved, and the account lease entered into ``stack`` --
+    before any gateway or order-capable task exists. None, logged as
+    account_lease_held, when another process holds the lease. See
+    runtime_lease.py for what the lease does and does not exclude."""
+    ref = await account_ref(broker)
+    try:
+        lease = stack.enter_context(account_lease(ref, holder=holder))
+    except AccountLeaseHeld as exc:
+        logger.error("account_lease_held", extra={
+            "event": "account_lease_held", "venue": ref.venue, "account_number": ref.account_number, "detail": str(exc)})
+        return None
+    logger.info("account_lease_acquired", extra={
+        "event": "account_lease_acquired", "venue": ref.venue, "account_number": ref.account_number,
+        "path": str(lease.path), "holder": holder})
+    return lease
+
+
 async def _run_scan(settings: Settings, asset_classes: list[AssetClass]) -> int:
     """`tradepulse scan --asset-class=... [asset-class ...]`: one or more
     lanes' discovery plus the stop/target position monitor, all CONCURRENTLY
@@ -428,22 +450,27 @@ async def _run_scan(settings: Settings, asset_classes: list[AssetClass]) -> int:
 
     broker = _build_broker(settings)
     ai_provider = _build_ai_provider(settings)
+    stack = contextlib.ExitStack()
     try:
-        capabilities = await _resolve_and_apply_market_data_feeds(broker, settings)
+        lease = await _enter_account_lease(stack, broker, "tradepulse scan")
+        if lease is None:
+            return 1
+        with stack:  # every leg below finishes before the account lease is released
+            capabilities = await _resolve_and_apply_market_data_feeds(broker, settings)
 
-        market_data = AlpacaMarketDataProvider(broker)
-        alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
-        gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
+            market_data = AlpacaMarketDataProvider(broker)
+            alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
+            gateway = _build_gateway(settings, repositories, broker, market_data, alerts, lease)
 
-        scan_legs = [
-            _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings, alerts, asset_class, capabilities)
-            for asset_class in asset_classes
-        ]
-        *scan_results, monitor_result = await asyncio.gather(
-            *scan_legs,
-            _run_monitor_leg(database, repositories, broker, market_data, gateway, alerts, settings),
-            return_exceptions=True,
-        )
+            scan_legs = [
+                _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings, alerts, asset_class, capabilities)
+                for asset_class in asset_classes
+            ]
+            *scan_results, monitor_result = await asyncio.gather(
+                *scan_legs,
+                _run_monitor_leg(database, repositories, broker, market_data, gateway, alerts, settings),
+                return_exceptions=True,
+            )
     finally:
         await broker.aclose()
         await ai_provider.aclose()
@@ -464,13 +491,18 @@ async def _run_monitor(settings: Settings) -> int:
     repositories = PersistenceRepositories.create(database)
 
     broker = _build_broker(settings)
+    stack = contextlib.ExitStack()
     try:
-        await _resolve_and_apply_market_data_feeds(broker, settings)
+        lease = await _enter_account_lease(stack, broker, "tradepulse monitor")
+        if lease is None:
+            return 1
+        with stack:
+            await _resolve_and_apply_market_data_feeds(broker, settings)
 
-        market_data = AlpacaMarketDataProvider(broker)
-        alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
-        gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
-        result = await _run_monitor_leg(database, repositories, broker, market_data, gateway, alerts, settings)
+            market_data = AlpacaMarketDataProvider(broker)
+            alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
+            gateway = _build_gateway(settings, repositories, broker, market_data, alerts, lease)
+            result = await _run_monitor_leg(database, repositories, broker, market_data, gateway, alerts, settings)
     finally:
         await broker.aclose()
 
@@ -934,122 +966,139 @@ async def _run_application(settings: Settings, port: int, open_browser: bool, *,
     ai_provider = _build_ai_provider(settings)
     alerts = TelegramAlerter(settings.telegram_bot_token, settings.telegram_chat_id)
 
-    async def work() -> int:
-        verification_startup_id = str(uuid4())
-        capabilities = await _resolve_and_apply_market_data_feeds(broker, settings)
-        market_data = AlpacaMarketDataProvider(broker)
-        gateway = _build_gateway(settings, repositories, broker, market_data, alerts)
-        settlement = SettlementProcessor(repositories, alerts)
-        dashboard_state = AppState(settings=settings, repositories=repositories, broker=broker, market_data=market_data)
-        server = _build_dashboard_server(dashboard_state, port, settings.log_level)
+    async def work(lease: AccountLease) -> int:
+        trading_task: asyncio.Task[None] | None = None
+        try:
+            verification_startup_id = str(uuid4())
+            capabilities = await _resolve_and_apply_market_data_feeds(broker, settings)
+            market_data = AlpacaMarketDataProvider(broker)
+            gateway = _build_gateway(settings, repositories, broker, market_data, alerts, lease)
+            settlement = SettlementProcessor(repositories, alerts)
+            dashboard_state = AppState(settings=settings, repositories=repositories, broker=broker, market_data=market_data)
+            server = _build_dashboard_server(dashboard_state, port, settings.log_level)
 
-        shutdown = asyncio.Event()
-        verification_task = asyncio.create_task(verification.watch(shutdown)) if verification is not None else None
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, shutdown.set)
+            shutdown = asyncio.Event()
+            verification_task = asyncio.create_task(verification.watch(shutdown)) if verification is not None else None
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, shutdown.set)
 
-        dashboard_task = asyncio.create_task(_run_dashboard_server(server, shutdown))
-        if open_browser:
-            asyncio.create_task(_open_browser_when_ready(server, port, shutdown))
+            dashboard_task = asyncio.create_task(_run_dashboard_server(server, shutdown))
+            if open_browser:
+                asyncio.create_task(_open_browser_when_ready(server, port, shutdown))
 
-        # MARKET_CLOSED is a routine, expected state -- not a safety fault
-        # like RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED/SYSTEM_DEGRADED.
-        # It only ever arises from sync_market_session flipping a
-        # previously-ACTIVE session overnight (risk/session.py), which
-        # always preserves trading_active=True -- the session is already
-        # properly started, just correctly reflecting that equities are
-        # shut. Calling _run_start here would hard-refuse (matching its
-        # own, correct, conservative behavior for the STANDALONE `start`
-        # command, which has no way to re-verify anything's changed) and
-        # previously blocked the ENTIRE supervisor -- including crypto
-        # (a continuous market that already tolerates MARKET_CLOSED at
-        # the execution boundary, see risk/session.py::execution_session_decision's
-        # CONTINUOUS_ASSET_SESSION branch) and monitor/settlement, which
-        # have nothing to do with equity market hours at all. Skip the
-        # redundant/wrong-shaped activation call in exactly this one case
-        # so the supervisor starts and each lane's own market-clock check
-        # (_scan_action, crypto unaffected) does the correct fine-grained
-        # gating instead.
-        current_session = await load_session(repositories)
-        if current_session.state == SessionState.MARKET_CLOSED:
-            logger.info("run_session_already_active_market_closed", extra={"event": "run_session_already_active_market_closed"})
-            start_result = 0
-        elif not _should_activate(current_session.state, resume=resume):
-            logger.warning("run_resume_session_not_active", extra={"event": "run_resume_session_not_active",
-                                                                    "state": current_session.state.value})
-            start_result = 1
-        else:
-            start_result = await _run_start(settings)
-        if start_result == 0 and verification is not None:
-            first_start = not await asyncio.to_thread((verification.directory / 'started.json').exists)
-            initial_reconciliation = await _run_reconcile(settings)
+            # MARKET_CLOSED is a routine, expected state -- not a safety fault
+            # like RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED/SYSTEM_DEGRADED.
+            # It only ever arises from sync_market_session flipping a
+            # previously-ACTIVE session overnight (risk/session.py), which
+            # always preserves trading_active=True -- the session is already
+            # properly started, just correctly reflecting that equities are
+            # shut. Calling _run_start here would hard-refuse (matching its
+            # own, correct, conservative behavior for the STANDALONE `start`
+            # command, which has no way to re-verify anything's changed) and
+            # previously blocked the ENTIRE supervisor -- including crypto
+            # (a continuous market that already tolerates MARKET_CLOSED at
+            # the execution boundary, see risk/session.py::execution_session_decision's
+            # CONTINUOUS_ASSET_SESSION branch) and monitor/settlement, which
+            # have nothing to do with equity market hours at all. Skip the
+            # redundant/wrong-shaped activation call in exactly this one case
+            # so the supervisor starts and each lane's own market-clock check
+            # (_scan_action, crypto unaffected) does the correct fine-grained
+            # gating instead.
             current_session = await load_session(repositories)
-            if (initial_reconciliation != 0 or current_session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED
-                    or not await verification.runtime_started(broker)):
+            if current_session.state == SessionState.MARKET_CLOSED:
+                logger.info("run_session_already_active_market_closed", extra={"event": "run_session_already_active_market_closed"})
+                start_result = 0
+            elif not _should_activate(current_session.state, resume=resume):
+                logger.warning("run_resume_session_not_active", extra={"event": "run_resume_session_not_active",
+                                                                        "state": current_session.state.value})
                 start_result = 1
-                shutdown.set()
             else:
+                start_result = await _run_start(settings)
+            if start_result == 0 and verification is not None:
+                first_start = not await asyncio.to_thread((verification.directory / 'started.json').exists)
+                initial_reconciliation = await _run_reconcile(settings)
+                current_session = await load_session(repositories)
+                if (initial_reconciliation != 0 or current_session.state == SessionState.FINANCIAL_INTEGRITY_BLOCKED
+                        or not await verification.runtime_started(broker)):
+                    start_result = 1
+                    shutdown.set()
+                else:
+                    event = AuditEvent(
+                        event_id=str(uuid4()), event_type='verification_runtime_started', severity='info',
+                        message='Guarded runtime activated after reconciliation', occurred_at=datetime.now(UTC),
+                        entity_type='verification_generation', entity_id=verification.generation,
+                        details={'generation': verification.generation, 'startup_id': verification_startup_id,
+                                 'first_start': first_start},
+                    )
+                    await repositories.audit_events.create_once(event.event_id, event)
+            if start_result != 0:
+                logger.error("run_session_activation_failed", extra={"event": "run_session_activation_failed"})
+                # The dashboard still comes up so an operator can see why.
+            if start_result == 0 or verification is None:
+                # Every lane always starts outside a verification generation: a
+                # refused activation must never leave open positions without a
+                # monitor, settlement or reconciliation. Scan lanes idle until the
+                # session is active (_scan_lane_enabled), so `tradepulse start`
+                # resumes scanning without a restart. Inside a verification
+                # generation a refused start still shuts the run down (the soak
+                # runner owns retries).
+                trading_task = asyncio.create_task(
+                    _run_trading_supervisor(
+                        database, repositories, ai_provider, market_data, broker, gateway, settlement, settings, alerts,
+                        shutdown, capabilities,
+                        **({"verification_enabled": True} if verification is not None else {}),
+                    )
+                )
+
+            await shutdown.wait()
+            # ---- graceful shutdown: stop scheduling, let in-flight work finish, stop the server, done ----
+            if trading_task is not None:
+                await trading_task
+            if verification is not None and start_result == 0:
+                # Capture final evidence after in-flight trading work drains. This
+                # uses existing one-shot authorities and their own DB leases.
+                await _run_settle(settings)
+                await _run_reconcile(settings)
+            await dashboard_task
+            if verification_task is not None:
+                await verification_task
+            if verification is not None:
                 event = AuditEvent(
-                    event_id=str(uuid4()), event_type='verification_runtime_started', severity='info',
-                    message='Guarded runtime activated after reconciliation', occurred_at=datetime.now(UTC),
+                    event_id=str(uuid4()), event_type='verification_runtime_stopped', severity='info',
+                    message='Guarded runtime drained and stopped', occurred_at=datetime.now(UTC),
                     entity_type='verification_generation', entity_id=verification.generation,
-                    details={'generation': verification.generation, 'startup_id': verification_startup_id,
-                             'first_start': first_start},
+                    details={'generation': verification.generation, 'startup_id': verification_startup_id},
                 )
                 await repositories.audit_events.create_once(event.event_id, event)
-        trading_task: asyncio.Task[None] | None = None
-        if start_result != 0:
-            logger.error("run_session_activation_failed", extra={"event": "run_session_activation_failed"})
-            # The dashboard still comes up so an operator can see why.
-        if start_result == 0 or verification is None:
-            # Every lane always starts outside a verification generation: a
-            # refused activation must never leave open positions without a
-            # monitor, settlement or reconciliation. Scan lanes idle until the
-            # session is active (_scan_lane_enabled), so `tradepulse start`
-            # resumes scanning without a restart. Inside a verification
-            # generation a refused start still shuts the run down (the soak
-            # runner owns retries).
-            trading_task = asyncio.create_task(
-                _run_trading_supervisor(
-                    database, repositories, ai_provider, market_data, broker, gateway, settlement, settings, alerts,
-                    shutdown, capabilities,
-                    **({"verification_enabled": True} if verification is not None else {}),
-                )
-            )
+            return 0
+        finally:
+            # Order-capable work never outlives work(): on every exit path,
+            # exceptions and cancellation included, the trading supervisor is
+            # cancelled if still running and awaited before the caller releases
+            # the account lease.
+            if trading_task is not None:
+                if not trading_task.done():
+                    trading_task.cancel()
+                await asyncio.gather(trading_task, return_exceptions=True)
 
-        await shutdown.wait()
-        # ---- graceful shutdown: stop scheduling, let in-flight work finish, stop the server, done ----
-        if trading_task is not None:
-            await trading_task
-        if verification is not None and start_result == 0:
-            # Capture final evidence after in-flight trading work drains. This
-            # uses existing one-shot authorities and their own DB leases.
-            await _run_settle(settings)
-            await _run_reconcile(settings)
-        await dashboard_task
-        if verification_task is not None:
-            await verification_task
-        if verification is not None:
-            event = AuditEvent(
-                event_id=str(uuid4()), event_type='verification_runtime_stopped', severity='info',
-                message='Guarded runtime drained and stopped', occurred_at=datetime.now(UTC),
-                entity_type='verification_generation', entity_id=verification.generation,
-                details={'generation': verification.generation, 'startup_id': verification_startup_id},
-            )
-            await repositories.audit_events.create_once(event.event_id, event)
-        return 0
-
-    owner_token = str(uuid4())
-    if not await acquire_lock(database, RUN_LOCK_KEY, owner_token, "run", RUN_LOCK_TTL_SECONDS):
-        logger.error("run_already_active", extra={"event": "run_already_active"})
-        await broker.aclose()
-        await ai_provider.aclose()
-        return 1
+    stack = contextlib.ExitStack()
     try:
-        return await run_with_lock_renewal(database, RUN_LOCK_KEY, owner_token, RUN_LOCK_TTL_SECONDS, work())
+        # The account lease is taken before the per-database run lock and
+        # released after it.
+        lease = await _enter_account_lease(stack, broker, "tradepulse run")
+        if lease is None:
+            return 1
+        with stack:
+            owner_token = str(uuid4())
+            if not await acquire_lock(database, RUN_LOCK_KEY, owner_token, "run", RUN_LOCK_TTL_SECONDS):
+                logger.error("run_already_active", extra={"event": "run_already_active"})
+                return 1
+            try:
+                return await run_with_lock_renewal(database, RUN_LOCK_KEY, owner_token, RUN_LOCK_TTL_SECONDS, work(lease))
+            finally:
+                await release_lock(database, RUN_LOCK_KEY, owner_token)
     finally:
-        await release_lock(database, RUN_LOCK_KEY, owner_token)
         await broker.aclose()
         await ai_provider.aclose()
 

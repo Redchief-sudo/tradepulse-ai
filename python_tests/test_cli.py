@@ -12,6 +12,7 @@ import respx
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaAccount, AlpacaClock, AlpacaError
+from tradepulse.broker.port import AccountRef
 from tradepulse.cli import (
     CRYPTO_SCAN_INTERVAL_SECONDS,
     EQUITY_SCAN_INTERVAL_SECONDS,
@@ -222,13 +223,24 @@ def _settings(database_url: str, **extra: str) -> Settings:
     })
 
 
+def _stub_account(monkeypatch, number: str = "CLITEST") -> None:
+    """The order-capable commands resolve their broker's account before taking
+    its lease (cli._enter_account_lease). These tests' brokers have no real
+    account behind them, so the account is supplied; the lease is still real."""
+    async def resolve(broker):
+        return AccountRef("alpaca", number)
+
+    monkeypatch.setattr("tradepulse.cli.account_ref", resolve)
+
+
 @respx.mock
-async def test_scan_leg_skipped_when_its_lock_is_held_but_monitor_leg_still_runs(tmp_path) -> None:
+async def test_scan_leg_skipped_when_its_lock_is_held_but_monitor_leg_still_runs(tmp_path, monkeypatch) -> None:
     """A held scan lease must short-circuit the scan leg before any AI/broker
     order call is made -- if it didn't, this test would fail via respx's
     all-mocked assertion on the first unregistered HTTP call. The monitor
     leg has its own lock and must still run (proving one leg's lost lease
     doesn't block the other)."""
+    _stub_account(monkeypatch)
     database_url = f"sqlite:///{tmp_path}/test.db"
     database = AsyncSQLiteDatabase(database_url)
     await database.initialize()
@@ -250,6 +262,7 @@ async def test_three_lane_concurrent_scan_locks_independently_and_survives_one_c
     raising must never cancel its siblings or the monitor leg --
     return_exceptions=True on the shared gather call, not asyncio.TaskGroup.
     """
+    _stub_account(monkeypatch)
     database_url = f"sqlite:///{tmp_path}/test.db"
     database = AsyncSQLiteDatabase(database_url)
     await database.initialize()
@@ -280,6 +293,7 @@ async def test_market_data_capabilities_resolved_once_before_lane_fanout(tmp_pat
     """Capability resolution is a single broker-level fact, not a per-lane
     one -- it must happen exactly once, before the scan legs fan out, never
     duplicated inside each _run_scan_leg."""
+    _stub_account(monkeypatch)
     database_url = f"sqlite:///{tmp_path}/test.db"
 
     call_count = {"n": 0}
@@ -303,7 +317,8 @@ async def test_market_data_capabilities_resolved_once_before_lane_fanout(tmp_pat
 
 
 @respx.mock
-async def test_monitor_exits_cleanly_when_lock_is_held(tmp_path) -> None:
+async def test_monitor_exits_cleanly_when_lock_is_held(tmp_path, monkeypatch) -> None:
+    _stub_account(monkeypatch)
     database_url = f"sqlite:///{tmp_path}/test.db"
     database = AsyncSQLiteDatabase(database_url)
     await database.initialize()
@@ -994,6 +1009,7 @@ async def test_run_application_lock_lifecycle_refuses_duplicate_and_releases_on_
     proves that whole lifecycle: a concurrent second invocation refuses
     immediately (never reaching the trading supervisor), and the first
     invocation's own release actually frees the lease for a later caller."""
+    _stub_account(monkeypatch)
     database_url = f"sqlite:///{tmp_path}/test.db"
     database = AsyncSQLiteDatabase(database_url)
     await database.initialize()
@@ -1038,6 +1054,7 @@ async def test_run_application_still_starts_supervisor_when_session_activation_r
     lanes idle on their own session check (_scan_lane_enabled), and honoring the
     refusal no longer means starving protection. The dashboard stays up so an
     operator can see why."""
+    _stub_account(monkeypatch)
     database_url = f"sqlite:///{tmp_path}/test.db"
     settings = _settings(database_url)
 
@@ -1079,6 +1096,7 @@ async def test_run_application_starts_supervisor_when_session_already_market_clo
     including crypto (a continuous market unaffected by equity hours) and
     monitor/settlement. _run_start must never even be called in this case;
     the supervisor must start directly."""
+    _stub_account(monkeypatch)
     database_url = f"sqlite:///{tmp_path}/test.db"
     database = AsyncSQLiteDatabase(database_url)
     await database.initialize()
@@ -1113,6 +1131,7 @@ async def test_run_application_still_gates_activation_but_starts_supervisor_from
     """Symmetry check: the MARKET_CLOSED bypass above must not accidentally
     widen to every state -- a brand-new (DISABLED) session still goes
     through the real _run_start gate exactly as before."""
+    _stub_account(monkeypatch)
     database_url = f"sqlite:///{tmp_path}/test.db"
     settings = _settings(database_url)
 

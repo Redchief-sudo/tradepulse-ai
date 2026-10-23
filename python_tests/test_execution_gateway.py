@@ -4,6 +4,7 @@ from decimal import Decimal
 
 import httpx
 import respx
+from lease_support import held_test_lease
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient
@@ -49,7 +50,7 @@ async def _setup(tmp_path):
     alerts = TelegramAlerter(None, None)
     settlement = SettlementProcessor(repositories, alerts, clock=lambda: NOW)
     limits = risk_limits_for_profile("balanced")
-    gateway = ExecutionGateway(repositories, broker, market_data, settlement, alerts, limits, ExecutionMode.PAPER, clock=lambda: NOW)
+    gateway = ExecutionGateway(repositories, broker, market_data, settlement, alerts, limits, ExecutionMode.PAPER, clock=lambda: NOW, lease=held_test_lease())
     return repositories, broker, gateway
 
 

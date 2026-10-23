@@ -25,6 +25,7 @@ from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories
 from tradepulse.providers import AlpacaMarketDataProvider
 from tradepulse.reconciliation import run_reconciliation
 from tradepulse.risk import SESSION_RECORD_ID, load_session, transition_session
+from tradepulse.runtime_lease import AccountLease
 from tradepulse.settlement import SettlementProcessor
 
 logger = logging.getLogger(__name__)
@@ -61,11 +62,13 @@ def build_broker(settings: Settings) -> AlpacaClient:
 
 def build_gateway(
     settings: Settings, repositories: PersistenceRepositories, broker: BrokerPort,
-    market_data: AlpacaMarketDataProvider, alerts: TelegramAlerter,
+    market_data: AlpacaMarketDataProvider, alerts: TelegramAlerter, lease: AccountLease,
 ) -> ExecutionGateway:
+    """Raises ValueError if ``lease`` is for another venue than ``broker``."""
     settlement = SettlementProcessor(repositories, alerts)
     risk_limits = risk_limits_for_profile(settings.risk_profile)
-    return ExecutionGateway(repositories, broker, market_data, settlement, alerts, risk_limits, ExecutionMode(settings.execution_mode))
+    return ExecutionGateway(repositories, broker, market_data, settlement, alerts, risk_limits,
+                            ExecutionMode(settings.execution_mode), lease=lease)
 
 
 async def run_start(settings: Settings) -> int:

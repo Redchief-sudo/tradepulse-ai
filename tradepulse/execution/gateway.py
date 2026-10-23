@@ -71,6 +71,7 @@ from tradepulse.risk import (
     open_portfolio_risk,
     symbol_entries_today,
 )
+from tradepulse.runtime_lease import AccountLease, AccountLeaseUnavailable
 from tradepulse.settlement import SettlementProcessor
 
 from .fill_attribution import (
@@ -184,7 +185,14 @@ class ExecutionGateway:
         risk_limits: RiskLimits,
         execution_mode: ExecutionMode,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        *,
+        lease: AccountLease,
     ) -> None:
+        # Every submission is fenced by the account lease (runtime_lease.py);
+        # a gateway can never exist without one, nor with one for another venue.
+        if lease.ref.venue != broker.venue:
+            raise ValueError(f"account lease is for venue {lease.ref.venue!r}, the broker is {broker.venue!r}")
+        self._lease = lease
         self._repositories = repositories
         self._broker = broker
         self._market_data = market_data
@@ -480,6 +488,20 @@ class ExecutionGateway:
                 rejected = replace(approved, status=TradeIntentStatus.REJECTED, rejection_reason=reason)
                 await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
                 return ExecutionResult("rejected", trade_intent_id, [reason], Decimal("0"), None)
+
+        # Account ownership fence: this process must still hold the account
+        # lease, or another TradePulse runtime may be trading the same account.
+        # No ambiguity to recover from on rejection -- place_order is never called.
+        try:
+            self._lease.verify()
+        except AccountLeaseUnavailable as exc:
+            await self._alerts.send(
+                "critical",
+                f"Account lease for {self._lease.ref.key} not held immediately before broker submission -- order NOT placed.",
+                {"account": self._lease.ref.key, "symbol": request.asset.symbol, "trade_intent_id": trade_intent_id,
+                 "cause": str(exc)},
+            )
+            return await self._reject_before_submission(approved, "ACCOUNT_LEASE_NOT_HELD")
 
         # Final ownership fence, right before the irreversible sequence
         # begins: if the caller holds a per-asset execution reservation

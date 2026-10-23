@@ -26,6 +26,16 @@ The first activation is always deliberate: run `tradepulse start`, since `--resu
 
 Deploy step: after deploying, rebuild the frontend (`cd frontend && npm run build`). A stale prebuilt `frontend/dist` cannot send the `X-TradePulse-Control` header, so the dashboard's start, stop and reset buttons would get 403.
 
+## 1a. Account lease (one runtime per account)
+
+The order-capable commands (`tradepulse run`, `scan` and `monitor`) each take an exclusive lease on their broker account before building anything that can place an order, and hold it until every order-capable task has finished. The gateway re-checks the lease immediately before every order submission; if it is no longer held, the order is rejected as `ACCOUNT_LEASE_NOT_HELD` with a critical alert, and no broker call is made. `settle`, `reconcile`, `status`, `start`, `stop`, `dashboard` and the verification commands place no orders and take no lease.
+
+Mutual exclusion holds among processes on **one host** that resolve the **same lease directory** on a **local filesystem**. It does not cover another host, another user or `TRADEPULSE_LEASE_DIR` (a different domain), or broker API clients that are not TradePulse. Those remain the operator's responsibility (one host per account, design section 3.8), and reconciliation's integrity lock detects them after the fact.
+
+- **Where the lease lives:** `TRADEPULSE_LEASE_DIR` if set, otherwise `$XDG_STATE_HOME/tradepulse/leases`, otherwise `~/.local/state/tradepulse/leases`. The directory is mode 0700. A directory on NFS, CIFS/SMB or SSHFS is refused.
+- **The file:** `<venue>-<account number>.lock`, mode 0600. Never delete it: the kernel releases the lock when its process exits or dies, so a crashed runtime never strands the lease, and deleting the file is exactly what would let two runtimes lock the same account.
+- **When a command refuses:** it logs `account_lease_held`, naming the holder's command, pid and start time, and exits 1. Stop that process; do not delete the lock file. On success it logs `account_lease_acquired` with the venue, account number, path and holder.
+
 ## 2. Restart semantics
 
 `tradepulse run --resume` continues only an already-ACTIVE or MARKET_CLOSED session. It never activates a MANUALLY_STOPPED, DISABLED, RISK_STOPPED or FINANCIAL_INTEGRITY_BLOCKED one.

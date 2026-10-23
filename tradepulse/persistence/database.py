@@ -203,9 +203,17 @@ class AsyncSQLiteDatabase:
         def initialize_sync() -> None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             existed = self.path.exists() and self.path.stat().st_size > 0
-            with self._connect() as connection:
-                connection.executescript(SCHEMA)
-                initialize_identity(connection, legacy=existed)
+            # A sqlite3 connection's own context manager commits or rolls
+            # back but never closes; left open, it is closed whenever the
+            # garbage collector reaches it, checkpointing the WAL into the
+            # database file at an unpredictable moment.
+            connection = self._connect()
+            try:
+                with connection:
+                    connection.executescript(SCHEMA)
+                    initialize_identity(connection, legacy=existed)
+            finally:
+                connection.close()
 
         await asyncio.to_thread(initialize_sync)
 

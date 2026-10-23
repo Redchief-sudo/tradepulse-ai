@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from test_cli import _settings, _stub_build_dashboard_server
+from test_cli import _settings, _stub_account, _stub_build_dashboard_server
 from test_settlement_engine import _repositories
 from tradepulse import cli
 from tradepulse.models import AssetClass, SessionState, TradingSession
@@ -72,6 +72,7 @@ async def test_supervisor_starts_every_lane_including_plain_reconcile(monkeypatc
 
 
 async def test_refused_activation_still_starts_the_supervisor_and_keeps_the_process_up(tmp_path, monkeypatch):
+    _stub_account(monkeypatch)
     settings = _settings(f"sqlite:///{tmp_path}/test.db")
     supervisor_calls = []
 
@@ -95,6 +96,7 @@ async def test_refused_activation_still_starts_the_supervisor_and_keeps_the_proc
 
 
 async def test_resume_does_not_activate_a_stopped_session_but_still_starts_the_supervisor(tmp_path, monkeypatch):
+    _stub_account(monkeypatch)
     repositories = await _repositories(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.MANUALLY_STOPPED, False, NOW))
     settings = _settings(f"sqlite:///{tmp_path}/test.db")
