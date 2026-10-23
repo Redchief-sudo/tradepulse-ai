@@ -7,11 +7,14 @@ import decimal
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 
+import httpx
 import pytest
 
-from tradepulse.broker import AlpacaError
+from tradepulse.alerts import TelegramAlerter
+from tradepulse.broker import AlpacaError, is_definitive_rejection
 from tradepulse.broker.port import BrokerPort, account_ref
 from tradepulse.broker.simulated import (
+    Fault,
     FeePosting,
     FeeRates,
     FeeScenario,
@@ -22,7 +25,21 @@ from tradepulse.broker.simulated import (
     SimulatorScriptError,
 )
 from tradepulse.broker.types import AlpacaOptionContract, AlpacaOrderRequest, RawBar
-from tradepulse.models import AssetClass, Side
+from tradepulse.config import risk_limits_for_profile
+from tradepulse.execution import ExecutionGateway, ExecutionRequest
+from tradepulse.models import (
+    AssetClass,
+    AssetIdentity,
+    ExecutionMode,
+    SessionState,
+    Side,
+    TradeIntentStatus,
+    TradingSession,
+)
+from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate
+from tradepulse.providers import AlpacaMarketDataProvider
+from tradepulse.risk import save_session
+from tradepulse.settlement import SettlementProcessor
 
 T0 = datetime(2026, 10, 19, 14, 0, tzinfo=UTC)  # Monday, 10:00 New York, market open
 
@@ -897,3 +914,216 @@ async def test_every_refused_submission_leaves_no_trace() -> None:
         with pytest.raises((AlpacaError, SimulatorScriptError)):
             await broker.place_order(request)
         assert _footprint(broker) == before
+
+
+# === Rev.135: fault injection ==================================================
+
+
+async def _raises(call: object) -> Exception:
+    try:
+        await call  # type: ignore[misc]
+    except Exception as exc:  # noqa: BLE001 - the test inspects whatever the fault raised
+        return exc
+    raise AssertionError("no fault fired")
+
+
+async def test_submit_ambiguous_accepted_records_the_order_then_raises() -> None:
+    broker = _broker()
+    _quote(broker, "AAPL", "100", "100.10", T0)
+    broker.inject(Fault.SUBMIT_AMBIGUOUS_ACCEPTED)
+    exc = await _raises(broker.place_order(_order("AAPL", "1", coid="c1")))
+    assert isinstance(exc, httpx.ConnectError) and not is_definitive_rejection(exc)
+    found = await broker.get_order_by_client_order_id("c1")
+    assert found is not None and found.status == "filled"
+    assert broker.queued_faults == ()
+
+
+@pytest.mark.parametrize(("fault", "raised", "definitive"), [
+    (Fault.SUBMIT_AMBIGUOUS_NOT_ACCEPTED, httpx.ConnectError, False),
+    (Fault.SUBMIT_REJECTED, AlpacaError, True),
+])
+async def test_submit_faults_that_record_nothing(fault: Fault, raised: type[Exception], definitive: bool) -> None:
+    broker = _broker()
+    _quote(broker, "AAPL", "100", "100.10", T0)
+    broker.inject(fault)
+    before = _footprint(broker)
+    exc = await _raises(broker.place_order(_order("AAPL", "1", coid="c1")))
+    assert isinstance(exc, raised) and is_definitive_rejection(exc) is definitive
+    if isinstance(exc, AlpacaError):
+        assert exc.status_code == 422
+    assert _footprint(broker) == before
+    assert await broker.get_order_by_client_order_id("c1") is None
+    placed = await broker.place_order(_order("AAPL", "1", coid="c1"))  # the fault fired once
+    assert placed.status == "new"
+
+
+async def test_lookup_timeout_hits_order_lookups_only() -> None:
+    broker = _broker()
+    _quote(broker, "AAPL", "100", "100.10", T0)
+    placed = await broker.place_order(_order("AAPL", "1", coid="c1"))
+    broker.inject(Fault.LOOKUP_TIMEOUT, times=2)
+    await broker.get_account()  # out of scope: unaffected, fault still queued
+    for call in (broker.get_order(placed.broker_order_id), broker.get_order_by_client_order_id("c1")):
+        exc = await _raises(call)
+        assert isinstance(exc, httpx.ReadTimeout) and not is_definitive_rejection(exc)
+    assert (await broker.get_order(placed.broker_order_id)).status == "filled"
+
+
+async def test_rate_limited_hits_any_method_as_a_429() -> None:
+    broker = _broker()
+    broker.inject(Fault.RATE_LIMITED, times=2)
+    for call in (broker.get_clock(), broker.get_bars("AAPL", AssetClass.EQUITY, T0, T0)):
+        exc = await _raises(call)
+        assert isinstance(exc, AlpacaError) and exc.status_code == 429 and not is_definitive_rejection(exc)
+    await broker.get_clock()
+
+
+async def test_disconnected_fails_every_call_until_reconnect_and_keeps_the_queue() -> None:
+    clock = ManualClock(T0)
+    broker = SimulatedBroker(clock=clock, session=_session())
+    _quote(broker, "AAPL", "100", "100.10", T0)
+    broker.schedule_fills("c1", [(timedelta(seconds=5), Decimal("1"), None)])
+    placed = await broker.place_order(_order("AAPL", "1", coid="c1"))
+    broker.inject(Fault.SUBMIT_REJECTED)
+    broker.inject(Fault.DISCONNECTED)
+    for call in (broker.get_order(placed.broker_order_id), broker.place_order(_order("AAPL", "1")),
+                 broker.get_activities(), broker.get_latest_quote("AAPL", AssetClass.EQUITY)):
+        exc = await _raises(call)
+        assert isinstance(exc, httpx.ConnectError) and not is_definitive_rejection(exc)
+    assert broker.queued_faults == ((Fault.SUBMIT_REJECTED, 1),)
+    clock.set(T0 + timedelta(seconds=10))
+    broker.reconnect()
+    # The outage never moved the scheduled fill.
+    (fill,) = await broker.get_activities()
+    assert fill.transaction_time == T0 + timedelta(seconds=5)
+
+
+async def test_fault_precedence_is_first_in_scope_and_disconnect_overrides() -> None:
+    broker = _broker()
+    _quote(broker, "AAPL", "100", "100.10", T0)
+    placed = await broker.place_order(_order("AAPL", "1", coid="c1"))
+    broker.inject(Fault.LOOKUP_TIMEOUT)
+    broker.inject(Fault.SUBMIT_REJECTED)
+    broker.inject(Fault.DISCONNECTED)
+    assert isinstance(await _raises(broker.place_order(_order("AAPL", "1"))), httpx.ConnectError)
+    assert isinstance(await _raises(broker.get_order(placed.broker_order_id)), httpx.ConnectError)
+    assert broker.queued_faults == ((Fault.LOOKUP_TIMEOUT, 1), (Fault.SUBMIT_REJECTED, 1))
+    broker.reconnect()
+    rejected = await _raises(broker.place_order(_order("AAPL", "1")))
+    assert isinstance(rejected, AlpacaError) and rejected.status_code == 422
+    assert isinstance(await _raises(broker.get_order(placed.broker_order_id)), httpx.ReadTimeout)
+    assert broker.queued_faults == ()
+
+
+def test_fault_injection_is_validated() -> None:
+    with pytest.raises(ValueError):
+        _broker().inject(Fault.RATE_LIMITED, times=0)
+
+
+# --- through the real ExecutionGateway ---------------------------------------------
+
+GATEWAY_NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)  # Monday, session open
+
+
+async def _gateway(tmp_path: object) -> tuple[PersistenceRepositories, SimulatedBroker, ExecutionGateway]:
+    database = AsyncSQLiteDatabase(f"sqlite:///{tmp_path}/test.db")
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    # The broker's clock runs a second ahead of the gateway's: the broker
+    # processes an order after the gateway timestamps its intent, and the
+    # gateway reads fills strictly after that timestamp (Alpaca's ``after``).
+    broker = SimulatedBroker(
+        clock=ManualClock(GATEWAY_NOW + timedelta(seconds=1)),
+        session=SimSession.from_exchange_calendar("XNYS", date(2026, 8, 1), date(2026, 9, 30)),
+    )
+    broker.set_quote("AAPL", AssetClass.EQUITY, Decimal("199.50"), Decimal("199.60"), at=GATEWAY_NOW)
+    alerts = TelegramAlerter(None, None)
+    settlement = SettlementProcessor(repositories, alerts, clock=lambda: GATEWAY_NOW)
+    gateway = ExecutionGateway(repositories, broker, AlpacaMarketDataProvider(broker), settlement, alerts,
+                               risk_limits_for_profile("balanced"), ExecutionMode.PAPER, clock=lambda: GATEWAY_NOW)
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, GATEWAY_NOW))
+    return repositories, broker, gateway
+
+
+def _buy() -> ExecutionRequest:
+    return ExecutionRequest(asset=AssetIdentity("AAPL", AssetClass.EQUITY, "alpaca:AAPL"), side=Side.BUY,
+                            requested_quantity=Decimal("5"), strategy="test", confidence=Decimal("90"),
+                            idempotency_key="k1")
+
+
+async def _intent_status(repositories: PersistenceRepositories) -> TradeIntentStatus:
+    [row] = await repositories.trade_intents.list_all()
+    return hydrate("trade_intents", row["payload"]).status
+
+
+async def test_faults_classified_in_operation_context(tmp_path: object) -> None:
+    # Accepted but the response was lost: recovery finds the order by client
+    # order id, adopts it and settles it. One order only.
+    repositories, broker, gateway = await _gateway(tmp_path / "accepted")  # type: ignore[operator]
+    broker.inject(Fault.SUBMIT_AMBIGUOUS_ACCEPTED)
+    result = await gateway.execute_intent(_buy())
+    assert (result.status, result.filled_quantity) == ("filled", Decimal("5"))
+    assert await _intent_status(repositories) == TradeIntentStatus.FILLED
+    assert len(broker._orders) == 1
+
+    # Never accepted: the lookup finds nothing. The current gateway does not
+    # conclude absence; it holds the intent as SUBMISSION_UNKNOWN for an
+    # operator and never resubmits, even when the same intent is re-executed.
+    repositories, broker, gateway = await _gateway(tmp_path / "not-accepted")  # type: ignore[operator]
+    broker.inject(Fault.SUBMIT_AMBIGUOUS_NOT_ACCEPTED)
+    assert (await gateway.execute_intent(_buy())).status == "pending"
+    assert await _intent_status(repositories) == TradeIntentStatus.SUBMISSION_UNKNOWN
+    assert (await gateway.execute_intent(_buy())).status == "pending"
+    assert broker._orders == {}
+
+    # Accepted, and the recovery lookup itself times out: still never a
+    # second order. The next attempt's lookup succeeds and adopts the one order.
+    repositories, broker, gateway = await _gateway(tmp_path / "timeout")  # type: ignore[operator]
+    broker.inject(Fault.SUBMIT_AMBIGUOUS_ACCEPTED)
+    broker.inject(Fault.LOOKUP_TIMEOUT)
+    assert (await gateway.execute_intent(_buy())).status == "pending"
+    assert await _intent_status(repositories) == TradeIntentStatus.SUBMISSION_UNKNOWN
+    assert len(broker._orders) == 1
+    result = await gateway.execute_intent(_buy())
+    assert (result.status, result.filled_quantity) == ("filled", Decimal("5"))
+    assert await _intent_status(repositories) == TradeIntentStatus.FILLED
+    assert len(broker._orders) == 1
+
+    # A definitive rejection is final.
+    repositories, broker, gateway = await _gateway(tmp_path / "rejected")  # type: ignore[operator]
+    broker.inject(Fault.SUBMIT_REJECTED)
+    assert (await gateway.execute_intent(_buy())).status == "rejected"
+    assert await _intent_status(repositories) == TradeIntentStatus.REJECTED
+    assert broker._orders == {}
+
+
+async def test_disconnection_fails_exactly_the_network_calls_and_spares_local_ones() -> None:
+    from tradepulse.broker.port import BrokerPort
+    from tradepulse.broker.simulated import NETWORK_OPERATIONS
+
+    # Every port call is either network-dependent or one of the three local ones.
+    local = {"set_market_data_feeds", "rate_limit_snapshot", "aclose"}
+    port_calls = set(BrokerPort.__protocol_attrs__) - {"venue", "implementation"}  # type: ignore[attr-defined]
+    assert NETWORK_OPERATIONS == port_calls - local
+
+    broker = _broker()
+    broker.inject(Fault.DISCONNECTED)
+    calls = {
+        "get_account": broker.get_account(), "get_positions": broker.get_positions(), "get_clock": broker.get_clock(),
+        "place_order": broker.place_order(_order("AAPL", "1")), "get_order": broker.get_order("x"),
+        "get_order_by_client_order_id": broker.get_order_by_client_order_id("x"),
+        "get_open_orders": broker.get_open_orders(), "cancel_order": broker.cancel_order("x"),
+        "get_activities": broker.get_activities(), "get_latest_quote": broker.get_latest_quote("AAPL", AssetClass.EQUITY),
+        "get_latest_option_quotes": broker.get_latest_option_quotes([OCC]),
+        "get_options_chain": broker.get_options_chain("AAPL", "2026-10-01", "2026-12-31"),
+        "get_bars": broker.get_bars("AAPL", AssetClass.EQUITY, T0, T0),
+    }
+    assert set(calls) == NETWORK_OPERATIONS
+    for name, call in calls.items():
+        exc = await _raises(call)
+        assert isinstance(exc, httpx.ConnectError), name
+
+    # Local configuration, telemetry and cleanup keep working during the outage.
+    broker.set_market_data_feeds(equity_feed="sip", option_feed="opra")
+    assert broker.rate_limit_snapshot is None
+    await broker.aclose()

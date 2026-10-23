@@ -52,6 +52,12 @@ orders; time in force other than ``day`` and ``gtc``; extended hours; replace;
 buying-power checks on buys. A sell larger than the position less open sells
 is a 403.
 
+Rev.135 adds fault injection (``inject``, ``Fault``): scoped, queued failures
+that fire before any state change, plus a DISCONNECTED state. Faults apply
+only to the network-dependent BrokerPort calls (NETWORK_OPERATIONS); local
+configuration (set_market_data_feeds), the rate-limit snapshot and aclose
+never touch the network and keep working during an outage.
+
 Other assumptions that are not verified Alpaca behaviour are named here:
 
 - [scenario] a position's mark is the mid of the latest quote at or before the
@@ -92,8 +98,11 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from enum import StrEnum
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
+
+import httpx
 
 from tradepulse.models import AssetClass, Side
 from tradepulse.models.market import canonical_venue
@@ -130,6 +139,39 @@ class SimulatorScriptError(RuntimeError):
     """The scenario script is missing something a real broker would always
     have (for example a price for a held position). Raised instead of
     inventing the missing value."""
+
+
+class Fault(StrEnum):
+    """Injected broker failures (Rev.135). Each is raised the way the real
+    client surfaces it: network failures as raw httpx exceptions, HTTP
+    answers as AlpacaError. A RATE_LIMITED read stands for a 429 that
+    outlasted AlpacaClient's own retries."""
+
+    SUBMIT_AMBIGUOUS_ACCEPTED = "submit_ambiguous_accepted"  # order recorded; ConnectError
+    SUBMIT_AMBIGUOUS_NOT_ACCEPTED = "submit_ambiguous_not_accepted"  # nothing recorded; ConnectError
+    SUBMIT_REJECTED = "submit_rejected"  # nothing recorded; 422
+    LOOKUP_TIMEOUT = "lookup_timeout"  # ReadTimeout
+    RATE_LIMITED = "rate_limited"  # 429
+    DISCONNECTED = "disconnected"  # every network call: ConnectError until reconnect()
+
+
+_SUBMIT = frozenset({"place_order"})
+_FAULT_SCOPE: dict[Fault, frozenset[str] | None] = {  # None: any network-dependent call
+    Fault.SUBMIT_AMBIGUOUS_ACCEPTED: _SUBMIT,
+    Fault.SUBMIT_AMBIGUOUS_NOT_ACCEPTED: _SUBMIT,
+    Fault.SUBMIT_REJECTED: _SUBMIT,
+    Fault.LOOKUP_TIMEOUT: frozenset({"get_order", "get_order_by_client_order_id"}),
+    Fault.RATE_LIMITED: None,
+    Fault.DISCONNECTED: None,
+}
+_OPERATION_NAMES = {  # the network-dependent calls, with AlpacaClient's operation labels
+    "get_clock": "getClock", "get_account": "getAccount", "get_positions": "getPositions",
+    "get_latest_quote": "getLatestQuote", "get_latest_option_quotes": "getLatestOptionQuotes",
+    "get_options_chain": "getOptionsChain", "get_bars": "getBars", "place_order": "placeOrder",
+    "get_order": "getOrder", "get_order_by_client_order_id": "getOrderByClientOrderId",
+    "get_open_orders": "getOpenOrders", "cancel_order": "cancelOrder", "get_activities": "getActivities",
+}
+NETWORK_OPERATIONS = frozenset(_OPERATION_NAMES)
 
 
 class SimulatorInvariantError(RuntimeError):
@@ -490,12 +532,61 @@ class SimulatedBroker:
         self._parked: dict[tuple[str, AssetClass], list[tuple[datetime, _Event]]] = {}
         self._activities: list[_Activity] = []
         self._batches: dict[tuple[str, str, date], _FeeBatch] = {}
+        self._faults: list[tuple[Fault, int]] = []
+        self._disconnected = False
 
     # --- lifecycle -----------------------------------------------------------
 
-    def _check_open(self) -> None:
+    def _enter(self, method: str) -> Fault | None:
+        """Every network-dependent BrokerPort call (NETWORK_OPERATIONS)
+        passes here first, before any state change.
+        DISCONNECTED overrides everything; otherwise the first queued fault
+        whose scope includes ``method`` fires and is decremented, and faults
+        out of scope stay queued in order. SUBMIT_AMBIGUOUS_ACCEPTED is the
+        one fault returned instead of raised: place_order records the order
+        first, then raises."""
         if self._closed:
             raise RuntimeError("SimulatedBroker is closed")
+        operation = _OPERATION_NAMES[method]
+        if self._disconnected:
+            raise httpx.ConnectError(f"simulated: disconnected ({operation})")
+        for index, entry in enumerate(self._faults):
+            fault, remaining = entry
+            scope = _FAULT_SCOPE[fault]
+            if scope is not None and method not in scope:
+                continue
+            if remaining == 1:
+                del self._faults[index]
+            else:
+                self._faults[index] = (fault, remaining - 1)
+            if fault == Fault.SUBMIT_AMBIGUOUS_ACCEPTED:
+                return fault
+            if fault == Fault.SUBMIT_AMBIGUOUS_NOT_ACCEPTED:
+                raise httpx.ConnectError(f"simulated: connection refused ({operation})")
+            if fault == Fault.SUBMIT_REJECTED:
+                raise AlpacaError("simulated rejection", 422, None, None, operation)
+            if fault == Fault.LOOKUP_TIMEOUT:
+                raise httpx.ReadTimeout(f"simulated: read timed out ({operation})")
+            raise AlpacaError("rate limit exceeded", 429, None, None, operation)  # RATE_LIMITED
+        return None
+
+    def inject(self, fault: Fault, times: int = 1) -> None:
+        """Queue ``fault`` to fire on its next ``times`` in-scope calls.
+        DISCONNECTED is a state, not queued: every network-dependent call
+        fails until reconnect(). Local calls are never faulted."""
+        if times < 1:
+            raise ValueError("a fault fires at least once")
+        if fault == Fault.DISCONNECTED:
+            self._disconnected = True
+        else:
+            self._faults.append((Fault(fault), times))
+
+    def reconnect(self) -> None:
+        self._disconnected = False
+
+    @property
+    def queued_faults(self) -> tuple[tuple[Fault, int], ...]:
+        return tuple(self._faults)
 
     async def aclose(self) -> None:
         self._closed = True
@@ -636,13 +727,13 @@ class SimulatedBroker:
     # --- BrokerPort: account, positions, clock --------------------------------
 
     async def get_clock(self) -> AlpacaClock:
-        self._check_open()
+        self._enter("get_clock")
         now = self._clock()
         return AlpacaClock(is_open=self._session.is_open(now), next_open=self._session.next_open(now),
                            next_close=self._session.next_close(now), timestamp=now)
 
     async def get_account(self) -> AlpacaAccount:
-        self._check_open()
+        self._enter("get_account")
         now = self._clock()
         self._materialize(now)
         equity, cash, long_value, short_value = self._equity_at(now)
@@ -662,7 +753,7 @@ class SimulatedBroker:
         )
 
     async def get_positions(self) -> list[AlpacaPosition]:
-        self._check_open()
+        self._enter("get_positions")
         self.last_positions_received_at = None
         now = self._clock()
         self._materialize(now)
@@ -690,13 +781,13 @@ class SimulatedBroker:
     async def get_latest_quote(
         self, symbol: str, asset_class: AssetClass, feed_override: str | None = None
     ) -> RawQuote:
-        self._check_open()
+        self._enter("get_latest_quote")
         quote = self.quote_at(symbol, asset_class, self._clock())
         return RawQuote(symbol=quote.symbol, bid=quote.bid, ask=quote.ask, timestamp=quote.timestamp,
                         source=self._source(asset_class, feed_override))
 
     async def get_latest_option_quotes(self, symbols: list[str]) -> dict[str, RawQuote]:
-        self._check_open()
+        self._enter("get_latest_option_quotes")
         now = self._clock()
         return {symbol.upper(): self.quote_at(symbol.upper(), AssetClass.OPTION, now) for symbol in symbols}
 
@@ -705,7 +796,7 @@ class SimulatedBroker:
     ) -> list[AlpacaOptionContract]:
         """Active, tradable contracts expiring in [gte, lte], as AlpacaClient
         returns them -- minus any that have already expired by the clock."""
-        self._check_open()
+        self._enter("get_options_chain")
         today = self._session.trade_date(self._clock()).isoformat()
         return [
             contract for contract in self._chains.get(underlying_symbol.upper(), ())
@@ -727,7 +818,7 @@ class SimulatedBroker:
     ) -> list[RawBar]:
         """The most recent ``limit`` completed daily bars stamped within
         [start, end], oldest first, as AlpacaClient returns them."""
-        self._check_open()
+        self._enter("get_bars")
         now = self._clock()
         start, end = _aware_utc(start, "start"), _aware_utc(end, "end")
         visible = []
@@ -1066,7 +1157,13 @@ class SimulatedBroker:
         return Decimal(100)
 
     async def place_order(self, order: AlpacaOrderRequest) -> AlpacaOrderResponse:
-        self._check_open()
+        fault = self._enter("place_order")
+        placed = self._place(order)
+        if fault == Fault.SUBMIT_AMBIGUOUS_ACCEPTED:
+            raise httpx.ConnectError("simulated: connection lost after the order was accepted")
+        return placed
+
+    def _place(self, order: AlpacaOrderRequest) -> AlpacaOrderResponse:
         now = self._clock()
         self._materialize(now)
         symbol, asset_class = self._classify(order.symbol)
@@ -1142,18 +1239,18 @@ class SimulatedBroker:
         return found
 
     async def get_order(self, broker_order_id: str) -> AlpacaOrderResponse:
-        self._check_open()
+        self._enter("get_order")
         self._materialize(self._clock())
         return parse_order_data(self._order_by_id(broker_order_id, "getOrder").raw(), request_id=None)
 
     async def get_order_by_client_order_id(self, client_order_id: str) -> AlpacaOrderResponse | None:
-        self._check_open()
+        self._enter("get_order_by_client_order_id")
         self._materialize(self._clock())
         order_id = self._by_client_id.get(client_order_id)
         return None if order_id is None else parse_order_data(self._orders[order_id].raw(), request_id=None)
 
     async def get_open_orders(self) -> list[AlpacaOrderResponse]:
-        self._check_open()
+        self._enter("get_open_orders")
         self._materialize(self._clock())
         open_orders = sorted((o for o in self._orders.values() if o.status in OPEN_STATUSES),
                              key=lambda o: (o.created_at, o.seq), reverse=True)
@@ -1162,7 +1259,7 @@ class SimulatedBroker:
     async def cancel_order(self, broker_order_id: str) -> None:
         """Effective at clock(). A terminal order is a 422, or silently
         accepted with ``paper_cancel_terminal_returns_204``."""
-        self._check_open()
+        self._enter("cancel_order")
         now = self._clock()
         self._materialize(now)
         order = self._order_by_id(broker_order_id, "cancelOrder")
@@ -1181,7 +1278,7 @@ class SimulatedBroker:
     ) -> list[AlpacaActivity]:
         """The visible activity population in ascending ID order, paged by the
         same loop AlpacaClient uses (``paginate_activities``)."""
-        self._check_open()
+        self._enter("get_activities")
         now = self._clock()
         self._materialize(now)
 
