@@ -539,4 +539,12 @@ Every factual claim below is marked as one of:
   11. The start and end met the verified window; the report is preserved with its SHA-256 recorded.
 
   Coverage invariants (`all_asset_classes_exercised`, `slippage_*`, round-trip counts) are recorded, not gating.
-- [ ] **Step 5:** Record each criterion's outcome in `docs/rev139-phase-a0.md`. Phase A starts only when all hold.
+- [ ] **Step 5:** Record each criterion's outcome in `docs/rev139-phase-a0.md`.
+
+**Operator decisions (2026-10-24):**
+- **Phase A runs in parallel.** It starts once Rev.139 merges, without waiting for the 24-hour result, in its own worktree so the run's source is never edited (soak source guard). A defect the run finds is fixed on main and carried into Phase A.
+- **Inherited positions.** The account's open positions are not closed first. The soak's opening checkpoint records them as the deliberate inherited state.
+- **Run window:** Monday 2026-10-26 09:00 ET (13:00 UTC) to Tuesday 2026-10-27 16:30 ET (20:30 UTC), 31.5 hours.
+  - It covers two full sessions and Monday evening's fee batch.
+  - Both ends fall outside a session, and the start is outside the 15 minutes before the open.
+  - The operator asked for "Monday open to Tuesday close"; the ends were moved because of the Rev.127 failure, a mid-move snapshot at the open.

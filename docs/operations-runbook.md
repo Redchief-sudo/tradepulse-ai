@@ -77,6 +77,8 @@ A timeout or a failed broker lookup never clears an uncertain order; only broker
 
 ## 3. Starting a soak
 
+The Phase A0 verification run has its own window, command and acceptance criteria in `docs/rev139-phase-a0.md`. Check any soak window first with `scripts/a0_verification_window.py --start <ISO with offset> --hours <n>`: both ends must fall outside a session and not in the 15 minutes before an open.
+
 Stop the service first, because a soak needs exclusive use of the account (the runner now enforces this and refuses with `SUPERVISED_SERVICE_ACTIVE` if the service is still running):
 
 ```

@@ -148,6 +148,11 @@ Spot forex (later, optional) needs multi-currency cash in the ledger, P&L in the
 | A | IBKR adapter, stocks and options, IBKR evidence (executions, commission reports, Flex), IB Gateway and IBC on the server | 3–5 weeks | Conformance kit passes on IBKR paper; IBKR paper soak |
 | B | Futures lane (micros), contract model, rolls, Globex calendar, margin cap, variation-margin reconciliation, futures factors | 3–4 weeks | Futures paper soak, including a roll |
 | C | Forex through micro FX futures (universe and factors) | about 1 week on top of B | FX futures paper soak |
+
+**A0 status (2026-10-24):**
+- **Built:** Rev.130 to Rev.139. The full suite is green, the kit passes on the simulator, and the kit's read-only checks pass on Alpaca paper.
+- **Pending:** the Alpaca verification run (`docs/rev139-phase-a0.md`).
+- **Phase A:** starts in parallel (operator decision).
 | C2 (optional) | Spot forex, multi-currency ledger | 3–4 weeks | Spot FX paper soak |
 
 The estimates are for working sessions like the ones so far, including tests and review rounds. Prove-edge for each new lane follows its soak.
