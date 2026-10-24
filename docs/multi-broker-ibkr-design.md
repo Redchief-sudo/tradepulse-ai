@@ -86,7 +86,7 @@ Three identities stay distinct:
 - **Account** (`AccountRef`: venue plus account number): the account that holds cash and positions. It names the lease (3.8) and is never part of an asset key.
 - **Implementation** (`alpaca_http`, `simulated`): which code talks to the venue. It is provenance only and never part of any key.
 
-Account-scoped positions, reservations, reconciliation and risk are a later-phase migration. In A0 they stay keyed as they are today.
+Account-scoped positions, reservations, reconciliation and risk are not part of A0; in A0 they stay keyed as they are today. Running both venues (section 10, decided 2026-10-24) makes them a Phase A prerequisite.
 
 ### 3.8 Account ownership across hosts
 
@@ -168,12 +168,23 @@ The estimates are for working sessions like the ones so far, including tests and
 4. **API:** in IB Gateway, enable socket clients and allow `127.0.0.1` only.
 5. **Flex Web Service:** create a token and Activity and Trade Confirmation Flex queries for the paper account.
 
-## 10. Open questions for review
+## 10. Decisions and open questions
+
+**Decided by the operator (2026-10-24):**
+
+- **(Q1) One runtime drives several brokers.** A single TradePulse process holds a broker port per venue in a `BrokerRegistry` keyed by venue, rather than one process per broker.
+- **(Q5) Stocks and options run on both Alpaca and IBKR.** The venue is chosen per lane; nothing moves off Alpaca after Phase A.
+
+**What these decisions require in Phase A:**
+
+- **Per-account accounting:** positions, execution reservations, reconciliation and risk become account-scoped. Section 3.7 deferred this; with two venues trading the same symbols, it is a Phase A prerequisite. Asset keys are already venue-qualified (Rev.131).
+- **One lease per account:** the runtime holds the account lease (3.8, Task 7) for every account it trades, and each gateway is fenced by the lease of its own account.
+- **Combined risk:** portfolio limits (open risk, daily loss, position caps) count exposure across all venues together; a per-venue limit alone would let total risk double.
+- **Separate failure handling:** one venue being down stops entries on that venue's lanes only (section 3 "Failover is not automatic"); the other venue keeps trading and every position stays managed by the broker that holds it.
+
+**Still open:**
 
 0. The conformance kit's area list (3.4): anything missing that a broker has broken for you before?
-
-1. A broker port with a venue registry (proposed), or a separate runtime per broker?
 2. Forex through micro FX futures first (proposed), or spot from the start?
 3. Initial futures universe: index micros only, or index plus metals and energy micros?
 4. Margin cap value (proposed: initial margin at or below 25% of equity across futures).
-5. Does stock and options trading move from Alpaca to IBKR after Phase A, or run on both (venue chosen per lane)?
