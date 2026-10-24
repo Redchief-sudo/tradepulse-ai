@@ -649,13 +649,23 @@ async def test_late_fee_sorts_before_an_existing_cursor() -> None:
 
 
 async def test_after_id_is_a_lexicographic_bound() -> None:
+    """As checked read-only on the paper account (2026-10-23): a well-formed
+    token bounds lexicographically even when it is no activity's ID; a
+    malformed one is a definitive 422."""
     clock = ManualClock(T0)
     broker = SimulatedBroker(clock=clock, session=_session())
     await _same_millisecond_fills(broker, clock)
     ids = [a.activity_id for a in await broker.get_activities()]
-    bound = ids[0].split("::")[0] + "::~"  # sorts after every ID in that millisecond
-    assert [a.activity_id for a in await broker.get_activities(after_id=bound)] == ids[3:]
-    assert [a.activity_id for a in await broker.get_activities(after_id="20261019")] == ids
+    prefix = ids[0].split("::")[0]
+    after_the_millisecond = prefix + "::ffffffff-ffff-4fff-bfff-ffffffffffff"
+    before_everything = "20261019000000000::00000000-0000-0000-0000-000000000000"
+    assert [a.activity_id for a in await broker.get_activities(after_id=after_the_millisecond)] == ids[3:]
+    assert [a.activity_id for a in await broker.get_activities(after_id=before_everything)] == ids
+    for malformed in (prefix + "::~", "20261019", ids[0] + " "):
+        with pytest.raises(AlpacaError) as rejected:
+            await broker.get_activities(after_id=malformed)
+        assert (rejected.value.status_code, rejected.value.message) == (422, "invalid page_token")
+        assert is_definitive_rejection(rejected.value)
 
 
 async def test_since_filters_fill_time_and_fee_creation_time() -> None:

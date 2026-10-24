@@ -36,6 +36,25 @@ Mutual exclusion holds among processes on **one host** that resolve the **same l
 - **The file:** `<venue>-<account number>.lock`, mode 0600. Never delete it: the kernel releases the lock when its process exits or dies, so a crashed runtime never strands the lease, and deleting the file is exactly what would let two runtimes lock the same account.
 - **When a command refuses:** it logs `account_lease_held`, naming the holder's command, pid and start time, and exits 1. Stop that process; do not delete the lock file. On success it logs `account_lease_acquired` with the venue, account number, path and holder.
 
+## 1b. Broker conformance kit
+
+`python_tests/broker_conformance/` checks that a broker adapter behaves the way TradePulse needs: account identity, order acceptance and rejection, fills, recovery by client order id, fees captured once, activity ordering and paging, account totals, the trading calendar, and outages (simulator only).
+
+- **Default run** (`.venv/bin/python -m pytest python_tests`): only the simulator variants run. Every `integration` test is deselected, not skipped, and any lookup of an `alpaca.markets` host fails the test (`real broker host blocked in default test run`), so an unmocked broker call can never reach a real account.
+- **Read-only against the paper account:** `.venv/bin/python -m pytest -m integration python_tests/broker_conformance -k "alpaca_paper and not test_order_"`. It reads `.env` the way the CLI does and refuses anything but paper with live trading disabled. It places no orders.
+- **Order tests on paper** (`test_order_*`: one rejected order and one 1-share SPY round trip) run only with the operator's approval for that run, and only when all of these hold:
+  - `-m integration` is given and `TRADEPULSE_CONFORMANCE_ORDERS=1` is set;
+  - the configuration is paper with live trading disabled;
+  - the kit can take the account lease (holder "conformance kit");
+  - no `tradepulse-*` user unit is active and no `tradepulse run`/`scan`/`monitor` or soak process is running;
+  - the market is open (otherwise they skip).
+
+  However a test ends, the kit cancels any of its orders still open and checks that each symbol's position is back where it started, all while still holding the lease. Anything it cannot resolve (an order it cannot look up or cancel, a position that did not return) fails the run with a report naming each item. It never sends an offsetting trade, so resolve those by hand.
+
+  The process check fails closed: a process whose command line cannot be read counts as a possible runtime.
+
+  Those trades bypass the execution gateway, so they never reach a TradePulse database. Run them on an account that no TradePulse database is reconciling, or expect that database's reconciliation to flag them.
+
 ## 2. Restart semantics
 
 `tradepulse run --resume` continues only an already-ACTIVE or MARKET_CLOSED session. It never activates a MANUALLY_STOPPED, DISABLED, RISK_STOPPED or FINANCIAL_INTEGRITY_BLOCKED one.

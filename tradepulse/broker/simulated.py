@@ -37,9 +37,11 @@ Alpaca behaviour this follows, with sources (checked 2026-10-22):
 - activities (docs.alpaca.markets/reference/getaccountactivities): with
   ``direction=asc`` a page begins immediately after ``page_token``, the ID of
   the last activity of the previous page; ``after`` filters on creation time.
-  A FILL has no ``created_at``, so it filters on ``transaction_time``. A token
-  that is not an existing ID is treated as a lexicographic bound [scenario;
-  checked read-only on paper in Task 8];
+  A FILL has no ``created_at``, so it filters on ``transaction_time``.
+  Checked read-only on the paper account on 2026-10-23 (Task 8): a
+  ``page_token`` that is not ``<17 digits>::<UUID>`` is a 422 "invalid
+  page_token"; a well-formed one bounds lexicographically whether or not it
+  is an existing ID, including inside one millisecond;
 - FILL and FEE identity, raw keys and timing follow preserved soak evidence:
   FILL IDs carry New York time; FEE and CFEE IDs carry the date at midnight,
   so a late fee sorts before that day's fills; equity REG/TAF/CAT batches post
@@ -126,6 +128,8 @@ from .types import (
 NEW_YORK = ZoneInfo("America/New_York")
 _ALPACA_ASSET_CLASS = {AssetClass.EQUITY: "us_equity", AssetClass.CRYPTO: "crypto", AssetClass.OPTION: "us_option"}
 _OCC_SYMBOL = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+# The activity-ID shape Alpaca accepts as a page_token (see the module docstring).
+_ACTIVITY_ID = re.compile(r"^\d{17}::[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 OPEN_STATUSES = frozenset({"new", "accepted", "partially_filled"})
 TERMINAL_STATUSES = frozenset({"filled", "canceled", "expired", "rejected"})
 _ROUNDING_MODES = frozenset({
@@ -1286,6 +1290,8 @@ class SimulatedBroker:
             types = set(params["activity_types"].split(",")) if "activity_types" in params else None
             after = datetime.fromisoformat(params["after"]) if "after" in params else None
             token = params.get("page_token")
+            if token is not None and not _ACTIVITY_ID.match(token):
+                raise AlpacaError("invalid page_token", 422, None, None, "getActivities")
             rows = sorted(
                 (a for a in self._activities
                  if a.visible_at <= now and (types is None or a.raw["activity_type"] in types)

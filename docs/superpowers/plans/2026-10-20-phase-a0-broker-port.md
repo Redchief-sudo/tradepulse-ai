@@ -304,7 +304,7 @@ Every factual claim below is marked as one of:
 - **Cancelling a terminal order** is a 422 (documented). Flag `paper_cancel_terminal_returns_204` reproduces the paper bug Alpaca staff confirmed.
 - **Duplicate `client_order_id`** is not documented. Flag `duplicate_client_order_id_status`, default 422.
 - **`since`** filters `created_at` for FEE and CFEE (documented: `after` filters creation time) and `transaction_time` for FILL, which has no `created_at`.
-- **A `page_token` that is not an activity ID** is treated as a lexicographic bound; still to be checked read-only on paper in Task 8.
+- **A `page_token` that is not an activity ID:** settled read-only on paper in Task 8 (see the Rev.137 report).
 - **Fee shape** follows the soak evidence rather than one posting time:
   - `FeeScenario.observed_alpaca_2026(rates, posting: FeePosting)`;
   - equity REG/TAF/CAT post at a New York evening time on the trade date;
@@ -455,6 +455,14 @@ Every factual claim below is marked as one of:
 - [ ] **Step 3:** With the operator's agreement, run it read-only on paper: `pytest -m integration python_tests/broker_conformance -k "alpaca_paper and not order"`. Expected: PASS. Record the `after_id` result.
 - [ ] **Step 4:** Full suite green.
 - [ ] **Step 5:** Commit: `test(broker): conformance kit; fail-closed integration isolation (A0.8)`.
+
+**Rev.137 report (2026-10-23).** The read-only paper run (`-m integration -k "alpaca_paper and not test_order_"`, with the operator's agreement) passed 6 tests; the outage test is simulator-only and skipped.
+- **`after_id` result:** Task 5's assumption was half right.
+  - A `page_token` that is not `<17 digits>::<UUID>` is rejected with a 422, "invalid page_token" (a definitive rejection).
+  - A well-formed token bounds lexicographically whether or not it is an existing activity ID: 6 of 6 checks between instants, and 1 inside one millisecond, over 191 activities.
+  - The simulator now models both, and the kit asserts both.
+- **Test filter:** the plan's `-k "... and not order"` also excluded the read-only `test_unknown_client_order_id_is_not_found`. The runbook uses `not test_order_`.
+- **Not run:** the order tests (`TRADEPULSE_CONFORMANCE_ORDERS=1`). They need the operator's approval for a specific run.
 
 ### Task 9: The whole runtime against the simulator
 
