@@ -487,6 +487,11 @@ Every factual claim below is marked as one of:
 - [ ] **Step 3:** Full suite green.
 - [ ] **Step 4:** Commit: `test: end-to-end runtime on the simulated broker (A0.9)`.
 
+**Rev.138 report (2026-10-24).** All six scenarios pass, and no production code changed: no incompatibility was found between the runtime and the simulator.
+- **Clock offset:** the runtime's clock trails the broker's by 1 ms. The gateway reads fills strictly after its intent's timestamp (Alpaca's `after` is exclusive), so with identical frozen clocks a fill stamped at that same instant would correctly be excluded.
+- **Fees still due:** between a position's close and its fee batch, reconciliation is `degraded` with `ACCOUNTING_EPOCH_INCOMPLETE`, and the epoch records an interim `asset_fee` `drift_detected` transition. That is the runtime correctly waiting for fees. The tests judge outcomes by the soak evidence's rule (the latest record per subject must be `matched` or `corrected`), and that holds once the fees post.
+- **Lagged-fill test:** it shortens the gateway's real-time poll budget (`FILL_TIMEOUT_SECONDS = 1`), because the broker clock is manual and cannot advance while the gateway sleeps. The gateway then leaves the intent for reconciliation, which attributes the fill once it is visible, exactly once.
+
 ### Task 10: Merge and the 24-hour verification run
 
 **Files:**
