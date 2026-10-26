@@ -1,6 +1,6 @@
 # Rev.140: unsupported short inventory — design specification
 
-**Status:** revision 3, for independent review. **Design only.**
+**Status:** revision 4, for independent review. **Design only.**
 - This authorization covers design updates, nothing more: no code, schema, test, merge, push or broker order.
 - Implementation starts only after:
   - the A0 verification run (Mon 2026-10-26 09:00 ET to Tue 2026-10-27 16:30 ET) has concluded;
@@ -12,7 +12,8 @@
 **Revision history:**
 - **rev. 1** (2026-10-26): first draft.
 - **rev. 2** (2026-10-26): R1 to R3 decisions, immutable records, invariants, recovery, 16 tests.
-- **rev. 3** (2026-10-26): the institutional audit's TP140-01 to TP140-05, and the operator's R4 to R8. Change log in section 10.
+- **rev. 3** (2026-10-26): the institutional audit's TP140-01 to TP140-05, and the operator's R4 to R8.
+- **rev. 4** (2026-10-26): TP140-R3-01. Section 3.1 is replaced by a conservative two-bound authorization that does not assume atomic broker reads. R9 to R11 are decided. Change log in section 10.
 
 **Origin:**
 - the operator's decisions C10, D6 and R1 to R8 (2026-10-25 and 2026-10-26);
@@ -63,56 +64,96 @@
 
 ## 3. Design
 
-### 3.1 Prevention: sellable inventory (TP140-01)
+### 3.1 Prevention: a conservative bound on sellable inventory (TP140-01, TP140-R3-01)
 
-**Pending sells are counted per order, never per fill or per settlement.**
-- The sellable quantity for an asset is computed from **one synchronized broker snapshot**, plus the intent store read inside the asset's execution reservation.
-- Each pending sell is counted exactly once, at its broker-reported unfilled remainder.
+**Principle.** The broker's reads are not atomic.
+- Positions can lag executions.
+- An order can change state, or reach a terminal state and leave the open-order list, between any two reads.
+- An external order can appear and fill between reads.
 
-**The synchronized snapshot.** Reads in this order:
-1. `get_open_orders()` (*O₁*);
-2. `get_positions()` (*P*);
-3. `get_open_orders()` (*O₂*).
+So the gateway does **not** try to reconstruct one consistent broker state. It computes two bounds, each conservative under a *different* kind of lag, and authorizes at most the smaller. Neither bound depends on two reads agreeing.
 
-The snapshot is valid only if, for every sell order of the asset, *O₁* and *O₂* agree on status and `filled_qty`.
-- **Why this order:** a fill between the reads lowers *P* while the order still shows its old remainder. That under-states sellable, the safe direction.
-- **Two consistent order reads** prove no fill happened between them, so *P* and *O₂* describe the same inventory.
-- **Retries:** if the reads disagree, the snapshot is retaken up to 3 times. After that the sell is refused, `SELLABLE_SNAPSHOT_UNSTABLE`.
+**Inputs.** All are read inside the asset's execution reservation, so no other TradePulse order on the asset can start meanwhile:
+1. *O₁* = `get_open_orders()`;
+2. *P* = `get_positions()`: the broker quantity for the asset;
+3. *O₂* = `get_open_orders()`;
+4. *A* = `get_activities("FILL", after_id = reconciliation's cursor)`, filtered to the asset;
+5. **from the local store,** in one read transaction:
+   - *L* = Σ open long lot quantity;
+   - for every TradePulse SELL intent on the asset not yet **terminal and fully settled:** its approved quantity *a*, and its settled quantity *s*;
+   - any open quarantined records.
 
-**The per-order reservation.** The *pending set* is built **keyed by broker order ID**, so each order appears once, from the union of:
-- the asset's SELL intents in `risk_approved`, `submitted`, `accepted`, `partially_filled` or `submission_unknown`;
-- the asset's SELL orders in *O₂*.
+**The order set** *Ω*, keyed by broker order ID, or by intent ID before submission: every sell order in *O₁* ∪ *O₂*, plus every TradePulse SELL intent from input 5, whatever its broker status. An order that went terminal and left both open-order reads is still in *Ω* through its intent, until it is fully settled locally.
 
-An intent is linked to its broker order by `client_order_id` (= intent ID). Each member's reservation *r*:
+**Bound 1, local (exact for TradePulse's own orders):**
 
-| Order state | *r* | Why |
-|---|---|---|
-| Intent `risk_approved`, not yet submitted | approved quantity | not yet at the broker, so not in *P* |
-| Open at the broker (in *O₂*), with or without an intent | `qty − filled_qty` from *O₂* | the filled part is already out of *P*; the remainder is not yet |
-| Intent in-flight but absent from *O₂* | resolved by `get_order(broker_order_id)` within the snapshot. Terminal (`filled`, `canceled`, `expired`, `rejected`): *r* = 0, its fills already in *P*. Lookup fails or is non-terminal: *r* = approved − broker `filled_qty` if known, otherwise the approved quantity. | never released on missing evidence |
-| Intent `submission_unknown` | the approved quantity, until recovery proves the outcome | it may exist at the broker in any state |
-| Broker open order with no intent (out-of-band) | `qty − filled_qty`; also alerted | it can consume inventory |
+  *B*ₗ = *L* − Σ over TradePulse sell intents in *Ω* of (*a* − *s*)
 
-- **The rule:** sellable = *P*.qty − Σ *r*.
-- **The request:** a sell is approved for at most sellable. Above that, `INSUFFICIENT_SELLABLE_QUANTITY (held, pending by order, requested)`.
+- *L* changes only when TradePulse settles a fill.
+- (*a* − *s*) covers each intent's unsettled part: filled-but-unsettled quantity and unfilled remainder alike. A `submission_unknown` intent counts in full, since *s* = 0.
+- **The lag it is immune to:** positions and order status. It reads neither.
+- **What it cannot see:** external orders and executions.
 
-**Invariant S1 (counted once).** Every pending sell order contributes exactly one *r*, keyed by broker order ID, or by intent ID before submission. *r* is derived only from one snapshot. Settlement status and local fills **never** enter *r*. A partial fill is thus neither double-counted (it is already out of *P*, and *r* excludes it) nor released (its remainder stays in *r* until the broker reports a terminal state).
+**Bound 2, broker (covers external orders):**
 
-**Refusals.** Each one refuses the sell; none releases anything:
-- `BROKER_OPEN_ORDERS_UNAVAILABLE` or `BROKER_POSITIONS_UNAVAILABLE`;
-- `SELLABLE_SNAPSHOT_UNSTABLE`;
-- `filled_qty > qty` on any order (`BROKER_ORDER_EVIDENCE_INVALID`);
-- sellable < 0 (`SELLABLE_NEGATIVE`). This also alerts critical: an oversell is in flight.
+  *B*ᵦ = *P* − Σ over every order in *Ω* of its **original** quantity *q*
+
+- **Each order counts at its full original quantity, never `qty − filled_qty`.** So it doesn't matter whether *P* already reflects that order's fills:
+  - if a fill *f* is reflected in *P*, the bound is *f* lower than necessary, which is safe;
+  - if it is not yet reflected, *P* over-states holdings by at most *f*, and the full *q* subtracts it.
+- **The lag it is immune to:** position lag and order-status lag, for every order it has seen.
+- **What it cannot see:** an execution from an order that appears in neither open-order read and has no TradePulse intent. That is the activity check's job.
+
+**The activity check, for external executions that positions may not yet reflect.**
+- If *A* contains any FILL for the asset that has no exact-ID match among local `Fill` and `quarantine_executions` rows, the sell is refused with `UNRECONCILED_BROKER_ACTIVITY`.
+- The activity page must be proven complete, as in A0; otherwise it is refused with `ACTIVITY_PAGE_UNPROVEN`.
+
+**Authorization:** sellable = max(0, min(*B*ₗ, *B*ᵦ)).
+
+**Lemma (stated for review; proved by the tests in section 7).** Let *H* be the broker's true long quantity when the order is submitted, and *W* = *H* − Σ the true unfilled remainder of every sell order outstanding then. If none of the refusals below fires, then sellable ≤ *W* for every order and execution that is either TradePulse's or visible in any of *O₁*, *O₂* or *A*.
+- **TradePulse's orders only:**
+  - *L* = *H* − (filled, unsettled buys) + (filled, unsettled sells).
+  - Each intent's *a* − *s* = its filled-unsettled part + its unfilled remainder.
+  - So *B*ₗ = *H* − Σ unfilled remainder − (filled, unsettled buys) = *W* − (filled, unsettled buys) ≤ *W*.
+- **Orders seen in *O₁* ∪ *O₂*:**
+  - *P* = *H* + (fills not yet reflected in *P*), and those are ≤ Σ (*q* − remainder) over seen orders. A lagging buy only lowers *P*.
+  - So *B*ᵦ = *P* − Σ *q* ≤ *H* − Σ remainder = *W*.
+- **External executions seen only in *A*:** refused outright.
+
+**The stated limit.** No pre-trade check can bound an external order *submitted after the last read*: invisible in *O₂* and *A*, and not yet in *P*. That residual is detected afterwards:
+- reconciliation, by a missed fill or I2;
+- 3.5's latch.
+
+It is excluded operationally by the existing rule that nothing else trades the account.
+
+**Refusals.** None of them writes anything, releases any reservation, or changes any intent:
+- a failed read, of any input: `BROKER_OPEN_ORDERS_UNAVAILABLE`, `BROKER_POSITIONS_UNAVAILABLE` or `BROKER_ACTIVITIES_UNAVAILABLE`;
+- *O₁* and *O₂* disagreeing on any order of the asset's status or `filled_qty`, still after **3 attempts** (R10): `SELLABLE_SNAPSHOT_UNSTABLE`.
+  - Agreement is **not** treated as proof of atomicity; the bound does not rely on it.
+  - Disagreement means the evidence is still moving, so the sell waits.
+- `filled_qty > qty` on any order, a negative *P*, or a negative *L*: `INVENTORY_EVIDENCE_INVALID`;
+- `UNRECONCILED_BROKER_ACTIVITY` or `ACTIVITY_PAGE_UNPROVEN`;
 - `UNSUPPORTED_SHORT_POSITION`, which covers:
-  - a sell when *P*.qty ≤ 0;
+  - *P* < 0;
   - a buy classified as protective against a negative position;
-  - any order on an asset with open quarantined inventory (3.2, 3.8).
+  - any order on an asset with open quarantined inventory.
 
-This removes the gateway's cover path.
+  This removes the gateway's cover path.
 
-**Window.** The snapshot is taken before A1's local decision window (A1 6.3). It runs inside the asset's execution reservation, so no other TradePulse order on the asset can begin between the snapshot and submission. Out-of-band orders placed in that interval are caught by reconciliation (3.5), not prevented.
+**Applying the bound to a request:**
+- **Non-protective sells:** none exist today. A request above sellable is refused with `INSUFFICIENT_SELLABLE_QUANTITY (bₗ, bᵦ, requested)`.
+- **A protective exit** (a stop, the ladder, a time stop, a forced close) is **reduced** to sellable when sellable > 0, rather than refused, so protection is never lost to the bound's conservatism. The difference is alerted `SELLABLE_BELOW_REQUESTED`, with both bounds.
+- **Sellable = 0** refuses with the same reason. The monitor retries next pass, and the reservation and intents are unchanged.
+- **An unexplained difference** between *P* and *L* beyond Σ of *Ω*'s quantities is recorded for reconciliation every pass. The bound already takes the smaller.
 
-**No broker dependency (R2).** Test 2 runs against a simulator that accepts every oversell. Whether Alpaca rejects one is not tested; a later experiment needs separate operator authorization, an isolated paper account and isolation from the active verification generation.
+**Invariant S1, restated.**
+- Every order in *Ω* contributes exactly once to each bound: at (*a* − *s*) in *B*ₗ if it is TradePulse's, and at its original *q* in *B*ᵦ.
+- A TradePulse sell leaves *Ω* only when it is terminal at the broker **and** fully settled locally. A terminal order disappearing from the open-order list therefore never releases anything.
+- Settlement status, `filled_qty` and position freshness **never increase** sellable. They only take effect through *L* (settlement) or *P*, each inside its own bound.
+
+**Cost:** four broker reads per sell, instead of today's one or two. Retries add two per attempt. Exits are rare.
+
+**No broker dependency (R2).** Tests 1 to 4b run against a simulator that accepts every oversell. Whether Alpaca rejects one is not tested; a later experiment needs separate operator authorization, an isolated paper account and isolation from the active verification generation.
 
 ### 3.2 Settlement of an oversell
 
@@ -325,7 +366,7 @@ Each is checked by reconciliation on every pass, and by the tests.
 | I9 | The seven tables are never updated or deleted, and their triggers exist | refusal / `SCHEMA_TRIGGER_MISSING` |
 | I10 | Every financial value is `Decimal`; JSON is parsed with `parse_float=Decimal` | test failure |
 | I11 | Each broker activity ID maps to at most one of: a `Fill`, a `quarantine_executions` row | `INTEGRITY_VIOLATION` |
-| S1 | Each pending sell order contributes exactly one reservation, derived from one synchronized snapshot (3.1) | refusal |
+| S1 | Each order in *Ω* counts exactly once in each bound (*a* − *s* locally, original *q* at the broker). A TradePulse sell leaves *Ω* only when terminal **and** fully settled. Settlement status, `filled_qty` and position freshness never raise sellable. (3.1) | refusal |
 
 ## 5. Recovery behaviour
 
@@ -345,8 +386,8 @@ Each is checked by reconciliation on every pass, and by the tests.
 
 | Change | When it is visible |
 |---|---|
-| Sellable quantity from a synchronized snapshot, per order | Every sell. Normally equal to today's held quantity, because the monitor allows one exit at a time. |
-| Two extra broker calls per sell (`get_open_orders` twice) | Every exit; within the rate limit |
+| Sellable = max(0, min(local bound, broker bound)) | Every sell. With no pending sell, sellable = min(*P*, *L*), normally equal to today's held quantity. A protective exit above it is reduced and alerted, never refused while sellable > 0. |
+| Three extra broker reads per sell (`get_open_orders` twice, `get_activities` once) | Every exit; within the rate limit |
 | `UNSUPPORTED_SHORT_POSITION` refusals; no automatic cover | Only with negative or quarantined inventory: none in the inspected databases |
 | An oversell becomes a liability and a latch | Only on an oversell: none in the inspected databases |
 | The closure conservation check includes the liability | Every settlement; identical without an oversell |
@@ -358,23 +399,37 @@ Replaying every preserved soak database must give identical ledgers and decision
 
 ## 7. Tests (deterministic, on `SimulatedBroker` with its clock; no network)
 
-**Prevention (TP140-01):**
-1. **Partial fills:**
-   - a sell of 10 against 10 fills 4. The snapshot shows *P* = 6, and the order has `filled_qty` 4, so *r* = 6 and sellable = 0;
-   - **local settlement of the 4 is delayed:** sellable is still 0, neither 6 (released) nor −4 (double-counted);
-   - the remainder fills, and sellable stays 0.
+**Prevention (TP140-01, TP140-R3-01).** These need two new Rev.135-style simulator faults:
+- `POSITIONS_LAG(n)`: positions served from the view *n* executions ago;
+- `STEP_BETWEEN(call, action)`: an execution, cancel or out-of-band order applied immediately before the named read.
+
+1. **Partial fills with delayed settlement:**
+   - a sell of 10 against 10 fills 4; *P* = 6 reflected; local settlement is delayed;
+   - *B*ₗ = 10 − 10 = 0 and *B*ᵦ = 6 − 10 → 0, so sellable = 0: neither released (6) nor double-counted;
+   - after settlement *B*ₗ = 6 − 6 = 0; after the last 6 fill and settle, the intent leaves *Ω*.
 2. **Overlapping sells, no broker safety net:**
    - the simulator accepts oversells;
    - two exits race, called directly against the gateway; exactly one is approved;
-   - a seeded randomized sequence of 1,000 sell requests, partial fills, cancels and out-of-band orders (fixed seed) never yields a submitted sell above sellable.
+   - a seeded sequence of 1,000 random steps (sells, partial fills, cancels, out-of-band orders, `POSITIONS_LAG` and `STEP_BETWEEN` at random reads; fixed seed) **never** yields a submitted sell that drives the simulator's true long quantity, net of outstanding sells, below 0, except where the stated limit applies (an out-of-band order placed after the last read). Those cases are asserted to be latched by the next reconciliation.
 3. **Order states:**
-   - a canceled partial gives *r* = 0;
-   - an expired order gives 0;
-   - `submission_unknown` reserves the full approved quantity;
-   - an in-flight intent absent from the open orders resolves through `get_order`; if that lookup fails, it reserves the approved quantity;
-   - an out-of-band open order reduces sellable and alerts;
-   - `filled_qty > qty` is refused.
-4. **An unstable snapshot:** a fill injected between *O₁* and *O₂*, three times, gives `SELLABLE_SNAPSHOT_UNSTABLE`. Injected once, the retry succeeds with the post-fill figures.
+   - a canceled partial;
+   - an expired order;
+   - `submission_unknown` (*s* = 0, counted in full);
+   - an out-of-band open order (counted at its full *q* in *B*ᵦ, and alerted);
+   - `filled_qty > qty` (`INVENTORY_EVIDENCE_INVALID`).
+4. **Terminal-order disappearance:**
+   - `STEP_BETWEEN(get_open_orders#1, fill-remaining)` together with `POSITIONS_LAG(1)`. The TradePulse order completes and is absent from both *O₁* and *O₂*, while *P* still shows the pre-fill quantity;
+   - the order stays in *Ω* through its unsettled intent, *B*ₗ is unchanged, and sellable is not increased.
+4a. **Delayed broker positions:**
+   - `POSITIONS_LAG(1..3)` across fills, with settlement current;
+   - *B*ₗ governs; a protective exit is reduced to sellable and alerted `SELLABLE_BELOW_REQUESTED`, never above the true quantity.
+4b. **Inconsistent order and position evidence:**
+   - *O₁* ≠ *O₂* on three attempts → `SELLABLE_SNAPSHOT_UNSTABLE`, with no write and reservations unchanged;
+   - one mismatch, then agreement → it proceeds, with the bound computed afresh;
+   - *P* < 0 or *L* < 0 → `INVENTORY_EVIDENCE_INVALID`;
+   - an external FILL in *A* with no local match → `UNRECONCILED_BROKER_ACTIVITY`;
+   - an external order that appears and fills between *O₁* and *O₂* (`STEP_BETWEEN`), with *P* lagging → caught by *A*;
+   - an incomplete activity page → `ACTIVITY_PAGE_UNPROVEN`.
 
 **Oversell and quarantine:**
 
@@ -448,15 +503,19 @@ Replaying every preserved soak database must give identical ledgers and decision
 
 ## 8. Remaining open questions
 
-- **R9. The list of Alpaca corporate-action activity types** that trigger 3.10's refusal. **Proposed:** taken from Alpaca's activity-type documentation at implementation, with any unrecognised non-trade activity type naming the instrument also refusing (fail closed).
-- **R10. Retries for an unstable snapshot.** 3 attempts is a proposal; each costs two broker calls. Confirm.
-- **R11. Adoption of unmanaged long inventory** into strategy management. **Proposed:** out of scope for Rev.140; it is resolved only by a verified sale. Confirm.
+**Decided by the operator (2026-10-26):**
+- **R9. Approved:** fail-closed corporate-action classification, from Alpaca's documented activity types plus instrument-specific evidence. Any unrecognised non-trade activity naming the instrument refuses.
+- **R10. Approved:** at most 3 attempts, then refusal on unresolved inconsistency. Agreement between reads is not proof of atomicity (3.1).
+- **R11. Approved:** adopting unmanaged long inventory stays outside Rev.140. A resolved liability never turns its surplus into strategy inventory automatically.
+
+**Still open:**
+- **R12. The two new simulator faults** (`POSITIONS_LAG`, `STEP_BETWEEN`) go in `tradepulse/broker/simulated.py` beside Rev.135's faults. They are test-only behaviour in a production module, as Rev.135's are. Confirm.
 
 ## 9. Consistency with A1
 
 | Rev.140 element | A1 form |
 |---|---|
-| Sellable snapshot and S1 | Per account. The snapshot is one of A1 6.4's complete snapshots; S1 keys orders by `(account_key, broker_order_id)`. Taken outside the decision window (A1 6.3). |
+| The sellable bound and S1 | Per account: *L* from that account's lots, *P*, *O₁*, *O₂* and *A* from that account's broker, *Ω* keyed by `(account_key, broker_order_id)`. Read outside the risk decision window (A1 6.3). A1 6.4's freshness rule applies to the reads, but freshness is not treated as atomicity. |
 | Activity IDs, `fill:cash:<id>`, I11 | The A1 canonical ID `<account_key>\|<venue>\|ExecutionEvent\|<broker id>` (A1 5.2). Cash keys gain the account (A1 3). |
 | The seven tables and their triggers | Gain `account_key`. A1's migration (7.3) must re-create every trigger after any table rebuild, and the 7.4 equivalence checks include them. |
 | I2 | Per position key (account and instrument) |
@@ -480,10 +539,12 @@ Replaying every preserved soak database must give identical ledgers and decision
 | Found while tracing | `pnl_evidence`'s closure conservation would have rejected every oversell; it is amended to include the liability | 1, 3.2 |
 | Found while tracing | Heuristic fill matching could pair a cover with an unrelated buy; disabled for quarantined assets | 1, 3.5 |
 | Valuation (audit section 4) | Exposure and equity marks defined separately by sign; gap stress test | 3.3, test 9 |
+| **TP140-R3-01** (rev. 4) non-atomic reads | 3.1 replaced. Sellable is now the minimum of a local bound and a broker bound: the local one immune to position lag, the broker one counting each order at its full original quantity. An activity check covers external executions not yet in positions. Terminal orders stay counted until settled. Matching reads are no longer treated as proof. The residual (an external order after the last read) is stated, and detected by reconciliation. Protective exits are reduced, not refused. | 3.1, 4 (S1), 6, tests 1–4b |
+| R9–R11 (rev. 4) | Decided as above | 8 |
 
 ## 11. Evidence required for implementation approval
 
 1. The A0 verification run concluded, its criteria decided, and its report and database preserved with SHA-256. The operator has reviewed that evidence.
-2. Independent review of rev. 3, sections 3.1, 3.6, 3.7 and 4, with R9 to R11 decided.
+2. Independent review of rev. 4's section 3.1 and its lemma, with R12 decided.
 3. Explicit operator authorization to implement.
-4. Then, before merge: the 22 tests, the full suite, mypy and ruff green; test 21's replay; the operator's review of the Rev.140 zip.
+4. Then, before merge: the 24 tests, the full suite, mypy and ruff green; test 21's replay; the operator's review of the Rev.140 zip.
