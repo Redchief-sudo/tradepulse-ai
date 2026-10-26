@@ -1,9 +1,9 @@
 # Rev.140: unsupported short inventory — design specification
 
-**Status:** revision 5, for independent review. **Design only.**
+**Status:** revision 6, for independent review. **Design only.**
 - This authorization covers design updates, nothing more: no code, schema, test, merge, push or broker order.
 - Implementation starts only after:
-  - the A0 verification run (Mon 2026-10-26 09:00 ET to Tue 2026-10-27 16:30 ET) has concluded;
+  - the A0 verification run (Mon 2026-10-26 16:30 ET to Wed 2026-10-28 16:30 ET, 48 hours) has concluded;
   - its report and database are preserved with SHA-256;
   - its evidence has been reviewed;
   - the operator gives explicit authorization.
@@ -13,6 +13,7 @@
 - **rev. 1** (2026-10-26): first draft.
 - **rev. 2** (2026-10-26): R1 to R3 decisions, immutable records, invariants, recovery, 16 tests.
 - **rev. 3** (2026-10-26): the institutional audit's TP140-01 to TP140-05, and the operator's R4 to R8.
+- **rev. 6** (2026-10-26): TP140-R5-01 (cursor bootstrap, proven by conservation), TP140-R5-02 (late activities: the cursor is never a completeness proof), TP140-R5-03 (obligations survive reservation expiry during submission), and R12 decided by the operator (test-only faults). Contracts, one append-only table (`fill_cursor_bootstrap`) and tests 4k to 4r.
 - **rev. 5** (2026-10-26): TP140-R4-01 (unresolved executions survive the cursor; durable records) and TP140-R4-02 (sell authorization serialized per asset; concurrency tests). Contract and test additions only.
 - **rev. 4** (2026-10-26): TP140-R3-01. Section 3.1 is replaced by a conservative two-bound authorization that does not assume atomic broker reads. R9 to R11 are decided. Change log in section 10.
 
@@ -192,6 +193,72 @@ This is a pre-existing gap in the live runtime, recorded here and closed by this
 - **`reset-integrity`:** refused while **any** unresolved execution is open, regardless of `fill_lookback`. This closes the 24-hour gap above.
 - **Cursor ordering:** a missed fill is recorded before *C* passes it, so a crash leaves either both the row and the cursor advance, or neither.
 
+
+**Bootstrap of *C* for an existing database (TP140-R5-01).**
+
+*C* never comes into existence by assumption. Neither "start at the latest activity", which would violate K1, nor "start at the oldest one returned", which would trust history the broker may not fully provide, is acceptable. *C* is created only by an explicit operator command:
+
+`tradepulse reconcile bootstrap-fill-cursor --reason "<text>"`
+
+**Preconditions:**
+- the account lease is held by the command itself, and no runtime is running;
+- the database is not an evidence database (A1 7.2, 4).
+
+**1. Read the whole history.**
+- `GET /v2/account` (account number checked against `AccountRef`; `created_at` kept), and `GET /v2/positions`.
+- Every activity of **every** type from inception: no `after`, `direction=asc`, paged to exhaustion under A0's page-completeness rule.
+- Every page's raw SHA-256 is recorded.
+
+**2. Inception.** The earliest activity's date must be on or after the account's `created_at` date, and the first cash activity must be a funding flow (`CSD` or `JNLC` in). Otherwise the broker's history cannot be shown to start at the account's beginning: `FILL_HISTORY_INCOMPLETE: inception`.
+
+**3. Position conservation, exact, per asset (P1).**
+- Σ signed FILL quantity, plus Σ in-asset fee quantity (`CFEE` with a quantity), plus every other quantity-changing activity, must equal the broker's position quantity.
+- An activity type that changes quantity in a way the command does not model refuses (`FILL_HISTORY_INCOMPLETE: unmodelled <type>`).
+- Missing early activities show up here, as a position the history does not explain.
+
+**4. Cash conservation, exact to the cent (P1).** Σ of every activity's cash effect (FILL notional by side, and `net_amount` for the rest) must equal the broker's `cash`.
+- This identity must first be shown read-only on the paper account before Task 4 is implemented (evidence item, §11). If it does not hold exactly, the cause is found and documented first; it is not absorbed by a tolerance.
+
+**5. Classify every FILL activity.** Each gets exactly one of:
+
+| Class | When | Written as |
+|---|---|---|
+| `matched_fill` | an exact-ID local `Fill` with identical side, quantity, price and time | outcome |
+| `pre_database` | `transaction_time` before the database's `verification_identity.created_at`, so it is history TradePulse never held. It is explained by P1 and, for positions still open, by the opening checkpoint's inherited inventory. | outcome, with the identity and checkpoint digests as evidence |
+| `legacy_reconciled` | an existing `reconciliation_records` row (`fill`, outcome `matched`/`corrected`) names the activity, even if by the old heuristic | outcome, citing that row's ID and digest. The row itself is unchanged. |
+| (none of these) | | an `unresolved_broker_executions` row |
+
+**6. One write transaction stores:**
+- every outcome and unresolved row;
+- a `fill_cursor_bootstrap` row (append-only, 3.11): account, boundary activity ID, activity count, page digests, the P1 results, the database's SHA-256 beforehand, and the reason;
+- *C* = the last activity ID.
+
+**7. Any failure writes nothing.** Until a bootstrap succeeds:
+- `run`, `scan` and `monitor` refuse to start (`FILL_CURSOR_NOT_BOOTSTRAPPED`);
+- the deployment is rolled back to the Rev.139 build. The new tables are additive, so the old build runs the same database.
+
+Positions are never left half-protected by a Rev.140 runtime that cannot authorize sells.
+
+**Late-arriving activities: *C* is never a completeness proof (TP140-R5-02).**
+- **Why it matters:** Alpaca's activity IDs begin with the transaction time (A0, rev. 3). An activity the broker reports late therefore gets an ID **before** *C*, and `after = C` would never return it.
+- **No published bound:** Alpaca documents no maximum reporting delay.
+- **No usable evidence either:** the preserved databases cannot measure one, because their inboxes were back-filled at each soak's start.
+
+So no time window alone is treated as proof. Every pass:
+1. **Incremental read:** activities after *C*.
+2. **Overlap read:** activities with `after` = *C*'s transaction time − *Δ*, where *Δ* is a validated setting (the overlap window). It defaults to **7 days**, chosen for cost, not as a proven bound. Results are deduplicated by activity ID.
+3. **A late activity** is one found by read 2 or 3 whose ID ≤ *C* and that has no outcome or unresolved row. It is classified in one transaction (outcome or unresolved row), recorded as a `late_activity` reconciliation record with its first-seen time, and alerted critical. K1 is restored before the pass ends.
+4. **Daily full re-read:** once per trading day after the close, every activity since the bootstrap boundary, deduplicated the same way. At today's volume (about 150 fills in three months) this is one or two pages.
+5. **Conservation P1, the completeness proof.**
+   - **When:** every pass for each asset with activity or a pending sell, and for every asset after the daily re-read.
+   - **The equation:** bootstrap baseline + Σ classified quantity activities = broker position quantity, exactly.
+   - **On a mismatch,** sells of that asset are refused immediately (`ACTIVITY_HISTORY_UNPROVEN`). If it persists on the next pass (positions can lag a new fill by one read), the account latches `FILL_HISTORY_INCOMPLETE:<asset>`.
+   - **The cash equation** is checked daily in the same way.
+
+**What this guarantees.** An execution that positions reflect but no read has returned breaks P1. So does one that a read returns late, until it is classified. Neither can pass silently because a cursor moved past its time.
+
+**The A0 run supplies the first real evidence.** Its database keeps each activity page's receipt time (`received_at`, A0's activity cursor). An activity's first observation is the receipt time of the first page that contains it, and its lag is that minus its `transaction_time`. From these the maximum observed lag is measured, and *Δ* is checked against it before implementation (§11). If the preserved database proves not to support this for every activity, that is reported, and the measurement comes instead from a read-only poll log gathered before Task 4.
+
 ### 3.1b Sell authorization is serialized per asset (TP140-R4-02)
 
 **Today:**
@@ -222,6 +289,26 @@ This is a pre-existing gap in the live runtime, recorded here and closed by this
 - Every authorization's *Ω* contains every sell intent committed before it acquired the reservation.
 - **Consequence:** authorizations are totally ordered, and each subtracts the full quantity of every earlier sell that is still unsettled. So Σ quantities submitted ≤ the min bound in force when the first one began, plus only inventory that settlement has since proven. Two protective exits can never both spend the same sellable quantity, whether either was reduced or not.
 - **Across processes:** the reservation is a row in the shared database's `locks` table, so it serializes the monitor inside `run` and a standalone `monitor` command alike. The account lease (Rev.136) separately prevents two runtimes on one account.
+
+
+**Reservation expiry during submission (TP140-R5-03).** A local lease cannot make a broker submission atomic. So the reservation only decides **who may start** an authorization, and never decides whether an obligation exists.
+
+**What exists today:**
+- the submission identity is the intent ID, sent as `client_order_id`, and persisted with status `submitted` before `place_order` (`execution/gateway.py:547-555`);
+- `run_with_lock_renewal` does **not** cancel the work when a renewal fails (`persistence/lock.py:92-99`), so an in-flight `place_order` and its polling run to completion after the lease is lost;
+- an ambiguous response is `submission_unknown`, recovered by `get_order_by_client_order_id`.
+
+**Invariant S3.**
+- Once an intent is persisted at `risk_approved`, its obligation (*a* − *s*, counted in full while unsettled) stays in *Ω* until broker evidence proves it terminal **and** settlement completes.
+- No lease expiry, process exit, timeout, holder change or failed lookup removes it.
+- Recovery by `client_order_id` needs no lease, and can be done by any process.
+
+**Duplicate exits are refused at the gateway, not only in the monitor.** A SELL for an asset with any other TradePulse sell intent in `submitted` or `submission_unknown` is refused (`PRIOR_SUBMISSION_UNRESOLVED`). This is the monitor's `has_in_flight_intent` rule (`monitor/coordinator.py:495`), made a gateway rule. A second holder who acquires an expired reservation therefore cannot place a second exit while the first is unresolved. Even without the rule, S1 and S3 bound it.
+
+**The original holder after losing its lease:**
+- it may finish recording the broker's outcome for its own intent. That is evidence-driven and needs no reservation;
+- it starts nothing new: the existing renewal-failure callback;
+- it never retries a submission.
 
 ### 3.2 Settlement of an oversell
 
@@ -413,9 +500,10 @@ New payload tables, created with `CREATE TABLE IF NOT EXISTS`. They are additive
 | `legacy_lot_conversions` | `lot_id` | |
 | `unresolved_broker_executions` | `activity_id` | 3.1a |
 | `unresolved_execution_outcomes` | `activity_id` | 3.1a |
+| `fill_cursor_bootstrap` | `account_ref` | 3.1a; at most one per account |
 
 **Immutability (R6).**
-- SQLite `BEFORE UPDATE` and `BEFORE DELETE` triggers reject changes on all nine tables.
+- SQLite `BEFORE UPDATE` and `BEFORE DELETE` triggers reject changes on all ten tables.
 - **At startup the runtime verifies that every trigger exists**, with its expected SQL, and refuses to run otherwise (`SCHEMA_TRIGGER_MISSING`).
 - Triggers are stored in the database file, so SQLite's online backup copies them. Test 19 proves a restore keeps them.
 
@@ -433,11 +521,13 @@ Each is checked by reconciliation on every pass, and by the tests.
 | C1 | Per quarantined record and pool: *A* = *R* + *U*, and *U* = 0 when open quantity is 0 | `INTEGRITY_VIOLATION` |
 | I7 | No lot, holding, settlement event or strategy record originates from an oversell's excess, a cover, a surplus or a converted lot | `INTEGRITY_VIOLATION` |
 | I8 | Any open quarantined record, legacy short lot or open unresolved broker execution ⇒ `FINANCIAL_INTEGRITY_BLOCKED` | re-latch at startup and on every pass |
-| I9 | The nine tables are never updated or deleted, and their triggers exist | refusal / `SCHEMA_TRIGGER_MISSING` |
+| I9 | The ten tables are never updated or deleted, and their triggers exist | refusal / `SCHEMA_TRIGGER_MISSING` |
 | I10 | Every financial value is `Decimal`; JSON is parsed with `parse_float=Decimal` | test failure |
 | I11 | Each broker activity ID maps to at most one of: a `Fill`, a `quarantine_executions` row | `INTEGRITY_VIOLATION` |
 | K1 | Every FILL activity at or before the cursor *C* has an exact accounting match or a durable unresolved row; *C* advances only with those writes (3.1a) | refusal to advance; latch |
 | S2 | At most one sell authorization per asset holds the execution reservation; each one's *Ω* contains every earlier committed sell intent (3.1b) | `EXECUTION_RESERVATION_REQUIRED` / `_LOST` |
+| S3 | An intent's sell obligation leaves *Ω* only on broker evidence of a terminal state plus completed settlement, never on lease state, timeout or process exit; a second sell of the asset is refused while any TradePulse sell is `submitted` or `submission_unknown` (3.1b) | `PRIOR_SUBMISSION_UNRESOLVED` |
+| P1 | Bootstrap baseline + Σ classified quantity activities = broker position quantity, per asset, exactly; the cash identity holds daily (3.1a) | sells refused; latch if it persists |
 | S1 | Each order in *Ω* counts exactly once in each bound (*a* − *s* locally, original *q* at the broker). A TradePulse sell leaves *Ω* only when terminal **and** fully settled. Settlement status, `filled_qty` and position freshness never raise sellable. (3.1) | refusal |
 
 ## 5. Recovery behaviour
@@ -467,7 +557,7 @@ Each is checked by reconciliation on every pass, and by the tests.
 | An oversell becomes a liability and a latch | Only on an oversell: none in the inspected databases |
 | The closure conservation check includes the liability | Every settlement; identical without an oversell |
 | Heuristic fill matching disabled for quarantined assets and covers | Only with quarantined records |
-| Seven new tables with triggers; trigger verification at startup | Always; normally empty |
+| Ten new tables with triggers; trigger verification at startup | Always; normally empty |
 | A new final settlement stage | Every settlement; a no-op without a liability |
 
 Replaying every preserved soak database must give identical ledgers and decisions.
@@ -515,6 +605,44 @@ Replaying every preserved soak database must give identical ledgers and decision
    - only after an exact-ID accounted outcome is written does authorization proceed.
 4d. **Crash between detection and cursor advance:** neither the unresolved row nor the advance survives, and the next pass records both. A crash after the commit but before the latch is followed by a re-latch at startup.
 4e. **The cursor never skips:** with an incomplete activity page, *C* does not advance, and the sell check refuses (`ACTIVITY_PAGE_UNPROVEN`).
+
+**Bootstrap and late activities (TP140-R5-01, R5-02):**
+
+4k. **Bootstrap, complete history:**
+   - a simulator account with three months of fills, fees, an inherited position from before the database existed, and one legacy heuristic match;
+   - the bootstrap classifies every FILL (`matched_fill`, `pre_database`, `legacy_reconciled`) and sets *C*;
+   - P1 holds; the bootstrap record's digests reproduce.
+4l. **Bootstrap, missing early history:**
+   - the simulator's activity history is truncated before the first fill; positions are unchanged;
+   - P1 fails: `FILL_HISTORY_INCOMPLETE`, nothing is written, and `run` refuses `FILL_CURSOR_NOT_BOOTSTRAPPED`;
+   - truncating before the funding flow fails the inception check instead.
+4m. **Bootstrap refusals:**
+   - an unmodelled quantity-changing activity type;
+   - a cash identity off by 0.01;
+   - an evidence database;
+   - a runtime holding the lease.
+   Each writes nothing.
+4n. **A delayed activity:**
+   - a FILL is withheld from reads (a new `WITHHOLD_ACTIVITY(id, until)` simulator fault) while positions already reflect it;
+   - P1 fails and sells of the asset are refused (`ACTIVITY_HISTORY_UNPROVEN`) on the first pass; the latch is set on the second;
+   - *C* advances past its timestamp with later activities;
+   - when the activity becomes visible, the overlap read finds it (ID ≤ *C*); it is classified and alerted `late_activity`, and P1 holds again;
+   - with *Δ* shorter than the delay, the daily full re-read finds it instead.
+4o. **Deduplication:** the same activity returned by the incremental, overlap and full reads produces one classification and one row.
+
+**Expiry during submission (TP140-R5-03):**
+
+4p. **The lease expires while `place_order` is in flight:**
+   - `HOLD_CALL("place_order")` blocks the first holder's request while the clock passes the lease TTL;
+   - a second holder acquires the reservation; its sell is refused `PRIOR_SUBMISSION_UNRESOLVED`;
+   - the call is released, and the first holder records the outcome and starts nothing new;
+   - exactly one exit exists at the broker.
+4q. **Ambiguous submission, then a restart:**
+   - `SUBMIT_AMBIGUOUS_ACCEPTED` plus lease expiry plus a process restart;
+   - the intent stays `submission_unknown` with its full obligation;
+   - a new runtime's exit is refused until recovery by `client_order_id` finds the order;
+   - Σ submitted ≤ the bound, and no duplicate.
+4r. **The first holder's late response after the second acquired:** its outcome is recorded once, and nothing is resubmitted. The second holder's *Ω* still counted it in full throughout.
 
 **Concurrent protective exits (TP140-R4-02).** Each runs as concurrent asyncio tasks against one gateway, and again against two gateways on separate connections to the same database file. The fixture is 10 shares, with an earlier sell of 4 partially filled (2), its fills delayed, and settlement lagging:
 
@@ -597,7 +725,7 @@ Replaying every preserved soak database must give identical ledgers and decision
     - an evidence database is refused;
     - a replay of the fixture is identical every time.
 19. **Triggers:**
-    - `UPDATE` and `DELETE` are refused on all nine tables;
+    - `UPDATE` and `DELETE` are refused on all ten tables;
     - a database missing one trigger is refused at startup;
     - an online backup and restore keeps every trigger.
 20. **Checkpoint compatibility (R7):**
@@ -613,8 +741,10 @@ Replaying every preserved soak database must give identical ledgers and decision
 - **R10. Approved:** at most 3 attempts, then refusal on unresolved inconsistency. Agreement between reads is not proof of atomicity (3.1).
 - **R11. Approved:** adopting unmanaged long inventory stays outside Rev.140. A resolved liability never turns its surplus into strategy inventory automatically.
 
-**Still open:**
-- **R12. The two new simulator faults** (`POSITIONS_LAG`, `STEP_BETWEEN`) go in `tradepulse/broker/simulated.py` beside Rev.135's faults. They are test-only behaviour in a production module, as Rev.135's are. Confirm.
+- **R12. Approved (2026-10-26):** the simulator faults live beside Rev.135's in `tradepulse/broker/simulated.py`. They are `POSITIONS_LAG`, `STEP_BETWEEN`, `ACCEPT_OVERSELL`, `OVERFILL`, `WITHHOLD_ACTIVITY` and `HOLD_CALL`. Conditions:
+  - they are reachable only through `SimulatedBroker` methods;
+  - no `Settings` key, environment variable or CLI flag can enable them;
+  - production broker construction (`build_broker`) never returns a `SimulatedBroker`. Tests prove each condition.
 
 ## 9. Consistency with A1
 
@@ -623,7 +753,9 @@ Replaying every preserved soak database must give identical ledgers and decision
 | The fill cursor *C*, unresolved executions, S2 | Per account: *C* and the unresolved records gain `account_key`, and the reservation is per position key (A1 3). |
 | The sellable bound and S1 | Per account: *L* from that account's lots, *P*, *O₁*, *O₂* and *A* from that account's broker, *Ω* keyed by `(account_key, broker_order_id)`. Read outside the risk decision window (A1 6.3). A1 6.4's freshness rule applies to the reads, but freshness is not treated as atomicity. |
 | Activity IDs, `fill:cash:<id>`, I11 | The A1 canonical ID `<account_key>\|<venue>\|ExecutionEvent\|<broker id>` (A1 5.2). Cash keys gain the account (A1 3). |
-| The nine tables and their triggers | Gain `account_key`. A1's migration (7.3) must re-create every trigger after any table rebuild, and the 7.4 equivalence checks include them. |
+| The cursor bootstrap and P1 (rev. 6) | Per account: one `fill_cursor_bootstrap` row per `account_key`, and P1 per position key. A1's migration may not create *C* for a new account by any route other than the bootstrap command. |
+| S3 and `PRIOR_SUBMISSION_UNRESOLVED` (rev. 6) | Per position key; the submission identity stays the intent ID sent as `client_order_id` (A1 5.2). |
+| The ten tables and their triggers | Gain `account_key`. A1's migration (7.3) must re-create every trigger after any table rebuild, and the 7.4 equivalence checks include them. |
 | I2 | Per position key (account and instrument) |
 | Quarantined records in risk | Counted in A1's consolidated exposure and equity by the sign rules of 3.3 (A1 6.7) |
 | The latch | A1's per-account integrity cause; entries blocked globally (A1 6.6) |
@@ -648,11 +780,18 @@ Replaying every preserved soak database must give identical ledgers and decision
 | **TP140-R3-01** (rev. 4) non-atomic reads | 3.1 replaced. Sellable is now the minimum of a local bound and a broker bound: the local one immune to position lag, the broker one counting each order at its full original quantity. An activity check covers external executions not yet in positions. Terminal orders stay counted until settled. Matching reads are no longer treated as proof. The residual (an external order after the last read) is stated, and detected by reconciliation. Protective exits are reduced, not refused. | 3.1, 4 (S1), 6, tests 1–4b |
 | R9–R11 (rev. 4) | Decided as above | 8 |
 | **TP140-R4-01** (rev. 5) cursor safety | A durable per-account fill cursor *C* that advances only with an outcome or an unresolved row for every activity (K1). Durable unresolved-execution records, at any age, block sells of that asset and `reset-integrity`. Outcomes only from exact-ID accounting evidence. Closes today's 24-hour `fill_lookback` ageing gap. | 3.1, 3.1a, 3.11, 4 (K1, I8), tests 4c–4e |
+| **TP140-R5-01** (rev. 6) cursor bootstrap | *C* is created only by `reconcile bootstrap-fill-cursor`: full history read, an inception check, exact position and cash conservation (P1), and a classification for every FILL (`matched_fill`, `pre_database`, `legacy_reconciled` or unresolved) with legacy evidence cited, not rewritten. Any failure writes nothing, the runtime refuses to start, and the deployment rolls back. | 3.1a, 4 (P1), tests 4k–4m |
+| **TP140-R5-02** (rev. 6) late activities | *C* is an optimization, not proof. An overlap read (*Δ* = 7 days, not a proven bound), a daily full re-read, deduplication by activity ID, and `late_activity` classification. Completeness rests on P1 every pass: sells refused on a mismatch, latch if it persists. *Δ* is checked against the A0 run's measured lag. | 3.1a, 4 (P1), tests 4n–4o |
+| **TP140-R5-03** (rev. 6) expiry in flight | Obligations tied to the submission identity (S3), never to the lease. A gateway-level `PRIOR_SUBMISSION_UNRESOLVED` rule against duplicate exits. The original holder only records its outcome. | 3.1b, 4 (S3), tests 4p–4r |
+| R12 (rev. 6) | Approved as test-only: no settings or CLI path; `build_broker` never returns the simulator | 8 |
 | **TP140-R4-02** (rev. 5) concurrent exits | The reservation is mandatory for sells and verified before any read. A fixed order of operations, with the intent persisted before release. Invariant S2 (total order), across processes. | 3.1b, 4 (S2), tests 4f–4j |
 
 ## 11. Evidence required for implementation approval
 
 1. The A0 verification run concluded, its criteria decided, and its report and database preserved with SHA-256. The operator has reviewed that evidence.
-2. Independent review of rev. 5's sections 3.1 to 3.1b, with R12 decided.
-3. Explicit operator authorization to implement.
-4. Then, before merge: the 32 tests, the full suite, mypy and ruff green; test 21's replay; the operator's review of the Rev.140 zip.
+2. Independent review of rev. 6's sections 3.1 to 3.1b.
+3. **Read-only evidence before Task 4,** each kept in `~/tradepulse-evidence/` with a manifest:
+   - the cash identity of 3.1a step 4 shown exactly on the paper account;
+   - the A0 run's maximum observed activity lag, measured, with *Δ* checked against it.
+4. Explicit operator authorization to implement.
+5. Then, before merge: the 40 tests, the full suite, mypy and ruff green; test 21's replay; the operator's review of the Rev.140 zip.

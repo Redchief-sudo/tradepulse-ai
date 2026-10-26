@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** prepared for review. **Not to be executed** until every gate in "Before Task 1" is met.
+**Status:** revision 2 (spec rev. 6), prepared for review. **Not to be executed** until every gate in "Before Task 1" is met.
 
 **Goal:** TradePulse cannot knowingly submit an oversell. An actual broker oversell is preserved whole and quarantined as a short-exposure liability, which TradePulse never trades automatically. Only verified broker evidence, through an operator command, resolves it.
 
@@ -18,21 +18,24 @@
 - `Decimal` for every financial value;
 - `SimulatedBroker` and `ManualClock` from Rev.133–135.
 
-**Spec:** `docs/superpowers/specs/2026-10-26-rev140-unsupported-short-inventory-design.md`, rev. 5 (branch `rev140-design`). Section numbers below (§) refer to it.
+**Spec:** `docs/superpowers/specs/2026-10-26-rev140-unsupported-short-inventory-design.md`, rev. 6 (branch `rev140-design`). Section numbers below (§) refer to it.
 
 ## Before Task 1 (gates; none is a code step)
 
 1. **The A0 run:** concluded, its 11 criteria decided, and its report and database preserved with SHA-256. The operator has reviewed that evidence.
-2. **Independent review** of spec rev. 5, §3.1 to §3.1b, done, with R12 (the simulator faults in Task 1) decided.
-3. **Explicit operator authorization** to implement Rev.140.
-4. **No soak or verification generation** is running from the main checkout (soak source guard). Work happens in a fresh worktree from main at that moment, branch `rev140`. The design branch is merged into it first, so the spec travels with the code.
+2. **Independent review** of spec rev. 6, §3.1 to §3.1b, done. R12 is approved (spec §8): the faults in Task 1 are test-only.
+3. **Read-only evidence before Task 4** (spec §11.3), each kept in `~/tradepulse-evidence/` with a manifest:
+   - the cash identity of §3.1a step 4 shown exactly on the paper account; a mismatch is explained and documented first, never absorbed by a tolerance;
+   - the A0 run's maximum observed activity lag, measured from its activity-page receipt times (spec §3.1a), with the overlap window *Δ* (default 7 days) checked against it.
+4. **Explicit operator authorization** to implement Rev.140.
+5. **No soak or verification generation** is running from the main checkout (soak source guard). Work happens in a fresh worktree from main at that moment, branch `rev140`. The design branch is merged into it first, so the spec travels with the code.
 
-**Rev.140 is one Rev.** Each task below is one commit on `rev140`, with its subject ending `(Rev.140 task N)`. Work stops after Task 13 for the operator's review. Merge (fast-forward main, push, zip) happens only after approval.
+**Rev.140 is one Rev.** Each task below is one commit on `rev140`, with its subject ending `(Rev.140 task N)`. Work stops after Task 14 for the operator's review. Merge (fast-forward main, push, zip) happens only after approval.
 
 ## Global Constraints
 
 - Every financial value is `Decimal`. JSON is parsed with `parse_float=Decimal`. No `float` reaches a ledger, a bound or a comparison (spec I10).
-- No existing ledger row, lot, fill, settlement event or broker payload is ever rewritten. All nine new tables are insert-only, enforced by triggers (spec §3.11, I9).
+- No existing ledger row, lot, fill, settlement event or broker payload is ever rewritten. All ten new tables are insert-only, enforced by triggers (spec §3.11, I9).
 - The cash key for every broker execution is `fill:cash:<activity id>`, one entry per execution (I1).
 - Refusal reasons are exactly the strings in the spec:
   - `INSUFFICIENT_SELLABLE_QUANTITY`
@@ -55,9 +58,14 @@
   - `BROKER_EVIDENCE_CHANGED`
   - `QUARANTINED_INVENTORY`
   - `ACCOUNT_LEASE_HELD`
+  - `FILL_CURSOR_NOT_BOOTSTRAPPED`
+  - `FILL_HISTORY_INCOMPLETE` (with a `: inception`, `: unmodelled <type>` or `:<asset>` suffix)
+  - `ACTIVITY_HISTORY_UNPROVEN`
+  - `PRIOR_SUBMISSION_UNRESOLVED`
 - **Snapshot attempts:** at most **3**; then refuse (R10).
 - **Rounding:** fee shares use `ROUND_DOWN` at the posted fee's own quantum. The final share of a record and pool takes the exact remainder (§3.6).
-- **No new broker call** outside the gateway's four reads (§3.1) and `quarantine resolve`'s activity read. **No order** is ever placed by Rev.140 code except through the existing gateway path.
+- **No new broker call** outside the gateway's four reads (§3.1), `quarantine resolve`'s activity read, `bootstrap-fill-cursor`'s account, position and activity reads, and reconciliation's overlap and daily full activity reads (§3.1a). All are reads.
+- **Overlap window *Δ*:** setting `fill_overlap_days`, default 7, validated > 0; not a proven bound (§3.1a). **No order** is ever placed by Rev.140 code except through the existing gateway path.
 - `BrokerPort` and `OrderState` are unchanged. An order's original quantity and client order ID are read from `OrderState.raw["qty"]` and `raw["client_order_id"]`.
 - Every task ends with `.venv/bin/python -m pytest python_tests -q`, `.venv/bin/ruff check tradepulse python_tests` and `.venv/bin/mypy tradepulse` all clean.
 
@@ -66,10 +74,10 @@
 Inputs the spec implies that no task's own tests would otherwise exercise. Each line's test is added to the owning task.
 
 1. **A broker open sell with `qty: null`** (a notional order, from outside TradePulse) → `INVENTORY_EVIDENCE_INVALID`, never treated as 0. *Task 3, `test_notional_open_order_refuses`.*
-2. **A crypto position whose broker quantity is below local lots** because an in-asset fee (`CFEE`) has not settled yet → sellable = *P*. The protective exit is reduced, never refused, and never sells above *P*. *Task 5, `test_crypto_cfee_lag_reduces_not_refuses`.*
+2. **A crypto position whose broker quantity is below local lots** because an in-asset fee (`CFEE`) has not settled yet → sellable = *P*. The protective exit is reduced, never refused, and never sells above *P*. *Task 6, `test_crypto_cfee_lag_reduces_not_refuses`.*
 3. **A restarted runtime finding an open unresolved execution** written by a previous process, with no latch set (latch call lost) → re-latched at startup before any lane runs. *Task 4, `test_startup_relatches_open_unresolved`.*
-4. **An option position** (multiplier 100) oversold by 1 contract → the liability's proceeds use the multiplier, and the valuation identity holds to the cent. *Task 6, `test_option_oversell_uses_multiplier`.*
-5. **`quarantine resolve` run while the trading runtime holds the account lease** → refused (`ACCOUNT_LEASE_HELD`). It must not race settlement on the same database. *Task 10, `test_resolve_refuses_while_runtime_leased`.*
+4. **An option position** (multiplier 100) oversold by 1 contract → the liability's proceeds use the multiplier, and the valuation identity holds to the cent. *Task 7, `test_option_oversell_uses_multiplier`.*
+5. **`quarantine resolve` run while the trading runtime holds the account lease** → refused (`ACCOUNT_LEASE_HELD`). It must not race settlement on the same database. *Task 11, `test_resolve_refuses_while_runtime_leased`.*
 
 ---
 
@@ -77,15 +85,17 @@ Inputs the spec implies that no task's own tests would otherwise exercise. Each 
 
 | File | Responsibility |
 |---|---|
-| `tradepulse/broker/simulated.py` (modify) | Four test faults: `POSITIONS_LAG`, `STEP_BETWEEN`, `ACCEPT_OVERSELL`, `OVERFILL` |
-| `tradepulse/persistence/database.py` (modify) | Nine tables, their triggers, `verify_schema_triggers` |
-| `tradepulse/persistence/repositories.py` (modify) | Nine repositories on `PersistenceRepositories` |
-| `tradepulse/models/quarantine.py` (create) | The nine record dataclasses |
-| `tradepulse/persistence/hydration.py` (modify) | Hydrators for the nine records; `SettlementEvent.liability_hold_projected` |
+| `tradepulse/broker/simulated.py` (modify) | Six test faults: `POSITIONS_LAG`, `STEP_BETWEEN`, `ACCEPT_OVERSELL`, `OVERFILL`, `WITHHOLD_ACTIVITY`, `HOLD_CALL` |
+| `tradepulse/persistence/database.py` (modify) | Ten tables, their triggers, `verify_schema_triggers` |
+| `tradepulse/persistence/repositories.py` (modify) | Ten repositories on `PersistenceRepositories` |
+| `tradepulse/models/quarantine.py` (create) | The ten record dataclasses |
+| `tradepulse/persistence/hydration.py` (modify) | Hydrators for the ten records; `SettlementEvent.liability_hold_projected` |
 | `tradepulse/execution/sellable.py` (create) | The pure bound: pending set, both bounds, the decision |
 | `tradepulse/reconciliation/unresolved.py` (create) | Fill cursor *C*, unresolved executions, outcomes (K1) |
+| `tradepulse/reconciliation/bootstrap.py` (create) | `bootstrap-fill-cursor`: inception, P1, classification, the bootstrap record (§3.1a) |
+| `tradepulse/reconciliation/completeness.py` (create) | Overlap and daily full re-reads, `late_activity`, per-pass P1 (§3.1a) |
 | `tradepulse/reconciliation/coordinator.py` (modify) | Write unresolved rows, advance *C*; I2; `UNEXPLAINED_SHORT_POSITION`; heuristic disabled on quarantined assets |
-| `tradepulse/execution/gateway.py` (modify) | Mandatory reservation; four reads with retry; reduce or refuse; no cover path |
+| `tradepulse/execution/gateway.py` (modify) | Mandatory reservation; four reads with retry; reduce or refuse; no cover path; `PRIOR_SUBMISSION_UNRESOLVED` (S3) |
 | `tradepulse/settlement/engine.py`, `stages.py`, `accounting.py` (modify) | Liability instead of a short lot; closure conservation with *Q*; `project_liability_hold`; flag lists |
 | `tradepulse/monitor/coordinator.py` (modify) | No orders on negative or quarantined assets; alerts |
 | `tradepulse/valuation.py`, `tradepulse/risk/engine.py` (modify) | Signed valuation and exposure of quarantined records (§3.3) |
@@ -94,14 +104,14 @@ Inputs the spec implies that no task's own tests would otherwise exercise. Each 
 | `tradepulse/quarantine/resolve.py` (create) | `quarantine resolve`; exactly once (§3.7) |
 | `tradepulse/quarantine/legacy.py` (create) | Legacy short-lot detection and `adopt-legacy-lot` (§3.9) |
 | `tradepulse/quarantine/corporate_actions.py` (create) | The fail-closed corporate-action refusal (§3.10) |
-| `tradepulse/session_commands.py` (modify) | `reset-integrity` gates |
-| `tradepulse/cli.py` (modify) | `quarantine resolve`, `quarantine adopt-legacy-lot` |
+| `tradepulse/session_commands.py` (modify) | `reset-integrity` gates; startup refusal before bootstrap |
+| `tradepulse/cli.py` (modify) | `quarantine resolve`, `quarantine adopt-legacy-lot`, `reconcile bootstrap-fill-cursor` |
 | `python_tests/test_rev140_*.py` (create) | One file per task, named below |
-| `docs/rev140-unsupported-short-inventory.md` (create, Task 13) | The Rev record |
+| `docs/rev140-unsupported-short-inventory.md` (create, Task 14) | The Rev record |
 
 ---
 
-### Task 1: Simulator test faults (R12)
+### Task 1: Simulator test faults (R12, approved as test-only)
 
 **Files:**
 - Modify: `tradepulse/broker/simulated.py:148-175` (the `Fault` enum and `_FAULT_SCOPE`), and the order-acceptance check near `:1194`
@@ -113,7 +123,10 @@ Inputs the spec implies that no task's own tests would otherwise exercise. Each 
   - `SimulatedBroker.lag_positions(executions: int) -> None`: `get_positions` serves the view from that many executions ago, until `lag_positions(0)`;
   - `SimulatedBroker.step_before(call: str, action: Callable[[], None]) -> None`: runs `action` once, immediately before the next call named `call` (`"get_open_orders"`, `"get_positions"` or `"get_activities"`);
   - `SimulatedBroker.overfill_next(extra: Decimal) -> None`: the next fill of the next order executes `extra` more than ordered;
-  - with `ACCEPT_OVERSELL` injected, the `:1194` insufficient-quantity 403 is skipped for the next `times` orders.
+  - with `ACCEPT_OVERSELL` injected, the `:1194` insufficient-quantity 403 is skipped for the next `times` orders;
+  - `SimulatedBroker.withhold_activity(activity_id: str, until: datetime) -> None` (`WITHHOLD_ACTIVITY`): `get_activities` omits that activity until the simulator clock reaches `until`, while positions and cash already reflect it. Its ID is unchanged, so it sorts before activities created meanwhile;
+  - `SimulatedBroker.hold_call(call: str) -> Callable[[], None]` (`HOLD_CALL`): the next call named `call` (e.g. `"place_order"`) blocks until the returned release function is called; the order is accepted at the broker when the call is entered, not when released.
+- **R12 conditions (spec §8):** no `Settings` key, environment variable or CLI flag reaches any fault, and `build_broker` (`session_commands.py:58`) never returns a `SimulatedBroker`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -123,10 +136,14 @@ async def test_step_before_runs_once_before_named_call(sim): ... # action fills 
 async def test_accept_oversell_skips_insufficient_qty(sim): ...  # held 10, inject(ACCEPT_OVERSELL); place_order(qty=12, SELL) accepted; position -2
 async def test_overfill_next_fills_more_than_ordered(sim): ...   # held 10; overfill_next(Decimal("2")); sell 10 -> FILL qty 12; raw order qty "10"
 async def test_open_order_raw_carries_qty_and_client_id(sim): ...# raw["qty"] == "10" and raw["client_order_id"] == the request's
+async def test_withhold_activity_hidden_until_then_visible(sim): ...# fill; withhold_activity(id, t+2d); position reflects it; activities omit it; clock t+2d -> present, same id
+async def test_hold_call_blocks_until_released(sim): ...          # release = hold_call("place_order"); task pending; broker open orders already show it; release() -> task returns it
+def test_faults_unreachable_from_settings_env_or_cli(): ...       # no Settings field, env var or argparse option names any Fault member (introspection over Settings, os.environ use and cli parser)
+def test_build_broker_never_returns_simulator(): ...              # for every broker setting value accepted by Settings, build_broker returns a non-SimulatedBroker or raises
 ```
 
-- [ ] **Step 2:** Run `.venv/bin/python -m pytest python_tests/test_simulated_broker.py -q -k "lag or step_before or oversell or overfill or raw_carries"`. Expected: FAIL (attributes are missing).
-- [ ] **Step 3:** Implement the four faults. Every injected fault is recorded in the simulator's existing fault log (as for Rev.135), so a test can assert that it fired.
+- [ ] **Step 2:** Run `.venv/bin/python -m pytest python_tests/test_simulated_broker.py -q -k "lag or step_before or oversell or overfill or raw_carries or withhold or hold_call or unreachable or never_returns"`. Expected: FAIL (attributes are missing).
+- [ ] **Step 3:** Implement the six faults and the two methods. Every injected fault is recorded in the simulator's existing fault log (as for Rev.135), so a test can assert that it fired.
 - [ ] **Step 4:** Run the same command. Expected: PASS. Then run the full suite, ruff and mypy.
 - [ ] **Step 5:** Commit: `test(broker): simulator faults for position lag, interleaving and oversell (Rev.140 task 1)`.
 
@@ -134,8 +151,8 @@ async def test_open_order_raw_carries_qty_and_client_id(sim): ...# raw["qty"] ==
 
 **Files:**
 - Modify: `tradepulse/persistence/database.py`:
-  - `SCHEMA`: add nine `CREATE TABLE IF NOT EXISTS`;
-  - `EVIDENCE_TABLES`: add the nine;
+  - `SCHEMA`: add ten `CREATE TABLE IF NOT EXISTS`;
+  - `EVIDENCE_TABLES`: add the ten;
   - new `QUARANTINE_TABLES` and `verify_schema_triggers`.
 - Modify: `tradepulse/persistence/repositories.py:667` (`PersistenceRepositories`).
 - Create: `tradepulse/models/quarantine.py`.
@@ -154,6 +171,7 @@ async def test_open_order_raw_carries_qty_and_client_id(sim): ...# raw["qty"] ==
     - `legacy_lot_conversions(lot_id UNIQUE)`
     - `unresolved_broker_executions`
     - `unresolved_execution_outcomes`
+    - `fill_cursor_bootstrap(account_ref UNIQUE)`
   - **Triggers:** `quarantine_no_update_<table>` and `quarantine_no_delete_<table>`, each `BEFORE ... BEGIN SELECT RAISE(ABORT, '<table> is append-only'); END`.
   - **Startup check:** `verify_schema_triggers(connection) -> None` raises `DatabaseError("SCHEMA_TRIGGER_MISSING:<name>")` when any trigger is absent, or its `sqlite_master.sql` differs from the expected text. It is called from `AsyncSQLiteDatabase.initialize` after `initialize_identity`.
   - **Models** in `tradepulse/models/quarantine.py`: frozen, slotted dataclasses, validated as in `models/settlement.py`:
@@ -165,14 +183,15 @@ async def test_open_order_raw_carries_qty_and_client_id(sim): ...# raw["qty"] ==
     - `QuarantineFeeRecognition(record_id, event_id, pool, amount, recognized_at)`
     - `LegacyLotConversion(lot_id, liability_id, lot_digest, converted_at, reason)`
     - `UnresolvedBrokerExecution(activity_id, asset_key, side, quantity, price, transaction_time, raw_sha256, first_seen_at, pass_id)`
-    - `UnresolvedExecutionOutcome(activity_id, outcome: Literal["matched_fill","quarantine_execution"], matched_record_id, evidence_sha256, resolved_at)`
+    - `UnresolvedExecutionOutcome(activity_id, outcome: Literal["matched_fill","quarantine_execution","pre_database","legacy_reconciled"], matched_record_id, evidence_sha256, resolved_at)`
+    - `FillCursorBootstrap(account_ref, boundary_activity_id, activity_count, page_sha256s: tuple[str, ...], position_results, cash_result, database_sha256_before, reason, created_at)`
   - **Repositories:** `PersistenceRepositories` gains attributes with the table names, each a `RecordRepository`.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-async def test_nine_tables_exist(db): ...                       # names == QUARANTINE_TABLES
-async def test_update_and_delete_refused_on_every_table(db): ...# parametrized over 9 tables x {UPDATE, DELETE}; sqlite3 raises "append-only"
+async def test_ten_tables_exist(db): ...                       # names == QUARANTINE_TABLES
+async def test_update_and_delete_refused_on_every_table(db): ...# parametrized over 10 tables x {UPDATE, DELETE}; sqlite3 raises "append-only"
 async def test_missing_trigger_refused_at_initialize(tmp_path): # drop one trigger, re-initialize -> DatabaseError "SCHEMA_TRIGGER_MISSING:quarantine_no_update_quarantine_executions"
 async def test_backup_restore_keeps_triggers(tmp_path): ...     # sqlite3 backup API to new file; verify_schema_triggers passes on it
 async def test_new_tables_mark_ever_evidence(db): ...           # insert one liability -> verification_identity.ever_evidence == 1
@@ -281,7 +300,46 @@ async def test_k1_every_activity_at_or_before_c_accounted_or_recorded(runtime): 
 - [ ] **Step 4:** Run it. Expected: PASS. Then the full suite, ruff and mypy.
 - [ ] **Step 5:** Commit: `feat(reconciliation): durable fill cursor and unresolved executions (Rev.140 task 4)`.
 
-### Task 5: Gateway sell authorization (§3.1, §3.1b)
+### Task 5: Cursor bootstrap and history completeness (§3.1a, TP140-R5-01, R5-02)
+
+**Files:**
+- Create: `tradepulse/reconciliation/bootstrap.py`, `tradepulse/reconciliation/completeness.py`
+- Modify: `tradepulse/reconciliation/coordinator.py` (`_reconcile_fills` calls the completeness pass), `tradepulse/cli.py` (`reconcile bootstrap-fill-cursor`; `run`, `scan` and `monitor` refuse before bootstrap), `tradepulse/config/settings.py` (`fill_overlap_days`)
+- Test: `python_tests/test_rev140_bootstrap.py`, `python_tests/test_rev140_late_activity.py`
+
+**Interfaces:**
+- Consumes: Task 1's `withhold_activity`; Task 2's `FillCursorBootstrap`; Task 4's `record_pass`, `fill_cursor`, `open_unresolved`; A0's page-completeness rule.
+- Produces:
+  - `bootstrap_fill_cursor(repositories, broker, account_ref, *, reason: str, now: datetime) -> FillCursorBootstrap`. Preconditions: it holds the account lease itself, and the database is not an evidence database. It reads the account, positions and every activity of every type from inception, then checks in order: inception (`FILL_HISTORY_INCOMPLETE: inception`), unmodelled quantity types (`FILL_HISTORY_INCOMPLETE: unmodelled <type>`), P1 per asset, and the cash identity to the cent (`FILL_HISTORY_INCOMPLETE:<asset>` or `:cash`). It classifies every FILL as `matched_fill`, `pre_database` (before `verification_identity.created_at`), `legacy_reconciled` (citing the existing `reconciliation_records` row, unchanged) or unresolved. All rows, the bootstrap record and *C* are written in one transaction; any failure writes nothing.
+  - `require_bootstrapped(repositories, account_ref) -> None`: raises `FILL_CURSOR_NOT_BOOTSTRAPPED`; called at the start of `run`, `scan` and `monitor`.
+  - `completeness_pass(repositories, broker, *, now: datetime, full: bool) -> CompletenessResult`: the incremental read, the overlap read from *C*'s transaction time − *Δ*, and (when `full`) every activity since the bootstrap boundary, deduplicated by activity ID. Each activity with ID ≤ *C* and no outcome or unresolved row is classified in one transaction and recorded as a `late_activity` reconciliation record with its first-seen time, alerted critical. Then P1 per asset.
+  - `CompletenessResult(late_activity_ids: tuple[str, ...], p1_failures: tuple[str, ...])`.
+  - `history_unproven(repositories, asset_key: str) -> bool`, read by Task 6's gateway: true while the latest pass's P1 failed for the asset (`ACTIVITY_HISTORY_UNPROVEN`). A second consecutive failure latches `FILL_HISTORY_INCOMPLETE:<asset>`.
+  - The daily full pass runs once per trading day after the close; the cash identity is checked in it.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+async def test_bootstrap_complete_history(runtime): ...            # spec 4k: 3 months of fills + fees, a pre-database position, one legacy heuristic match;
+                                                                 # each FILL classified once; P1 holds; C == last id; record digests reproduce
+async def test_bootstrap_missing_early_history_refuses(runtime): ... # spec 4l: activities truncated before first fill -> FILL_HISTORY_INCOMPLETE; no row written;
+                                                                 # require_bootstrapped raises FILL_CURSOR_NOT_BOOTSTRAPPED
+async def test_bootstrap_truncated_before_funding_fails_inception(runtime): ... # spec 4l
+async def test_bootstrap_refusals_write_nothing(runtime): ...       # spec 4m, parametrized: unmodelled type, cash off by Decimal("0.01"), evidence db, lease held
+async def test_legacy_record_cited_not_rewritten(runtime): ...      # reconciliation_records row bytes identical after bootstrap; outcome cites its id and digest
+async def test_delayed_activity_found_by_overlap(runtime): ...      # spec 4n: withhold_activity; first pass ACTIVITY_HISTORY_UNPROVEN, sell refused; second pass latched;
+                                                                 # C advances past it; on release overlap read classifies it, late_activity alert, P1 holds
+async def test_delay_beyond_overlap_found_by_full_reread(runtime): ... # spec 4n: fill_overlap_days=1, delay 3 days -> found by full pass
+async def test_same_activity_three_reads_one_row(runtime): ...      # spec 4o
+async def test_position_lag_one_pass_does_not_latch(runtime): ...   # lag_positions(1) for one pass: sells refused, no latch; next pass P1 holds
+```
+
+- [ ] **Step 2:** Run `.venv/bin/python -m pytest python_tests/test_rev140_bootstrap.py python_tests/test_rev140_late_activity.py -q`. Expected: FAIL.
+- [ ] **Step 3:** Implement. P1 sums the classified quantity activities after the bootstrap baseline; any activity type that changes quantity and is not modelled refuses rather than being ignored.
+- [ ] **Step 4:** Run it. Expected: PASS. Then the full suite, ruff and mypy.
+- [ ] **Step 5:** Commit: `feat(reconciliation): fill-cursor bootstrap and history completeness (Rev.140 task 5)`.
+
+### Task 6: Gateway sell authorization (§3.1, §3.1b)
 
 **Files:**
 - Modify: `tradepulse/execution/gateway.py:200-560`
@@ -296,11 +354,13 @@ async def test_k1_every_activity_at_or_before_c_accounted_or_recorded(runtime): 
 - Produces: `ExecutionGateway.execute_intent` behaviour, in this order for a SELL:
   1. **Token:** `request.symbol_lock_owner_token is None` → `rejected`, `EXECUTION_RESERVATION_REQUIRED`, before any read.
   2. **Reservation:** `renew_lock` fails → `EXECUTION_RESERVATION_LOST`.
-  3. **Quarantine:** an open quarantined record or an open unresolved execution on the asset → `UNSUPPORTED_SHORT_POSITION` or `UNRESOLVED_BROKER_EXECUTION`.
+  3. **Quarantine and history:** an open quarantined record, an open unresolved execution, or `history_unproven` on the asset → `UNSUPPORTED_SHORT_POSITION`, `UNRESOLVED_BROKER_EXECUTION` or `ACTIVITY_HISTORY_UNPROVEN`. Any other TradePulse SELL intent on the asset in `submitted` or `submission_unknown` → `PRIOR_SUBMISSION_UNRESOLVED` (S3).
   4. **Reads,** up to 3 attempts: *O₁*, *P*, *O₂*, then *A* = activities after *C* for the asset. A read failure → the matching `BROKER_*_UNAVAILABLE`. An unmatched FILL in *A* → `UNRECONCILED_BROKER_ACTIVITY`. Unproven pages → `ACTIVITY_PAGE_UNPROVEN`.
   5. **Size:** `compute_sellable`, then `size_sell(protective=protective_exit)`. A reduction alerts warning `SELLABLE_BELOW_REQUESTED` with both bounds.
   6. **Short guards:** *P* ≤ 0, or a BUY against *P* < 0 → `UNSUPPORTED_SHORT_POSITION`. The `held_quantity < 0` branch of `protective_exit` (`gateway.py:266-267`) is removed.
   7. **Then today's sequence:** `risk_approved`, the fence, `submitted`, submit.
+
+  **S3:** an intent at `risk_approved` or later stays in *Ω* until broker evidence proves it terminal and settlement completes; no lease loss, timeout, process exit or failed lookup removes it. After losing its lease, a holder only records the outcome of its own in-flight intent, starts nothing new and never resubmits.
 
   Every refusal returns `ExecutionResult("rejected", None, [reason], Decimal("0"), None)`, writes no intent row and releases nothing.
 
@@ -319,14 +379,20 @@ async def test_unstable_three_times_refuses_unchanged(runtime): ...        # spe
 async def test_external_fill_between_reads_caught_by_activities(runtime): ... # spec 4b
 async def test_buy_against_negative_position_refused(runtime): ...         # cover path removed
 async def test_crypto_cfee_lag_reduces_not_refuses(runtime): ...           # Review Focus 2
+async def test_lease_expires_during_place_order(runtime): ...             # spec 4p: hold_call("place_order"); clock past TTL; second holder refused PRIOR_SUBMISSION_UNRESOLVED;
+                                                                         # release; first holder records outcome only; exactly one exit at broker
+async def test_ambiguous_submission_lease_expiry_restart(runtime): ...    # spec 4q: SUBMIT_AMBIGUOUS_ACCEPTED + expiry + new runtime; intent submission_unknown, full obligation;
+                                                                         # exit refused until client_order_id recovery; sum(submitted) <= bound
+async def test_late_response_after_second_acquired(runtime): ...         # spec 4r: outcome recorded once, no resubmission; second holder's pending set counted it in full
+async def test_history_unproven_refuses_sell(runtime): ...                # Task 5's history_unproven -> ACTIVITY_HISTORY_UNPROVEN, no broker read
 ```
 
 - [ ] **Step 2:** Run `.venv/bin/python -m pytest python_tests/test_rev140_gateway.py -q`. Expected: FAIL.
 - [ ] **Step 3:** Implement. The four reads happen before the existing portfolio-risk lock (sells take no portfolio lock today, `gateway.py:285`), inside the caller's execution reservation.
 - [ ] **Step 4:** Run it, then `python_tests/test_execution_gateway.py`, `test_runtime_on_simulator.py` and the full suite. Expected: PASS, with no existing test changed except where it relied on a tokenless sell; list each such change in the commit body.
-- [ ] **Step 5:** Commit: `feat(execution): sell authorization by conservative bound under mandatory reservation (Rev.140 task 5)`.
+- [ ] **Step 5:** Commit: `feat(execution): sell authorization by conservative bound under mandatory reservation (Rev.140 task 6)`.
 
-### Task 6: Settlement of an oversell (§3.2)
+### Task 7: Settlement of an oversell (§3.2)
 
 **Files:**
 - Modify: `tradepulse/settlement/engine.py:66-119` (`_project_lot`), `:448-470` (handlers)
@@ -361,9 +427,9 @@ async def test_buy_against_legacy_short_lot_blocked(runtime): ...    # UNSUPPORT
 - [ ] **Step 3:** Run `.venv/bin/python -m pytest python_tests/test_rev140_settlement.py -q`. Expected: FAIL.
 - [ ] **Step 4:** Implement.
 - [ ] **Step 5:** Run it, then `test_settlement_engine.py`, `test_durable_accounting.py`, `test_restart_survival.py` and the full suite. Expected: PASS.
-- [ ] **Step 6:** Commit: `feat(settlement): oversell excess as quarantined liability, final hold stage (Rev.140 task 6)`.
+- [ ] **Step 6:** Commit: `feat(settlement): oversell excess as quarantined liability, final hold stage (Rev.140 task 7)`.
 
-### Task 7: The monitor (§3.4)
+### Task 8: The monitor (§3.4)
 
 **Files:**
 - Modify: `tradepulse/monitor/coordinator.py:446-540`
@@ -383,9 +449,9 @@ async def test_quarantined_asset_skipped_other_asset_stop_fires(runtime): ...
 - [ ] **Step 2:** Run `.venv/bin/python -m pytest python_tests/test_rev140_monitor.py -q`. Expected: FAIL.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** Run it, then `test_monitor_coordinator.py`, `test_monitor_unmanaged.py` and the full suite. Expected: PASS.
-- [ ] **Step 5:** Commit: `feat(monitor): never trade negative or quarantined inventory (Rev.140 task 7)`.
+- [ ] **Step 5:** Commit: `feat(monitor): never trade negative or quarantined inventory (Rev.140 task 8)`.
 
-### Task 8: Valuation, exposure and reconciliation identity (§3.3, §3.5)
+### Task 9: Valuation, exposure and reconciliation identity (§3.3, §3.5)
 
 **Files:**
 - Modify: `tradepulse/valuation.py:200-230`, `tradepulse/risk/engine.py:440-645` (`build_portfolio_snapshot`), `tradepulse/reconciliation/coordinator.py:314-328,362-372`
@@ -412,9 +478,9 @@ async def test_cover_not_heuristically_matched_to_unrelated_buy(runtime): ... # 
 - [ ] **Step 2:** Run `.venv/bin/python -m pytest python_tests/test_rev140_valuation.py -q`. Expected: FAIL.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** Run it, then `test_valuation_observation.py`, `test_reconciliation_coordinator.py`, `test_risk_engine.py` and the full suite. Expected: PASS.
-- [ ] **Step 5:** Commit: `feat(valuation): quarantined inventory in equity, exposure and reconciliation (Rev.140 task 8)`.
+- [ ] **Step 5:** Commit: `feat(valuation): quarantined inventory in equity, exposure and reconciliation (Rev.140 task 9)`.
 
-### Task 9: Fee allocation and recognition (§3.6)
+### Task 10: Fee allocation and recognition (§3.6)
 
 **Files:**
 - Create: `tradepulse/quarantine/fees.py`
@@ -446,9 +512,9 @@ async def test_crypto_in_asset_fee_on_excess_holds(runtime): ... # ASSET_FEE_UNS
 - [ ] **Step 2:** Run `.venv/bin/python -m pytest python_tests/test_rev140_fees.py -q`. Expected: FAIL.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** Run it, then `test_asset_fees.py`, `test_generation_fees.py` and the full suite. Expected: PASS.
-- [ ] **Step 5:** Commit: `feat(quarantine): signed fee allocation and conserved recognition (Rev.140 task 9)`.
+- [ ] **Step 5:** Commit: `feat(quarantine): signed fee allocation and conserved recognition (Rev.140 task 10)`.
 
-### Task 10: `quarantine resolve` (§3.7, §3.8)
+### Task 11: `quarantine resolve` (§3.7, §3.8)
 
 **Files:**
 - Create: `tradepulse/quarantine/resolve.py`
@@ -457,7 +523,7 @@ async def test_crypto_in_asset_fee_on_excess_holds(runtime): ... # ASSET_FEE_UNS
 
 **Interfaces:**
 - Consumes:
-  - Tasks 2, 4, 9;
+  - Tasks 2, 4, 10;
   - `account_lease` (Rev.136): the command takes the account lease, and refuses `ACCOUNT_LEASE_HELD` if the runtime holds it.
 - Produces:
   - `resolve_from_activity(repositories, broker: BrokerPort, activity_id: str, reason: str, now: datetime) -> ResolveResult`, where `ResolveResult(resolved: tuple[QuarantineResolution, ...], surplus: UnmanagedLongInventory | None)`;
@@ -486,9 +552,9 @@ async def test_resolve_refuses_while_runtime_leased(runtime): ...# Review Focus 
 - [ ] **Step 2:** Run `.venv/bin/python -m pytest python_tests/test_rev140_resolve.py -q`. Expected: FAIL.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** Run it, then `test_integrity_reset_proof.py`, `test_cli.py` and the full suite. Expected: PASS.
-- [ ] **Step 5:** Commit: `feat(quarantine): evidence-verified resolution with exactly-once cash (Rev.140 task 10)`.
+- [ ] **Step 5:** Commit: `feat(quarantine): evidence-verified resolution with exactly-once cash (Rev.140 task 11)`.
 
-### Task 11: Legacy short lots and corporate actions (§3.9, §3.10)
+### Task 12: Legacy short lots and corporate actions (§3.9, §3.10)
 
 **Files:**
 - Create: `tradepulse/quarantine/legacy.py`, `tradepulse/quarantine/corporate_actions.py`
@@ -500,7 +566,7 @@ async def test_resolve_refuses_while_runtime_leased(runtime): ...# Review Focus 
   - `find_open_short_lots(repositories) -> list[PositionLot]`, latched as `LEGACY_SHORT_LOT: <lot_id>` at startup and on each reconciliation;
   - `adopt_legacy_lot(repositories, broker, lot_id: str, reason: str, now) -> LegacyLotConversion`, which raises `AdoptRefused(reason)` for each of §3.9's four preconditions;
   - `converted_lot_ids(connection) -> frozenset[str]`, used by `_project_lot` and `_project_holding`;
-  - on adoption, every fee already attributed to the lot is re-allocated, by appending `opening`-pool `QuarantineFeeAllocation` rows equal to it (Task 9's `allocate_fee`). The original fee attributions are left unchanged, and `check_c1` holds from the conversion onwards;
+  - on adoption, every fee already attributed to the lot is re-allocated, by appending `opening`-pool `QuarantineFeeAllocation` rows equal to it (Task 10's `allocate_fee`). The original fee attributions are left unchanged, and `check_c1` holds from the conversion onwards;
   - `CORPORATE_ACTION_ACTIVITY_TYPES: frozenset[str]`, taken from Alpaca's documented activity types at implementation, with the source URL and access date in a comment (R9);
   - `corporate_action_blocks(activities, asset_key, since) -> str | None`. Any non-trade activity type naming the instrument that is not known to be harmless (`FILL`, the fee types, `JNLC` and the cash flows) also blocks.
 
@@ -517,9 +583,9 @@ async def test_unknown_non_trade_activity_blocks_resolution(runtime): ... # spec
 - [ ] **Step 2:** Run `.venv/bin/python -m pytest python_tests/test_rev140_legacy.py -q`. Expected: FAIL.
 - [ ] **Step 3:** Implement. The test-18 fixture is built by `python_tests/fixtures/rev140/make_legacy_short_fixture.py`, which runs `c10bb2fa`'s settlement on an oversell, so the short lot is authentic old-code output.
 - [ ] **Step 4:** Run it, then the full suite. Expected: PASS.
-- [ ] **Step 5:** Commit: `feat(quarantine): legacy short-lot adoption and fail-closed corporate actions (Rev.140 task 11)`.
+- [ ] **Step 5:** Commit: `feat(quarantine): legacy short-lot adoption and fail-closed corporate actions (Rev.140 task 12)`.
 
-### Task 12: Replay of every preserved database (spec test 21)
+### Task 13: Replay of every preserved database (spec test 21)
 
 **Files:**
 - Create: `scripts/rev140_replay_check.py`
@@ -536,24 +602,24 @@ async def test_unknown_non_trade_activity_blocks_resolution(runtime): ... # spec
 - [ ] **Step 2:** Run `.venv/bin/python -m pytest python_tests/test_rev140_replay.py -q`. Expected: FAIL.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** Run it. Expected: PASS. Then run the script on a copy of each of the six preserved soak databases and of the service database. Expected: every report has `issues: {}`, identical ledger digests, and no `UNSUPPORTED_SHORT_*`. The original files' SHA-256 values are unchanged before and after.
-- [ ] **Step 5:** Commit the script and test. The reports go to `~/tradepulse-evidence/rev140-replay/` with a manifest, never into git. Commit message: `test: replay preserved databases under Rev.140 (Rev.140 task 12)`.
+- [ ] **Step 5:** Commit the script and test. The reports go to `~/tradepulse-evidence/rev140-replay/` with a manifest, never into git. Commit message: `test: replay preserved databases under Rev.140 (Rev.140 task 13)`.
 
-### Task 13: Decimal guard, Rev record, review stop
+### Task 14: Decimal guard, Rev record, review stop
 
 **Files:**
 - Test: `python_tests/test_rev140_decimal.py`
 - Create: `docs/rev140-unsupported-short-inventory.md`
 
-- [ ] **Step 1:** Write `test_no_float_in_rev140_paths` (spec test 22). It runs the fixtures of Tasks 3 to 11 with `decimal.getcontext().traps[decimal.FloatOperation] = True`, and asserts every value read from the nine tables, and every `SellableDecision` field, is a `Decimal`.
+- [ ] **Step 1:** Write `test_no_float_in_rev140_paths` (spec test 22). It runs the fixtures of Tasks 3 to 12 with `decimal.getcontext().traps[decimal.FloatOperation] = True`, and asserts every value read from the ten tables, and every `SellableDecision` field, is a `Decimal`.
 - [ ] **Step 2:** Run it, then the full suite. Expected: PASS.
 - [ ] **Step 3:** Write the Rev record:
   - what changed, per spec section;
   - the behaviour changes (spec §6);
   - the replay report hashes;
-  - every test changed in Task 5 and why;
+  - every test changed in Task 6 and why;
   - anything omitted.
 - [ ] **Step 4:** Run `.venv/bin/python -m pytest python_tests -q`, `.venv/bin/ruff check tradepulse python_tests` and `.venv/bin/mypy tradepulse`. Record the counts in the Rev record.
-- [ ] **Step 5:** Commit: `docs: Rev.140 record (Rev.140 task 13)`.
+- [ ] **Step 5:** Commit: `docs: Rev.140 record (Rev.140 task 14)`.
 - [ ] **Step 6: Stop.** Give the operator the review summary and the zip (`git archive --format=zip --prefix=tradepulse-ai/ -o ~/Downloads/"vegabond-tradepulse(rev.140).zip" <sha>`, sent with SendUserFile). Do not merge until it is approved.
 
 ---
@@ -562,16 +628,19 @@ async def test_unknown_non_trade_activity_blocks_resolution(runtime): ... # spec
 
 | Spec | Task |
 |---|---|
-| §3.1 bound, S1, refusals, tests 1–4b | 3, 5 |
+| §3.1 bound, S1, refusals, tests 1–4b | 3, 6 |
 | §3.1a cursor, K1, tests 4c–4e | 4 |
-| §3.1b reservation, S2, tests 4f–4j | 5 |
-| §3.2 liability, I3, the stage, tests 5, 7, 20 | 6 |
-| §3.3 / §3.5 valuation, I2, heuristic, tests 6, 9, 15 | 8 |
-| §3.4 monitor, test 8 | 7 |
-| §3.6 fees, I4, C1, tests 10, 11 | 9 |
-| §3.7 / §3.8 resolve, surplus, I1, I5, I11, tests 12–14, 16, 17 | 10 |
-| §3.9 / §3.10 legacy, corporate actions, test 18 | 11 |
+| §3.1a bootstrap, late activities, P1, tests 4k–4o (TP140-R5-01, R5-02) | 5 |
+| §3.1b reservation, S2, tests 4f–4j | 6 |
+| §3.1b S3, `PRIOR_SUBMISSION_UNRESOLVED`, tests 4p–4r (TP140-R5-03) | 6 |
+| §3.2 liability, I3, the stage, tests 5, 7, 20 | 7 |
+| §3.3 / §3.5 valuation, I2, heuristic, tests 6, 9, 15 | 9 |
+| §3.4 monitor, test 8 | 8 |
+| §3.6 fees, I4, C1, tests 10, 11 | 10 |
+| §3.7 / §3.8 resolve, surplus, I1, I5, I11, tests 12–14, 16, 17 | 11 |
+| §3.9 / §3.10 legacy, corporate actions, test 18 | 12 |
 | §3.11 schema, triggers, I9, test 19 | 2 |
-| R12 simulator faults | 1 |
-| Test 21 replay | 12 |
-| Test 22, I10 | 13 |
+| R12 simulator faults, test-only conditions | 1 |
+| §11.3 read-only evidence (cash identity, measured lag) | gate before Task 4 |
+| Test 21 replay | 13 |
+| Test 22, I10 | 14 |
