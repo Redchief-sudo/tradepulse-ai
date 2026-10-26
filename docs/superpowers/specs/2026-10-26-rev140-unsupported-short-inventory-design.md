@@ -1,6 +1,6 @@
 # Rev.140: unsupported short inventory — design specification
 
-**Status:** revision 4, for independent review. **Design only.**
+**Status:** revision 5, for independent review. **Design only.**
 - This authorization covers design updates, nothing more: no code, schema, test, merge, push or broker order.
 - Implementation starts only after:
   - the A0 verification run (Mon 2026-10-26 09:00 ET to Tue 2026-10-27 16:30 ET) has concluded;
@@ -13,6 +13,7 @@
 - **rev. 1** (2026-10-26): first draft.
 - **rev. 2** (2026-10-26): R1 to R3 decisions, immutable records, invariants, recovery, 16 tests.
 - **rev. 3** (2026-10-26): the institutional audit's TP140-01 to TP140-05, and the operator's R4 to R8.
+- **rev. 5** (2026-10-26): TP140-R4-01 (unresolved executions survive the cursor; durable records) and TP140-R4-02 (sell authorization serialized per asset; concurrency tests). Contract and test additions only.
 - **rev. 4** (2026-10-26): TP140-R3-01. Section 3.1 is replaced by a conservative two-bound authorization that does not assume atomic broker reads. R9 to R11 are decided. Change log in section 10.
 
 **Origin:**
@@ -77,7 +78,7 @@ So the gateway does **not** try to reconstruct one consistent broker state. It c
 1. *O₁* = `get_open_orders()`;
 2. *P* = `get_positions()`: the broker quantity for the asset;
 3. *O₂* = `get_open_orders()`;
-4. *A* = `get_activities("FILL", after_id = reconciliation's cursor)`, filtered to the asset;
+4. *A* = `get_activities("FILL", after_id = C)`, where *C* is the fill-reconciliation cursor of 3.1a, filtered to the asset. The asset's durable unresolved executions, at any age, are also read (3.1a);
 5. **from the local store,** in one read transaction:
    - *L* = Σ open long lot quantity;
    - for every TradePulse SELL intent on the asset not yet **terminal and fully settled:** its approved quantity *a*, and its settled quantity *s*;
@@ -106,6 +107,7 @@ So the gateway does **not** try to reconstruct one consistent broker state. It c
 
 **The activity check, for external executions that positions may not yet reflect.**
 - If *A* contains any FILL for the asset that has no exact-ID match among local `Fill` and `quarantine_executions` rows, the sell is refused with `UNRECONCILED_BROKER_ACTIVITY`.
+- If the asset has any open `unresolved_broker_executions` record, whatever its age and wherever *C* is, the sell is refused with `UNRESOLVED_BROKER_EXECUTION` (3.1a). This is A1 6.6's uncertain-inventory rule: no exit is sent against inventory TradePulse cannot account for.
 - The activity page must be proven complete, as in A0; otherwise it is refused with `ACTIVITY_PAGE_UNPROVEN`.
 
 **Authorization:** sellable = max(0, min(*B*ₗ, *B*ᵦ)).
@@ -154,6 +156,72 @@ It is excluded operationally by the existing rule that nothing else trades the a
 **Cost:** four broker reads per sell, instead of today's one or two. Retries add two per attempt. Exits are rare.
 
 **No broker dependency (R2).** Tests 1 to 4b run against a simulator that accepts every oversell. Whether Alpaca rejects one is not tested; a later experiment needs separate operator authorization, an isolated paper account and isolation from the active verification generation.
+
+
+### 3.1a Unresolved broker executions and the fill cursor (TP140-R4-01)
+
+**Today:**
+- Outside a verification generation, fill reconciliation has **no cursor**. Each pass reads FILL activities over a rolling window, `now − fill_lookback`, which defaults to 1 day (`reconciliation/coordinator.py:338,764`).
+- `reset-integrity`'s gate is a fresh reconciliation over that same window (`session_commands.py:271-273`).
+- So a missed fill more than 24 hours old drops out of both the activity read and `missed_fills_detected`. The latch it set stays, but the evidence that justified it is no longer re-checked.
+
+This is a pre-existing gap in the live runtime, recorded here and closed by this section.
+
+**Durable records.** Two append-only tables, with the 3.11 triggers:
+- **`unresolved_broker_executions`**
+  - It holds: `activity_id`, asset key, side, quantity, price, `transaction_time`, the raw payload's SHA-256, `first_seen_at`, and the reconciliation pass ID.
+  - Reconciliation writes one row the first time it classifies a FILL activity as unaccounted: no exact-ID match to a `Fill` or a `quarantine_executions` row, and no recovery through a known intent.
+  - Unique on `activity_id`.
+- **`unresolved_execution_outcomes`**
+  - It holds: `activity_id`, the outcome (`matched_fill` or `quarantine_execution`), the matched record ID, the evidence digests, and `resolved_at`.
+  - Unique on `activity_id`.
+  - It is written **only** when an exact-ID match exists with identical side, quantity, price and time, the raw digest is unchanged, and exactly one `fill:cash:<activity id>` entry exists (I1).
+  - No command, flag or timeout writes an outcome.
+- An unresolved execution is **open** while it has no outcome.
+
+**The cursor *C*.**
+- *C* is a durable, per-account fill-reconciliation cursor: an Alpaca activity ID, ordered with A0's `page_token` rule.
+- It is stored with the pass that advanced it.
+- *C* advances only in the same SQLite transaction that writes either a canonical outcome (an exact match) or an `unresolved_broker_executions` row for **every** FILL activity between the old and new positions, from a page proven complete.
+
+**Invariant K1:** every FILL activity at or before *C* has either an exact-ID accounting match, or an `unresolved_broker_executions` row. So *A* (after *C*) together with the open unresolved records (any age) covers every FILL activity the broker has reported. Nothing falls between them.
+
+**Interaction with the rest of the design:**
+- **The latch:** writing an unresolved row and latching `FINANCIAL_INTEGRITY_BLOCKED` happen in the same pass. If the latch call fails after the commit, startup and the next pass re-latch from the open rows (I8 extended).
+- **The sell check:** the asset's open unresolved rows refuse every sell of that asset (3.1).
+- **`reset-integrity`:** refused while **any** unresolved execution is open, regardless of `fill_lookback`. This closes the 24-hour gap above.
+- **Cursor ordering:** a missed fill is recorded before *C* passes it, so a crash leaves either both the row and the cursor advance, or neither.
+
+### 3.1b Sell authorization is serialized per asset (TP140-R4-02)
+
+**Today:**
+- The monitor takes the asset's execution reservation before an exit (`reserve_symbol_for_execution`, a non-blocking lease).
+- But the gateway checks it only if the caller passes `symbol_lock_owner_token`, and only immediately before submission (`execution/gateway.py:506-522`).
+- A sell without a token is not serialized.
+
+**The contract:**
+1. **Required.** Every SELL request, and every order on an asset with quarantined inventory, must carry `symbol_lock_owner_token`. Without it: `EXECUTION_RESERVATION_REQUIRED`, before any read.
+2. **Verified at the start.**
+   - The gateway verifies and renews the reservation (`renew_lock`) **before** reading any 3.1 input. A lost reservation refuses (`EXECUTION_RESERVATION_LOST`).
+   - The existing fence before submission stays.
+3. **Order of operations,** all while holding the reservation:
+   1. verify the reservation;
+   2. read the 3.1 inputs;
+   3. compute sellable;
+   4. reduce or refuse;
+   5. persist the intent at `risk_approved`, with its quantity;
+   6. fence;
+   7. persist `submitted`;
+   8. submit.
+
+   The caller releases the reservation only after `execute_intent` returns. By then the intent is durable in a non-terminal or terminal status, so the next holder's *Ω* contains it.
+4. **Lease expiry.** If the lease (`SYMBOL_LOCK_TTL_SECONDS`, renewed during execution) is lost at any point before submission, the fence refuses. An intent persisted at `risk_approved` and never submitted stays in *Ω* until it is marked rejected, so it is counted in full by any concurrent authorization.
+
+**Invariant S2:**
+- For each asset (in A1, each position key), at most one sell authorization holds the reservation at a time.
+- Every authorization's *Ω* contains every sell intent committed before it acquired the reservation.
+- **Consequence:** authorizations are totally ordered, and each subtracts the full quantity of every earlier sell that is still unsettled. So Σ quantities submitted ≤ the min bound in force when the first one began, plus only inventory that settlement has since proven. Two protective exits can never both spend the same sellable quantity, whether either was reduced or not.
+- **Across processes:** the reservation is a row in the shared database's `locks` table, so it serializes the monitor inside `run` and a standalone `monitor` command alike. The account lease (Rev.136) separately prevents two runtimes on one account.
 
 ### 3.2 Settlement of an oversell
 
@@ -343,9 +411,11 @@ New payload tables, created with `CREATE TABLE IF NOT EXISTS`. They are additive
 | `quarantine_fee_allocations` | `(fee_canonical_id, record_id)` | signed |
 | `quarantine_fee_recognitions` | `(record_id, event_id, pool)` | signed |
 | `legacy_lot_conversions` | `lot_id` | |
+| `unresolved_broker_executions` | `activity_id` | 3.1a |
+| `unresolved_execution_outcomes` | `activity_id` | 3.1a |
 
 **Immutability (R6).**
-- SQLite `BEFORE UPDATE` and `BEFORE DELETE` triggers reject changes on all seven tables.
+- SQLite `BEFORE UPDATE` and `BEFORE DELETE` triggers reject changes on all nine tables.
 - **At startup the runtime verifies that every trigger exists**, with its expected SQL, and refuses to run otherwise (`SCHEMA_TRIGGER_MISSING`).
 - Triggers are stored in the database file, so SQLite's online backup copies them. Test 19 proves a restore keeps them.
 
@@ -362,10 +432,12 @@ Each is checked by reconciliation on every pass, and by the tests.
 | I5 | Per quarantined record: Σ resolution quantity ≤ original quantity; each `(record, activity)` resolved at most once | `INTEGRITY_VIOLATION` |
 | C1 | Per quarantined record and pool: *A* = *R* + *U*, and *U* = 0 when open quantity is 0 | `INTEGRITY_VIOLATION` |
 | I7 | No lot, holding, settlement event or strategy record originates from an oversell's excess, a cover, a surplus or a converted lot | `INTEGRITY_VIOLATION` |
-| I8 | Any open quarantined record or legacy short lot ⇒ `FINANCIAL_INTEGRITY_BLOCKED` | re-latch at startup and on every pass |
-| I9 | The seven tables are never updated or deleted, and their triggers exist | refusal / `SCHEMA_TRIGGER_MISSING` |
+| I8 | Any open quarantined record, legacy short lot or open unresolved broker execution ⇒ `FINANCIAL_INTEGRITY_BLOCKED` | re-latch at startup and on every pass |
+| I9 | The nine tables are never updated or deleted, and their triggers exist | refusal / `SCHEMA_TRIGGER_MISSING` |
 | I10 | Every financial value is `Decimal`; JSON is parsed with `parse_float=Decimal` | test failure |
 | I11 | Each broker activity ID maps to at most one of: a `Fill`, a `quarantine_executions` row | `INTEGRITY_VIOLATION` |
+| K1 | Every FILL activity at or before the cursor *C* has an exact accounting match or a durable unresolved row; *C* advances only with those writes (3.1a) | refusal to advance; latch |
+| S2 | At most one sell authorization per asset holds the execution reservation; each one's *Ω* contains every earlier committed sell intent (3.1b) | `EXECUTION_RESERVATION_REQUIRED` / `_LOST` |
 | S1 | Each order in *Ω* counts exactly once in each bound (*a* − *s* locally, original *q* at the broker). A TradePulse sell leaves *Ω* only when terminal **and** fully settled. Settlement status, `filled_qty` and position freshness never raise sellable. (3.1) | refusal |
 
 ## 5. Recovery behaviour
@@ -388,6 +460,9 @@ Each is checked by reconciliation on every pass, and by the tests.
 |---|---|
 | Sellable = max(0, min(local bound, broker bound)) | Every sell. With no pending sell, sellable = min(*P*, *L*), normally equal to today's held quantity. A protective exit above it is reduced and alerted, never refused while sellable > 0. |
 | Three extra broker reads per sell (`get_open_orders` twice, `get_activities` once) | Every exit; within the rate limit |
+| Sells require the execution reservation | Always. The monitor already passes it, so no change on today's path. |
+| A durable fill cursor and unresolved-execution records | Every reconciliation pass; normally no unresolved rows |
+| `reset-integrity` refuses while any unresolved execution is open, at any age | Only after a missed fill. Today such a fill ages out of the gate after 24 h. |
 | `UNSUPPORTED_SHORT_POSITION` refusals; no automatic cover | Only with negative or quarantined inventory: none in the inspected databases |
 | An oversell becomes a liability and a latch | Only on an oversell: none in the inspected databases |
 | The closure conservation check includes the liability | Every settlement; identical without an oversell |
@@ -430,6 +505,36 @@ Replaying every preserved soak database must give identical ledgers and decision
    - an external FILL in *A* with no local match → `UNRECONCILED_BROKER_ACTIVITY`;
    - an external order that appears and fills between *O₁* and *O₂* (`STEP_BETWEEN`), with *P* lagging → caught by *A*;
    - an incomplete activity page → `ACTIVITY_PAGE_UNPROVEN`.
+
+**Cursor safety (TP140-R4-01).** These use the simulator clock to pass `fill_lookback`:
+
+4c. **The external fill that outlives the window:**
+   - an external SELL fill is observed and recorded unresolved, the latch is set, and *C* advances past it as later activities arrive;
+   - 25 h later (beyond `fill_lookback`), with no outcome, a protective sell of that asset is refused (`UNRESOLVED_BROKER_EXECUTION`);
+   - `reset-integrity` is refused, although `missed_fills_detected` over the window is 0;
+   - only after an exact-ID accounted outcome is written does authorization proceed.
+4d. **Crash between detection and cursor advance:** neither the unresolved row nor the advance survives, and the next pass records both. A crash after the commit but before the latch is followed by a re-latch at startup.
+4e. **The cursor never skips:** with an incomplete activity page, *C* does not advance, and the sell check refuses (`ACTIVITY_PAGE_UNPROVEN`).
+
+**Concurrent protective exits (TP140-R4-02).** Each runs as concurrent asyncio tasks against one gateway, and again against two gateways on separate connections to the same database file. The fixture is 10 shares, with an earlier sell of 4 partially filled (2), its fills delayed, and settlement lagging:
+
+4f. **Two protective exits at once:**
+   - exactly one acquires the reservation; the other is skipped and retried next pass;
+   - the first is sized to sellable: *B*ₗ = 10 − (4 − 0) = 6, and *B*ᵦ = *P* − 4. That gives 6 while positions lag (*P* = 10), and 4 once *P* reflects the 2 filled (*P* = 8). Sellable = min of the two;
+   - after it, the second's *Ω* includes it, and its sellable is 0;
+   - Σ submitted ≤ that bound (6 or 4), in both position-lag cases.
+4g. **A reduced exit, then a competing one:**
+   - the first requests 10 and is reduced to the bound (6 or 4, as in 4f), with `SELLABLE_BELOW_REQUESTED`;
+   - the second, after delayed fills arrive but before settlement, gets 0;
+   - after settlement of everything, sellable is again min(*P*, *L*) and never more than the true remainder.
+4h. **Lease lost mid-authorization:**
+   - the first's lease expires after it persists `risk_approved` but before the fence; the fence refuses submission;
+   - the second, starting meanwhile, counts the first's approved quantity in full until it is marked rejected;
+   - Σ submitted ≤ the bound.
+4i. **No token:** a sell without `symbol_lock_owner_token` is refused (`EXECUTION_RESERVATION_REQUIRED`) before any broker read.
+4j. **Seeded concurrency:**
+   - 200 seeded trials of 2 to 5 concurrent protective exits, with random delays, partial fills, `POSITIONS_LAG` and lease expiries;
+   - in every trial Σ submitted sell quantity ≤ the initial min bound, plus inventory settlement proved meanwhile, and the simulator's true long quantity never goes below 0.
 
 **Oversell and quarantine:**
 
@@ -492,7 +597,7 @@ Replaying every preserved soak database must give identical ledgers and decision
     - an evidence database is refused;
     - a replay of the fixture is identical every time.
 19. **Triggers:**
-    - `UPDATE` and `DELETE` are refused on all seven tables;
+    - `UPDATE` and `DELETE` are refused on all nine tables;
     - a database missing one trigger is refused at startup;
     - an online backup and restore keeps every trigger.
 20. **Checkpoint compatibility (R7):**
@@ -515,9 +620,10 @@ Replaying every preserved soak database must give identical ledgers and decision
 
 | Rev.140 element | A1 form |
 |---|---|
+| The fill cursor *C*, unresolved executions, S2 | Per account: *C* and the unresolved records gain `account_key`, and the reservation is per position key (A1 3). |
 | The sellable bound and S1 | Per account: *L* from that account's lots, *P*, *O₁*, *O₂* and *A* from that account's broker, *Ω* keyed by `(account_key, broker_order_id)`. Read outside the risk decision window (A1 6.3). A1 6.4's freshness rule applies to the reads, but freshness is not treated as atomicity. |
 | Activity IDs, `fill:cash:<id>`, I11 | The A1 canonical ID `<account_key>\|<venue>\|ExecutionEvent\|<broker id>` (A1 5.2). Cash keys gain the account (A1 3). |
-| The seven tables and their triggers | Gain `account_key`. A1's migration (7.3) must re-create every trigger after any table rebuild, and the 7.4 equivalence checks include them. |
+| The nine tables and their triggers | Gain `account_key`. A1's migration (7.3) must re-create every trigger after any table rebuild, and the 7.4 equivalence checks include them. |
 | I2 | Per position key (account and instrument) |
 | Quarantined records in risk | Counted in A1's consolidated exposure and equity by the sign rules of 3.3 (A1 6.7) |
 | The latch | A1's per-account integrity cause; entries blocked globally (A1 6.6) |
@@ -533,7 +639,7 @@ Replaying every preserved soak database must give identical ledgers and decision
 | **TP140-05** corporate actions | Fail closed; seven minimum requirements for a future procedure | 3.10, test 17 |
 | **R4** surplus | Unmanaged long inventory from the same execution; the hold stays until it is resolved | 3.7, 3.8, test 16 |
 | **R5** | No automatic adjustment | 3.10 |
-| **R6** | Triggers on all seven tables; startup verification; backup test | 3.11, test 19 |
+| **R6** | Triggers on all nine tables; startup verification; backup test | 3.11, test 19 |
 | **R7** | Compatibility tests with events checkpointed by today's code | 5, test 20 |
 | **R8** | Exact-ID matching only; the hold clears on a fresh evidence proof, never a flag | 3.5, 3.7, test 15 |
 | Found while tracing | `pnl_evidence`'s closure conservation would have rejected every oversell; it is amended to include the liability | 1, 3.2 |
@@ -541,10 +647,12 @@ Replaying every preserved soak database must give identical ledgers and decision
 | Valuation (audit section 4) | Exposure and equity marks defined separately by sign; gap stress test | 3.3, test 9 |
 | **TP140-R3-01** (rev. 4) non-atomic reads | 3.1 replaced. Sellable is now the minimum of a local bound and a broker bound: the local one immune to position lag, the broker one counting each order at its full original quantity. An activity check covers external executions not yet in positions. Terminal orders stay counted until settled. Matching reads are no longer treated as proof. The residual (an external order after the last read) is stated, and detected by reconciliation. Protective exits are reduced, not refused. | 3.1, 4 (S1), 6, tests 1–4b |
 | R9–R11 (rev. 4) | Decided as above | 8 |
+| **TP140-R4-01** (rev. 5) cursor safety | A durable per-account fill cursor *C* that advances only with an outcome or an unresolved row for every activity (K1). Durable unresolved-execution records, at any age, block sells of that asset and `reset-integrity`. Outcomes only from exact-ID accounting evidence. Closes today's 24-hour `fill_lookback` ageing gap. | 3.1, 3.1a, 3.11, 4 (K1, I8), tests 4c–4e |
+| **TP140-R4-02** (rev. 5) concurrent exits | The reservation is mandatory for sells and verified before any read. A fixed order of operations, with the intent persisted before release. Invariant S2 (total order), across processes. | 3.1b, 4 (S2), tests 4f–4j |
 
 ## 11. Evidence required for implementation approval
 
 1. The A0 verification run concluded, its criteria decided, and its report and database preserved with SHA-256. The operator has reviewed that evidence.
-2. Independent review of rev. 4's section 3.1 and its lemma, with R12 decided.
+2. Independent review of rev. 5's sections 3.1 to 3.1b, with R12 decided.
 3. Explicit operator authorization to implement.
-4. Then, before merge: the 24 tests, the full suite, mypy and ruff green; test 21's replay; the operator's review of the Rev.140 zip.
+4. Then, before merge: the 32 tests, the full suite, mypy and ruff green; test 21's replay; the operator's review of the Rev.140 zip.
