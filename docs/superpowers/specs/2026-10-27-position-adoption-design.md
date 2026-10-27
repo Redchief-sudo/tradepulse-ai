@@ -1,7 +1,7 @@
 # Rev.142: adopting unmanaged long positions for protective management — design specification
 
-**Status:** design, rev. 2. Approved for specification drafting: Sections 1–3, reviews ADOPT-01 to ADOPT-08 and REV142-01 to REV142-03, and operator decisions Q1 and Q2 (rev. 2).
-**Implementation is blocked** until Rev.140 is implemented, validated and approved (section 3.1).
+**Status:** design, rev. 3. Approved for specification drafting: Sections 1–3, reviews ADOPT-01 to ADOPT-08 and REV142-01 to REV142-03, and operator decisions Q1 and Q2 (rev. 2).
+**Implementation is blocked** until Rev.140 is implemented, validated and approved (section 3.1), and Rev.143 is merged (3.8a).
 **Branch:** `rev142-adoption-design`. No production code, no migration, and no change to the active A0 verification run.
 
 ## 1. What happens today (traced in the code, main at `c10bb2fa`)
@@ -268,25 +268,13 @@ Per bound generation, for each `opening_inventory` adoption *a* of asset *k* wit
 - So the cash arrives at the broker, and the generation's expected cash (opening cash + ledger movements) no longer equals observed cash. `generation_cash` is `mismatch`, and the mandatory invariants fail. **A dividend in a verification run already fails closed today, for any asset.** Rev. 1 wrongly said it stays a `profit_adjustment`.
 - Rev.140 §3.10 likewise fails closed on corporate actions.
 
-**Consequence.** Q1's target treatment needs dividend **cash recognition**, which TradePulse does not have for any asset:
-- a ledger entry per dividend and withholding activity;
-- entitlement evidence from corporate-action announcements (record date, eligible quantity, rate);
-- reinvestment handling;
-- corrections and reversals.
+**Rev. 3: delegated to Rev.143.** Dividend cash recognition and verified attribution are specified separately in `docs/superpowers/specs/2026-10-27-dividend-recognition-design.md` (branch `rev143-dividends-design`), which is scheduled **before** this Rev. Rev.142 therefore:
+- **Relies on Rev.143's `adopted` bucket.** A dividend on adopted shares is attributed there: entitlement by the trade date before the ex-date, verified against the announcement and the Alpaca activity to the share and the cent. It is recorded once in the cash ledger and excluded from generation performance through Rev.143's `D_excl`.
+- **Never adds dividends to `X(k)`.** The exclusion is defined once, in Rev.143 (DV-I4).
+- **Allocates no dividend cash itself.** An unverified dividend is held in Rev.143's `D_unresolved`, so it fails closed there.
+- **Gives Rev.143 an `origin` to bucket by.** The adopted lot (`origin="adopted"`) and its `opened_at` are the inputs Rev.143's `adopted` bucket reads.
 
-Building that inside Rev.142 would make Rev.142 the dividend-accounting Rev for every position. **Rev. 2 therefore splits it:**
-
-1. **In Rev.142 (fail closed).** A dividend or withholding activity on an asset with an adoption in the generation keeps today's result: `generation_cash` mismatch, so the mandatory invariants are not matched and the snapshot is `INCOMPLETE_EVIDENCE`. In addition, Rev.142 records it as `adopted_income_unresolved:{activity_id}` (a critical alert, once per activity) and marks `generation_equity` `unresolved_adopted_income` for that asset.
-   - No allocation is invented. The activity's cash is not moved into any ledger by Rev.142.
-   - `prove_edge` is already `ineligible_adopted` for the asset.
-2. **The attribution contract, for the future dividend-recognition Rev,** which must satisfy it before 1 is lifted:
-   - **Eligible quantity:** the adopted lot's remaining quantity at the end of the **record date**. It comes from verified corporate-action evidence: Alpaca's announcements endpoint, the same source D12 names for IBKR. Never the quantity held when the cash arrives.
-   - **Attributed amount:** eligible quantity × declared rate, minus the matching withholding activities, reconciled to the actual broker cash activities by activity ID. Any difference makes it unresolved.
-   - **Ledger:** one cash entry per real broker activity. The dividend is recorded in `adoption_income` (per adoption and activity) and excluded from generation performance by adding it to `X(k)`.
-   - **Reinvestment** (a share credit) changes the adopted lot's quantity only through a verified corporate-action procedure (Rev.140 §3.10). Until one exists, a reinvestment is unresolved.
-   - **Corrections and reversals** reference the original activity, and recompute `adoption_income` exactly once.
-
-**Note for the operator:** in a verification run, a dividend on **any** held asset currently fails the cash check. That is a pre-existing limit, not something Rev.142 introduces. It belongs to the future dividend-recognition Rev.
+The rev. 2 fail-closed placeholder (`adopted_income_unresolved`) is retired.
 
 ### 3.9 Risk, scanner and epochs
 
@@ -298,7 +286,7 @@ Building that inside Rev.142 would make Rev.142 the dividend-accounting Rev for 
      - outside a verification generation: unconditionally.
   - **Durable:** the exclusion is derived from immutable adoption rows and the bound checkpoint, so it survives restarts with no extra state.
   - **Enforced twice:** in the scanner, as a candidate rejection `ADOPTED_ASSET_EXCLUDED`, and in the gateway as the authorization boundary. A BUY there is rejected with `ADOPTED_ASSET_REENTRY_BLOCKED` before any risk evaluation. Protective SELLs are unaffected.
-  - **Release:** only at an authorized new-generation boundary, meaning a new bound opening checkpoint. The new checkpoint's binding verifies, for each excluded asset of the previous generation, that its adopted lot is closed and its accounting is settled; otherwise the asset stays excluded in the new generation. Settled means no open intents, the fee status (and crypto epoch) is `reconciled_net`, and there is no `adopted_income_unresolved` record.
+  - **Release:** only at an authorized new-generation boundary, meaning a new bound opening checkpoint. The new checkpoint's binding verifies, for each excluded asset of the previous generation, that its adopted lot is closed and its accounting is settled; otherwise the asset stays excluded in the new generation. Settled means no open intents, the fee status (and crypto epoch) is `reconciled_net`, and there is no `pending` or `unresolved` Rev.143 dividend attribution for the asset.
   - **Outside a verification generation, Rev.142 introduces no release.** An asset adopted outside a run stays excluded from strategy entries for that account until a future Rev designs re-entry. This is a deliberate operational consequence (section 6).
 - **Crypto accounting epochs** (`reconciliation/epochs.py`). Adopted inventory has its own epoch, which is excluded from strategy evidence. It is never assigned to a strategy epoch.
   - **Membership.** The adoption transaction creates `crypto_epoch:adopted:{adoption_id}` with:
@@ -356,7 +344,6 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
   | `ADOPTED_EXIT_REFUSED` | critical | once per asset per hour |
   | `MIXED_LOT_ORIGIN` | integrity hold | — |
   | `ADOPTION_CHECKPOINT_MISMATCH` | integrity hold | — |
-  | `adopted_income_unresolved` | critical | once per activity |
   | `ADOPTED_ASSET_REENTRY_BLOCKED` | gateway rejection (no alert) | — |
 
 ## 4. Invariants
@@ -372,7 +359,7 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
 - **AD-I9 no synthetic fill:** no `fills` row, lookup or default exists for any `adoption:` ID.
 - **AD-I10 re-entry:** no strategy BUY is authorized for an excluded account and asset (3.9).
 - **AD-I11 epochs:** adopted crypto inventory belongs only to its adopted epoch; no strategy epoch contains an adopted lot or a protective SELL of one.
-- **AD-I12 income:** Rev.142 never allocates dividend or withholding cash. Attributable income is unresolved until the dividend-recognition Rev exists (3.8a).
+- **AD-I12 income:** Rev.142 never allocates dividend or withholding cash. Rev.143 attributes it (bucket `adopted`), and `X(k)` contains no dividends (3.8a).
 
 ## 5. Recovery
 
@@ -390,7 +377,7 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
 - Open risk rises by the adopted positions' risk to their stops, so new-entry capacity under the profile's `max_open_risk_pct` falls. For example, MSFT at a ~$500 stop on a $543.73 basis adds ~$577 of open risk.
 - Opening-inventory positions are no longer silently skipped. If adoption fails, they are reported as unmanaged.
 - **Adopted symbols are excluded from new strategy entries** for the rest of the verification generation (Q2). **Outside a verification run the exclusion has no release in Rev.142.** For example, a manual AAPL purchase that gets adopted stops the strategy buying AAPL on that account until a future Rev adds re-entry.
-- A dividend on an adopted asset during a verification run raises `adopted_income_unresolved` in addition to today's cash-check failure (3.8a).
+- A dividend on an adopted asset is attributed by Rev.143 to its `adopted` bucket and excluded from run performance (3.8a).
 - Reports split strategy P&L from inherited P&L.
 - With the setting off, nothing changes. The flag stays off for the remainder of A0 and is frozen in any verification run.
 
@@ -427,7 +414,7 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
 | T27 | Evidence generation (`verification/evidence.py`) after a partial and after a full adopted-lot closure, for equity and crypto: it builds, lists adoptions as their own class, and contains no fill entry for any `adoption:` ID. |
 | T28 | Crypto epochs: adoption creates the adopted epoch atomically; a protective SELL joins it, never a strategy epoch; a coin fee on the adopted lot attributes to it; partial exit stays pending; full exit reconciles; a late fee supersedes once; restart between adoption and SELL changes nothing; `prove_edge` excludes it. |
 | T29 | Q2 durability: after full closure, a strategy BUY is refused in the scanner (`ADOPTED_ASSET_EXCLUDED`) and the gateway (`ADOPTED_ASSET_REENTRY_BLOCKED`), across a runtime restart; a new bound checkpoint releases it only when the closure obligations are settled, and keeps it excluded otherwise; outside a generation it is never released. |
-| T30 | Q1 fail closed: a dividend and its withholding on an adopted asset in a generation produce `adopted_income_unresolved` once per activity, `generation_equity` `unresolved_adopted_income`, no cash ledger entry from Rev.142 and no allocation; a dividend on a non-adopted asset behaves exactly as today. |
+| T30 | Q1 with Rev.143: a dividend and its withholding on an adopted asset in a generation are attributed to the `adopted` bucket, excluded through `D_excl`, recorded once in the cash ledger, and absent from `X(k)`; generation equity change from the asset stays $0. |
 
 ## 8. Out of scope
 
@@ -439,12 +426,18 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
 
 ## 9. Open questions
 
-Q1 and Q2 were decided by the operator for rev. 2 (section 2, 3.8a, 3.9). Two items remain for the operator:
+Q1 and Q2 were decided by the operator for rev. 2 (section 2, 3.8a, 3.9). Q3 is answered in rev. 3; Q4 remains for the operator:
 
-- **Q3.** Dividend cash recognition (3.8a, part 2) is a separate future Rev. Until it exists, a dividend on **any** held asset fails a verification run's cash check. Should that Rev be scheduled before verification runs that may span ex-dividend dates of held assets?
+- **Q3 (answered in rev. 3).** Dividend recognition is Rev.143, scheduled before Rev.142.
 - **Q4.** Outside a verification run, an adopted asset stays excluded from strategy entries with no release (3.9). Is that acceptable until a re-entry Rev, or should re-entry outside runs be designed next?
 
 ## 10. Change log
+
+**rev. 3 (2026-10-27).** Dividends delegated to Rev.143.
+1. **3.8a:** the fail-closed placeholder `adopted_income_unresolved` and the attribution contract were replaced by a reference to the Rev.143 spec. Rev.143 is scheduled before Rev.142 (order: Rev.140 → Rev.141 → Rev.143 → Rev.142).
+2. **Single exclusion:** dividends are excluded through Rev.143's `D_excl`, never through `X(k)`. The rev. 2 wording "adding it to `X(k)`" is removed.
+3. **Entitlement:** rev. 2 said record date. Rev.143 uses the trade date before the ex-date, which is correct under T+1.
+4. T30, AD-I12, section 6 and the alerts table updated; Q3 answered.
 
 **rev. 2 (2026-10-27).** Operator decisions Q1 and Q2, and the reviewer's forensic requirements 1–5.
 
@@ -467,7 +460,7 @@ Q1 and Q2 were decided by the operator for rev. 2 (section 2, 3.8a, 3.9). Two it
 
 ## 11. Evidence required for implementation approval
 
-- Rev.140 implemented, merged and its acceptance gates passed. A0 concluded with its evidence preserved.
+- Rev.140 implemented, merged and its acceptance gates passed. Rev.143 merged. A0 concluded with its evidence preserved.
 - The Rev.142 plan reviewed, with the `originating_fill_id` inventory re-run on the plan's base commit.
 - All T1–T30 pass; the full Python suite, mypy (project config) and Ruff (changed files) are reported exactly, along with the frontend tests for the dashboard badge.
 - T22's recorded-scenario comparison is attached as evidence that the setting off changes nothing.
