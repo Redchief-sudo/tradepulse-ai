@@ -1,6 +1,6 @@
 # Rev.143: dividend cash recognition and verified attribution — design specification
 
-**Status:** design, rev. 1, written from the operator-approved Sections 1–3 (2026-10-27).
+**Status:** design, rev. 2. Written from the operator-approved Sections 1–3; rev. 2 adds the operator decisions on dividend dates and escalation (2026-10-27).
 **Order of work:** Rev.140 → Rev.141 → **Rev.143** → Rev.142. Rev.142 rev. 3 depends on this spec (section 3.9).
 **Branch:** `rev143-dividends-design`. No production code, no migration, and no change to the active A0 verification run.
 
@@ -27,6 +27,8 @@
 | D-6 | Unproven attribution fails closed. It is never an invented allocation. |
 | D-7 | No feature flag. Recording replaces a failure that already happens. |
 | D-8 | Alpaca's real fields and rounding are measured before implementation (G0). |
+| D-9 | Entitlement comes from the **corporate-action announcement's** ex-date (and record date), never from the `DIV` activity's `date`. The activity establishes only when, and how much, cash was credited. Alpaca may credit cash after the payable date, and the activity's `date` and creation time may differ from the dividend's effective dates. |
+| D-10 | Escalation: a critical alert **3 NYSE trading days** after the activity is **first observed** in the broker feed, counted on the actual trading calendar (not 72 hours). The threshold controls alert escalation only. The accounting safeguards apply from the first observation. |
 
 ## 3. Design
 
@@ -64,7 +66,10 @@ A new `_persist_generation_dividends(connection, activities, membership, *, now)
    - `economic_type` and `cash_amount`;
    - `cash_entry_id`;
    - the checkpoint identifiers, as `_adjustment_actual` has today.
-3. **Status:** a `dividend_attribution_status` row, `pending`, with a deadline 3 trading days after the receipt (`unresolved` immediately for `dividend_unsupported`).
+3. **Status:** a `dividend_attribution_status` row, `pending`, with:
+   - `first_observed_at`: the time this cycle first saw the activity in the broker feed. It is never the ex-date and never the activity's `date`;
+   - `escalation_deadline`: the end of the 3rd NYSE trading session after `first_observed_at` (3.4 step 7);
+   - `unresolved` immediately for `dividend_unsupported`.
 
 **On replay,** an existing record is re-validated against the receipt and its cash entry, as `validate_generation_adjustment` does. A difference raises `GENERATION_DIVIDEND_RECEIPT_OR_CASH_MISMATCH`. A changed receipt under the same ID is already refused by the activity inbox (`BROKER_ACTIVITY_RECEIPT_CHANGED`).
 
@@ -83,8 +88,14 @@ A new `_persist_generation_dividends(connection, activities, membership, *, now)
 1. **Announcement.**
    - Fetch Alpaca corporate-action announcements for the symbol: `ca_types=dividend`, over the window `[activity date − 90 days, activity date]`. That's the measured maximum window (evidence `2026-10-26-r7-api-semantics`).
    - Store each announcement raw in `corporate_action_announcements` with its SHA-256.
-   - The match must be **exactly one** announcement with all of: sub-type cash; the same symbol; `payable_date` = the activity's payment date (as G0 establishes which field that is); rate = `per_share_amount`.
-   - Zero or several matches: retry next cycle until the deadline.
+   - **Candidates** are announcements with all of:
+     - sub-type cash and the same symbol;
+     - rate = the activity's `per_share_amount`;
+     - `payable_date` ≤ the activity's credit date, because Alpaca may credit late but never before the payable date (to be confirmed at G0);
+     - not already consumed by another `verified` activity on the same symbol.
+   - **The match** is the unique candidate whose eligible quantity, computed at **its own** `ex_date` (step 3), equals the activity's `qty`. That disambiguates two quarterly dividends at the same rate inside the 90-day window.
+   - Zero matches, or more than one, keeps the activity `pending` and retries (step 7).
+   - The activity's `date` is never used as an entitlement date (D-9).
    - `ex_date > payable_date` (a special dividend paid before going ex, settled with due bills): `unresolved` (`DIVIDEND_SPECIAL_EX_DATE`).
 2. **Entitlement by trade date.** A fill counts as before the ex-date when its **trade date** is earlier than `ex_date`. The time of day is not used: a pre-market buy on the ex-date is not entitled, and an after-hours buy on the evening before is.
    - The trade date is the broker-reported trading date of the execution when Alpaca supplies one (measured at G0).
@@ -104,7 +115,19 @@ A new `_persist_generation_dividends(connection, activities, membership, *, now)
    - If `qty` or `per_share_amount` is missing: `DIVIDEND_RECEIPT_INCOMPLETE`.
 5. **Withholding.** Each withholding activity is paired with exactly one verified income activity: same symbol, same payment date, same announcement. It is attributed in the income activity's proportions. If the income activity isn't verified, or the pairing isn't unique, the withholding stays pending and is unresolved at its deadline.
 6. **Exact split.** The activity's `net_amount` is split across lots and buckets in proportion to eligible quantity, using the largest-remainder method on cents, with ties broken by `lot_id`, so the parts sum **exactly** to `net_amount`. Each part is one immutable `dividend_attributions` row: `(activity_id, bucket, lot_id or bucket name, eligible_qty, amount, announcement_id, announcement_sha256)`. The status then becomes `verified`.
-7. **Deadline.** An activity still `pending` at its deadline becomes `unresolved` with the last reason, and raises a critical `DIVIDEND_ATTRIBUTION_UNRESOLVED` alert once per activity.
+7. **Retry and escalation (D-10).** The safeguards apply from the first observation, not from the deadline: a `pending` activity is in `D_unresolved`, the asset's equity status is unresolved, and snapshots are `INCOMPLETE_EVIDENCE` (3.7). Any integrity restriction an existing rule applies also takes effect immediately, unchanged: an invalid receipt leaves the cash check mismatched (3.2), and a quarantined instrument keeps its hold.
+
+   | Time since `first_observed_at` | Behaviour |
+   |---|---|
+   | Immediately | Cash recorded; attribution attempted in the same cycle; if unmatched, `pending` with the safeguards above |
+   | Every reconciliation cycle | Attribution retried against the stored announcements |
+   | At least once per trading day | Announcements re-fetched for the symbol (refreshed entitlement evidence) |
+   | At `escalation_deadline` (end of the 3rd NYSE trading session) | Status `unresolved` with the last reason; critical `DIVIDEND_ATTRIBUTION_UNRESOLVED` Telegram alert once per activity, for operator review |
+   | After the deadline | Retries continue. A later successful match moves it to `verified` and sends an info alert; it never skips the operator alert already sent |
+
+   - **Trading calendar.** The deadline is computed from Alpaca's market calendar (`GET /v2/calendar`), through a new `get_calendar(start, end)` on the broker port, beside `get_clock`. `SimulatedBroker` implements it from its `SimSession`.
+   - The calendar response used is stored with the status row, as evidence (`deadline_source = "alpaca_calendar"`).
+   - **If the calendar can't be read,** the deadline is computed as 3 weekdays (`deadline_source = "weekday_fallback"`). Holidays only push the true deadline later, so the alert may come early but never late. It is recomputed from the calendar when it next becomes available, but never moved later than an alert already sent.
 
 **Quarantined instruments (Rev.140 §3.10):** if the instrument has open quarantined inventory, the activity is `unresolved` (`DIVIDEND_ON_QUARANTINED_INSTRUMENT`). The cash is still recorded, and the quarantine hold stays.
 
@@ -148,8 +171,9 @@ The cash is recorded once, whatever the bucket (3.3).
 
 These are recorded in an evidence directory with a manifest, as in `2026-10-26-r7-api-semantics`. Read-only Alpaca calls only, with no orders.
 
-1. `GET /v2/account/activities?activity_types=DIV,DIVCGL,DIVCGS,DIVTXEX,DIVNRA,DIVTW,DIVFT,DIVROC` on the paper account: the field names and types, which date `date` is, and whether `qty` and `per_share_amount` are present.
-2. `GET /v2/corporate_actions/announcements?ca_types=dividend` for the held symbols: the field names, the `cash` rate format, and the ex, record and payable dates.
+1. `GET /v2/account/activities?activity_types=DIV,DIVCGL,DIVCGS,DIVTXEX,DIVNRA,DIVTW,DIVFT,DIVROC` on the paper account. Capture `activity_type`, `id`, `date`, `net_amount`, `qty`, `per_share_amount`, `status`, `symbol`, `description` and any creation timestamp. Record what `date` means relative to the matched announcement's payable date, and whether credits arrive after it (D-9).
+2. `GET /v2/corporate_actions/announcements?ca_types=dividend` for the held symbols: the field names, the `cash` rate format, and `ex_date`, `record_date` and `payable_date`. For each `DIV` sample in (1), record its announcement's three dates beside the activity's `date`.
+6. `GET /v2/calendar` for the next 30 days: the field format, and whether early closes are marked (3.4 step 7).
 3. The rounding rule, derived from (1) and (2) when samples exist.
 4. Whether Alpaca's newer corporate-actions endpoint (market data) is the better source. Record it; don't switch without a review.
 5. Whether fill activities carry a trade date distinct from `transaction_time`, and how overnight-session fills are dated (3.4 step 2).
@@ -176,7 +200,7 @@ All additions use `CREATE TABLE IF NOT EXISTS`, with no rebuild of existing tabl
 |---|---|---|
 | `corporate_action_announcements` | `(announcement_id, sha256)` | immutable; `BEFORE UPDATE` / `BEFORE DELETE` triggers verified at startup with Rev.140's trigger check |
 | `dividend_attributions` | `(activity_id, bucket, holder_id)`, where `holder_id` = `lot_id` or the bucket name | immutable, with triggers as above |
-| `dividend_attribution_status` | `activity_id` PK | mutable: `pending`, `verified` or `unresolved`; `reason`; `deadline`; `updated_at` |
+| `dividend_attribution_status` | `activity_id` PK | mutable: `pending`, `verified` or `unresolved`; `reason`; `first_observed_at` (set once); `escalation_deadline`; `deadline_source`; the calendar response used; `alerted_at`; `updated_at` |
 
 The cash entries reuse `cash_ledger`, and the records reuse `reconciliation_records`.
 
@@ -228,7 +252,7 @@ The cash entries reuse `cash_ledger`, and the records reuse `reconciliation_reco
 | T3 | Invalid receipt (each field rule) raises `DIVIDEND_RECEIPT_INVALID` and writes nothing. |
 | T4 | `DIVROC` and an unknown `DIV*` type: cash recorded, `unresolved`, alert once. |
 | T5 | Pre-run dividend activity is not recorded; unresolved membership raises. |
-| T6 | Announcement matching: one match → verified; zero → pending then unresolved at the deadline; two → unresolved; amended announcement → the version used is recorded. |
+| T6 | Announcement matching: one match → verified; a credit dated after the payable date still matches; zero → pending; two same-rate announcements in the window → disambiguated by eligible quantity at each ex-date, and still ambiguous → pending; amended announcement → the version used is recorded; the activity's `date` is never used for entitlement. |
 | T7 | Special dividend (`ex_date > payable_date`) → `unresolved` (`DIVIDEND_SPECIAL_EX_DATE`). |
 | T8 | Entitlement by trade date: bought the day before (including after hours) is entitled; bought pre-market on the ex-date is not; sold on or after the ex-date keeps it; sold before loses it; an overnight-session fill without a broker trade date → `DIVIDEND_TRADE_DATE_AMBIGUOUS`. |
 | T9 | Quantity cross-check mismatch → `DIVIDEND_QUANTITY_MISMATCH`. |
@@ -240,12 +264,15 @@ The cash entries reuse `cash_ledger`, and the records reuse `reconciliation_reco
 | T15 | Strategy bucket: appears in the trade attribution's `dividend_income`, not in price P&L; counted in run equity. |
 | T16 | Outside a run, unexplained eligible quantity → `DIVIDEND_ELIGIBLE_QUANTITY_UNEXPLAINED`. |
 | T17 | Reversal of a verified dividend: mirror rows; partial reversal unresolved; reissue attributed as new. |
-| T18 | Pending and unresolved: `D_unresolved` set, equity status unresolved, snapshot `INCOMPLETE_EVIDENCE`; verification clears `D_unresolved`. |
+| T18 | From the first observation: `D_unresolved` set, equity status unresolved, snapshot `INCOMPLETE_EVIDENCE`; verification clears `D_unresolved`. |
 | T19 | Quarantined instrument: cash recorded, `DIVIDEND_ON_QUARANTINED_INSTRUMENT`, hold kept. |
 | T20 | Immutability: update and delete on announcements and attributions fail; a missing trigger refuses startup. |
 | T21 | End to end: the worked example in 3.7; cash check matches; run equity includes $2.60 only. |
 | T22 | Recovery: crash after recording, before attribution; restart attributes once. |
 | T23 | Receipt shape differing from the fixtures → `DIVIDEND_RECEIPT_SHAPE_UNVERIFIED`. |
+| T24 | Escalation on the trading calendar: first observed on a Wednesday before Thanksgiving, so the deadline skips the holiday (end of the following Monday's session); the alert fires once at the deadline, not before; the deadline starts at first observation, not at the ex-date or the activity `date`. |
+| T25 | Calendar unavailable → weekday fallback (alert early, never late); when the calendar returns, the deadline is recomputed but never later than an alert already sent. |
+| T26 | A match after the deadline → `verified`, an info alert, and the critical alert is not repeated; announcements re-fetched at least once per trading day while pending. |
 
 ## 8. Out of scope
 
@@ -256,10 +283,18 @@ The cash entries reuse `cash_ledger`, and the records reuse `reconciliation_reco
 
 ## 9. Open questions
 
-- **Q1.** If G0 finds that `date` on a `DIV` activity is not the payable date, the matching key changes. G0 decides, and the spec is revised before the plan.
-- **Q2.** The 3-trading-day deadline is a judgement. Is it right for the operator, or should unresolved be raised sooner?
+- **Q1 (decided, rev. 2):** entitlement uses the announcement's dates. The `DIV` activity gives only the credit (D-9). G0 still records what `date` means.
+- **Q2 (decided, rev. 2):** 3 NYSE trading days from first observation, for alert escalation only (D-10).
+
+No open questions remain for the operator.
 
 ## 10. Change log
+
+**rev. 2 (2026-10-27).** Operator decisions on dividend dates and escalation.
+1. **D-9:** entitlement from the announcement's dates only. Announcement matching no longer requires `payable_date` = activity date, since a credit may be late; it requires `payable_date` ≤ the credit date. Same-rate quarterly dividends are disambiguated by the eligible quantity at each candidate's own ex-date.
+2. **D-10:** escalation 3 NYSE trading days after **first observation**, on Alpaca's calendar. The safeguards are immediate, with daily announcement refreshes and a weekday fallback that can only alert early. New broker-port method `get_calendar`.
+3. G0 captures the exact fields the operator listed, and the calendar.
+4. Tests T6 and T18 updated; T24–T26 added.
 
 **rev. 1 (2026-10-27).** First written version, from approved Sections 1–3.
 - **Section 2 correction:** entitlement uses the ex-date (D-4), not the record date. Under T+1, a share bought on the record date is not entitled.
@@ -270,4 +305,4 @@ The cash entries reuse `cash_ledger`, and the records reuse `reconciliation_reco
 ## 11. Evidence required for implementation approval
 
 - Rev.140 and Rev.141 merged. G0 measurements recorded with a manifest, and the spec revised if they differ.
-- All T1–T23 pass; the full Python suite, mypy (project configuration) and Ruff (changed files) are reported exactly.
+- All T1–T26 pass; the full Python suite, mypy (project configuration) and Ruff (changed files) are reported exactly.
