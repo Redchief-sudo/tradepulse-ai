@@ -1,6 +1,6 @@
 # Rev.142: adopting unmanaged long positions for protective management — design specification
 
-**Status:** design, rev. 1. Approved for specification drafting: Sections 1–3 and reviews ADOPT-01 to ADOPT-08 and REV142-01 to REV142-03.
+**Status:** design, rev. 2. Approved for specification drafting: Sections 1–3, reviews ADOPT-01 to ADOPT-08 and REV142-01 to REV142-03, and operator decisions Q1 and Q2 (rev. 2).
 **Implementation is blocked** until Rev.140 is implemented, validated and approved (section 3.1).
 **Branch:** `rev142-adoption-design`. No production code, no migration, and no change to the active A0 verification run.
 
@@ -47,6 +47,8 @@ A broker position with no local holding gets no protection.
 | REV142-01 | The generation-equity exclusion is proven against dividends, capital flows, fee corrections and unrelated trading. All inherited-position performance is excluded from `prove_edge`. |
 | REV142-02 | Neither adoption nor full liquidation clears an integrity hold. |
 | REV142-03 | A late fee correction after full closure updates both projections exactly once, without reopening inventory or duplicating cash. |
+| Q1 | Dividends attributable to adopted inventory are excluded from generation performance and `prove_edge`, and kept in broker cash, ledgers and reconciliation. Attribution needs verified entitlement evidence; when it can't be proven, the measurement is unresolved (fail closed), never an invented allocation (3.8a). |
+| Q2 | No strategy BUY of an account-qualified asset that had an adoption during the verification generation, even after full closure. The exclusion is durable across restarts and released only at an authorized new-generation boundary with closure obligations reconciled. No re-entry mechanism outside a generation is introduced by Rev.142 (3.9). |
 
 ## 3. Design
 
@@ -137,6 +139,8 @@ The write runs in one SQLite write transaction (`database.run(..., write=True)`,
 3. **`Holding`:** quantity and average price from the lot; `stop_loss` from the adoption; `target_price=None`; `current_stop=None`; `scaled_out=False`.
 4. **`AuditEvent`** `adopted_position` (warning), with a deterministic ID `adopted_position:{adoption_id}`, delivered through `alert_once`.
 
+5. **Crypto only: the adopted accounting epoch.** An `accounting_epochs` row `crypto_epoch:adopted:{adoption_id}`, with `origin="adopted"`, `owned_quantity = adopted_quantity` and no trade intents (3.9). This is internal classification, like the lot.
+
 **Neutrality (ADOPT-01):** the transaction writes nothing to `fills`, `cash_ledger`, `trade_intents` or `settlements`, and calls no broker method except the reads that came before it.
 
 **Idempotency (ADOPT-08):**
@@ -178,7 +182,14 @@ The adopted lot has no fill row. Each site below gets an explicit `lot.origin ==
 | `reconciliation/epochs.py:258,276` (crypto epochs) | selected fill IDs | adopted crypto lots form their own epoch; owned quantity includes them (3.9) |
 | `verification/evidence.py:151,224,416,432,457,459,463,465,492,522` | `fills[lot.originating_fill_id]` | asset from the adoption row; the opening fill is "none, adopted"; quantity allocation from `adopted_quantity`; the bundle lists adoptions as their own evidence class |
 
-The plan must re-run this inventory with `grep -rn originating_fill_id tradepulse` at implementation time, and fail the task if a site is missing from the table.
+**No adopted lot may be treated as having an originating fill.** No code path may construct, look up or default a fill for an `adoption:` ID.
+
+**Source-level regression guard (test T26).**
+- An AST test walks `tradepulse/` and collects every attribute access or subscript of `originating_fill_id` as a `(module, enclosing function)` pair.
+- It compares that set with an approved list held in the test. Each entry names the site and the test (T11 or T27) that exercises its adopted branch.
+- A new or moved site fails the test until it is added with its adopted-lot test. The two sites that only **write** the field (`settlement/engine.py:100`, `persistence/hydration.py:260`) and the schema and repository registrations are listed as write-only.
+
+The plan must also re-run this inventory with `grep -rn originating_fill_id tradepulse` at implementation time, and fail the task if a site is missing from the table.
 
 #### 3.6.2 Closing an adopted lot (ADOPT-08)
 
@@ -241,8 +252,7 @@ Per bound generation, for each `opening_inventory` adoption *a* of asset *k* wit
   - The remaining value is in equity through the position, and is subtracted through `R × mark`.
   - Result: the inherited asset contributes **exactly zero** to generation equity, before, during and after adoption.
 - **Generation cash:** unchanged. Expected cash = opening cash + in-run cash movements, and the closing fill is an in-run movement.
-- **What `N(k)` never contains:** deposits, withdrawals, interest, dividends, other cash adjustments, and fills of other assets. They keep their existing classification (`generation_adjustment_totals`: `capital_flows` versus `profit_adjustments`), and `N(k)` reads only adopted-lot closures, so they can't be pulled in.
-  - **Decision (rev. 1):** a dividend paid on adopted opening inventory stays a generation `profit_adjustment`, exactly as today. Rev.142 changes no non-fill classification. See open question Q1.
+- **What `N(k)` never contains:** deposits, withdrawals, interest, dividends, other cash adjustments, and fills of other assets. `N(k)` reads only adopted-lot closures, so they can't be pulled in. Deposits, withdrawals and interest keep their existing classification (`generation_adjustment_totals`). Dividends follow 3.8a.
 
 **Worked example (also test T16).**
 - Checkpoint: 10 shares, `V₀` = $1,000.
@@ -250,11 +260,57 @@ Per bound generation, for each `opening_inventory` adoption *a* of asset *k* wit
 - The remaining 6 are marked at $112: `R × mark` = $672.
 - `X` = 672 + 458 − 1000 = **$130**. The broker equity change from this asset is also $130, so the generation's change is $0.
 
+### 3.8a Dividends on adopted inventory (Q1)
+
+**Today (traced, rev. 2 correction).**
+- `reconciliation/generation_fees.py::adjustment_receipt` recognizes only `CSD`, `CSW`, `INT`, `JNLC` and `JNLD`. No code creates a `cash_ledger` entry for a dividend activity (`DIV*`), or for dividend withholding.
+- Membership (`reconciliation/membership.py::_classify`) still classifies an in-run dividend activity as `in_generation`.
+- So the cash arrives at the broker, and the generation's expected cash (opening cash + ledger movements) no longer equals observed cash. `generation_cash` is `mismatch`, and the mandatory invariants fail. **A dividend in a verification run already fails closed today, for any asset.** Rev. 1 wrongly said it stays a `profit_adjustment`.
+- Rev.140 §3.10 likewise fails closed on corporate actions.
+
+**Consequence.** Q1's target treatment needs dividend **cash recognition**, which TradePulse does not have for any asset:
+- a ledger entry per dividend and withholding activity;
+- entitlement evidence from corporate-action announcements (record date, eligible quantity, rate);
+- reinvestment handling;
+- corrections and reversals.
+
+Building that inside Rev.142 would make Rev.142 the dividend-accounting Rev for every position. **Rev. 2 therefore splits it:**
+
+1. **In Rev.142 (fail closed).** A dividend or withholding activity on an asset with an adoption in the generation keeps today's result: `generation_cash` mismatch, so the mandatory invariants are not matched and the snapshot is `INCOMPLETE_EVIDENCE`. In addition, Rev.142 records it as `adopted_income_unresolved:{activity_id}` (a critical alert, once per activity) and marks `generation_equity` `unresolved_adopted_income` for that asset.
+   - No allocation is invented. The activity's cash is not moved into any ledger by Rev.142.
+   - `prove_edge` is already `ineligible_adopted` for the asset.
+2. **The attribution contract, for the future dividend-recognition Rev,** which must satisfy it before 1 is lifted:
+   - **Eligible quantity:** the adopted lot's remaining quantity at the end of the **record date**. It comes from verified corporate-action evidence: Alpaca's announcements endpoint, the same source D12 names for IBKR. Never the quantity held when the cash arrives.
+   - **Attributed amount:** eligible quantity × declared rate, minus the matching withholding activities, reconciled to the actual broker cash activities by activity ID. Any difference makes it unresolved.
+   - **Ledger:** one cash entry per real broker activity. The dividend is recorded in `adoption_income` (per adoption and activity) and excluded from generation performance by adding it to `X(k)`.
+   - **Reinvestment** (a share credit) changes the adopted lot's quantity only through a verified corporate-action procedure (Rev.140 §3.10). Until one exists, a reinvestment is unresolved.
+   - **Corrections and reversals** reference the original activity, and recompute `adoption_income` exactly once.
+
+**Note for the operator:** in a verification run, a dividend on **any** held asset currently fails the cash check. That is a pre-existing limit, not something Rev.142 introduces. It belongs to the future dividend-recognition Rev.
+
 ### 3.9 Risk, scanner and epochs
 
 - **Open risk:** `open_portfolio_risk` already sums every holding at `average_price − effective stop`. Adopted holdings now count. That's correct, because the risk is real, and it reduces the budget for new entries (section 6).
-- **Scanner:** the existing opening-inventory block becomes "no entry on any `(account_ref, asset_key)` with an open adopted lot, or a bound opening position not yet adopted". When an adopted lot closes to zero, the block lifts for future generations. Within the same generation the opening block still applies (unchanged).
-- **Crypto epochs** (`reconciliation/epochs.py`): an adopted crypto lot is its own accounting epoch, `crypto_epoch:adopted:{adoption_id}`, with `owned_quantity = adopted_quantity`. Today's `broker − opening` subtraction no longer applies to it once adopted.
+- **Re-entry exclusion (Q2).** A strategy BUY is refused for an `(account_ref, asset_key)` when either of these holds:
+  1. A bound opening checkpoint lists the asset and it is not yet adopted. This is today's block, unchanged.
+  2. A `position_adoptions` row exists for the account and asset, and either:
+     - inside a verification generation: its `adopted_at` ≥ the bound generation's `opened_at`, or its `source_id` is the bound checkpoint ID;
+     - outside a verification generation: unconditionally.
+  - **Durable:** the exclusion is derived from immutable adoption rows and the bound checkpoint, so it survives restarts with no extra state.
+  - **Enforced twice:** in the scanner, as a candidate rejection `ADOPTED_ASSET_EXCLUDED`, and in the gateway as the authorization boundary. A BUY there is rejected with `ADOPTED_ASSET_REENTRY_BLOCKED` before any risk evaluation. Protective SELLs are unaffected.
+  - **Release:** only at an authorized new-generation boundary, meaning a new bound opening checkpoint. The new checkpoint's binding verifies, for each excluded asset of the previous generation, that its adopted lot is closed and its accounting is settled; otherwise the asset stays excluded in the new generation. Settled means no open intents, the fee status (and crypto epoch) is `reconciled_net`, and there is no `adopted_income_unresolved` record.
+  - **Outside a verification generation, Rev.142 introduces no release.** An asset adopted outside a run stays excluded from strategy entries for that account until a future Rev designs re-entry. This is a deliberate operational consequence (section 6).
+- **Crypto accounting epochs** (`reconciliation/epochs.py`). Adopted inventory has its own epoch, which is excluded from strategy evidence. It is never assigned to a strategy epoch.
+  - **Membership.** The adoption transaction creates `crypto_epoch:adopted:{adoption_id}` with:
+    - `origin="adopted"`, `adoption_id`, `trade_intent_ids=[]`;
+    - `starting_broker_quantity = adopted_quantity`, set at creation, so the `start is None` recovery branch, which sums preceding fills, never runs for it;
+    - the generation fields from the bound checkpoint, as `new_epoch` does today.
+  - **Exits.** `reserve_epoch` for a protective SELL on an asset with an open adopted lot appends the intent to that adopted epoch. It never appends to a strategy epoch, and never calls `new_epoch` with `broker − opening`. An adopted asset never has a strategy epoch, because of the mixed-origin rule (3.6.3) and the re-entry exclusion.
+  - **Lot selection.** Epoch reconciliation selects the adopted epoch's lots by `lot.adoption_id == epoch.adoption_id`, not by `originating_fill_id` (sites `epochs.py:258,276`). A coin-denominated fee that debits the adopted lot (`asset_fee_quantities`) is attributed to the adopted epoch. Strategy epochs exclude adopted lots from their `preceding` computation.
+  - **Partial and complete exits.** The epoch stays pending until the adopted lot is closed, every appended intent is terminal and the fees are reconciled. Then it moves to `reconciled_net` as today.
+  - **Late fee evidence** after `reconciled_net` follows today's checkpoint supersession (`superseded_checkpoint_ids`) on the adopted epoch.
+  - **Restart:** the epoch row is written atomically with the adoption, and `reserve_epoch` is already idempotent per intent.
+  - **Evidence:** an epoch with `origin="adopted"` is excluded from `prove_edge` and strategy fee evidence, and reported with the adoption.
 - **Rev.141:** the per-profile limits are unaffected. `symbol_entries_today` counts BUY intents only, and adoption creates none.
 
 ### 3.10 Integrity holds (REV142-02)
@@ -280,6 +336,8 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
 
 **`TradeAttribution`** gains `origin` (default `"fill"`) and `adoption_id`.
 
+**Crypto `accounting_epochs` payloads** gain `origin` (default `"fill"`) and `adoption_id` (3.9). Existing rows hydrate as `"fill"`.
+
 ### 3.12 Operator surface
 
 - **Telegram on adoption:** `Adopted MSFT 13.252 (opening inventory) — basis $543.73 (broker, unverified), mark $531.96, stop $500.23 (atr|8% fallback)`.
@@ -298,6 +356,8 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
   | `ADOPTED_EXIT_REFUSED` | critical | once per asset per hour |
   | `MIXED_LOT_ORIGIN` | integrity hold | — |
   | `ADOPTION_CHECKPOINT_MISMATCH` | integrity hold | — |
+  | `adopted_income_unresolved` | critical | once per activity |
+  | `ADOPTED_ASSET_REENTRY_BLOCKED` | gateway rejection (no alert) | — |
 
 ## 4. Invariants
 
@@ -309,6 +369,10 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
 - **AD-I6 P&L:** for each attribution row, `broker_basis_pnl − managed_pnl == (adoption_mark_price − broker_avg_entry_price) × qty`, and no report sums the two.
 - **AD-I7 generation:** an adopted opening asset contributes 0 to generation equity, and `X(k)` contains only that asset's adopted closures and mark.
 - **AD-I8 holds:** no Rev.142 code path clears an integrity hold or `financial_integrity_manual_reenable_required`.
+- **AD-I9 no synthetic fill:** no `fills` row, lookup or default exists for any `adoption:` ID.
+- **AD-I10 re-entry:** no strategy BUY is authorized for an excluded account and asset (3.9).
+- **AD-I11 epochs:** adopted crypto inventory belongs only to its adopted epoch; no strategy epoch contains an adopted lot or a protective SELL of one.
+- **AD-I12 income:** Rev.142 never allocates dividend or withholding cash. Attributable income is unresolved until the dividend-recognition Rev exists (3.8a).
 
 ## 5. Recovery
 
@@ -325,6 +389,8 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
 - Inherited and unknown long positions get stops and full exit management, and can be sold automatically. That's the purpose.
 - Open risk rises by the adopted positions' risk to their stops, so new-entry capacity under the profile's `max_open_risk_pct` falls. For example, MSFT at a ~$500 stop on a $543.73 basis adds ~$577 of open risk.
 - Opening-inventory positions are no longer silently skipped. If adoption fails, they are reported as unmanaged.
+- **Adopted symbols are excluded from new strategy entries** for the rest of the verification generation (Q2). **Outside a verification run the exclusion has no release in Rev.142.** For example, a manual AAPL purchase that gets adopted stops the strategy buying AAPL on that account until a future Rev adds re-entry.
+- A dividend on an adopted asset during a verification run raises `adopted_income_unresolved` in addition to today's cash-check failure (3.8a).
 - Reports split strategy P&L from inherited P&L.
 - With the setting off, nothing changes. The flag stays off for the remainder of A0 and is frozen in any verification run.
 
@@ -348,7 +414,7 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
 | T14 | Exactly-once closure: replay the closing fill and its settlement event; `closures`, cash and attribution are unchanged. |
 | T15 | P&L: the review's example (basis $100, mark $110, sale $115 × 10, fee $2) gives broker basis +$148, managed +$48, difference $100; no report sums them. |
 | T16 | Generation equity: the worked example in 3.8 before adoption, after the partial sale and after the full sale, with a price move between; generation equity change is $0 and generation cash matches. |
-| T17 | REV142-01: a deposit, a withdrawal, a dividend on the adopted asset, interest, a fee correction on another asset and a trade in another asset are absent from `X(k)`, and classified as today. |
+| T17 | REV142-01: a deposit, a withdrawal, interest, a fee correction on another asset and a trade in another asset are absent from `X(k)`, and classified as today. |
 | T18 | REV142-03: a fee correction after full closure updates `realized_pnl` and the attribution once; replaying it changes nothing; no lot reopens; one cash effect. |
 | T19 | Mixed origin: a BUY fill on an adopted asset latches `MIXED_LOT_ORIGIN` and creates no lot; the scanner refuses the entry earlier. |
 | T20 | REV142-02: an unexpected position latches the integrity block; it is adopted and fully liquidated; the block and the re-enable requirement persist. |
@@ -357,6 +423,11 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
 | T23 | Immutability: update and delete on `position_adoptions` fail; a missing trigger refuses startup. |
 | T24 | Evidence bundle: `verification/evidence.py` builds with adopted lots, lists them as their own class and raises no missing-fill error. |
 | T25 | End to end (Rev.138 runtime harness): inherited position → adoption → ratchet → scale-out → stop-out; every snapshot's mandatory invariants match. |
+| T26 | Source guard: the AST inventory of `originating_fill_id` reads equals the approved list; adding an unlisted read fails the test. |
+| T27 | Evidence generation (`verification/evidence.py`) after a partial and after a full adopted-lot closure, for equity and crypto: it builds, lists adoptions as their own class, and contains no fill entry for any `adoption:` ID. |
+| T28 | Crypto epochs: adoption creates the adopted epoch atomically; a protective SELL joins it, never a strategy epoch; a coin fee on the adopted lot attributes to it; partial exit stays pending; full exit reconciles; a late fee supersedes once; restart between adoption and SELL changes nothing; `prove_edge` excludes it. |
+| T29 | Q2 durability: after full closure, a strategy BUY is refused in the scanner (`ADOPTED_ASSET_EXCLUDED`) and the gateway (`ADOPTED_ASSET_REENTRY_BLOCKED`), across a runtime restart; a new bound checkpoint releases it only when the closure obligations are settled, and keeps it excluded otherwise; outside a generation it is never released. |
+| T30 | Q1 fail closed: a dividend and its withholding on an adopted asset in a generation produce `adopted_income_unresolved` once per activity, `generation_equity` `unresolved_adopted_income`, no cash ledger entry from Rev.142 and no allocation; a dividend on a non-adopted asset behaves exactly as today. |
 
 ## 8. Out of scope
 
@@ -368,10 +439,21 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
 
 ## 9. Open questions
 
-- **Q1.** Should dividends and other income on adopted **opening** inventory also be excluded from generation equity, so that all economic results of inherited inventory are excluded and not only its price change? Rev. 1 keeps today's classification and changes nothing (3.8).
-- **Q2.** Should a closed adopted asset be eligible for new strategy entries within the same verification generation? Rev. 1 says no (3.9).
+Q1 and Q2 were decided by the operator for rev. 2 (section 2, 3.8a, 3.9). Two items remain for the operator:
+
+- **Q3.** Dividend cash recognition (3.8a, part 2) is a separate future Rev. Until it exists, a dividend on **any** held asset fails a verification run's cash check. Should that Rev be scheduled before verification runs that may span ex-dividend dates of held assets?
+- **Q4.** Outside a verification run, an adopted asset stays excluded from strategy entries with no release (3.9). Is that acceptable until a re-entry Rev, or should re-entry outside runs be designed next?
 
 ## 10. Change log
+
+**rev. 2 (2026-10-27).** Operator decisions Q1 and Q2, and the reviewer's forensic requirements 1–5.
+
+1. **Correction:** rev. 1 said a dividend on adopted inventory "stays a generation `profit_adjustment`, exactly as today". That was wrong. `adjustment_receipt` recognizes no dividend activity, so a dividend in a verification run already fails the generation cash check, for any asset. Section 3.8a records the traced behaviour.
+2. **Q1 (3.8a):** split into a fail-closed rule inside Rev.142 (`adopted_income_unresolved`, no invented allocation) and an attribution contract for a future dividend-recognition Rev: record-date eligible quantity from verified announcements, withholding, reinvestment and corrections. New test T30; the dividend case was removed from T17.
+3. **Q2 (3.9):** re-entry exclusion derived from immutable adoption rows and the bound checkpoint, so it is durable across restarts. It is enforced in the scanner and at the gateway, and released only at a new bound checkpoint with closure obligations settled. No release outside a generation. New test T29; consequence stated in section 6.
+4. **Crypto epochs (3.9, 3.3.3 step 5):** a separate adopted epoch, created atomically with the adoption. It covers protective-SELL membership, lot selection by `adoption_id`, coin fees, partial and full exits, late fees, restart and evidence exclusion. New test T28.
+5. **Opening-fill lookups (3.6.1):** an explicit no-synthetic-fill rule, and an AST source-level guard (T26). Evidence generation is tested after partial and full closure (T27).
+6. Open questions Q3 (dividend-recognition scheduling) and Q4 (re-entry outside runs) added for the operator.
 
 **rev. 1 (2026-10-27).** Written from the approved Sections 1–3 and reviews ADOPT-01 to 08 and REV142-01 to 03.
 
@@ -387,5 +469,5 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
 
 - Rev.140 implemented, merged and its acceptance gates passed. A0 concluded with its evidence preserved.
 - The Rev.142 plan reviewed, with the `originating_fill_id` inventory re-run on the plan's base commit.
-- All T1–T25 pass; the full Python suite, mypy (project config) and Ruff (changed files) are reported exactly, along with the frontend tests for the dashboard badge.
+- All T1–T30 pass; the full Python suite, mypy (project config) and Ruff (changed files) are reported exactly, along with the frontend tests for the dashboard badge.
 - T22's recorded-scenario comparison is attached as evidence that the setting off changes nothing.
