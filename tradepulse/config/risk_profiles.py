@@ -54,6 +54,8 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         # universe -- see docs/exit-intelligence-portfolio-optimization-calibration.md
         max_correlation_threshold=Decimal("0.75"),
         max_correlation_threshold_crypto=Decimal("0.85"),
+        # Rev.141: the open-risk cap sits under 12 positions x 0.50% = 6%, so it binds.
+        max_open_risk_pct=Decimal("5.0"), max_entries_per_symbol_per_day=2, max_cost_to_risk_pct=Decimal("10"),
     ),
     "balanced": RiskLimits(
         profile_id="balanced",
@@ -89,6 +91,8 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         # ~p85 -- catches AAPL/MSFT-level (0.55) relatedness, most cautious
         max_correlation_threshold=Decimal("0.55"),
         max_correlation_threshold_crypto=Decimal("0.75"),
+        # Rev.141: one entry per symbol per day (no add-ons); a tighter cost rule.
+        max_open_risk_pct=Decimal("1.0"), max_entries_per_symbol_per_day=1, max_cost_to_risk_pct=Decimal("8"),
     ),
     "micro": RiskLimits(
         profile_id="micro",
@@ -105,6 +109,8 @@ RISK_PROFILES: dict[str, RiskLimits] = {
         # same posture as balanced -- ~p90
         max_correlation_threshold=Decimal("0.65"),
         max_correlation_threshold_crypto=Decimal("0.80"),
+        # Rev.141: 3 positions x 1.0% = 3%; one entry per symbol per day.
+        max_open_risk_pct=Decimal("3.0"), max_entries_per_symbol_per_day=1, max_cost_to_risk_pct=Decimal("10"),
     ),
 }
 

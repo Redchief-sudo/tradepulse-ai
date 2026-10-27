@@ -3,6 +3,8 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import pytest
+
 from tradepulse.config import risk_limits_for_profile
 from tradepulse.models import (
     AssetClass,
@@ -1056,6 +1058,49 @@ def test_cost_rule_rejects_a_trade_whose_costs_eat_its_edge() -> None:
     assert not any(r.startswith("COST_EXCEEDS_RISK_FRACTION") for r in equity.reasons)
 
 
+PROFILE_IDS = ("conservative", "micro", "balanced", "aggressive")
+
+
+@pytest.mark.parametrize("profile_id", PROFILE_IDS)
+def test_each_profile_refuses_a_buy_once_open_risk_reaches_its_cap(profile_id: str) -> None:
+    """Rev.141: the combined open-risk cap applies under every profile, not
+    only balanced. Equity 100,000; a buy risking 3 per share (stop 97)."""
+    limits = risk_limits_for_profile(profile_id)
+    cap = limits.max_open_risk_pct / 100 * Decimal("100000")
+    buy = _buy(stop_loss=Decimal("97"), confidence=Decimal("95"))
+    assert evaluate_risk(buy, _snapshot(), limits, _quoted(open_risk=cap - Decimal("300"))).approved
+    decision = evaluate_risk(buy, _snapshot(), limits, _quoted(open_risk=cap))
+    assert not decision.approved and "INSUFFICIENT_CAPACITY_FOR_MINIMUM_LOT" in decision.reasons
+
+
+@pytest.mark.parametrize("profile_id", PROFILE_IDS)
+def test_each_profile_refuses_an_entry_past_its_per_symbol_limit(profile_id: str) -> None:
+    limits = risk_limits_for_profile(profile_id)
+    allowed = limits.max_entries_per_symbol_per_day
+    buy = _buy(stop_loss=Decimal("97"), confidence=Decimal("95"))
+    assert evaluate_risk(buy, _snapshot(), limits, _quoted(symbol_entries_today=allowed - 1)).approved
+    decision = evaluate_risk(buy, _snapshot(), limits, _quoted(symbol_entries_today=allowed))
+    assert not decision.approved and f"MAX_ENTRIES_PER_SYMBOL_REACHED ({allowed}/{allowed})" in decision.reasons
+
+
+@pytest.mark.parametrize("profile_id", PROFILE_IDS)
+def test_each_profile_refuses_a_buy_whose_costs_exceed_its_share_of_risk(profile_id: str) -> None:
+    """R = 1% (stop 99, price 100). An equity's cost is its spread, so the
+    allowed spread is max_cost_to_risk_pct % of 1%: 0.08 for conservative,
+    0.10 for the others. At the limit passes; just over is refused."""
+    limits = risk_limits_for_profile(profile_id)
+    allowed_spread = limits.max_cost_to_risk_pct / 100
+    buy = _buy(stop_loss=Decimal("99"), confidence=Decimal("95"))
+
+    def quoted_with_spread(spread: Decimal) -> RiskEvalOptions:
+        return _quoted(bid=Decimal("100") - spread / 2, ask=Decimal("100") + spread / 2)
+
+    at_limit = evaluate_risk(buy, _snapshot(), limits, quoted_with_spread(allowed_spread))
+    assert not any(r.startswith("COST_EXCEEDS_RISK_FRACTION") for r in at_limit.reasons)
+    over = evaluate_risk(buy, _snapshot(), limits, quoted_with_spread(allowed_spread + Decimal("0.02")))
+    assert not over.approved and any(r.startswith("COST_EXCEEDS_RISK_FRACTION") for r in over.reasons)
+
+
 def test_protective_exits_ignore_every_entry_limit() -> None:
     decision = evaluate_risk(_buy(side=Side.SELL, stop_loss=Decimal("99")), _snapshot(), LIMITS,
                              _quoted(protective_exit=True, open_risk=Decimal("99999"), symbol_entries_today=9))
@@ -1093,3 +1138,32 @@ async def test_symbol_entries_today_counts_this_symbols_buys_only(tmp_path) -> N
         await repositories.fills.create_once(fill_id, fill, unique_value=None)
 
     assert await symbol_entries_today(repositories, _aapl(), NOW) == 2
+
+
+async def test_symbol_entries_today_counts_pending_buys_of_this_symbol(tmp_path) -> None:
+    """Rev.141: an entry still in flight counts against the per-symbol limit,
+    so a second entry can't pass while the first is unfilled. Sells, other
+    symbols, terminal intents and the intent being evaluated don't count."""
+    from tradepulse.risk import symbol_entries_today
+
+    repositories = await _repositories(tmp_path)
+
+    async def intent(intent_id: str, asset, side: Side, status: TradeIntentStatus) -> None:
+        row = TradeIntent(intent_id, f"idem-{intent_id}", f"corr-{intent_id}", asset, side, ExecutionMode.PAPER,
+                          "ai_scan", NOW, requested_quantity=Decimal("5"), stop_loss=Decimal("95"), status=status,
+                          risk_snapshot={"entry_price": "100"})
+        await repositories.trade_intents.create_once(intent_id, row, status=status.value, unique_value=f"idem-{intent_id}")
+
+    await intent("pending-aapl", _aapl(), Side.BUY, TradeIntentStatus.SUBMITTED)
+    await intent("unknown-aapl", _aapl(), Side.BUY, TradeIntentStatus.SUBMISSION_UNKNOWN)
+    await intent("current", _aapl(), Side.BUY, TradeIntentStatus.RISK_APPROVED)
+    await intent("exit-aapl", _aapl(), Side.SELL, TradeIntentStatus.SUBMITTED)
+    await intent("canceled-aapl", _aapl(), Side.BUY, TradeIntentStatus.CANCELED)
+    await intent("pending-msft", AssetIdentity("MSFT", AssetClass.EQUITY, "alpaca:MSFT"), Side.BUY,
+                 TradeIntentStatus.SUBMITTED)
+    # The pending intent also has a fill today: it still counts once.
+    fill = Fill("f1", "pending-aapl", "order-f1", _aapl(), Side.BUY, ExecutionMode.PAPER,
+                Decimal("1"), Decimal("100"), Decimal("0"), Decimal("0"), NOW)
+    await repositories.fills.create_once("f1", fill, unique_value=None)
+
+    assert await symbol_entries_today(repositories, _aapl(), NOW, exclude_intent_id="current") == 2

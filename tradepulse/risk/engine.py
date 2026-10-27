@@ -226,7 +226,7 @@ def evaluate_risk(
     # Cost rule: a buy's estimated round-trip cost (full spread plus a fee
     # each side) must be a small fraction of the trade's own risk R, or the
     # edge is paid away in friction -- the same test at any account size.
-    if (intent.side == Side.BUY and not opts.protective_exit and limits.max_cost_to_risk_pct
+    if (intent.side == Side.BUY and not opts.protective_exit
             and intent.stop_loss is not None and price > 0 and price > intent.stop_loss
             and opts.bid is not None and opts.ask is not None and not opts.skip_market_data_checks):
         mid = (opts.bid + opts.ask) / 2
@@ -280,7 +280,7 @@ def evaluate_risk(
     # approved_qty into it; zero remaining headroom naturally floors to a
     # zero-ish quantity, caught by the final minimum-lot/notional check.
 
-    if limits.max_entries_per_symbol_per_day and opts.symbol_entries_today >= limits.max_entries_per_symbol_per_day:
+    if opts.symbol_entries_today >= limits.max_entries_per_symbol_per_day:
         reasons.append(f"MAX_ENTRIES_PER_SYMBOL_REACHED ({opts.symbol_entries_today}/{limits.max_entries_per_symbol_per_day})")
 
     if limits.max_simultaneous_orders and snapshot.outstanding_orders >= limits.max_simultaneous_orders:
@@ -338,12 +338,11 @@ def evaluate_risk(
                 # stands to lose at its stop, plus this buy's, stays within
                 # max_open_risk_pct of equity. Positions protected at or above
                 # break-even contribute nothing, which frees room for new trades.
-                if limits.max_open_risk_pct:
-                    remaining_risk = (limits.max_open_risk_pct / 100) * total_equity - opts.open_risk
-                    capped_by_risk = _round_qty(max(remaining_risk, Decimal(0)) / unit_risk, intent.asset_class)
-                    if capped_by_risk < approved_qty:
-                        approved_qty = capped_by_risk
-                        reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_MAX_OPEN_RISK")
+                remaining_risk = (limits.max_open_risk_pct / 100) * total_equity - opts.open_risk
+                capped_by_risk = _round_qty(max(remaining_risk, Decimal(0)) / unit_risk, intent.asset_class)
+                if capped_by_risk < approved_qty:
+                    approved_qty = capped_by_risk
+                    reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_MAX_OPEN_RISK")
 
         # The cap bounds the whole position: notional already held in this
         # asset (broker market value, multiplier included) consumes it.
@@ -425,13 +424,23 @@ async def open_portfolio_risk(repositories: PersistenceRepositories) -> Decimal:
     return total
 
 
-async def symbol_entries_today(repositories: PersistenceRepositories, asset, now: datetime) -> int:
-    """Distinct BUY intents with a fill in the current NY risk day for this asset."""
+async def symbol_entries_today(repositories: PersistenceRepositories, asset, now: datetime, *,
+                               exclude_intent_id: str | None = None) -> int:
+    """Distinct BUY intents for this asset that either have a fill in the
+    current NY risk day or are still pending (Rev.141: an entry in flight
+    counts, so a second can't pass while the first is unfilled).
+    ``exclude_intent_id`` is the intent being evaluated."""
     start, end = _risk_day_bounds(now)
     key = asset_identity_key(asset)
     rows = await list_all_by_json_time_range(repositories.fills, "filled_at", start, end)
     fills = [hydrate("fills", row["payload"]) for row in rows]
-    return len({f.trade_intent_id for f in fills if f.side == Side.BUY and asset_identity_key(f.asset) == key})
+    entries = {f.trade_intent_id for f in fills if f.side == Side.BUY and asset_identity_key(f.asset) == key}
+    for row in await list_all_by_statuses(repositories.trade_intents, list(_PENDING_BUY_STATUSES)):
+        intent = hydrate("trade_intents", row["payload"])
+        if intent.side == Side.BUY and asset_identity_key(intent.asset) == key:
+            entries.add(intent.trade_intent_id)
+    entries.discard(exclude_intent_id)
+    return len(entries)
 
 
 async def build_portfolio_snapshot(

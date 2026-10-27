@@ -1924,3 +1924,32 @@ async def test_add_on_buy_is_sized_against_the_holdings_enforced_stop(tmp_path) 
     # risk is ~49.55, so ~6 shares -- not the ~65 its own 195 stop implies.
     assert Decimal(intent["requested_quantity"]) <= Decimal("6.06")
     assert Decimal(intent["stop_loss"]) == Decimal("195")
+
+
+@respx.mock
+async def test_conservative_refuses_a_second_entry_while_the_first_is_unfilled(tmp_path) -> None:
+    """Rev.141: conservative allows one entry per symbol per day, and an entry
+    still in flight counts. The second BUY is refused before any order is sent."""
+    repositories, broker, _ = await _setup(tmp_path)
+    gateway = ExecutionGateway(repositories, broker, AlpacaMarketDataProvider(broker),
+                               SettlementProcessor(repositories, TelegramAlerter(None, None), clock=lambda: NOW),
+                               TelegramAlerter(None, None), risk_limits_for_profile("conservative"),
+                               ExecutionMode.PAPER, clock=lambda: NOW, lease=held_test_lease())
+    await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    first = TradeIntent("first-entry", "idem-first", "corr-first", _aapl(), Side.BUY, ExecutionMode.PAPER, "test", NOW,
+                        requested_quantity=Decimal("5"), stop_loss=Decimal("190"), status=TradeIntentStatus.SUBMITTED,
+                        risk_snapshot={"entry_price": "199.55"})
+    await repositories.trade_intents.create_once("first-entry", first, status=first.status.value, unique_value="idem-first")
+    _mock_account()
+    _mock_positions()
+    _mock_quote()
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
+
+    request = ExecutionRequest(asset=_aapl(), side=Side.BUY, requested_quantity=Decimal("1"), strategy="test",
+                               confidence=Decimal("95"), stop_loss=Decimal("190"))
+    result = await gateway.execute_intent(request)
+    await broker.aclose()
+
+    assert result.status == "rejected"
+    assert "MAX_ENTRIES_PER_SYMBOL_REACHED (1/1)" in result.reasons
+    assert order_route.call_count == 0

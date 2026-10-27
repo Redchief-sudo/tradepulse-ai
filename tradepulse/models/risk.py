@@ -89,7 +89,9 @@ class RiskLimits:
     single_unit_target_r: Decimal = Decimal("1.5")
     stall_exit_days: int = 7
     stall_min_r: Decimal = Decimal("0.5")
-    # Entry limits (risk/engine.py::evaluate_risk). 0 disables each.
+    # Entry limits (risk/engine.py::evaluate_risk). Required: every profile
+    # must set all three (Rev.141). The 0 defaults exist only so an omitted
+    # limit reaches __post_init__ and fails there, rather than disabling a check.
     # max_open_risk_pct: combined risk to stop of open positions and pending
     # buys, as % of equity; a position whose stop is at or above its average
     # price contributes nothing. max_entries_per_symbol_per_day: filled BUYs
@@ -109,7 +111,7 @@ class RiskLimits:
             "options_premium_stop_pct", "options_target_otm_pct",
             "break_even_trigger_pct", "trailing_atr_multiplier", "max_correlation_threshold",
             "max_correlation_threshold_crypto", "scale_out_r", "final_target_r", "single_unit_target_r",
-            "stall_min_r", "max_open_risk_pct", "max_cost_to_risk_pct",
+            "stall_min_r",
         ):
             object.__setattr__(self, name, decimal_value(getattr(self, name), name, nonnegative=True))
         for name in ("options_spread_limit_pct", "options_slippage_limit_pct"):
@@ -127,7 +129,7 @@ class RiskLimits:
         if not (0 < self.scale_out_fraction < 1):
             raise ValueError("scale_out_fraction must be between 0 and 1 (both exclusive)")
         for name in ("options_expiry_min_days", "options_expiry_max_days", "options_forced_close_days_before_expiry",
-                     "max_hold_days", "stall_exit_days", "max_entries_per_symbol_per_day"):
+                     "max_hold_days", "stall_exit_days"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be nonnegative")
         if self.options_expiry_min_days > self.options_expiry_max_days:
@@ -136,6 +138,11 @@ class RiskLimits:
             raise ValueError("max_correlation_threshold must not exceed 1 (a Pearson correlation coefficient)")
         if self.max_correlation_threshold_crypto > 1:
             raise ValueError("max_correlation_threshold_crypto must not exceed 1 (a Pearson correlation coefficient)")
+        for name in ("max_open_risk_pct", "max_cost_to_risk_pct"):
+            object.__setattr__(self, name, decimal_value(getattr(self, name), name, positive=True))
+        entries = self.max_entries_per_symbol_per_day
+        if isinstance(entries, bool) or not isinstance(entries, int) or entries < 1:
+            raise ValueError("max_entries_per_symbol_per_day must be an integer of at least 1")
 
     def spread_limit_for(self, asset_class) -> Decimal:
         """Maximum quoted spread (% of mid) for a buy of this asset class."""
