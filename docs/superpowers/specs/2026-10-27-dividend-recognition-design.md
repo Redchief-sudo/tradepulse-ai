@@ -125,7 +125,7 @@ A new `_persist_generation_dividends(connection, activities, membership, *, now)
    | At `escalation_deadline` (end of the 3rd NYSE trading session) | Status `unresolved` with the last reason; critical `DIVIDEND_ATTRIBUTION_UNRESOLVED` Telegram alert once per activity, for operator review |
    | After the deadline | Retries continue. A later successful match moves it to `verified` and sends an info alert; it never skips the operator alert already sent |
 
-   - **Trading calendar.** The deadline is computed from Alpaca's market calendar (`GET /v2/calendar`), through a new `get_calendar(start, end)` on the broker port, beside `get_clock`. `SimulatedBroker` implements it from its `SimSession`.
+   - **Trading calendar.** The deadline is computed from Alpaca's market calendar (`GET /v2/calendar`), through a new `get_calendar(start, end)` on the broker port, beside `get_clock`. `SimulatedBroker` implements it from its `SimSession`. Early-close days count as sessions. Any future broker adapter (A2's IBKR `TradingPort`) must implement `get_calendar` too.
    - The calendar response used is stored with the status row, as evidence (`deadline_source = "alpaca_calendar"`).
    - **If the calendar can't be read,** the deadline is computed as 3 weekdays (`deadline_source = "weekday_fallback"`). Holidays only push the true deadline later, so the alert may come early but never late. It is recomputed from the calendar when it next becomes available, but never moved later than an alert already sent.
 
@@ -270,7 +270,7 @@ The cash entries reuse `cash_ledger`, and the records reuse `reconciliation_reco
 | T21 | End to end: the worked example in 3.7; cash check matches; run equity includes $2.60 only. |
 | T22 | Recovery: crash after recording, before attribution; restart attributes once. |
 | T23 | Receipt shape differing from the fixtures → `DIVIDEND_RECEIPT_SHAPE_UNVERIFIED`. |
-| T24 | Escalation on the trading calendar: first observed on a Wednesday before Thanksgiving, so the deadline skips the holiday (end of the following Monday's session); the alert fires once at the deadline, not before; the deadline starts at first observation, not at the ex-date or the activity `date`. |
+| T24 | Escalation on the trading calendar: first observed on Wednesday 2026-11-25; Thursday 11-26 (Thanksgiving) is not a session, and Friday 11-27 (early close) counts, so the deadline is the end of Tuesday 12-01's session; the alert fires once at the deadline, not before; the deadline starts at first observation, not at the ex-date or the activity `date`. |
 | T25 | Calendar unavailable → weekday fallback (alert early, never late); when the calendar returns, the deadline is recomputed but never later than an alert already sent. |
 | T26 | A match after the deadline → `verified`, an info alert, and the critical alert is not repeated; announcements re-fetched at least once per trading day while pending. |
 
