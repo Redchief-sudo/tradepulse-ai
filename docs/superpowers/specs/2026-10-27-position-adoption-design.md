@@ -1,6 +1,6 @@
 # Rev.142: adopting unmanaged long positions for protective management — design specification
 
-**Status:** design, rev. 4. Approved for specification drafting: Sections 1–3, reviews ADOPT-01 to ADOPT-08 and REV142-01 to REV142-03, and operator decisions Q1 and Q2 (rev. 2).
+**Status:** design, rev. 5. Approved for specification drafting: Sections 1–3, reviews ADOPT-01 to ADOPT-08 and REV142-01 to REV142-03, and operator decisions Q1 and Q2 (rev. 2).
 **Implementation is blocked** until Rev.140 is implemented, validated and approved (section 3.1), and Rev.143 is merged (3.8a).
 **Branch:** `rev142-adoption-design`. No production code, no migration, and no change to the active A0 verification run.
 
@@ -271,7 +271,7 @@ Per bound generation, for each `opening_inventory` adoption *a* of asset *k* wit
 - Rev.140 §3.10 likewise fails closed on corporate actions.
 
 **Rev. 3: delegated to Rev.143.** Dividend cash recognition and verified attribution are specified separately in `docs/superpowers/specs/2026-10-27-dividend-recognition-design.md` (branch `rev143-dividends-design`), which is scheduled **before** this Rev. Rev.142 therefore:
-- **Relies on Rev.143's inherited buckets.** A dividend on adopted shares goes to `adopted` when Rev.143's evidence E1 establishes the ex-date quantity. Otherwise it goes to `inherited_unallocated` (whole amount, no quantity claimed), and only when the strategy's entitlement is provably zero. If it isn't, Rev.143 leaves it unresolved. The adoption quantity is never entitlement evidence (Rev.143 TP143-01). In both cases it is entitlement by the trade date before the ex-date, verified against the announcement and the Alpaca activity. It is recorded once in the cash ledger and excluded from generation performance through Rev.143's `D_excl`.
+- **Relies on Rev.143's inherited buckets.** A dividend on adopted shares goes to `adopted` when Rev.143's evidence E1 establishes the ex-date quantity. Otherwise it goes to `excluded_unallocated` (whole amount, no quantity claimed, `attribution_status = excluded_unallocated`, `entitlement_status = not_established`, never `verified`), and only when the strategy's entitlement is provably zero. If it isn't, Rev.143 leaves it unresolved. The adoption quantity is never entitlement evidence (Rev.143 TP143-01). In both cases it is entitlement by the trade date before the ex-date, verified against the announcement and the Alpaca activity. It is recorded once in the cash ledger and excluded from generation performance through Rev.143's `D_excl`.
 - **Never adds dividends to `X(k)`.** The exclusion is defined once, in Rev.143 (DV-I4).
 - **Allocates no dividend cash itself.** An unverified dividend is held in Rev.143's `D_unresolved`, so it fails closed there.
 - **Gives Rev.143 an `origin` to bucket by.** The adopted lot (`origin="adopted"`) and its `opened_at` are the inputs Rev.143's `adopted` bucket reads.
@@ -417,9 +417,9 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
 | T27 | Evidence generation (`verification/evidence.py`) after a partial and after a full adopted-lot closure, for equity and crypto: it builds, lists adoptions as their own class, and contains no fill entry for any `adoption:` ID. |
 | T28 | Crypto epochs: adoption creates the adopted epoch atomically; a protective SELL joins it, never a strategy epoch; a coin fee on the adopted lot attributes to it; partial exit stays pending; full exit reconciles; a late fee supersedes once; restart between adoption and SELL changes nothing; `prove_edge` excludes it. |
 | T29 | Q2 durability: after full closure, a strategy BUY is refused in the scanner (`ADOPTED_ASSET_EXCLUDED`) and the gateway (`ADOPTED_ASSET_REENTRY_BLOCKED`), across a runtime restart; a new bound checkpoint releases it only when the closure obligations are settled, and keeps it excluded otherwise; outside a generation it is never released. |
-| T30 | Q1 with Rev.143: a dividend and its withholding on an adopted asset are attributed to `adopted` (E1 established) or `inherited_unallocated` (not established, S = 0), excluded through `D_excl`, each activity recorded once in the ledger, and absent from `X(k)`; `adopted_quantity` is never read as entitlement evidence; generation equity change from the asset stays $0. |
+| T30 | Q1 with Rev.143: a dividend and its withholding on an adopted asset are attributed to `adopted` (E1 established) or `excluded_unallocated` (not established, S = 0; never reported `verified`), excluded through `D_excl`, each activity recorded once in the ledger, and absent from `X(k)`; `adopted_quantity` is never read as entitlement evidence; generation equity change from the asset stays $0. |
 | T31 | TP142-01 hydration: an adopted lot, its holding, attribution and crypto epoch round-trip through `encode_payload`/`hydrate` with `origin` and `adoption_id` intact; legacy rows hydrate as `origin="fill"` with `adoption_id=None`; an `adopted` lot without `adoption_id`, or a `fill` lot with one, fails `__post_init__`. |
-| T32 | TP142-01 runtime survival: with the `fills` repository wrapped to **fail the test** on any lookup of an `adoption:` key, run one real adopted lot (no originating broker fill) through adoption → partial sale → settlement replay → restart → full sale → late fee correction after closure → fee replay → historical evidence reconstruction (`verification/evidence.py`) → generation valuation. After every step, the lot's and attribution's `origin` and `adoption_id` are unchanged, and no fill lookup occurred. Run for an equity and a crypto asset. |
+| T32 | TP142-01 runtime survival: with the `fills` repository wrapped to **fail the test** on any lookup of an `adoption:` key, run one real adopted lot (no originating broker fill) through: adoption → partial sale → **evidence builder (`verification/evidence.py`) while open** → settlement replay → restart → full sale → **evidence builder after full liquidation** → late fee correction after closure → fee replay → **evidence builder again after the late fee** → generation valuation. After every step, the lot's and attribution's `origin` and `adoption_id` are unchanged, and no fill lookup occurred. Run for an equity and a crypto asset. The post-liquidation evidence runs are mandatory: that is where a stale opening-fill reference would reappear. |
 
 ## 8. Out of scope
 
@@ -437,6 +437,10 @@ Q1 and Q2 were decided by the operator for rev. 2 (section 2, 3.8a, 3.9). Q3 is 
 - **Q4.** Outside a verification run, an adopted asset stays excluded from strategy entries with no release (3.9). Is that acceptable until a re-entry Rev, or should re-entry outside runs be designed next?
 
 ## 10. Change log
+
+**rev. 5 (2026-10-27).** Final review alignment.
+- T32 now runs the verification evidence builder explicitly while the lot is open, after full liquidation, and again after the late fee correction (reviewer requirement).
+- The Rev.143 rev. 5 bucket is renamed to `excluded_unallocated`, with its separate statuses; such a dividend is never reported `verified`.
 
 **rev. 4 (2026-10-27).** Joint forensic review corrections.
 - **TP142-01:** runtime identity proofs added: T31 (hydration round trip and legacy defaults) and T32 (a real adopted lot through adoption, partial and full sale, replay, restart, late fee after closure, fee replay, evidence reconstruction and valuation, with fill lookups set to fail). Invariant AD-I13.
