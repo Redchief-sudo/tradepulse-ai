@@ -1,6 +1,6 @@
 # Rev.144: shared market calendar, cross-checked against every broker — design specification
 
-**Status:** design, rev. 2. Written from the operator-approved Sections 1–2; rev. 2 corrects joint forensic review findings TP144-01 to 03 (2026-10-27).
+**Status:** design, rev. 3. Written from the operator-approved Sections 1–2; rev. 2 corrects joint forensic review findings TP144-01 to 03 (2026-10-27).
 **Order of work:** Rev.140 → Rev.141 → **Rev.144** → Rev.143 → Rev.142. Rev.143's dividend deadline depends on this spec (section 3.8).
 **Branch:** `rev144-calendar-design`. No production code, no migration, and no change to the active A0 verification run.
 
@@ -101,20 +101,29 @@ class BrokerSession:
 
 ### 3.4 Daily cross-check
 
-- **When:** at the first reconciliation cycle of each NY date, and at startup. Each run of the check gets a durable `check_id` (UUID4), written before any broker call.
+- **When:** at the first reconciliation cycle of each NY date, and at startup.
+- **Lifecycle (TP144-R2-01).** Each check is a sequence of **immutable events** in `calendar_check_events`, all keyed by one `check_id` (UUID4):
+  1. **`started`**, written and committed **before** any broker call: `check_id`, `broker`, `venue`, the requested range, `started_at`.
+  2. **`fetched`**, written after the response arrives: the raw response, `response_sha256`, `received_at`.
+  3. Exactly **one terminal event**:
+     - **`completed`**, written in **one transaction** with all of that check's `calendar_check_dates` and `instrument_hours` rows. Date rows never exist without their `completed` event;
+     - or **`failed`**: a reason, plus the raw error.
+  - A `UNIQUE(check_id, event)` constraint, and a check that refuses a second terminal event for a `check_id`, make a check end at most once.
+  - **Only a check with a `completed` event confers any verification.** A `started` or `fetched` check without a terminal event (a crash, or an interrupted request) confers nothing.
+  - At startup, every check that has had no terminal event for more than 10 minutes gets an appended `failed` event, reason `interrupted`, so the audit trail closes. It never gets `completed`.
 - **For each connected broker and each venue it serves:**
   - fetch `get_calendar(today, today + 30 days)`;
   - compare **each date** in the broker's response with `MarketCalendar` for the same venue: session or not, open time, close time.
-- **Results are recorded per date (TP144-03).** One `calendar_check_dates` row per `(check_id, broker, venue, date)`, with result `agreed` or `contested`, plus both values when contested.
+- **Results are recorded per date (TP144-03),** in the `completed` transaction: one `calendar_check_dates` row per `(check_id, broker, venue, date)`, with result `agreed` or `contested`, plus both values when contested.
   - A date the broker response does **not** contain is not recorded, and is not covered by that check.
-  - A header row in `calendar_checks` holds `(check_id, broker, venue)`, the requested range, `checked_at`, `response_sha256`, the raw response, and the overall result (`completed` or `failed`).
+  - `checked_at` for freshness is the `completed` event's `received_at`, the time of the broker observation.
 - **Status of a (venue, date)** is derived, never stored as a flag:
   - **`contested`:** for any connected broker, the most recent `calendar_check_dates` row for (broker, venue, date) is `contested`.
   - **`verified`:** for **every** connected broker that serves the venue, there is a `calendar_check_dates` row for exactly (broker, venue, date) that is `agreed` and **fresh**. Fresh means its check's `checked_at` falls within the last 3 NYSE trading sessions; that's the freshness policy. A check covers only the dates in its own response. It never verifies a date outside its coverage.
   - **`unverified`:** neither of the above, including any date not covered by a fresh check of every serving broker.
   - **`beyond_horizon`:** past the library window (3.1); it overrides all of the above.
 - **On contest:** a critical `CALENDAR_CONTESTED` alert, once per (date, venue, broker), naming both values. A later agreeing row for the same (broker, venue, date) clears it, and both rows are kept. There is no majority vote.
-- **On failure to check:** the `calendar_checks` header is `failed`, no date rows are written, and status degrades naturally to `unverified` as freshness lapses. A critical `CALENDAR_UNVERIFIED` alert fires once per day while any date in the next 5 sessions is `unverified`.
+- **On failure to check:** a `failed` event is written, no date rows are written, and status degrades naturally to `unverified` as freshness lapses. A critical `CALENDAR_UNVERIFIED` alert fires once per day while any date in the next 5 sessions is `unverified`.
 
 ### 3.4a Verified instrument hours (option late closes)
 
@@ -179,12 +188,12 @@ All tables are append-only, with `BEFORE UPDATE` / `BEFORE DELETE` triggers veri
 
 | Table | Primary key / unique | Columns |
 |---|---|---|
-| `calendar_checks` | PK `check_id`; `UNIQUE(check_id, broker, venue)` | `broker`, `venue`, `range_start`, `range_end`, `checked_at` (the original observation time, set once), `result` (`completed` or `failed`), `response_sha256`, the raw response |
-| `calendar_check_dates` | `UNIQUE(check_id, broker, venue, date)` | `result` (`agreed` or `contested`), `broker_open`, `broker_close`, `calendar_open`, `calendar_close` |
-| `instrument_hours` | `UNIQUE(check_id, broker, instrument_key, date)` | `open`, `close`, `response_sha256` |
+| `calendar_check_events` | `UNIQUE(check_id, event)`; at most one of `completed` and `failed` per `check_id` (enforced in the inserting transaction, plus a `BEFORE INSERT` trigger) | `event` (`started`, `fetched`, `completed` or `failed`), `broker`, `venue`, `range_start`, `range_end`, `at`; on `fetched`: `received_at`, `response_sha256`, the raw response; on `failed`: `reason`, the error |
+| `calendar_check_dates` | `UNIQUE(check_id, broker, venue, date)`; inserted only in the transaction that writes `completed` for `check_id` | `result` (`agreed` or `contested`), `broker_open`, `broker_close`, `calendar_open`, `calendar_close` |
+| `instrument_hours` | `UNIQUE(check_id, broker, instrument_key, date)`; inserted only with `completed` | `open`, `close`, `response_sha256` |
 
 - `check_id` is a UUID4 per check run, so two checks at the same timestamp for different venues or ranges can't collide.
-- Statuses are derived from these rows by the rules in 3.4 and 3.4a.
+- Statuses are derived only from date and hours rows whose `check_id` has a `completed` event, by the rules in 3.4 and 3.4a.
 
 ### 3.8 Effect on other work
 
@@ -215,8 +224,8 @@ These are recorded in an evidence directory with a manifest. Any difference from
 ## 5. Recovery
 
 - The calendar is rebuilt from the pinned library at every start, so there is no state to recover.
-- Contested and verified status is re-derived from `calendar_checks` at startup.
-- A crash during a check leaves no row, and the check is retried at the next cycle.
+- Contested and verified status is re-derived at startup from completed checks' rows (`calendar_check_events`, `calendar_check_dates` and `instrument_hours`).
+- A crash during a check leaves at most `started` and `fetched` events, which confer nothing. They are closed as `failed`/`interrupted` at startup, and a new check runs at the next cycle.
 
 ## 6. Behaviour changes
 
@@ -243,11 +252,12 @@ These are recorded in an evidence directory with a manifest. Any difference from
 | T11 | Crypto entries and every exit are unaffected in T4–T9. |
 | T12 | Fingerprint: changing the library session data (simulated) between run start and a later check → `frozen_configuration_mismatch`; A0's existing context is unaffected. |
 | T13 | `get_calendar` shape: Alpaca (recorded fixture), `SimulatedBroker` and an IBKR hours-string fixture return the same `BrokerSession` shape, in UTC. |
-| T14 | `calendar_checks` immutability: update and delete fail; a missing trigger refuses startup. |
+| T14 | Immutability of `calendar_check_events`, `calendar_check_dates` and `instrument_hours`: update and delete fail; a missing trigger refuses startup. |
 | T15 | Unchanged behaviour: the time stop and stall exit count calendar days; `_risk_day_bounds` is unchanged. |
 | T16 | Rev.143 hook: the deadline from `nth_session_after`; contested → the earlier of calendar and weekdays. |
 | T17 | Identity (TP144-02): two checks at the same `checked_at` for different venues, and for overlapping ranges, both persist; replaying a check's rows with the same `check_id` changes nothing. |
 | T18 | Coverage (TP144-03): a check covering 10-27 to 10-30 does not verify 10-31; a broker response missing a date leaves that date `unverified`; with two connected brokers, one fresh agreement is not enough; a 4-session-old agreement is not fresh. |
+| T19 | Lifecycle (TP144-R2-01): a crash after `started` and after `fetched` → no date rows and no verification; startup appends `failed`/`interrupted` after 10 minutes; a second terminal event for a `check_id` is refused; date rows can't be inserted without `completed` in the same transaction; a `failed` check's response never verifies a date. |
 
 ## 8. Out of scope
 
@@ -261,6 +271,8 @@ These are recorded in an evidence directory with a manifest. Any difference from
 None for the operator. G0 (3.9) may require spec changes before the plan.
 
 ## 10. Change log
+
+**rev. 3 (2026-10-27).** Forensic finding TP144-R2-01. The check lifecycle is immutable events (`started` → `fetched` → `completed` | `failed`) in `calendar_check_events`. They replace the `calendar_checks` header, which recorded values it couldn't know at insert time. Date and instrument rows are written only in the `completed` transaction, and only completed checks confer verification. Interrupted checks are closed as `failed` at startup. Test T19.
 
 **rev. 2 (2026-10-27).** Joint forensic review corrections.
 - **TP144-01:** one `entry_window_open` decision replaces the separate broker-clock and `is_regular_hours` checks. A late-close option is authorized only from its own executing broker's fresh contract hours, and only after a verified session that day. That also resolves a second contradiction found while fixing it: Alpaca's equity clock reads closed after 16:00. Ordinary contracts stay restricted. Tests T10 and T10a.
@@ -277,4 +289,4 @@ None for the operator. G0 (3.9) may require spec changes before the plan.
 
 - Rev.140 and Rev.141 merged; A0 concluded with its evidence preserved.
 - G0 recorded with a manifest.
-- All T1–T18 pass; the full Python suite, mypy (project configuration) and Ruff (changed files) are reported exactly.
+- All T1–T19 pass; the full Python suite, mypy (project configuration) and Ruff (changed files) are reported exactly.
