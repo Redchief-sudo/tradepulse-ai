@@ -1,6 +1,6 @@
 # Rev.143: dividend cash recognition and verified attribution — design specification
 
-**Status:** design, rev. 3. Written from the operator-approved Sections 1–3; rev. 2 adds the operator decisions on dividend dates and escalation (2026-10-27).
+**Status:** design, rev. 4. Written from the operator-approved Sections 1–3; rev. 2 adds the operator decisions on dividend dates and escalation (2026-10-27).
 **Order of work:** Rev.140 → Rev.141 → Rev.144 → **Rev.143** → Rev.142. Depends on Rev.144's market calendar (3.4 step 7). Rev.142 rev. 3 depends on this spec (section 3.9).
 **Branch:** `rev143-dividends-design`. No production code, no migration, and no change to the active A0 verification run.
 
@@ -29,6 +29,7 @@
 | D-8 | Alpaca's real fields and rounding are measured before implementation (G0). |
 | D-9 | Entitlement comes from the **corporate-action announcement's** ex-date (and record date), never from the `DIV` activity's `date`. The activity establishes only when, and how much, cash was credited. Alpaca may credit cash after the payable date, and the activity's `date` and creation time may differ from the dividend's effective dates. |
 | D-10 | Escalation: a critical alert **3 NYSE trading days** after the activity is **first observed** in the broker feed, counted on the actual trading calendar (not 72 hours). The threshold controls alert escalation only. The accounting safeguards apply from the first observation. |
+| D-11 | Inherited dividend entitlement is established only by checkpoint + complete activity evidence (E1). When it can't be, the whole activity is excluded **only** if TradePulse's complete fill history proves the strategy's entitlement is zero; otherwise unresolved. **Flagged for reviewer confirmation** (TP143-01). |
 
 ## 3. Design
 
@@ -102,19 +103,39 @@ A new `_persist_generation_dividends(connection, activities, membership, *, now)
    - Otherwise it is the America/New_York calendar date of `transaction_time`.
    - A fill executed in Alpaca's overnight session (20:00–04:00 ET) belongs to the next trading day's trade date. Without a broker-reported trade date, a fill between 20:00 and 24:00 ET on the day before `ex_date` is **ambiguous**, and the activity is `unresolved` (`DIVIDEND_TRADE_DATE_AMBIGUOUS`).
    - Below, "before `T_ex`" means "trade date earlier than `ex_date`".
-3. **Eligible quantity by bucket:**
-   - **`strategy`**, per lot with `origin="fill"`: `opened_quantity` if the lot's opening fill executed before `T_ex`, minus Σ closures whose closing fill executed before `T_ex`, but not below zero.
-   - **`adopted`**, per lot with `origin="adopted"` (Rev.142): the same rule. Before Rev.142 exists, no such lots.
-   - **`opening_unadopted`:** when the bound opening checkpoint opened before `T_ex`, its quantity for the asset, minus any quantity already represented by an adopted lot.
-   - **`pre_generation`:** when `T_ex` is before the bound checkpoint's `opened_at`, the **whole** activity goes here and the lot buckets are not computed. The shares were held before the run.
-   - Outside a verification run there are no `opening_unadopted` or `pre_generation` buckets. Any eligible broker quantity not in lots leaves the activity `unresolved` (`DIVIDEND_ELIGIBLE_QUANTITY_UNEXPLAINED`).
-4. **Cross-checks against Alpaca.** Each must be exact; any failure leaves the activity `unresolved` with the named reason:
-   - Σ bucket quantities = the activity's `qty` (`DIVIDEND_QUANTITY_MISMATCH`);
-   - the announcement rate = `per_share_amount` (`DIVIDEND_RATE_MISMATCH`);
-   - `net_amount` = round(`qty × rate`, cent) under the rounding rule measured at G0, with no tolerance (`DIVIDEND_AMOUNT_MISMATCH`).
-   - If `qty` or `per_share_amount` is missing: `DIVIDEND_RECEIPT_INCOMPLETE`.
-5. **Withholding.** Each withholding activity is paired with exactly one verified income activity: same symbol, same payment date, same announcement. It is attributed in the income activity's proportions. If the income activity isn't verified, or the pairing isn't unique, the withholding stays pending and is unresolved at its deadline.
-6. **Exact split.** The activity's `net_amount` is split across lots and buckets in proportion to eligible quantity, using the largest-remainder method on cents, with ties broken by `lot_id`, so the parts sum **exactly** to `net_amount`. Each part is one immutable `dividend_attributions` row: `(activity_id, bucket, lot_id or bucket name, eligible_qty, amount, announcement_id, announcement_sha256)`. The status then becomes `verified`.
+3. **Eligible quantity and its evidence (TP143-01).** Two kinds of holdings are treated differently, because TradePulse holds complete history only for its own trades.
+   - **`strategy`**, per lot with `origin="fill"`. The evidence is TradePulse's own settled fills, which are complete for every lot it opened. Eligible quantity = `opened_quantity` if the opening fill's trade date is before `ex_date`, minus Σ closures whose closing fill's trade date is before `ex_date`, and never below zero. Call the total **S**.
+   - **Inherited holdings** are adopted lots, unadopted opening inventory and shares held before the run. TradePulse has no acquisition history for them. Their quantity at the start of the ex-date is **established** only by evidence **E1**:
+     - a bound opening checkpoint whose `opened_at` is before the start of `ex_date`'s trade date; **and**
+     - a complete, verified activity population for the account and asset, from the checkpoint's opening cursor to the end of the trade date before `ex_date`. "Complete" means membership is resolved for every activity, with no `unresolved_generation_membership`. It must contain **no** quantity-changing activity other than fills TradePulse settled: no transfer (`ACATC`, `ACATS`, `JNLS`), no corporate action, and no unknown non-cash type.
+     - Then the inherited quantity **I** = checkpoint quantity ± those settled fills' inherited part. Under Rev.142, inherited and strategy inventory never mix in one asset, so that part is zero unless the fill closed an adopted lot.
+   - **Never used as entitlement evidence:** an adoption-time quantity (`adopted_quantity`), a broker position observed after the ex-date, an adopted lot's `opened_at`, or the activity's own `qty` alone.
+   - **Decision** (D-11):
+
+     | Case | Result |
+     |---|---|
+     | **I established** | S + I must equal the activity's `qty` exactly (step 4). Strategy rows per lot; inherited rows in bucket `adopted` (per adoption) or `opening_unadopted`, with `quantity_evidence = "checkpoint_plus_activity"`. |
+     | **I not established, and S = 0** | The whole activity goes to bucket **`inherited_unallocated`** as one row with `eligible_qty = null` and `quantity_evidence = "not_established"`. It claims no holding period and no quantity. It asserts only that the strategy's entitlement is zero, which follows from TradePulse's complete fill history. Status `verified`. |
+     | **I not established, and S > 0** | `unresolved` (`DIVIDEND_INHERITED_QUANTITY_UNESTABLISHED`), because the split depends on an unknown. |
+     | **Outside a verification run** (no checkpoint) | any `qty − S ≠ 0` is `unresolved` (`DIVIDEND_ELIGIBLE_QUANTITY_UNEXPLAINED`), unless S = 0, which takes the `inherited_unallocated` row above. |
+
+     The rev. 3 bucket `pre_generation` is removed. An ex-date before the run has no checkpoint before it, so it is the "I not established" case, and S = 0 there because every strategy lot of the run opened after the checkpoint.
+4. **Representation and cross-checks (TP143-02).** Each activity's cash is its own `net_amount`, posted exactly once (3.3). Cash is **never** derived, netted or re-deducted. The generation cash check (expected = opening + Σ ledger, against Alpaca's cash) is the **independent** proof that nothing is deducted twice: posting a withholding that Alpaca already netted, for example, shows up as a cash mismatch.
+   - **Representation** is a constant `DIVIDEND_REPRESENTATION`, fixed from the G0 evidence (3.8) and citing its evidence directory:
+
+     | Value | Meaning | Amount check for an income activity *d* and its paired withholding *w₁…wₙ* |
+     |---|---|---|
+     | `gross_and_separate_withholding` | `DIV` carries the gross amount; each withholding activity is a separate cash debit | *d*.`net_amount` = round(`qty × rate`); each *wᵢ* < 0; Σ\|*wᵢ*\| ≤ *d*; net cash = *d* + Σ *wᵢ* |
+     | `net_with_withholding_record` | `DIV` is already net; withholding activities carry no cash (`net_amount = 0`) or are informational | *d*.`net_amount` + Σ withheld amounts recorded on the *wᵢ* = round(`qty × rate`); every *wᵢ*.`net_amount` = 0 |
+     | `unknown` | G0 could not establish it | attribution refused for every dividend activity (`DIVIDEND_REPRESENTATION_UNKNOWN`); cash still posted per activity |
+
+     A withholding whose cash contradicts the representation, such as a non-zero cash debit under `net_with_withholding_record`, leaves the group `unresolved` (`DIVIDEND_REPRESENTATION_INCONSISTENT`). The cash check independently flags it too.
+   - **Worked example** (`gross_and_separate_withholding`): `DIV` +$100.00 and `DIVNRA` −$15.00 post two entries, so the cash change is **+$85.00**, matching Alpaca. Under no representation is the $15 deducted from an already-net $85.
+   - **Other exact checks,** each with its named reason: Σ (S + I) = `qty` when I is established (`DIVIDEND_QUANTITY_MISMATCH`); announcement rate = `per_share_amount` (`DIVIDEND_RATE_MISMATCH`); the representation's amount check (`DIVIDEND_AMOUNT_MISMATCH`, no tolerance); a missing `qty` or `per_share_amount` (`DIVIDEND_RECEIPT_INCOMPLETE`).
+5. **Withholding pairing.** Each withholding activity pairs with exactly one income activity: same symbol, same credit date, same announcement. Together they form a **dividend group**. A group is attributed as a unit, only when every member is valid. If the income activity isn't verified, or the pairing isn't unique, the withholding stays `pending` and is `unresolved` at its deadline.
+6. **Exact split.** Within a group, each member's `net_amount` is split separately, in the same proportions (eligible quantity; a single row for `inherited_unallocated`). The split uses the largest-remainder method on cents, with ties broken by `lot_id`. Each row is one immutable `dividend_attributions` row: `(activity_id, component = income | withholding, bucket, holder_id, eligible_qty or null, quantity_evidence, amount, announcement_id, announcement_sha256)`.
+   - Σ rows per activity = that activity's `net_amount` exactly, and Σ rows per group = the group's posted cash exactly.
+   - The group's status then becomes `verified`.
 7. **Retry and escalation (D-10).** The safeguards apply from the first observation, not from the deadline: a `pending` activity is in `D_unresolved`, the asset's equity status is unresolved, and snapshots are `INCOMPLETE_EVIDENCE` (3.7). Any integrity restriction an existing rule applies also takes effect immediately, unchanged: an invalid receipt leaves the cash check mismatched (3.2), and a quarantined instrument keeps its hold.
 
    | Time since `first_observed_at` | Behaviour |
@@ -135,6 +156,7 @@ A new `_persist_generation_dividends(connection, activities, membership, *, now)
 - A reversal (income with `net_amount < 0`, or withholding with `> 0`) must match exactly one **verified** original: same announcement, same `qty`, and an amount equal and opposite.
 - It is then attributed with the original's rows, sign flipped, row for row, and the status becomes `verified`.
 - A partial or unmatched reversal is `unresolved` (`DIVIDEND_REVERSAL_UNMATCHED`).
+- **Conservation:** a reversal of an income activity and the reversal of its paired withholding each post their own cash once. When an original group and its reversal group are both `verified`, their attribution rows sum to exactly zero per holder and component, and their posted cash sums to exactly zero.
 - A reissue after a reversal is a new activity, attributed normally.
 - No attribution row is ever updated or deleted. Corrections are additional rows.
 
@@ -145,7 +167,7 @@ A new `_persist_generation_dividends(connection, activities, membership, *, now)
 | `strategy` | included | included, as a separate "dividend income" component on the lot's trade attribution, never mixed into price P&L |
 | `adopted` | excluded via `D_excl` | excluded |
 | `opening_unadopted` | excluded via `D_excl` | excluded |
-| `pre_generation` | excluded via `D_excl` | excluded |
+| `inherited_unallocated` | excluded via `D_excl` | excluded (no quantity claimed) |
 | pending or unresolved | held in `D_unresolved`; equity status unresolved for the asset | excluded until verified |
 
 The cash is recorded once, whatever the bucket (3.3).
@@ -155,14 +177,14 @@ The cash is recorded once, whatever the bucket (3.3).
 `generation_equity = account.equity − Σₖ X(k) − capital_flows − D_excl − D_unresolved`
 
 - `X(k)` is today's opening-inventory exclusion. Under Rev.142 it is the adopted form, and it contains **no** dividends.
-- `D_excl` = Σ `dividend_attributions.amount` for buckets `adopted`, `opening_unadopted` and `pre_generation`.
+- `D_excl` = Σ `dividend_attributions.amount` for buckets `adopted`, `opening_unadopted` and `inherited_unallocated`, over both components.
 - `D_unresolved` = Σ `net_amount` of `pending` or `unresolved` activities.
 - When `D_unresolved ≠ 0`, `generation_equity.status = "unresolved_dividend_attribution"` with the activity IDs, and the mandatory invariants are not `matched`, so the snapshot is `INCOMPLETE_EVIDENCE`.
 - The broker equity check (cash + holdings = Alpaca equity) is unchanged. The dividend is in Alpaca's cash, and the ledger now matches it.
 
 **Worked example (test T21).**
 - The run opened holding 13.252 MSFT (unadopted). The strategy bought 10 AAPL before AAPL's ex-date.
-- MSFT pays $0.91 a share, $12.06 (`qty` 13.252, `pre_generation` no: the ex-date was after the run opened). AAPL pays $0.26 a share, $2.60.
+- MSFT pays $0.91 a share, $12.06 (`qty` 13.252; the ex-date is after the run opened and the activity population shows no MSFT transfer, so I = 13.252 is established by E1). AAPL pays $0.26 a share, $2.60.
 - Cash ledger +$14.66, so the cash check matches.
 - `D_excl` = $12.06 (`opening_unadopted`), so run equity includes **$2.60**.
 
@@ -171,6 +193,7 @@ The cash is recorded once, whatever the bucket (3.3).
 These are recorded in an evidence directory with a manifest, as in `2026-10-26-r7-api-semantics`. Read-only Alpaca calls only, with no orders.
 
 1. `GET /v2/account/activities?activity_types=DIV,DIVCGL,DIVCGS,DIVTXEX,DIVNRA,DIVTW,DIVFT,DIVROC` on the paper account. Capture `activity_type`, `id`, `date`, `net_amount`, `qty`, `per_share_amount`, `status`, `symbol`, `description` and any creation timestamp. Record what `date` means relative to the matched announcement's payable date, and whether credits arrive after it (D-9).
+1a. **Representation (TP143-02):** for each `DIV` sample with withholding, record whether the `DIV` `net_amount` is gross or net, and whether the withholding activity moves cash. This sets `DIVIDEND_REPRESENTATION` (3.4 step 4). With no samples, it stays `unknown` until the first real dividend (the verification event) establishes it.
 2. `GET /v2/corporate_actions/announcements?ca_types=dividend` for the held symbols: the field names, the `cash` rate format, and `ex_date`, `record_date` and `payable_date`. For each `DIV` sample in (1), record its announcement's three dates beside the activity's `date`.
 6. The calendar measurement moved to Rev.144's G0 (3.9 there).
 3. The rounding rule, derived from (1) and (2) when samples exist.
@@ -198,7 +221,7 @@ All additions use `CREATE TABLE IF NOT EXISTS`, with no rebuild of existing tabl
 | Table | Unique | Mutability |
 |---|---|---|
 | `corporate_action_announcements` | `(announcement_id, sha256)` | immutable; `BEFORE UPDATE` / `BEFORE DELETE` triggers verified at startup with Rev.140's trigger check |
-| `dividend_attributions` | `(activity_id, bucket, holder_id)`, where `holder_id` = `lot_id` or the bucket name | immutable, with triggers as above |
+| `dividend_attributions` | `(activity_id, component, bucket, holder_id)`, where `holder_id` = `lot_id`, `adoption_id` or the bucket name | immutable, with triggers as above |
 | `dividend_attribution_status` | `activity_id` PK | mutable: `pending`, `verified` or `unresolved`; `reason`; `first_observed_at` (set once); `escalation_deadline`; `deadline_source`; the calendar response used; `alerted_at`; `updated_at` |
 
 The cash entries reuse `cash_ledger`, and the records reuse `reconciliation_records`.
@@ -219,7 +242,8 @@ The cash entries reuse `cash_ledger`, and the records reuse `reconciliation_reco
 ## 4. Invariants
 
 - **DV-I1 cash:** every eligible `DIV*` activity with a valid receipt has exactly one `cash_ledger` entry equal to its `net_amount`, whatever its attribution status.
-- **DV-I2 conservation:** for a `verified` activity, Σ `dividend_attributions.amount` = `net_amount` exactly, and Σ eligible quantities = `qty` exactly.
+- **DV-I2 conservation:** for a `verified` activity, Σ `dividend_attributions.amount` = `net_amount` exactly. When I is established, Σ eligible quantities = `qty` exactly. Each dividend activity contributes exactly one cash entry, equal to its own `net_amount`, and no cash is derived from another activity.
+- **DV-I8 no inferred inheritance:** no inherited row has a non-null `eligible_qty` unless E1 established it. An `inherited_unallocated` row exists only when S = 0 from complete strategy fill history.
 - **DV-I3 entitlement:** no lot whose opening fill's trade date is on or after `ex_date` receives an attribution. A lot whose closing fill's trade date is on or after `ex_date` keeps its entitlement.
 - **DV-I4 single exclusion:** inherited dividend amounts are excluded once, through `D_excl`, and never through `X(k)`.
 - **DV-I5 no invention:** no attribution row exists for an activity that is not `verified`. Unresolved amounts are in `D_unresolved`.
@@ -259,7 +283,7 @@ The cash entries reuse `cash_ledger`, and the records reuse `reconciliation_reco
 | T11 | Withholding paired and split in the income's proportions; unpaired withholding unresolved at its deadline. |
 | T12 | Largest-remainder split over three lots sums exactly; ties are broken by `lot_id`. |
 | T13 | Bucket `opening_unadopted`: excluded through `D_excl`. |
-| T14 | Bucket `pre_generation`: `T_ex` before the run opened → whole activity excluded. |
+| T14 | Ex-date before the run opened: I not established, S = 0 → one `inherited_unallocated` row, `eligible_qty` null, excluded through `D_excl`. |
 | T15 | Strategy bucket: appears in the trade attribution's `dividend_income`, not in price P&L; counted in run equity. |
 | T16 | Outside a run, unexplained eligible quantity → `DIVIDEND_ELIGIBLE_QUANTITY_UNEXPLAINED`. |
 | T17 | Reversal of a verified dividend: mirror rows; partial reversal unresolved; reissue attributed as new. |
@@ -272,6 +296,12 @@ The cash entries reuse `cash_ledger`, and the records reuse `reconciliation_reco
 | T24 | Escalation on the trading calendar: first observed on Wednesday 2026-11-25; Thursday 11-26 (Thanksgiving) is not a session, and Friday 11-27 (early close) counts, so the deadline is the end of Tuesday 12-01's session; the alert fires once at the deadline, not before; the deadline starts at first observation, not at the ex-date or the activity `date`. |
 | T25 | Calendar status contested, unverified or beyond the horizon → the deadline is the earlier of the calendar and 3 weekdays (alert early, never late); a later recomputation never moves it past an alert already sent. |
 | T26 | A match after the deadline → `verified`, an info alert, and the critical alert is not repeated; announcements re-fetched at least once per trading day while pending. |
+| T27 | TP143-01: an adopted lot adopted **after** the ex-date with no E1 evidence → its `adopted_quantity` is never used; S = 0 → `inherited_unallocated`; with S > 0 on the same asset (outside Rev.142's no-mix rule, constructed directly) → `DIVIDEND_INHERITED_QUANTITY_UNESTABLISHED`. |
+| T28 | E1: checkpoint before the ex-date and a clean activity population → I established and S + I = `qty`; an `ACATC` or `JNLS` for the asset in the interval → not established; an unresolved membership in the interval → not established. |
+| T29 | TP143-02 gross representation: `DIV` +100.00 and `DIVNRA` −15.00 → two ledger entries, cash +85.00, cash check matches, rows sum per activity and per group. |
+| T30 | Net representation with an informational withholding (`net_amount` 0) → one cash effect, amount check uses the recorded withheld amount; a non-zero withholding cash debit under the net representation → `DIVIDEND_REPRESENTATION_INCONSISTENT`, and the cash check also flags the mismatch. |
+| T31 | Representation `unknown` → every dividend's cash is posted per activity, and attribution is refused with `DIVIDEND_REPRESENTATION_UNKNOWN`. |
+| T32 | Reversal of a group (income and withholding): cash and rows sum to exactly zero per holder and component; a reversal of the income alone → unresolved. |
 
 ## 8. Out of scope
 
@@ -288,6 +318,11 @@ The cash entries reuse `cash_ledger`, and the records reuse `reconciliation_reco
 No open questions remain for the operator.
 
 ## 10. Change log
+
+**rev. 4 (2026-10-27).** Joint forensic review corrections.
+- **TP143-01:** entitlement evidence is split. Strategy lots use TradePulse's complete fill history. Inherited holdings need E1: checkpoint before the ex-date plus a complete activity population with no transfer or corporate action. Adoption-time quantity is never evidence. The `pre_generation` bucket is replaced by `inherited_unallocated`, which claims no quantity and is used only when S = 0 is proven; S > 0 with I unknown is unresolved. The new decision D-11 is flagged for reviewer confirmation. Tests T27, T28; invariant DV-I8.
+- **TP143-02:** each activity posts its own `net_amount` once. The generation cash check is the independent proof against double deduction. A G0-fixed `DIVIDEND_REPRESENTATION` (gross + separate withholding, net + record, or unknown → refuse) drives the amount check. Withholding and income are attributed as a group, with rows per component. Reversal conservation. Tests T29–T32.
+- Rev.142 needs a matching edit: inherited dividends on an adopted asset may land in `adopted` or `inherited_unallocated`, both excluded through `D_excl` (Rev.142 rev. 4).
 
 **rev. 3 (2026-10-27).** The deadline now uses Rev.144's shared market calendar (`nth_session_after`). The broker-port `get_calendar` moved to Rev.144 as its cross-check. The weekday fallback became a weekday bound for non-verified calendar dates. T25 updated. Order: Rev.144 before Rev.143.
 
@@ -306,4 +341,4 @@ No open questions remain for the operator.
 ## 11. Evidence required for implementation approval
 
 - Rev.140, Rev.141 and Rev.144 merged. G0 measurements recorded with a manifest, and the spec revised if they differ.
-- All T1–T26 pass; the full Python suite, mypy (project configuration) and Ruff (changed files) are reported exactly.
+- All T1–T32 pass; the full Python suite, mypy (project configuration) and Ruff (changed files) are reported exactly.
