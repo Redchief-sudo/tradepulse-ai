@@ -1,6 +1,6 @@
 # Rev.144: shared market calendar, cross-checked against every broker — design specification
 
-**Status:** design, rev. 1, written from the operator-approved Sections 1–2 (2026-10-27).
+**Status:** design, rev. 2. Written from the operator-approved Sections 1–2; rev. 2 corrects joint forensic review findings TP144-01 to 03 (2026-10-27).
 **Order of work:** Rev.140 → Rev.141 → **Rev.144** → Rev.143 → Rev.142. Rev.143's dividend deadline depends on this spec (section 3.8).
 **Branch:** `rev144-calendar-design`. No production code, no migration, and no change to the active A0 verification run.
 
@@ -53,12 +53,20 @@ class MarketCalendar:
     def nth_session_after(self, venue: Venue, t: datetime, n: int) -> Session: ...         # n >= 1; sessions whose date is after t's NY date
     def is_regular_hours(self, venue: Venue, t: datetime) -> bool: ...
     def status(self, venue: Venue, day: date) -> Literal["verified", "contested", "unverified", "beyond_horizon"]: ...
+    def entry_window_open(self, broker: str, asset: AssetIdentity, t: datetime,
+                          broker_clock: BrokerClock) -> EntryWindow: ...   # the single entry-authorization question (3.5)
     fingerprint: str
+
+@dataclass(frozen=True, slots=True)
+class EntryWindow:
+    open: bool
+    basis: Literal["venue_regular_session", "verified_instrument_hours", "continuous"] | None
+    reason: str | None      # the rejection code when open is False
 ```
 
 - **`US_EQUITY`:** `exchange_calendars.get_calendar("XNYS")`, so NYSE holidays and early closes. Nasdaq shares the schedule.
 - **`US_OPTION`:** XNYS session **days**, with a regular close of 16:00 ET, or 13:00 on early-close days.
-  - Per-product late closes, such as 16:15 for some ETF and index options, are **not assumed**. They come from the broker's contract hours (3.4). Until a product's hours are known, entries in the 16:00–16:15 window are refused for it.
+  - Per-product late closes, such as 16:15 for some ETF and index options, are **not assumed** and **never change the venue calendar**. They are verified instrument hours (3.4a), used only by `entry_window_open` (3.5) for that instrument.
 - **`CRYPTO`:** always open. `is_session` is always true, and `status` is always `verified`.
 - **Horizon.** The library knows sessions only up to its built-in horizon. A query beyond it raises `CalendarHorizonExceeded`, and `status` reports `beyond_horizon`. Callers treat that as fail closed (3.5).
 - **Construction.** The calendar is built once at startup with the library's default window: 20 years back to **1 year ahead**. Measured 2026-10-27: the last session is 2027-10-27. It is rebuilt at the first cycle of each new NY date, so the horizon moves forward daily. Rev.144 never asks the library to extrapolate beyond its default window; a date past it is `beyond_horizon`.
@@ -93,24 +101,52 @@ class BrokerSession:
 
 ### 3.4 Daily cross-check
 
-- At the first reconciliation cycle of each NY date, and at startup, for each connected broker:
+- **When:** at the first reconciliation cycle of each NY date, and at startup. Each run of the check gets a durable `check_id` (UUID4), written before any broker call.
+- **For each connected broker and each venue it serves:**
   - fetch `get_calendar(today, today + 30 days)`;
-  - compare each date with `MarketCalendar` for the same venue: whether it is a session, its open time and its close time.
-- **Agreement:** a `calendar_checks` row with result `agreed`, plus the response hash and range.
-- **Disagreement on any date:** that date becomes **contested** for that venue. A critical `CALENDAR_CONTESTED` alert fires, once per (date, venue, broker), naming both values. The row records `contested` with the details.
-  - A later check that agrees clears the contest, and that is recorded.
-  - There is no automatic "majority wins": any contest fails closed.
-- **Option late closes:** a broker reporting a later close for a specific option product records a `product_hours` entry. That entry allows that product's entries until its close. It never changes the venue calendar.
-- **Failure to check:** the last successful check covers its 30-day range for at most **3 trading days**. After that, `status` is `unverified` for that venue until a check succeeds, with a critical `CALENDAR_UNVERIFIED` alert once per day.
+  - compare **each date** in the broker's response with `MarketCalendar` for the same venue: session or not, open time, close time.
+- **Results are recorded per date (TP144-03).** One `calendar_check_dates` row per `(check_id, broker, venue, date)`, with result `agreed` or `contested`, plus both values when contested.
+  - A date the broker response does **not** contain is not recorded, and is not covered by that check.
+  - A header row in `calendar_checks` holds `(check_id, broker, venue)`, the requested range, `checked_at`, `response_sha256`, the raw response, and the overall result (`completed` or `failed`).
+- **Status of a (venue, date)** is derived, never stored as a flag:
+  - **`contested`:** for any connected broker, the most recent `calendar_check_dates` row for (broker, venue, date) is `contested`.
+  - **`verified`:** for **every** connected broker that serves the venue, there is a `calendar_check_dates` row for exactly (broker, venue, date) that is `agreed` and **fresh**. Fresh means its check's `checked_at` falls within the last 3 NYSE trading sessions; that's the freshness policy. A check covers only the dates in its own response. It never verifies a date outside its coverage.
+  - **`unverified`:** neither of the above, including any date not covered by a fresh check of every serving broker.
+  - **`beyond_horizon`:** past the library window (3.1); it overrides all of the above.
+- **On contest:** a critical `CALENDAR_CONTESTED` alert, once per (date, venue, broker), naming both values. A later agreeing row for the same (broker, venue, date) clears it, and both rows are kept. There is no majority vote.
+- **On failure to check:** the `calendar_checks` header is `failed`, no date rows are written, and status degrades naturally to `unverified` as freshness lapses. A critical `CALENDAR_UNVERIFIED` alert fires once per day while any date in the next 5 sessions is `unverified`.
+
+### 3.4a Verified instrument hours (option late closes)
+
+- **Source:** only the **executing broker's** contract hours for the **instrument's own contract**, e.g. IBKR `reqContractDetails(contract).tradingHours` for that option. A reference contract, another product or another broker never counts.
+- **Recorded:** in `instrument_hours` as `(check_id, broker, instrument_key, date, open, close, response_sha256)`, one row per date in the response. Rows exist for the dates the response covers, and nothing else.
+- **Valid for an entry** at time *t* when all of these hold:
+  - a row exists for (broker, instrument, *t*'s NY date);
+  - it is fresh, using the same 3-session policy;
+  - its close is after *t*;
+  - the **venue** date status is `verified`;
+  - the venue has a session that date, and its close is ≤ the instrument close. An instrument row can extend that session's close; it can never create a session on a non-session date.
+- **Never changes the venue calendar** or any other instrument.
+- **Alpaca:** G0 (3.9) checks whether Alpaca exposes per-contract option hours. If it doesn't, no `instrument_hours` rows exist for Alpaca, and late-close entries on Alpaca stay refused (fail closed).
 
 ### 3.5 Use in trading decisions
 
-**Gateway** (`execution/gateway.py`, at the existing non-continuous, non-protective check):
-- **New entry:** after `market_clock.is_open` (unchanged), additionally require:
-  - `calendar.is_regular_hours(venue, now)`;
-  - `calendar.status(venue, today) == "verified"`.
-- Rejections are `CALENDAR_SESSION_CLOSED`, `CALENDAR_DATE_CONTESTED`, `CALENDAR_UNVERIFIED` and `CALENDAR_HORIZON_EXCEEDED`.
-- **Protective exits and crypto:** unchanged. The calendar is never consulted (C-5).
+**Gateway** (`execution/gateway.py`, at the existing non-continuous, non-protective check). The two separate checks, the broker clock and `is_regular_hours`, are replaced by **one** call (TP144-01):
+
+`window = calendar.entry_window_open(broker, asset, now, market_clock)`
+
+`market_clock` is fetched as today, and a fetch failure is still `MARKET_CLOCK_UNAVAILABLE`. The decision, in order:
+1. **Crypto:** `open`, basis `continuous`. This is unchanged; the gateway doesn't call it for continuous markets today.
+2. **Venue date status** is not `verified` → closed, with `CALENDAR_DATE_CONTESTED`, `CALENDAR_UNVERIFIED` or `CALENDAR_HORIZON_EXCEEDED`.
+3. **Venue regular session:** if `now` is within the venue's regular session **and** `market_clock.is_open` → open, basis `venue_regular_session`.
+4. **Verified instrument hours:** if `now` is after the venue's regular close and before a valid instrument-hours close (3.4a) **and** the broker clock shows that **today's** session took place (`market_clock.next_open` is after `now`, and the clock's own session for today closed no earlier than the venue close) → open, basis `verified_instrument_hours`.
+   - Here the instrument row is the executing broker's own statement that this contract is still trading. It stands in for the equity clock, which is closed by then. The venue-calendar witness is kept by step 2.
+5. **Otherwise** closed:
+   - `EQUITY_MARKET_CLOSED` or `OPTION_MARKET_CLOSED` when the broker clock says closed, preserving today's strings;
+   - `CALENDAR_SESSION_CLOSED` when the clock says open but the calendar does not;
+   - `OPTION_INSTRUMENT_HOURS_UNVERIFIED` for an option between the venue close and any claimed late close without a valid row.
+
+**Protective exits and crypto:** unchanged. The calendar is never consulted (C-5).
 
 **Session sync** (`risk/session.py`): it still transitions only on the broker clock. In addition, a **clock–calendar disagreement** blocks new entries through the same gateway check, using a new in-memory flag set by session sync, and raises a critical `CALENDAR_CLOCK_DISAGREEMENT` alert once per episode. The two cases are:
 - the clock says open while the calendar has no session or is outside regular hours;
@@ -130,13 +166,20 @@ The flag clears when the two agree again.
 | No successful check for more than 3 trading days | blocked | allowed | `CALENDAR_UNVERIFIED`, critical, daily |
 | Date beyond the library horizon | blocked | allowed | `CALENDAR_HORIZON_EXCEEDED`, critical, daily |
 | Clock–calendar disagreement | blocked while it lasts | allowed | `CALENDAR_CLOCK_DISAGREEMENT`, critical, once per episode |
-| Option product with unknown late close, 16:00–16:15 | blocked for that product | allowed | none |
+| Option instrument without valid verified hours after the venue close | blocked for that instrument (`OPTION_INSTRUMENT_HOURS_UNVERIFIED`) | allowed | none |
 
 ### 3.7 Schema
 
-`calendar_checks`: `record_id` PK = `{broker}:{checked_at}`, with `broker`, `venue`, `range_start`, `range_end`, `response_sha256`, `result` (`agreed`, `contested` or `failed`), `contested_dates`, the raw response, and `checked_at`.
-- It is append-only, with `BEFORE UPDATE` / `BEFORE DELETE` triggers, verified at startup with Rev.140's trigger check.
-- The current contested set is derived as the latest row per (broker, venue) whose range covers the date.
+All tables are append-only, with `BEFORE UPDATE` / `BEFORE DELETE` triggers verified at startup with Rev.140's trigger check (TP144-02).
+
+| Table | Primary key / unique | Columns |
+|---|---|---|
+| `calendar_checks` | PK `check_id`; `UNIQUE(check_id, broker, venue)` | `broker`, `venue`, `range_start`, `range_end`, `checked_at` (the original observation time, set once), `result` (`completed` or `failed`), `response_sha256`, the raw response |
+| `calendar_check_dates` | `UNIQUE(check_id, broker, venue, date)` | `result` (`agreed` or `contested`), `broker_open`, `broker_close`, `calendar_open`, `calendar_close` |
+| `instrument_hours` | `UNIQUE(check_id, broker, instrument_key, date)` | `open`, `close`, `response_sha256` |
+
+- `check_id` is a UUID4 per check run, so two checks at the same timestamp for different venues or ranges can't collide.
+- Statuses are derived from these rows by the rules in 3.4 and 3.4a.
 
 ### 3.8 Effect on other work
 
@@ -151,12 +194,14 @@ The flag clears when the two agree again.
 1. Alpaca `GET /v2/calendar` for 2026-10-27 to 2027-01-31: the field format, the time zone, and how early closes (11-27, 12-24) appear.
 2. Compare (1) with `exchange_calendars` 4.13.2 `XNYS` for the same range, and record any difference.
 3. IBKR (when TWS or Gateway is available, read-only): `tradingHours` and `liquidHours` for SPY and one SPY option, over the same range. Record the format and how holidays and early closes appear.
+4. Alpaca: whether any endpoint exposes per-contract option trading hours (3.4a). If none does, record that, and Alpaca late-close entries stay refused.
 
 These are recorded in an evidence directory with a manifest. Any difference from the library in (2) or (3) is resolved in the spec before the plan.
 
 ## 4. Invariants
 
-- **CAL-I1:** no new stock or option entry is submitted unless the broker clock is open **and** the calendar shows a verified regular session at that instant.
+- **CAL-I1:** no new stock or option entry is submitted unless `entry_window_open` is open: a verified venue date plus either (the broker clock open and the venue's regular session) or (the instrument's own fresh broker-verified hours, after a session that took place that day).
+- **CAL-I6:** verification never extends beyond the exact (broker, venue or instrument, date) rows a fresh check produced.
 - **CAL-I2:** no protective exit is refused because of the calendar.
 - **CAL-I3:** a contested date stays contested until a later successful check agrees. No majority or automatic override.
 - **CAL-I4:** the calendar fingerprint is frozen per verification run.
@@ -188,13 +233,16 @@ These are recorded in an evidence directory with a manifest. Any difference from
 | T7 | Cross-check: the simulated broker injects an extra holiday → contested + one alert; a later agreeing check clears it; both rows are kept. |
 | T8 | Cross-check: a shifted close time → contested. |
 | T9 | Clock–calendar disagreement: clock closed during a session for 4 minutes → no block; 6 minutes → block + one alert; agreement clears. |
-| T10 | Option late close: unknown product → entry at 16:05 refused; after the broker reports 16:15 for that product → allowed until 16:15. |
+| T10 | Option late close (TP144-01): an ordinary option at 16:05 → `OPTION_INSTRUMENT_HOURS_UNVERIFIED`; the instrument with a fresh verified 16:15 row → open at 16:05 (basis `verified_instrument_hours`) despite the equity clock reporting closed, and refused at 16:15; another option on the same underlying without its own row → still refused at 16:05; a row from a different broker or a reference contract → not accepted. |
+| T10a | Instrument hours never create a session: a row for a calendar holiday → entry refused; on a contested venue date → refused; a stale row (older than 3 sessions) → refused. |
 | T11 | Crypto entries and every exit are unaffected in T4–T9. |
 | T12 | Fingerprint: changing the library session data (simulated) between run start and a later check → `frozen_configuration_mismatch`; A0's existing context is unaffected. |
 | T13 | `get_calendar` shape: Alpaca (recorded fixture), `SimulatedBroker` and an IBKR hours-string fixture return the same `BrokerSession` shape, in UTC. |
 | T14 | `calendar_checks` immutability: update and delete fail; a missing trigger refuses startup. |
 | T15 | Unchanged behaviour: the time stop and stall exit count calendar days; `_risk_day_bounds` is unchanged. |
 | T16 | Rev.143 hook: the deadline from `nth_session_after`; contested → the earlier of calendar and weekdays. |
+| T17 | Identity (TP144-02): two checks at the same `checked_at` for different venues, and for overlapping ranges, both persist; replaying a check's rows with the same `check_id` changes nothing. |
+| T18 | Coverage (TP144-03): a check covering 10-27 to 10-30 does not verify 10-31; a broker response missing a date leaves that date `unverified`; with two connected brokers, one fresh agreement is not enough; a 4-session-old agreement is not fresh. |
 
 ## 8. Out of scope
 
@@ -209,6 +257,12 @@ None for the operator. G0 (3.9) may require spec changes before the plan.
 
 ## 10. Change log
 
+**rev. 2 (2026-10-27).** Joint forensic review corrections.
+- **TP144-01:** one `entry_window_open` decision replaces the separate broker-clock and `is_regular_hours` checks. A late-close option is authorized only from its own executing broker's fresh contract hours, and only after a verified session that day. That also resolves a second contradiction found while fixing it: Alpaca's equity clock reads closed after 16:00. Ordinary contracts stay restricted. Tests T10 and T10a.
+- **TP144-02:** check identity is a `check_id` UUID per run, with unique keys over (check, broker, venue[, date]). The original `checked_at` is preserved. Test T17.
+- **TP144-03:** evidence and status are per (broker, venue or instrument, date), restricted to a check's actual response coverage. `verified` requires every serving broker's fresh agreement for that exact date. Test T18; invariant CAL-I6.
+- G0 adds Alpaca per-contract hours.
+
 **rev. 1 (2026-10-27).** First written version, from approved Sections 1–2.
 - Adopts and reshapes Rev.143 rev. 2's `get_calendar` proposal as `BrokerSession`.
 - Option late closes are taken from broker contract hours only, never assumed (3.1, 3.4).
@@ -218,4 +272,4 @@ None for the operator. G0 (3.9) may require spec changes before the plan.
 
 - Rev.140 and Rev.141 merged; A0 concluded with its evidence preserved.
 - G0 recorded with a manifest.
-- All T1–T16 pass; the full Python suite, mypy (project configuration) and Ruff (changed files) are reported exactly.
+- All T1–T18 pass; the full Python suite, mypy (project configuration) and Ruff (changed files) are reported exactly.
