@@ -139,8 +139,13 @@ class BrokerSession:
 1. **Crypto:** `open`, basis `continuous`. This is unchanged; the gateway doesn't call it for continuous markets today.
 2. **Venue date status** is not `verified` → closed, with `CALENDAR_DATE_CONTESTED`, `CALENDAR_UNVERIFIED` or `CALENDAR_HORIZON_EXCEEDED`.
 3. **Venue regular session:** if `now` is within the venue's regular session **and** `market_clock.is_open` → open, basis `venue_regular_session`.
-4. **Verified instrument hours:** if `now` is after the venue's regular close and before a valid instrument-hours close (3.4a) **and** the broker clock shows that **today's** session took place (`market_clock.next_open` is after `now`, and the clock's own session for today closed no earlier than the venue close) → open, basis `verified_instrument_hours`.
-   - Here the instrument row is the executing broker's own statement that this contract is still trading. It stands in for the equity clock, which is closed by then. The venue-calendar witness is kept by step 2.
+4. **Verified instrument hours:** open, basis `verified_instrument_hours`, when all of these hold:
+   - `now` is after the venue's regular close and before a valid instrument-hours close (3.4a);
+   - the **venue calendar** shows a session today, with status `verified` (step 2). The broker clock can't answer "did today's session happen", since `BrokerClock` has only `is_open`, `next_open` and `next_close`;
+   - the broker clock was fetched successfully and is consistent with "after today's close": `is_open` is false and `next_open > now`;
+   - no `CALENDAR_CLOCK_DISAGREEMENT` episode has been active today.
+
+   Here the instrument row is the executing broker's own statement that this contract is still trading, and it stands in for the equity clock, which is closed by then.
 5. **Otherwise** closed:
    - `EQUITY_MARKET_CLOSED` or `OPTION_MARKET_CLOSED` when the broker clock says closed, preserving today's strings;
    - `CALENDAR_SESSION_CLOSED` when the clock says open but the calendar does not;
@@ -200,7 +205,7 @@ These are recorded in an evidence directory with a manifest. Any difference from
 
 ## 4. Invariants
 
-- **CAL-I1:** no new stock or option entry is submitted unless `entry_window_open` is open: a verified venue date plus either (the broker clock open and the venue's regular session) or (the instrument's own fresh broker-verified hours, after a session that took place that day).
+- **CAL-I1:** no new stock or option entry is submitted unless `entry_window_open` is open: a verified venue date plus either (the broker clock open and the venue's regular session) or (the instrument's own fresh broker-verified hours, after a verified venue session that day, with a consistent broker clock).
 - **CAL-I6:** verification never extends beyond the exact (broker, venue or instrument, date) rows a fresh check produced.
 - **CAL-I2:** no protective exit is refused because of the calendar.
 - **CAL-I3:** a contested date stays contested until a later successful check agrees. No majority or automatic override.
