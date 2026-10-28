@@ -1,6 +1,6 @@
 # Rev.142: adopting unmanaged long positions for protective management — design specification
 
-**Status:** design, rev. 3. Approved for specification drafting: Sections 1–3, reviews ADOPT-01 to ADOPT-08 and REV142-01 to REV142-03, and operator decisions Q1 and Q2 (rev. 2).
+**Status:** design, rev. 4. Approved for specification drafting: Sections 1–3, reviews ADOPT-01 to ADOPT-08 and REV142-01 to REV142-03, and operator decisions Q1 and Q2 (rev. 2).
 **Implementation is blocked** until Rev.140 is implemented, validated and approved (section 3.1), and Rev.143 is merged (3.8a).
 **Branch:** `rev142-adoption-design`. No production code, no migration, and no change to the active A0 verification run.
 
@@ -184,6 +184,8 @@ The adopted lot has no fill row. Each site below gets an explicit `lot.origin ==
 
 **No adopted lot may be treated as having an originating fill.** No code path may construct, look up or default a fill for an `adoption:` ID.
 
+**Runtime proof (TP142-01).** The source guard below finds new lookup sites, but it can't prove behaviour. Test T32 runs a real adopted lot, which has no originating broker fill, through every path, with the `fills` repository set to fail on any `adoption:` lookup.
+
 **Source-level regression guard (test T26).**
 - An AST test walks `tradepulse/` and collects every attribute access or subscript of `originating_fill_id` as a `(module, enclosing function)` pair.
 - It compares that set with an approved list held in the test. Each entry names the site and the test (T11 or T27) that exercises its adopted branch.
@@ -269,7 +271,7 @@ Per bound generation, for each `opening_inventory` adoption *a* of asset *k* wit
 - Rev.140 §3.10 likewise fails closed on corporate actions.
 
 **Rev. 3: delegated to Rev.143.** Dividend cash recognition and verified attribution are specified separately in `docs/superpowers/specs/2026-10-27-dividend-recognition-design.md` (branch `rev143-dividends-design`), which is scheduled **before** this Rev. Rev.142 therefore:
-- **Relies on Rev.143's `adopted` bucket.** A dividend on adopted shares is attributed there: entitlement by the trade date before the ex-date, verified against the announcement and the Alpaca activity to the share and the cent. It is recorded once in the cash ledger and excluded from generation performance through Rev.143's `D_excl`.
+- **Relies on Rev.143's inherited buckets.** A dividend on adopted shares goes to `adopted` when Rev.143's evidence E1 establishes the ex-date quantity. Otherwise it goes to `inherited_unallocated` (whole amount, no quantity claimed), and only when the strategy's entitlement is provably zero. If it isn't, Rev.143 leaves it unresolved. The adoption quantity is never entitlement evidence (Rev.143 TP143-01). In both cases it is entitlement by the trade date before the ex-date, verified against the announcement and the Alpaca activity. It is recorded once in the cash ledger and excluded from generation performance through Rev.143's `D_excl`.
 - **Never adds dividends to `X(k)`.** The exclusion is defined once, in Rev.143 (DV-I4).
 - **Allocates no dividend cash itself.** An unverified dividend is held in Rev.143's `D_unresolved`, so it fails closed there.
 - **Gives Rev.143 an `origin` to bucket by.** The adopted lot (`origin="adopted"`) and its `opened_at` are the inputs Rev.143's `adopted` bucket reads.
@@ -359,6 +361,7 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
 - **AD-I9 no synthetic fill:** no `fills` row, lookup or default exists for any `adoption:` ID.
 - **AD-I10 re-entry:** no strategy BUY is authorized for an excluded account and asset (3.9).
 - **AD-I11 epochs:** adopted crypto inventory belongs only to its adopted epoch; no strategy epoch contains an adopted lot or a protective SELL of one.
+- **AD-I13 identity:** `origin="adopted"` and `adoption_id` survive every persistence, hydration, settlement, replay, fee-replay, recovery and evidence path. No path reconstructs an adopted lot's identity from a fill.
 - **AD-I12 income:** Rev.142 never allocates dividend or withholding cash. Rev.143 attributes it (bucket `adopted`), and `X(k)` contains no dividends (3.8a).
 
 ## 5. Recovery
@@ -414,7 +417,9 @@ All tables are additive, using `CREATE TABLE IF NOT EXISTS`, with no rebuild of 
 | T27 | Evidence generation (`verification/evidence.py`) after a partial and after a full adopted-lot closure, for equity and crypto: it builds, lists adoptions as their own class, and contains no fill entry for any `adoption:` ID. |
 | T28 | Crypto epochs: adoption creates the adopted epoch atomically; a protective SELL joins it, never a strategy epoch; a coin fee on the adopted lot attributes to it; partial exit stays pending; full exit reconciles; a late fee supersedes once; restart between adoption and SELL changes nothing; `prove_edge` excludes it. |
 | T29 | Q2 durability: after full closure, a strategy BUY is refused in the scanner (`ADOPTED_ASSET_EXCLUDED`) and the gateway (`ADOPTED_ASSET_REENTRY_BLOCKED`), across a runtime restart; a new bound checkpoint releases it only when the closure obligations are settled, and keeps it excluded otherwise; outside a generation it is never released. |
-| T30 | Q1 with Rev.143: a dividend and its withholding on an adopted asset in a generation are attributed to the `adopted` bucket, excluded through `D_excl`, recorded once in the cash ledger, and absent from `X(k)`; generation equity change from the asset stays $0. |
+| T31 | TP142-01 hydration: an adopted lot, its holding, attribution and crypto epoch round-trip through `encode_payload`/`hydrate` with `origin` and `adoption_id` intact; legacy rows hydrate as `origin="fill"` with `adoption_id=None`; an `adopted` lot without `adoption_id`, or a `fill` lot with one, fails `__post_init__`. |
+| T32 | TP142-01 runtime survival: with the `fills` repository wrapped to **fail the test** on any lookup of an `adoption:` key, run one real adopted lot (no originating broker fill) through adoption → partial sale → settlement replay → restart → full sale → late fee correction after closure → fee replay → historical evidence reconstruction (`verification/evidence.py`) → generation valuation. After every step, the lot's and attribution's `origin` and `adoption_id` are unchanged, and no fill lookup occurred. Run for an equity and a crypto asset. |
+| T30 | Q1 with Rev.143: a dividend and its withholding on an adopted asset are attributed to `adopted` (E1 established) or `inherited_unallocated` (not established, S = 0), excluded through `D_excl`, each activity recorded once in the ledger, and absent from `X(k)`; `adopted_quantity` is never read as entitlement evidence; generation equity change from the asset stays $0. |
 
 ## 8. Out of scope
 
@@ -432,6 +437,10 @@ Q1 and Q2 were decided by the operator for rev. 2 (section 2, 3.8a, 3.9). Q3 is 
 - **Q4.** Outside a verification run, an adopted asset stays excluded from strategy entries with no release (3.9). Is that acceptable until a re-entry Rev, or should re-entry outside runs be designed next?
 
 ## 10. Change log
+
+**rev. 4 (2026-10-27).** Joint forensic review corrections.
+- **TP142-01:** runtime identity proofs added: T31 (hydration round trip and legacy defaults) and T32 (a real adopted lot through adoption, partial and full sale, replay, restart, late fee after closure, fee replay, evidence reconstruction and valuation, with fill lookups set to fail). Invariant AD-I13.
+- **Rev.143 rev. 4 alignment:** adopted-asset dividends go to `adopted` (E1 established) or `inherited_unallocated` (strategy share provably zero), both through `D_excl`. The adoption quantity is never entitlement evidence. T30 updated.
 
 **rev. 3 (2026-10-27).** Dividends delegated to Rev.143.
 1. **3.8a:** the fail-closed placeholder `adopted_income_unresolved` and the attribution contract were replaced by a reference to the Rev.143 spec. Rev.143 is scheduled before Rev.142 (order: Rev.140 → Rev.141 → Rev.143 → Rev.142).
@@ -462,5 +471,5 @@ Q1 and Q2 were decided by the operator for rev. 2 (section 2, 3.8a, 3.9). Q3 is 
 
 - Rev.140 implemented, merged and its acceptance gates passed. Rev.143 merged. A0 concluded with its evidence preserved.
 - The Rev.142 plan reviewed, with the `originating_fill_id` inventory re-run on the plan's base commit.
-- All T1–T30 pass; the full Python suite, mypy (project config) and Ruff (changed files) are reported exactly, along with the frontend tests for the dashboard badge.
+- All T1–T32 pass; the full Python suite, mypy (project config) and Ruff (changed files) are reported exactly, along with the frontend tests for the dashboard badge.
 - T22's recorded-scenario comparison is attached as evidence that the setting off changes nothing.
