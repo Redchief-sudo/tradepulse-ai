@@ -1,7 +1,7 @@
 # Rev.143: dividend cash recognition and verified attribution — design specification
 
-**Status:** design, rev. 2. Written from the operator-approved Sections 1–3; rev. 2 adds the operator decisions on dividend dates and escalation (2026-10-27).
-**Order of work:** Rev.140 → Rev.141 → **Rev.143** → Rev.142. Rev.142 rev. 3 depends on this spec (section 3.9).
+**Status:** design, rev. 3. Written from the operator-approved Sections 1–3; rev. 2 adds the operator decisions on dividend dates and escalation (2026-10-27).
+**Order of work:** Rev.140 → Rev.141 → Rev.144 → **Rev.143** → Rev.142. Depends on Rev.144's market calendar (3.4 step 7). Rev.142 rev. 3 depends on this spec (section 3.9).
 **Branch:** `rev143-dividends-design`. No production code, no migration, and no change to the active A0 verification run.
 
 ## 1. What happens today (traced in the code, main at `c10bb2fa`)
@@ -125,9 +125,8 @@ A new `_persist_generation_dividends(connection, activities, membership, *, now)
    | At `escalation_deadline` (end of the 3rd NYSE trading session) | Status `unresolved` with the last reason; critical `DIVIDEND_ATTRIBUTION_UNRESOLVED` Telegram alert once per activity, for operator review |
    | After the deadline | Retries continue. A later successful match moves it to `verified` and sends an info alert; it never skips the operator alert already sent |
 
-   - **Trading calendar.** The deadline is computed from Alpaca's market calendar (`GET /v2/calendar`), through a new `get_calendar(start, end)` on the broker port, beside `get_clock`. `SimulatedBroker` implements it from its `SimSession`. Early-close days count as sessions. Any future broker adapter (A2's IBKR `TradingPort`) must implement `get_calendar` too.
-   - The calendar response used is stored with the status row, as evidence (`deadline_source = "alpaca_calendar"`).
-   - **If the calendar can't be read,** the deadline is computed as 3 weekdays (`deadline_source = "weekday_fallback"`). Holidays only push the true deadline later, so the alert may come early but never late. It is recomputed from the calendar when it next becomes available, but never moved later than an alert already sent.
+   - **Trading calendar (rev. 3).** The deadline is `MarketCalendar.nth_session_after(US_EQUITY, first_observed_at, 3).close`, from Rev.144's shared calendar. Early-close days count as sessions. Broker calendars are Rev.144's cross-check, not the deadline's source.
+   - **When the date's calendar status is not `verified`** (`contested`, `unverified` or `beyond_horizon`): the deadline is the **earlier** of the calendar result and 3 weekdays (`deadline_source = "weekday_bound"`). The alert may come early, but never late. Otherwise `deadline_source = "market_calendar"`. A recomputation never moves the deadline later than an alert already sent.
 
 **Quarantined instruments (Rev.140 §3.10):** if the instrument has open quarantined inventory, the activity is `unresolved` (`DIVIDEND_ON_QUARANTINED_INSTRUMENT`). The cash is still recorded, and the quarantine hold stays.
 
@@ -173,7 +172,7 @@ These are recorded in an evidence directory with a manifest, as in `2026-10-26-r
 
 1. `GET /v2/account/activities?activity_types=DIV,DIVCGL,DIVCGS,DIVTXEX,DIVNRA,DIVTW,DIVFT,DIVROC` on the paper account. Capture `activity_type`, `id`, `date`, `net_amount`, `qty`, `per_share_amount`, `status`, `symbol`, `description` and any creation timestamp. Record what `date` means relative to the matched announcement's payable date, and whether credits arrive after it (D-9).
 2. `GET /v2/corporate_actions/announcements?ca_types=dividend` for the held symbols: the field names, the `cash` rate format, and `ex_date`, `record_date` and `payable_date`. For each `DIV` sample in (1), record its announcement's three dates beside the activity's `date`.
-6. `GET /v2/calendar` for the next 30 days: the field format, and whether early closes are marked (3.4 step 7).
+6. The calendar measurement moved to Rev.144's G0 (3.9 there).
 3. The rounding rule, derived from (1) and (2) when samples exist.
 4. Whether Alpaca's newer corporate-actions endpoint (market data) is the better source. Record it; don't switch without a review.
 5. Whether fill activities carry a trade date distinct from `transaction_time`, and how overnight-session fills are dated (3.4 step 2).
@@ -271,7 +270,7 @@ The cash entries reuse `cash_ledger`, and the records reuse `reconciliation_reco
 | T22 | Recovery: crash after recording, before attribution; restart attributes once. |
 | T23 | Receipt shape differing from the fixtures → `DIVIDEND_RECEIPT_SHAPE_UNVERIFIED`. |
 | T24 | Escalation on the trading calendar: first observed on Wednesday 2026-11-25; Thursday 11-26 (Thanksgiving) is not a session, and Friday 11-27 (early close) counts, so the deadline is the end of Tuesday 12-01's session; the alert fires once at the deadline, not before; the deadline starts at first observation, not at the ex-date or the activity `date`. |
-| T25 | Calendar unavailable → weekday fallback (alert early, never late); when the calendar returns, the deadline is recomputed but never later than an alert already sent. |
+| T25 | Calendar status contested, unverified or beyond the horizon → the deadline is the earlier of the calendar and 3 weekdays (alert early, never late); a later recomputation never moves it past an alert already sent. |
 | T26 | A match after the deadline → `verified`, an info alert, and the critical alert is not repeated; announcements re-fetched at least once per trading day while pending. |
 
 ## 8. Out of scope
@@ -290,6 +289,8 @@ No open questions remain for the operator.
 
 ## 10. Change log
 
+**rev. 3 (2026-10-27).** The deadline now uses Rev.144's shared market calendar (`nth_session_after`). The broker-port `get_calendar` moved to Rev.144 as its cross-check. The weekday fallback became a weekday bound for non-verified calendar dates. T25 updated. Order: Rev.144 before Rev.143.
+
 **rev. 2 (2026-10-27).** Operator decisions on dividend dates and escalation.
 1. **D-9:** entitlement from the announcement's dates only. Announcement matching no longer requires `payable_date` = activity date, since a credit may be late; it requires `payable_date` ≤ the credit date. Same-rate quarterly dividends are disambiguated by the eligible quantity at each candidate's own ex-date.
 2. **D-10:** escalation 3 NYSE trading days after **first observation**, on Alpaca's calendar. The safeguards are immediate, with daily announcement refreshes and a weekday fallback that can only alert early. New broker-port method `get_calendar`.
@@ -304,5 +305,5 @@ No open questions remain for the operator.
 
 ## 11. Evidence required for implementation approval
 
-- Rev.140 and Rev.141 merged. G0 measurements recorded with a manifest, and the spec revised if they differ.
+- Rev.140, Rev.141 and Rev.144 merged. G0 measurements recorded with a manifest, and the spec revised if they differ.
 - All T1–T26 pass; the full Python suite, mypy (project configuration) and Ruff (changed files) are reported exactly.
