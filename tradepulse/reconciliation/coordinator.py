@@ -352,6 +352,18 @@ def _execution_issue(connection: Any, *, activity: AlpacaActivity) -> str | None
     return execution_issue(connection, activity)
 
 
+async def _attribute_dividends(repositories: PersistenceRepositories, broker: BrokerPort, alerts: TelegramAlerter,
+                               now: datetime) -> None:
+    """Rev.143 §3.4: attribution after recording, every cycle. A failure
+    leaves activities pending (in D_unresolved); it never stops reconciliation."""
+    from tradepulse.reconciliation.dividend_attribution import attribute_dividends
+
+    try:
+        await attribute_dividends(repositories, broker, alerts, now)
+    except Exception as exc:  # noqa: BLE001 - attribution fails closed through D_unresolved
+        logger.warning("dividend_attribution_unavailable", extra={"event": "dividend_attribution_unavailable", "error": str(exc)})
+
+
 async def run_calendar_checks(repositories: PersistenceRepositories, broker: BrokerPort, alerts: TelegramAlerter,
                               now: datetime) -> None:
     """The daily calendar cross-check. Its failures are recorded as failed
@@ -906,6 +918,8 @@ async def run_reconciliation(
         await latch_financial_integrity_block(repositories, reason, clock=lambda: now)
         await alerts.send('critical', reason, {})
         return ReconciliationSummary('degraded', error=reason)
+    if generation_membership is not None:
+        await _attribute_dividends(repositories, broker, alerts, now)
     from tradepulse.settlement.accounting import accounting_issues, replay_accounting
     projection_error = None
     try:

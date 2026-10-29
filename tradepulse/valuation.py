@@ -153,15 +153,25 @@ def _generation_invariants(connection, account, positions):
                 raise ValueError('opening_inventory_mark_missing:' + key)
             prior_inventory_change += quantity * position.market_value / position.qty - Decimal(old['market_value'])
     capital = generation_adjustment_totals(connection)['capital_flows']
+    # Rev.143 §3.7: inherited dividends are excluded once (D_excl); an
+    # unattributed one holds the run's equity unresolved (D_unresolved).
+    from tradepulse.reconciliation.dividend_attribution import dividend_equity
+    dividends = dividend_equity(connection)
+    equity_status = cash_status if not dividends['unresolved_activity_ids'] else 'unresolved_dividend_attribution'
     return {
         'checkpoint_id': opening['checkpoint_id'], 'opening_quantities': opening_quantities,
         'population_record_id': latest['record_id'], 'population_status': 'matched',
         'generation_cash': {'status': cash_status, 'expected_cash': str(expected_cash),
                             'observed_cash': str(account.cash), 'difference': str(account.cash - expected_cash)},
-        'generation_equity': {'status': cash_status,
-                              'total_equity': str(account.equity - prior_inventory_change - capital),
+        'generation_equity': {'status': equity_status,
+                              'total_equity': str(account.equity - prior_inventory_change - capital
+                                                  - dividends['d_excl'] - dividends['d_unresolved']),
                               'excluded_opening_inventory_change': str(prior_inventory_change),
-                              'excluded_capital_flows': str(capital)},
+                              'excluded_capital_flows': str(capital),
+                              'excluded_inherited_dividends': str(dividends['d_excl']),
+                              'unresolved_dividends': str(dividends['d_unresolved']),
+                              'unresolved_dividend_activity_ids': dividends['unresolved_activity_ids']},
+        'dividend_entitlement_not_established': dividends['entitlement_not_established'],
     }
 
 
@@ -296,7 +306,8 @@ async def marked_snapshot(
                        and all(states.get(key) == 'reconciled_net' for key in set(lot_quantities) | set(holdings))
                        and observation_status in POSITION_OBSERVATION_MATCHED
                        and not generation_failed
-                       and (generation is None or generation['generation_cash']['status'] == 'matched'))
+                       and (generation is None or (generation['generation_cash']['status'] == 'matched'
+                                                   and generation['generation_equity']['status'] == 'matched')))
     results['mandatory_invariants'] = 'matched' if mandatory_match else 'incomplete_or_mismatched'
     if generation is not None and not mandatory_match:
         results['generation_equity']['status'] = 'incomplete_or_mismatched'
