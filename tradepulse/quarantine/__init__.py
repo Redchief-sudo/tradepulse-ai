@@ -8,10 +8,11 @@ follow spec §3.3's sign table, each at the mark that is adverse for it.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 
-from tradepulse.models.market import asset_identity_key
+from tradepulse.models.market import AssetIdentity, asset_identity_key
 from tradepulse.persistence import PersistenceRepositories, hydrate, paginate_all_rows
 
 BLOCKS = {"short_liability": "short_exposure_liabilities", "unmanaged_long": "unmanaged_long_inventory"}
@@ -27,6 +28,8 @@ class QuarantinedPosition:
     multiplier: Decimal
     reference_price: Decimal  # a liability's sale price, or the inventory's cost price
     last_confirmed_mark: Decimal | None  # the mark the latest equity snapshot recorded for it
+    asset: AssetIdentity | None = None
+    opened_at: datetime | None = None
 
     @property
     def signed_quantity(self) -> Decimal:
@@ -76,8 +79,9 @@ async def quarantined_positions(repositories: PersistenceRepositories, asset_key
             open_quantity = record.quantity - resolved.get(record_id, Decimal(0))
             if open_quantity > 0 and (asset_key is None or key == asset_key):
                 positions.append(QuarantinedPosition(record_id, kind, key, sign, open_quantity,  # type: ignore[arg-type]
-                                                     record.multiplier, getattr(record, price), marks.get(record_id)))
-    return positions
+                                                     record.multiplier, getattr(record, price), marks.get(record_id),
+                                                     record.asset, record.opened_at))
+    return sorted(positions, key=lambda position: (position.opened_at, position.record_id))
 
 
 def signed_quantities(records: list[QuarantinedPosition]) -> dict[str, Decimal]:

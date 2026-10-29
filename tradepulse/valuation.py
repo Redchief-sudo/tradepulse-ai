@@ -265,8 +265,9 @@ async def marked_snapshot(
                    (holdings[key].quantity if key in holdings else Decimal(0)) else 'mismatch' for key in identities}
     from tradepulse.settlement.accounting import accounting_issues
     projection_issues = await accounting_issues(repositories)
-    holds = await paginate_all_rows(repositories.integrity_holds)
-    results = {**blocks, 'projection_evidence': projection_issues, 'integrity_holds': len(holds),
+    from tradepulse.quarantine.release import active_hold_count
+    holds = await repositories.integrity_holds.database.run(active_hold_count)
+    results = {**blocks, 'projection_evidence': projection_issues, 'integrity_holds': holds,
                'broker_equity': 'matched' if difference == 0 else 'failed',
                'position_quantities': quantities, 'holdings_versus_lots': lots_result,
                'fee_finality': states,

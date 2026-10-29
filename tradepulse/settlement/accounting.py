@@ -7,6 +7,7 @@ external reconciliation observation, not a substitute for these journal rows.
 All synchronous helpers run only inside AsyncSQLiteDatabase.run transactions.
 """
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 
@@ -132,6 +133,34 @@ def _persist(connection, table, identifier, item, *, write):
     return True
 
 
+def _project_quarantine_cash(connection, *, write):
+    """Rev.140 §3.7 / I1: each quarantine execution's one cash entry,
+    re-derived from the immutable execution. A difference is
+    ACCOUNTING_DURABLE_ROW_CONFLICT; nothing is rewritten."""
+    from tradepulse.quarantine.resolve import execution_cash
+
+    changed = 0
+    for row in connection.execute('SELECT payload FROM quarantine_executions ORDER BY record_id').fetchall():
+        item = execution_cash(hydrate('quarantine_executions', decode_payload(row['payload'])))
+        changed += _persist(connection, 'cash_ledger', item.entry_id, item, write=write)
+    return changed
+
+
+def quarantine_cash_issues(connection):
+    from tradepulse.quarantine.resolve import execution_cash
+
+    issues = {}
+    for row in connection.execute('SELECT record_id, payload FROM quarantine_executions').fetchall():
+        try:
+            item = execution_cash(hydrate('quarantine_executions', decode_payload(row['payload'])))
+            _persist(connection, 'cash_ledger', item.entry_id, item, write=False)
+        except (ValueError, ArithmeticError, KeyError) as exc:
+            issues['quarantine_execution:' + row['record_id']] = str(exc)
+        if connection.execute('SELECT 1 FROM fills WHERE record_id=? OR broker_fill_id=?', (row['record_id'],) * 2).fetchone():
+            issues['quarantine_execution:' + row['record_id']] = 'INTEGRITY_VIOLATION: I11 activity is both a Fill and a quarantine execution'
+    return issues
+
+
 def project(connection, event, *, cash=False, trade=False, write=False):
     """Validate expected rows, optionally persist; never trust checkpoint flags."""
     changed = 0
@@ -153,6 +182,18 @@ async def project_accounting(repositories, event, *, cash=False, trade=False):
         lambda connection: project(connection, event, cash=cash, trade=trade, write=True), write=True)
 
 
+def _replay_project(connection, event):
+    """Verify first; only a repair (a missing row) needs the order free of
+    integrity holds. A replay that changes nothing is a pure verification,
+    so an order held for Rev.140 short exposure still replays."""
+    try:
+        return project(connection, event, cash=True, trade=True)
+    except ProjectionEvidenceError as exc:
+        if not str(exc).startswith('ACCOUNTING_DURABLE_ROW_MISSING:'):
+            raise
+    return project(connection, event, cash=True, trade=True, write=True)
+
+
 async def replay_accounting(repositories):
     """Repair only proven completed projections, atomically, without flag edits.
 
@@ -162,10 +203,11 @@ async def replay_accounting(repositories):
     def replay(connection):
         changed = 0
         sources = {}
+        event = None
         for row in connection.execute("SELECT payload FROM settlements WHERE status='completed' ORDER BY record_id"):
             original = decode_payload(row['payload'])
             event = hydrate('settlements', original)
-            changed += project(connection, event, cash=True, trade=True, write=True)
+            changed += _replay_project(connection, event)
             # Explicit versioned migration for settlements predating the
             # attribution stage. Validate the complete attribution population
             # above before recording the newly introduced checkpoint field.
@@ -185,7 +227,8 @@ async def replay_accounting(repositories):
                     (migration_id, encode_payload(receipt), receipt['occurred_at']))
                 connection.execute('UPDATE settlements SET payload=? WHERE record_id=?',
                                    (encode_payload(migrated), event.settlement_event_id))
-        for table in ('fills', 'position_lots', 'trade_attributions', 'settlements'):
+        changed += _project_quarantine_cash(connection, write=True)
+        for table in ('fills', 'position_lots', 'trade_attributions', 'settlements', 'quarantine_executions'):
             sources[table] = sha256(encode_payload([decode_payload(r['payload']) for r in connection.execute(
                 f'SELECT payload FROM {table} ORDER BY record_id')]).encode()).hexdigest()
         if changed:
@@ -194,7 +237,7 @@ async def replay_accounting(repositories):
                        'subject_id': 'completed_settlements', 'outcome': 'corrected',
                        'expected': {'durable_cash_and_pnl': True},
                        'actual': {'algorithm_version': 1, 'source_sha256': sources, 'inserted_rows': changed},
-                       'occurred_at': event.occurred_at.isoformat(),
+                       'occurred_at': (event.occurred_at if event is not None else datetime.now(UTC)).isoformat(),
                        'corrective_action': 'rebuild missing canonical cash and PnL from immutable fills and verified lot attributions'}
             connection.execute('INSERT INTO reconciliation_records(record_id,payload,created_at) VALUES(?,?,?)',
                                (identifier, encode_payload(payload), payload['occurred_at']))
@@ -217,5 +260,6 @@ async def accounting_issues(repositories):
                 issues[event.fill_id] = str(exc)
         for row in connection.execute('SELECT record_id FROM fills WHERE record_id NOT IN (SELECT fill_id FROM settlements)'):
             issues[row['record_id']] = 'ACCOUNTING_SETTLEMENT_MISSING'
+        issues.update(quarantine_cash_issues(connection))
         return issues
     return await repositories.settlements.database.run(check)

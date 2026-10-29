@@ -526,7 +526,11 @@ def unlock_proof(connection):
     if not connection.in_transaction:
         connection.execute('BEGIN')
     issues = checkpoint_issues(connection)
-    if connection.execute('SELECT 1 FROM integrity_holds LIMIT 1').fetchone():
+    from tradepulse.quarantine.release import active_hold_count
+
+    # Rev.140 §3.7: a SHORT_EXPOSURE hold whose exposure is fully resolved is
+    # released by the reset itself; every other hold must already be absent.
+    if active_hold_count(connection):
         issues['integrity_holds'] = 'RESET_ACTIVE_INTEGRITY_HOLD'
     for table in ('trade_intents', 'orders'):
         if connection.execute(f"SELECT 1 FROM {table} WHERE status NOT IN "

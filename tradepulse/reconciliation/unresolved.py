@@ -142,6 +142,10 @@ async def write_outcome_if_proven(repositories: PersistenceRepositories, activit
             if (execution.side, execution.quantity, execution.price, execution.executed_at) != facts \
                     or execution.raw_sha256 != recorded.raw_sha256:
                 return False
+            from tradepulse.quarantine.resolve import cash_issue
+
+            if cash_issue(connection, execution) is not None:  # I1: exactly one equal cash entry
+                return False
             outcome, matched = "quarantine_execution", execution.activity_id
             evidence.update(execution=execution_row[0])
         result = UnresolvedExecutionOutcome(

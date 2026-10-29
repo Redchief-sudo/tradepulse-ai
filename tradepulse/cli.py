@@ -472,6 +472,38 @@ async def _run_bootstrap_fill_cursor(settings: Settings, reason: str) -> int:
         await broker.aclose()
 
 
+async def _run_quarantine_resolve(settings: Settings, activity_id: str, reason: str) -> int:
+    """`tradepulse quarantine resolve --activity --reason` (Rev.140 §3.7):
+    resolves quarantined inventory from one verified broker execution. It
+    takes the account lease itself, so it refuses while a runtime holds it."""
+    from tradepulse.quarantine.resolve import ResolveRefused, resolve_from_activity
+
+    _require_credentials(settings, require_ai=False)
+    database = AsyncSQLiteDatabase(settings.database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    broker = _build_broker(settings)
+    stack = contextlib.ExitStack()
+    try:
+        lease = await _enter_account_lease(stack, broker, "tradepulse quarantine resolve")
+        if lease is None:
+            logger.error("quarantine_resolve_refused", extra={"event": "quarantine_resolve_refused", "reason": "ACCOUNT_LEASE_HELD"})
+            return 1
+        with stack:
+            try:
+                result = await resolve_from_activity(repositories, broker, lease, activity_id, reason, datetime.now(UTC))
+            except ResolveRefused as exc:
+                logger.error("quarantine_resolve_refused", extra={"event": "quarantine_resolve_refused", "reason": exc.reason})
+                return 1
+            logger.info("quarantine_resolved", extra={
+                "event": "quarantine_resolved", "activity_id": activity_id,
+                "resolved": [r.record_id for r in result.resolved],
+                "surplus": result.surplus.record_id if result.surplus else None})
+            return 0
+    finally:
+        await broker.aclose()
+
+
 async def _run_scan(settings: Settings, asset_classes: list[AssetClass]) -> int:
     """`tradepulse scan --asset-class=... [asset-class ...]`: one or more
     lanes' discovery plus the stop/target position monitor, all CONCURRENTLY
@@ -1182,6 +1214,11 @@ def _build_parser() -> argparse.ArgumentParser:
     reconcile_parser.add_argument("action", nargs="?", choices=["bootstrap-fill-cursor"],
                                   help="bootstrap-fill-cursor: create the fill cursor from complete broker history (Rev.140)")
     reconcile_parser.add_argument("--reason", help="why the fill cursor is being bootstrapped (required with bootstrap-fill-cursor)")
+    quarantine_parser = subparsers.add_parser("quarantine", help="controlled resolution of quarantined inventory (Rev.140)")
+    quarantine_parser.add_argument("action", choices=["resolve"],
+                                   help="resolve: account for one broker execution against quarantined inventory")
+    quarantine_parser.add_argument("--activity", required=True, help="the broker FILL activity ID")
+    quarantine_parser.add_argument("--reason", required=True, help="why this execution resolves the inventory")
     subparsers.add_parser("start", help="activate the trading session (refuses from RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED/SYSTEM_DEGRADED/MARKET_CLOSED)")
     subparsers.add_parser("stop", help="deactivate the trading session (never downgrades an active safety block)")
     subparsers.add_parser("status", help="report the current trading session state and exit")
@@ -1348,6 +1385,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "reconcile" and generation is not None:
             return asyncio.run(run_official(settings, generation, lambda verification: _run_reconcile(settings),
                                             reconciliation_only=True))
+        if args.command == "quarantine":
+            if not args.reason.strip():
+                print("tradepulse: quarantine resolve needs a non-empty --reason", file=sys.stderr)
+                return 1
+            return asyncio.run(_run_quarantine_resolve(settings, args.activity, args.reason))
         if args.command == "reset-integrity":
             return asyncio.run(_run_reset_integrity(settings, force=args.force))
         if args.command == "scan":

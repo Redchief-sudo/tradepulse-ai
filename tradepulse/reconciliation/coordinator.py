@@ -404,6 +404,27 @@ async def _reconcile_fills(
             )
             continue
 
+        # Rev.140 §3.7: a cover or unmanaged sale written by `quarantine
+        # resolve` matches by exact ID only, with its digest and its one cash
+        # entry re-verified; nothing is written for it here.
+        if await repositories.quarantine_executions.get(activity.activity_id) is not None:
+            from tradepulse.quarantine.resolve import execution_issue
+
+            issue = await repositories.quarantine_executions.database.run(lambda c, a=activity: execution_issue(c, a))
+            if issue is None:
+                await _record(
+                    repositories, reconciliation_type="fill", subject_id=activity.activity_id, outcome=ReconciliationOutcome.MATCHED,
+                    expected={"quarantine_execution": activity.activity_id},
+                    actual={"activity_id": activity.activity_id, "match_method": "quarantine_execution"}, occurred_at=now)
+                continue
+            missed_fills += 1
+            await _record(
+                repositories, reconciliation_type="fill", subject_id=activity.activity_id, outcome=ReconciliationOutcome.DRIFT_DETECTED,
+                expected={"quarantine_execution": activity.activity_id}, actual={"issue": issue}, occurred_at=now)
+            await latch_financial_integrity_block(
+                repositories, f"QUARANTINE_EXECUTION_MISMATCH: {activity.activity_id} {issue}", clock=lambda: now)
+            continue
+
         order_id = str(activity.raw.get("order_id") or "")
         candidate_intent = None
         if order_id:

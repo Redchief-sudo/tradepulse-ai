@@ -261,6 +261,15 @@ async def run_reset_integrity(settings: Settings, *, force: bool) -> int:
             "event": "reset_integrity_refused_unresolved_broker_execution", "reason": "UNRESOLVED_BROKER_EXECUTION",
             "activity_ids": sorted(row.activity_id for row in unresolved_executions)})
         return 1
+    from tradepulse.quarantine.release import released_short_exposure_holds, reset_gate_issues
+
+    # Rev.140 §3.7 step 6: open quarantined inventory, an I5 or C1 failure, or
+    # a quarantine execution without exactly its one cash entry keeps the latch.
+    quarantine_issues = await reset_gate_issues(repositories)
+    if quarantine_issues:
+        logger.error("reset_integrity_refused_quarantine", extra={
+            "event": "reset_integrity_refused_quarantine", "issues": quarantine_issues})
+        return 1
 
     from tradepulse.persistence.codec import encode_payload
     from tradepulse.reconciliation.epochs import require_unlock_proof, unlock_proof
@@ -326,8 +335,12 @@ async def run_reset_integrity(settings: Settings, *, force: bool) -> int:
 
     def validate_write(connection):
         # This runs in transition_session's BEGIN IMMEDIATE transaction, before
-        # any reset write. Never delete holds: every hold must already be absent.
+        # any reset write. Never delete holds: every hold must already be
+        # absent, except a SHORT_EXPOSURE hold whose exposure is fully
+        # resolved, which is released here, atomically with the transition.
         require_unlock_proof(connection, proof["digest"])
+        for hold_id in released_short_exposure_holds(connection):
+            connection.execute("DELETE FROM integrity_holds WHERE record_id=? AND status='short_exposure'", (hold_id,))
         connection.execute('INSERT INTO reconciliation_records(record_id,payload,created_at) VALUES(?,?,?)',
                            (receipt.record_id, encode_payload(receipt), now.isoformat()))
 
