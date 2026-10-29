@@ -351,6 +351,39 @@ async def _report_unmanaged_position(repositories: PersistenceRepositories, aler
     await alert_once(repositories.audit_events, alerts, event)
 
 
+async def _untradeable_assets(repositories: PersistenceRepositories, alerts: TelegramAlerter,
+                              positions: list[AlpacaPosition], now: datetime) -> set[str]:
+    """Rev.140 §3.4: assets the monitor must not trade at all -- a negative
+    broker position, open quarantined inventory, or an open unresolved
+    execution. The first two are alerted once per record per UTC day; an
+    unresolved execution is reconciliation's to alert."""
+    from tradepulse.quarantine import quarantined_positions
+    from tradepulse.reconciliation.unresolved import open_unresolved
+
+    untradeable: set[str] = set()
+    day = now.date().isoformat()
+    for record in await quarantined_positions(repositories):
+        untradeable.add(record.asset_key)
+        await alert_once(repositories.audit_events, alerts, AuditEvent(
+            event_id=f"quarantined_inventory:{record.record_id}:{day}", event_type="quarantined_inventory", severity="critical",
+            message=(f"QUARANTINED_INVENTORY: {record.asset_key} holds {record.open_quantity} quarantined ({record.kind}, "
+                     f"{record.record_id}); TradePulse places no order on it until it is resolved."),
+            occurred_at=now, entity_type="quarantined_inventory", entity_id=record.record_id,
+            details={"record_id": record.record_id, "asset_key": record.asset_key, "open_quantity": str(record.open_quantity)}))
+    for position in positions:
+        key = asset_key_from_broker_symbol(position.asset_class, position.symbol)
+        if position.qty < 0:
+            untradeable.add(key)
+            await alert_once(repositories.audit_events, alerts, AuditEvent(
+                event_id=f"unsupported_short_position:{key}:{day}", event_type="unsupported_short_position", severity="critical",
+                message=(f"UNSUPPORTED_SHORT_POSITION: {position.symbol} qty {position.qty} at the broker; "
+                         "TradePulse never trades a short position."),
+                occurred_at=now, entity_type="broker_position", entity_id=key,
+                details={"symbol": position.symbol, "qty": str(position.qty)}))
+    untradeable |= {row.asset_key for row in await open_unresolved(repositories)}
+    return untradeable
+
+
 async def _equity_market_open(broker: BrokerPort) -> bool | None:
     """Alpaca's clock for the US stock/option session; None if unavailable."""
     try:
@@ -442,10 +475,17 @@ async def run_position_monitor(
         # unheld broker position is reported rather than skipped.
         logger.error("monitor_opening_inventory_unavailable", exc_info=True)
         opening = {}
+    try:
+        untradeable = await _untradeable_assets(repositories, alerts, positions, clock())
+    except Exception:  # must never block other assets' exits; the gateway refuses these assets independently
+        logger.exception("monitor_untradeable_check_failed")
+        untradeable = set()
     unmanaged = 0
     for position in positions:
         try:
             key = asset_key_from_broker_symbol(position.asset_class, position.symbol)
+            if key in untradeable:
+                continue  # reported as short or quarantined inventory instead -- never "unmanaged"
             if await repositories.holdings.get(key) is None and opening.get(key) != position.qty:
                 unmanaged += 1
                 await _report_unmanaged_position(repositories, alerts, position, clock())
@@ -455,6 +495,8 @@ async def run_position_monitor(
     for position in positions:
         if lease_lost is not None and lease_lost.is_set():
             continue  # monitor's own command lease may no longer be exclusive -- stop starting new work
+        if asset_key_from_broker_symbol(position.asset_class, position.symbol) in untradeable:
+            continue  # Rev.140 §3.4: no order of any kind on a short, quarantined or unaccounted asset
         holding_row = await repositories.holdings.get(asset_key_from_broker_symbol(position.asset_class, position.symbol))
         if holding_row is None:
             continue  # nothing on file (e.g. opened outside this system) -- no threshold to check

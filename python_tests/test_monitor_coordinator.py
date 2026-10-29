@@ -569,7 +569,9 @@ async def test_short_position_breaching_inverted_thresholds_is_refused_not_cover
     await broker.aclose()
 
     assert order_route.call_count == 0
-    assert [r.reasons for r in summary.execution_results] == [["UNSUPPORTED_SHORT_POSITION"]]
+    assert summary.execution_results == []  # Rev.140 §3.4: skipped before any order is attempted
+    events = [hydrate("audit_events", row["payload"]).event_type for row in await repositories.audit_events.list_all()]
+    assert events.count("unsupported_short_position") == 1
 
 
 @respx.mock
