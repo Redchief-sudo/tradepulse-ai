@@ -216,8 +216,10 @@ This is a pre-existing gap in the live runtime, recorded here and closed by this
 - An activity type that changes quantity in a way the command does not model refuses (`FILL_HISTORY_INCOMPLETE: unmodelled <type>`).
 - Missing early activities show up here, as a position the history does not explain.
 
-**4. Cash conservation, exact to the cent (P1).** Σ of every activity's cash effect (FILL notional by side, and `net_amount` for the rest) must equal the broker's `cash`.
+**4. Cash conservation, exact to the cent (P1).** Σ of every activity's cash effect must equal the broker's `cash`. A FILL's effect is qty × price × contract multiplier (100 for an option), **rounded to the cent per fill**, negative for a buy and positive for a sell. Every other activity contributes its `net_amount`; a crypto `CFEE` coin fee has `net_amount` 0.
 - This identity must first be shown read-only on the paper account before Task 4 is implemented (evidence item, §11). If it does not hold exactly, the cause is found and documented first; it is not absorbed by a tolerance.
+- **Shown 2026-10-28** (`~/tradepulse-evidence/2026-10-28-rev140-gate3-measurements/`, manifest `de22a667…`): exact over 210 activities, $84,251.33 against $84,251.33, with per-fill cent rounding. Half-up and half-even can't be distinguished on that history, so a fill whose notional is an exact half cent is `FILL_HISTORY_INCOMPLETE: rounding tie` until a sample settles the mode.
+- **Maximum observed activity lag** (A0 run): fills at most 65 s (polling cadence); a back-dated fee batch 7.06 h. *Δ* = 7 days stands.
 
 **5. Classify every FILL activity.** Each gets exactly one of:
 
