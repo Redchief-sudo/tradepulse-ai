@@ -212,6 +212,19 @@ All tables are append-only, with `BEFORE UPDATE` / `BEFORE DELETE` triggers veri
 
 These are recorded in an evidence directory with a manifest. Any difference from the library in (2) or (3) is resolved in the spec before the plan.
 
+**G0 results (2026-10-29, read-only Alpaca paper; evidence `~/tradepulse-evidence/2026-10-29-rev144-g0/`, manifest SHA-256 prefix `1a081927646f223f`):**
+
+1. **Alpaca `/v2/calendar`.** One row per session, with these fields:
+   - `date`: `YYYY-MM-DD`;
+   - `open` and `close`: `HH:MM`, New York local time;
+   - `session_open` and `session_close`: the extended-hours window, `HHMM`;
+   - `settlement_date`.
+   - Holidays are absent. Early closes appear as `close: "13:00"` (2026-11-27 and 2026-12-24).
+   - Rev.144 uses `open` and `close` only. Extended hours are out of scope (§8).
+2. **Alpaca against `exchange_calendars` 4.13.2 `XNYS`, 2026-10-27 to 2027-01-31:** 65 sessions each, **no difference** in dates, opens or closes.
+3. **IBKR: not measured.** TWS and Gateway were not running. IBKR's `get_calendar` is part of A2, so this item moves to A2's G0. Rev.144 ships the documented `tradingHours` parser (format `YYYYMMDD:HHMM-YYYYMMDD:HHMM;YYYYMMDD:CLOSED`, with `timeZoneId`) against a fixture, to be confirmed by that measurement.
+4. **Alpaca per-contract option hours: none.** `/v2/options/contracts`, the single-contract endpoint, `/v2/assets` and `/v2/clock` expose no trading-hours field. Alpaca writes no `instrument_hours` rows, and late-close option entries on Alpaca stay refused.
+
 ## 4. Invariants
 
 - **CAL-I1:** no new stock or option entry is submitted unless `entry_window_open` is open: a verified venue date plus either (the broker clock open and the venue's regular session) or (the instrument's own fresh broker-verified hours, after a verified venue session that day, with a consistent broker clock).
