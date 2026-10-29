@@ -1123,6 +1123,7 @@ async def test_disconnection_fails_exactly_the_network_calls_and_spares_local_on
     calls = {
         "get_account": broker.get_account(), "get_positions": broker.get_positions(), "get_clock": broker.get_clock(),
         "get_calendar": broker.get_calendar(T0.date(), T0.date()),
+        "get_dividend_announcements": broker.get_dividend_announcements("AAPL", T0.date(), T0.date()),
         "place_order": broker.place_order(_order("AAPL", "1")), "get_order": broker.get_order("x"),
         "get_order_by_client_order_id": broker.get_order_by_client_order_id("x"),
         "get_open_orders": broker.get_open_orders(), "cancel_order": broker.cancel_order("x"),

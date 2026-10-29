@@ -186,7 +186,7 @@ _METHOD_FAULTS = {  # set through a method, never queued
     Fault.WITHHOLD_ACTIVITY: "withhold_activity", Fault.HOLD_CALL: "hold_call",
 }
 _OPERATION_NAMES = {  # the network-dependent calls, with AlpacaClient's operation labels
-    "get_clock": "getClock", "get_calendar": "getCalendar", "get_account": "getAccount", "get_positions": "getPositions",
+    "get_clock": "getClock", "get_calendar": "getCalendar", "get_dividend_announcements": "getDividendAnnouncements", "get_account": "getAccount", "get_positions": "getPositions",
     "get_latest_quote": "getLatestQuote", "get_latest_option_quotes": "getLatestOptionQuotes",
     "get_options_chain": "getOptionsChain", "get_bars": "getBars", "place_order": "placeOrder",
     "get_order": "getOrder", "get_order_by_client_order_id": "getOrderByClientOrderId",
@@ -530,6 +530,7 @@ class SimulatedBroker:
         self._clock = clock
         self._session = session
         self._calendar_differences: dict[date, str | datetime] = {}
+        self._announcements: list[dict[str, Any]] = []
         self._account_number = account_number
         self._account_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"tradepulse-sim:{account_number}"))
         self._created_at = clock()
@@ -847,6 +848,15 @@ class SimulatedBroker:
 
     def clear_calendar_differences(self) -> None:
         self._calendar_differences.clear()
+
+    async def get_dividend_announcements(self, symbol: str, since: date, until: date) -> list[dict[str, Any]]:
+        """Rev.143: the scripted announcements for ``symbol``, every one of them
+        (Alpaca's window is not an ex-date filter either)."""
+        self._enter("get_dividend_announcements")
+        return [dict(row) for row in self._announcements if symbol.upper() in (row.get("initiating_symbol"), row.get("target_symbol"))]
+
+    def set_dividend_announcements(self, rows: list[dict[str, Any]]) -> None:
+        self._announcements = [dict(row) for row in rows]
 
     async def get_account(self) -> AlpacaAccount:
         self._enter("get_account")

@@ -244,6 +244,19 @@ class AlpacaClient:
                 sessions.append(BrokerSession(venue, day, open_at, close_at, "alpaca:/v2/calendar"))
         return sessions
 
+    async def get_dividend_announcements(self, symbol: str, since: date, until: date) -> list[dict[str, Any]]:
+        """Rev.143 §3.4 step 1: cash-dividend corporate-action announcements,
+        raw. The window does not filter by ex-date (G0, 2026-10-29), so the
+        caller filters candidates itself. Rates are decimal strings."""
+        response = await self._request("GET", f"{self._trading_base}/corporate_actions/announcements", params={
+            "ca_types": "dividend", "since": since.isoformat(), "until": until.isoformat(), "symbol": symbol})
+        if not response.is_success:
+            raise_alpaca_error(response, "getDividendAnnouncements")
+        body = response.json()
+        if not isinstance(body, list) or not all(isinstance(row, dict) for row in body):
+            raise AlpacaDataIntegrityError("getDividendAnnouncements: expected a list of objects")
+        return body
+
     async def get_account(self) -> AlpacaAccount:
         response = await self._request("GET", f"{self._trading_base}/account")
         if not response.is_success:
