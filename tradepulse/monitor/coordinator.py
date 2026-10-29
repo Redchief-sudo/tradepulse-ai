@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter, alert_once
@@ -428,12 +428,23 @@ async def run_position_monitor(
     *,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     lease_lost: asyncio.Event | None = None,
+    adoption: Any = None,
 ) -> MonitorCycleSummary:
     try:
         positions = await broker.get_positions()
     except Exception as exc:  # noqa: BLE001 - protective coverage being unavailable is itself critical
         await alerts.send("critical", f"Position protection degraded -- Alpaca positions unavailable: {exc}", {})
         return MonitorCycleSummary("degraded", 0, 0, [], error=f"BROKER_POSITIONS_UNAVAILABLE: {exc}")
+
+    # Rev.142 §3.4 step 2: adopt eligible unmanaged longs before anything
+    # reads holdings, so a new adopted holding is protected this same cycle.
+    # ``adoption`` is set only with the setting on and the startup gate passed.
+    if adoption is not None:
+        from tradepulse.adoption import adoption_pass
+        try:
+            await adoption_pass(repositories, positions, adoption, alerts, clock())
+        except Exception:  # a failed adoption must never block other positions' exits
+            logger.exception("monitor_adoption_pass_failed")
 
     execution_results: list[ExecutionResult] = []
     exits_triggered = 0
@@ -489,7 +500,9 @@ async def run_position_monitor(
             key = asset_key_from_broker_symbol(position.asset_class, position.symbol)
             if key in untradeable:
                 continue  # reported as short or quarantined inventory instead -- never "unmanaged"
-            if await repositories.holdings.get(key) is None and opening.get(key) != position.qty:
+            # With adoption on (Rev.142), the opening-checkpoint suppression is
+            # removed: an inherited position that failed adoption is reported too.
+            if await repositories.holdings.get(key) is None and (adoption is not None or opening.get(key) != position.qty):
                 unmanaged += 1
                 await _report_unmanaged_position(repositories, alerts, position, clock())
         except Exception:  # noqa: BLE001 - detection failure on one position must never block exits
@@ -567,6 +580,15 @@ async def run_position_monitor(
                 database, execution_lock_key(holding.asset), owner_token, SYMBOL_LOCK_TTL_SECONDS, gateway.execute_intent(request),
             )
             execution_results.append(result)
+            if result.status == "rejected" and any(lot.origin == "adopted" for lot in matching_lots):
+                # Rev.142 §3.5: the adoption and holding stay; the refusal is an incident.
+                key = asset_identity_key(holding.asset)
+                await alert_once(repositories.audit_events, alerts, AuditEvent(
+                    event_id=f"adopted_exit_refused:{key}:{clock().strftime('%Y-%m-%dT%H')}", event_type="adopted_exit_refused",
+                    severity="critical", occurred_at=clock(), entity_type="asset", entity_id=key,
+                    message=f"ADOPTED_EXIT_REFUSED: {holding.asset.symbol} exit refused ({', '.join(result.reasons)}); "
+                            "the adopted position stays protected and is retried.",
+                    details={"asset_key": key, "reasons": list(result.reasons)}))
             if ladder is not None and ladder.scale_out and result.status in ("rejected", "skipped") and not result.filled_quantity:
                 # Nothing was sold (a stale quote at the open, say): clear the
                 # scale-out mark so the next cycle retries. The break-even stop

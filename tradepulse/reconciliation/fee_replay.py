@@ -159,6 +159,8 @@ async def replay_asset_fees(repositories, asset, activities, broker_quantity, *,
         attrs = {identifier: row for identifier, row in raw_attrs.items() if row['lot_id'] in {lot.lot_id for lot in lots}}
         opportunities = rows('opportunities')
         desired_attrs = {}
+        if any(lot.origin == 'adopted' for lot in new_lots):
+            raise AssetFeeIntegrityError('ASSET_FEE_ADOPTED_LOT_UNSUPPORTED')  # Rev.142: never a synthetic opening fill
         for lot in new_lots:
             opening = asset_fills[lot.originating_fill_id]
             intent = by_intent[opening.trade_intent_id]

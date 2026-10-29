@@ -206,6 +206,21 @@ CREATE TABLE IF NOT EXISTS dividend_attributions (
 CREATE TABLE IF NOT EXISTS dividend_attribution_status (
   record_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+-- Rev.142 §3.11: adoption facts are immutable; attributions are a
+-- recomputed projection; observations are mutable until closed.
+CREATE TABLE IF NOT EXISTS position_adoptions (
+  record_id TEXT PRIMARY KEY, account_ref TEXT NOT NULL, asset_key TEXT NOT NULL, source_id TEXT NOT NULL,
+  payload TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(account_ref, asset_key, source_id)
+);
+CREATE TABLE IF NOT EXISTS adoption_attributions (
+  record_id TEXT PRIMARY KEY, adoption_id TEXT NOT NULL, closing_fill_id TEXT NOT NULL,
+  payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(adoption_id, closing_fill_id)
+);
+CREATE TABLE IF NOT EXISTS unmanaged_observations (
+  record_id TEXT PRIMARY KEY, account_ref TEXT NOT NULL, asset_key TEXT NOT NULL, status TEXT NOT NULL,
+  payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_unmanaged_observing ON unmanaged_observations(account_ref, asset_key) WHERE status='observing';
 """
 
 # These triggers record provenance even if an operator later deletes all rows.
@@ -223,7 +238,8 @@ EVIDENCE_TABLES = (
 QUARANTINE_TABLES = EVIDENCE_TABLES[-10:]
 CALENDAR_TABLES = ("calendar_check_events", "calendar_check_dates", "instrument_hours")
 DIVIDEND_TABLES = ("corporate_action_announcements", "dividend_attributions")
-APPEND_ONLY_TABLES = QUARANTINE_TABLES + CALENDAR_TABLES + DIVIDEND_TABLES
+ADOPTION_TABLES = ("position_adoptions",)
+APPEND_ONLY_TABLES = QUARANTINE_TABLES + CALENDAR_TABLES + DIVIDEND_TABLES + ADOPTION_TABLES
 
 # Rev.144 §3.7: at most one terminal event per check, and date or hours rows
 # only for a check already completed in the same transaction.

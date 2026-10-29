@@ -53,6 +53,12 @@ class Holding:
             object.__setattr__(self, "current_stop", decimal_value(self.current_stop, "current_stop", positive=True))
 
 
+# Rev.142: an adopted lot's identity. The ``adoption:`` prefix can never
+# equal a broker fill ID, and nothing ever looks a fill up by it.
+ADOPTED_LOT_PREFIX = "adopted:"
+ADOPTION_FILL_PREFIX = "adoption:"
+
+
 @dataclass(frozen=True, slots=True)
 class PositionLot:
     lot_id: str
@@ -110,6 +116,22 @@ class PositionLot:
             object.__setattr__(self, "mae_price", decimal_value(self.mae_price, "mae_price", positive=True))
         if self.remaining_quantity > self.opened_quantity:
             raise ValueError("remaining_quantity cannot exceed opened_quantity")
+        adopted_lot, adopted_fill = self.lot_id.startswith(ADOPTED_LOT_PREFIX), self.originating_fill_id.startswith(ADOPTION_FILL_PREFIX)
+        if adopted_lot != adopted_fill or (adopted_lot and self.lot_id[len(ADOPTED_LOT_PREFIX):]
+                                           != self.originating_fill_id[len(ADOPTION_FILL_PREFIX):]):
+            raise ValueError("an adopted lot is lot_id 'adopted:<id>' with originating_fill_id 'adoption:<id>', and only then")
+        if adopted_lot and self.position_side != "long":
+            raise ValueError("only long positions are adopted")
+
+    @property
+    def origin(self) -> Literal["fill", "adopted"]:
+        """Rev.142: derived from the immutable identifiers, never stored, so
+        no persistence, replay or evidence path can lose it."""
+        return "adopted" if self.lot_id.startswith(ADOPTED_LOT_PREFIX) else "fill"
+
+    @property
+    def adoption_id(self) -> str | None:
+        return self.lot_id[len(ADOPTED_LOT_PREFIX):] if self.origin == "adopted" else None
 
     @property
     def status(self) -> LotStatus:

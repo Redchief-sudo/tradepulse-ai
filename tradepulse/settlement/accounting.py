@@ -51,6 +51,31 @@ def cash_evidence(connection, event):
                            'USD', fill.filled_at, 'immutable fill cash; accounting-v1')
 
 
+class _AdoptedOpening:
+    """Rev.142 §3.6.1: an adopted lot's opening evidence is its adoption row,
+    checked against the lot. It is never a fill, and none is looked up."""
+
+    def __init__(self, connection, lot):
+        from tradepulse.adoption import adoption_for_lot
+
+        adoption = adoption_for_lot(connection, lot)
+        if (Decimal(adoption['broker_avg_entry_price']) != lot.acquisition_price
+                or Decimal(adoption['adopted_quantity']) != lot.opened_quantity
+                or adoption['adopted_at'] != lot.opened_at.isoformat()):
+            raise ProjectionEvidenceError('ACCOUNTING_ADOPTION_LOT_MISMATCH:' + lot.lot_id)
+        self.asset, self.price, self.filled_at = lot.asset, lot.acquisition_price, lot.opened_at
+        self.side, self.quantity, self.trade_intent_id = Side.BUY, lot.opened_quantity, lot.originating_fill_id
+
+
+def _opening_evidence(connection, lot):
+    if lot.origin == 'adopted':
+        return _AdoptedOpening(connection, lot)
+    opening_raw = _get(connection, 'fills', lot.originating_fill_id)
+    if opening_raw is None:
+        raise ProjectionEvidenceError('ACCOUNTING_OPENING_FILL_MISSING:' + lot.lot_id)
+    return hydrate('fills', opening_raw)
+
+
 def pnl_evidence(connection, event):
     fill = source_fill(connection, event)
     key = asset_identity_key(fill.asset)
@@ -74,10 +99,7 @@ def pnl_evidence(connection, event):
         quantity = lot.closures.get(fill.fill_id)
         if quantity is None:
             continue
-        opening_raw = _get(connection, 'fills', lot.originating_fill_id)
-        if opening_raw is None:
-            raise ProjectionEvidenceError('ACCOUNTING_OPENING_FILL_MISSING:' + lot.lot_id)
-        opening = hydrate('fills', opening_raw)
+        opening = _opening_evidence(connection, lot)
         if (asset_identity_key(opening.asset) != key or opening.price != lot.acquisition_price
                 or opening.filled_at != lot.opened_at or opening.side == fill.side
                 or lot.opened_quantity > opening.quantity or quantity <= 0

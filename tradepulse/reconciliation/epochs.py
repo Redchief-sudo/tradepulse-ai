@@ -137,6 +137,16 @@ def new_epoch(key, identifier, now, starting_quantity, intent_ids, *, connection
     return epoch
 
 
+def adopted_epoch_payload(connection, adoption):
+    """Rev.142 §3.9: adopted crypto inventory is its own epoch, created with
+    the adoption. Its starting quantity is the adopted quantity, so the
+    recovery branch that sums preceding fills never runs for it."""
+    identifier = 'crypto_epoch:adopted:' + adoption.adoption_id
+    epoch = new_epoch(adoption.asset_key, identifier, adoption.adopted_at, adoption.adopted_quantity, [], connection=connection)
+    epoch.update(origin='adopted', adoption_id=adoption.adoption_id)
+    return identifier, epoch
+
+
 async def reserve_epoch(repositories, intent, broker_quantity, *, protective, now):
     """Reserve before submission; a restart of the same intent is idempotent.
 
@@ -152,6 +162,16 @@ async def reserve_epoch(repositories, intent, broker_quantity, *, protective, no
         own = next((e for e in epochs if intent.trade_intent_id in e['trade_intent_ids']), None)
         if own:
             return own['accounting_epoch_id']
+        adopted = [e for e in epochs if e.get('origin') == 'adopted' and e['fee_accounting_status'] != 'reconciled_net']
+        if adopted:
+            # Rev.142: an exit of adopted inventory joins its adopted epoch,
+            # never a strategy epoch; a strategy entry here is refused.
+            if not protective:
+                raise AccountingEpochPending('CRYPTO_ADOPTED_INVENTORY_OPEN:' + key)
+            epoch = adopted[-1]
+            epoch['trade_intent_ids'].append(intent.trade_intent_id)
+            save_epoch(connection, epoch, now)
+            return epoch['accounting_epoch_id']
         pending = [e for e in epochs if e['fee_accounting_status'] != 'reconciled_net']
         assigned = {i for e in epochs for i in e['trade_intent_ids']}
         legacy = [decode_payload(r['payload']) for r in connection.execute('SELECT payload FROM fills')]
@@ -255,7 +275,8 @@ def finalize_population(connection, *, key, proof, population_id, fills, fees, c
         # A fee follows the inventory lot it actually debits. Epoch-local time
         # windows cannot assign a receipt or define a verification generation.
         selected_ids = {f.fill_id for f in selected}
-        own_lots = [lot for lot in lots if lot.originating_fill_id in selected_ids]
+        own_lots = [lot for lot in lots if lot.originating_fill_id in selected_ids
+                    or (epoch.get('adoption_id') is not None and lot.adoption_id == epoch['adoption_id'])]
         epoch_fees = [fee for fee in fees if any(
             fee.activity_id in lot.asset_fee_quantities for lot in own_lots)]
         later = [e for e in epochs if aware_utc(e['opened_at']) > aware_utc(epoch['opened_at'])]
@@ -273,7 +294,7 @@ def finalize_population(connection, *, key, proof, population_id, fills, fees, c
                              for f in fills if aware_utc(f.filled_at) < aware_utc(epoch['opened_at'])), Decimal(0))
             preceding -= sum((lot.asset_fee_quantities.get(fee.activity_id, Decimal(0))
                               for fee in fees for lot in lots
-                              if lot.originating_fill_id not in selected_ids), Decimal(0))
+                              if lot.originating_fill_id not in selected_ids and lot.origin != 'adopted'), Decimal(0))
             start = str(preceding)
             epoch['starting_broker_quantity'] = start
         terminal = True

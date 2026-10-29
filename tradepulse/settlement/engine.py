@@ -124,6 +124,15 @@ async def _project_lot(repositories: PersistenceRepositories, event: SettlementE
             opened_at=event.occurred_at)
         await repositories.short_exposure_liabilities.create_once(liability.liability_id, liability, unique_value=event.fill_id)
     elif plan.opening_quantity > 0:
+        if any(lot.origin == "adopted" and lot.status != "closed" for lot in symbol_lots):
+            # Rev.142 §3.6.3: never mix origins in one asset. The scanner and
+            # gateway refuse such a BUY earlier; reaching here is an incident.
+            reason = f"MIXED_LOT_ORIGIN: {event.asset.symbol} fill {event.fill_id}"
+            await latch_financial_integrity_block(repositories, reason, clock=lambda: event.occurred_at)
+            hold = IntegrityHold(broker_order_id=event.broker_order_id or event.fill_id, trade_intent_id=event.trade_intent_id,
+                                 hold_type=IntegrityHoldType.MIXED_LOT_ORIGIN, reason=reason, created_at=event.occurred_at)
+            await repositories.integrity_holds.create_once(hold.broker_order_id, hold, status=hold.hold_type.value)
+            raise IntegrityViolationError("INTEGRITY_VIOLATION: MIXED_LOT_ORIGIN")
         new_lot = PositionLot(
             lot_id=str(uuid4()),
             originating_fill_id=event.fill_id,
@@ -249,6 +258,22 @@ async def _project_attribution(repositories: PersistenceRepositories, event: Set
             else (lot.acquisition_price - event.price) * quantity * multiplier
         )
 
+        if lot.origin == "adopted":
+            # Rev.142 §3.6.1: no opening intent. The attribution carries the
+            # adopted identity (lot_id) and is excluded from strategy statistics.
+            adoption = await _adoption(repositories, lot)
+            attribution = TradeAttribution(
+                attribution_id=f"{lot.lot_id}:{event.fill_id}", asset=event.asset, lot_id=lot.lot_id,
+                opening_trade_intent_id=lot.originating_fill_id, closing_trade_intent_id=event.trade_intent_id,
+                closing_fill_id=event.fill_id, quantity=quantity, entry_price=lot.acquisition_price, entry_at=lot.opened_at,
+                exit_price=event.price, exit_at=event.occurred_at, realized_pnl=pnl, created_at=event.occurred_at,
+                exit_reason=_infer_exit_reason(lot.position_side, Decimal(adoption["stop_loss"]), None, event.price),
+                max_favorable_excursion=lot.mfe_price, max_adverse_excursion=lot.mae_price,
+                entry_context={"adoption": {"adoption_id": lot.adoption_id, "classification": adoption["classification"],
+                                            "basis_provenance": adoption["basis_provenance"]}})
+            await repositories.trade_attributions.create_once(attribution.attribution_id, attribution)
+            continue
+
         opening_intent = None
         opening_fill_row = await repositories.fills.get(lot.originating_fill_id)
         if opening_fill_row is not None:
@@ -303,6 +328,12 @@ async def _project_attribution(repositories: PersistenceRepositories, event: Set
     return
 
 
+async def _adoption(repositories: PersistenceRepositories, lot: PositionLot) -> Mapping[str, Any]:
+    from tradepulse.adoption import adoption_for_lot
+
+    return await repositories.position_adoptions.database.run(lambda c: adoption_for_lot(c, lot))
+
+
 def _holding_record_id(asset: AssetIdentity) -> str:
     return asset_identity_key(asset)
 
@@ -317,6 +348,9 @@ PROTECTIVE_THRESHOLD_POLICY = "first_entry"
 async def _entry_protective_levels(
     repositories: PersistenceRepositories, lot: PositionLot
 ) -> tuple[Decimal | None, Decimal | None]:
+    if lot.origin == "adopted":  # Rev.142 §3.6.1: the adoption is the opening evidence; there is no fill
+        adoption = await _adoption(repositories, lot)
+        return Decimal(adoption["stop_loss"]), None
     fill_row = await repositories.fills.get(lot.originating_fill_id)
     if fill_row is None:
         return None, None

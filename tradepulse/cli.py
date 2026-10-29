@@ -346,6 +346,26 @@ async def _run_scan_leg(
         await release_lock(database, lock_key, owner_token)
 
 
+_ADOPTION_GATE_PASSED: set[str] = set()
+
+
+async def _adoption_config(settings: Settings, repositories: PersistenceRepositories, gateway: ExecutionGateway,
+                           market_data: AlpacaMarketDataProvider, risk_limits: Any) -> Any:
+    """Rev.142 §3.1: None with the setting off. With it on, the startup gate's
+    three operational checks must have passed in this process (they run
+    once, here or at `run` startup); a failure refuses (ADOPTION_REQUIRES_REV140)."""
+    if not settings.adopt_unmanaged_positions:
+        return None
+    from tradepulse.adoption import AdoptionConfig, startup_gate
+
+    account = gateway.account_ref
+    if account not in _ADOPTION_GATE_PASSED:
+        await startup_gate(repositories, gateway, account)
+        _ADOPTION_GATE_PASSED.add(account)
+        logger.info("adoption_gate_passed", extra={"event": "adoption_gate_passed"})
+    return AdoptionConfig(account_ref=account, risk_limits=risk_limits, market_data=market_data)
+
+
 async def _run_monitor_leg(
     database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, broker: BrokerPort,
     market_data: AlpacaMarketDataProvider, gateway: ExecutionGateway, alerts: TelegramAlerter, settings: Settings,
@@ -357,9 +377,11 @@ async def _run_monitor_leg(
     try:
         lease_lost, on_lease_lost = _lease_lost_signal(alerts, MONITOR_LOCK_KEY, owner_token)
         risk_limits = risk_limits_for_profile(await _resolve_risk_profile_id(settings, broker))
+        adoption = await _adoption_config(settings, repositories, gateway, market_data, risk_limits)
         return await run_with_lock_renewal(
             database, MONITOR_LOCK_KEY, owner_token, MONITOR_LOCK_TTL_SECONDS,
-            run_position_monitor(repositories, broker, market_data, gateway, alerts, risk_limits, lease_lost=lease_lost),
+            run_position_monitor(repositories, broker, market_data, gateway, alerts, risk_limits, lease_lost=lease_lost,
+                                 adoption=adoption),
             on_renewal_failed=on_lease_lost,
         )
     finally:
@@ -1089,6 +1111,14 @@ async def _run_application(settings: Settings, port: int, open_browser: bool, *,
             from tradepulse.reconciliation.coordinator import run_calendar_checks
 
             await run_calendar_checks(repositories, broker, alerts, datetime.now(UTC))  # Rev.144: before any entry
+            if settings.adopt_unmanaged_positions:  # Rev.142 §3.1: refuse to start unless the gate passes
+                from tradepulse.adoption import AdoptionGateError
+                try:
+                    await _adoption_config(settings, repositories, gateway, market_data,
+                                           risk_limits_for_profile(await _resolve_risk_profile_id(settings, broker)))
+                except AdoptionGateError as exc:
+                    logger.error("adoption_gate_refused", extra={"event": "adoption_gate_refused", "reason": str(exc)})
+                    return 1
             dashboard_state = AppState(settings=settings, repositories=repositories, broker=broker, market_data=market_data)
             server = _build_dashboard_server(dashboard_state, port, settings.log_level)
 

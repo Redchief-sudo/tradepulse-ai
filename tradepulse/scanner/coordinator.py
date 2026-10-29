@@ -28,7 +28,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import ROUND_FLOOR, Decimal
-from typing import Any
+from functools import partial
+from typing import Any, Literal
 from uuid import uuid4
 
 from tradepulse.broker import BrokerPort
@@ -390,6 +391,28 @@ def _stop_loss_price(reference_price: Decimal, stop_loss_pct: Decimal, asset_cla
     risk-per-share sizing already expects a caller to supply."""
     raw = reference_price * (Decimal("1") - stop_loss_pct / Decimal("100"))
     return _round_price(raw, asset_class)
+
+
+def entry_stop_loss(reference_price: Decimal, candles: list[Candle], asset_class: AssetClass,
+                    risk_limits: RiskLimits) -> tuple[Decimal | None, Literal["atr", "pct_fallback", "option_premium_pct"] | None]:
+    """The entry stop policy, shared by the scanner and Rev.142's adoption so
+    the two cannot drift. Options: a flat percentage of the premium, never
+    ATR -- ATR would need the contract's own candle history, which is too
+    short-lived and decay-driven to mean anything. Equity and crypto: ATR
+    when enabled and computable, otherwise the documented percentage
+    fallback. Returns (stop, source), or (None, None) when both are off."""
+    if asset_class == AssetClass.OPTION:
+        if risk_limits.options_premium_stop_pct > 0:
+            return _stop_loss_price(reference_price, risk_limits.options_premium_stop_pct, AssetClass.OPTION), "option_premium_pct"
+        return None, None
+    if risk_limits.atr_stop_multiplier > 0:
+        atr = _atr_stop_loss_price(reference_price, candles, risk_limits.atr_stop_multiplier, asset_class,
+                                   risk_limits.min_stop_distance_pct, risk_limits.max_stop_distance_pct)
+        if atr is not None:
+            return atr, "atr"
+    if risk_limits.stop_loss_pct > 0:
+        return _stop_loss_price(reference_price, risk_limits.stop_loss_pct, asset_class), "pct_fallback"
+    return None, None
 
 
 def _atr_stop_loss_price(
@@ -839,6 +862,11 @@ async def run_scan_cycle(
         if asset_identity_key(trade_asset) in opening_inventory:
             await _reject(candidate.symbol, "OPENING_INVENTORY_INSTRUMENT", instrument=trade_asset.symbol)
             continue
+        from tradepulse.adoption import reentry_excluded  # Rev.142 §3.9 Q2
+
+        if await repositories.trade_intents.database.run(partial(reentry_excluded, account_ref=None, key=asset_identity_key(trade_asset))):
+            await _reject(candidate.symbol, "ADOPTED_ASSET_EXCLUDED", instrument=trade_asset.symbol)
+            continue
 
         database = repositories.trade_intents.database
         owner_token = str(uuid4())
@@ -859,30 +887,9 @@ async def run_scan_cycle(
                 await _reject(candidate.symbol, "QUANTITY_ROUNDED_TO_ZERO", notional_budget=str(notional_budget), price=str(trade_quote.price))
                 continue
 
-            if asset_class == AssetClass.OPTION:
-                # A flat pct-of-entry-premium stop, never ATR -- ATR would
-                # need the CONTRACT's own candle history, which this design
-                # deliberately doesn't fetch (too short-lived/decay-driven
-                # to be a meaningful momentum signal; see the deterministic
-                # gate above, which correctly runs on the underlying
-                # instead). Reuses the same helper the equity/crypto
-                # fallback path already uses, just against the option's own
-                # premium.
-                stop_loss = (
-                    _stop_loss_price(trade_quote.price, risk_limits.options_premium_stop_pct, AssetClass.OPTION)
-                    if risk_limits.options_premium_stop_pct > 0 else None
-                )
-            else:
-                stop_loss = (
-                    (
-                        _atr_stop_loss_price(
-                            trade_quote.price, candles, risk_limits.atr_stop_multiplier, trade_asset.asset_class,
-                            risk_limits.min_stop_distance_pct, risk_limits.max_stop_distance_pct,
-                        )
-                        if risk_limits.atr_stop_multiplier > 0 else None
-                    )
-                    or (_stop_loss_price(trade_quote.price, risk_limits.stop_loss_pct, trade_asset.asset_class) if risk_limits.stop_loss_pct > 0 else None)
-                )
+            stop_loss, _ = entry_stop_loss(trade_quote.price, candles if asset_class != AssetClass.OPTION else [],
+                                           AssetClass.OPTION if asset_class == AssetClass.OPTION else trade_asset.asset_class,
+                                           risk_limits)
 
             opportunity = Opportunity(
                 opportunity_id=str(uuid4()), scan_generation=scan_generation, asset=trade_asset, quote=trade_quote,

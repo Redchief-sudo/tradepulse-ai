@@ -33,6 +33,11 @@ class VerificationPolicy:
         return asdict(self)
 
 
+def _adopted(lot) -> bool:
+    """Rev.142: an adopted lot (identity in its lot_id; it has no opening fill)."""
+    return str(lot["lot_id"]).startswith("adopted:")
+
+
 TABLES = (
     "fills", "settlements", "position_lots", "trade_attributions", "trade_intents", "orders",
     "accounting_epochs", "holdings", "cash_ledger", "pnl_records", "equity_snapshots", "reconciliation_records", "integrity_holds", "trading_sessions", "audit_events",
@@ -149,7 +154,8 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
         attrs[(row["lot_id"], row["closing_fill_id"])].append(row)
     allocated = defaultdict(lambda: Decimal(0))
     for lot in rows["position_lots"]:
-        allocated[lot["originating_fill_id"]] += number(lot["opened_quantity"])
+        if not _adopted(lot):  # Rev.142: an adopted lot has no opening fill; only its closures are fills
+            allocated[lot["originating_fill_id"]] += number(lot["opened_quantity"])
         for fill_id, quantity in lot["closures"].items():
             allocated[fill_id] += number(quantity)
     for fill_id, fill in fills.items():
@@ -222,7 +228,7 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
                     or row["outcome"] != "corrected" or not start <= fee.occurred_at <= now
                     or row["actual"]["asset_key"] != asset_identity_key(fee.asset)
                     or allocations != fee_allocations[fee.activity_id]
-                    or any(asset_identity_key(hydrate("fills", fills[lots_by_id[lid]["originating_fill_id"]]).asset) != asset_identity_key(fee.asset) for lid in allocations)
+                    or any(asset_identity_key(hydrate("position_lots", lots_by_id[lid]).asset) != asset_identity_key(fee.asset) for lid in allocations)
                     or sum(allocations.values(), Decimal(0)) != fee.quantity
                     or fee_basis[fee.activity_id] != number(allocation["cost_basis_debit"])):
                 problems.append("asset_fee_receipt_mismatch")
@@ -430,7 +436,11 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
             fill_fee_expenses[lot_id] += expense
             remaining -= expense
     groups = defaultdict(list)
+    adopted_lots = []
     for lot in rows["position_lots"]:
+        if _adopted(lot):
+            adopted_lots.append(lot)  # Rev.142: its own evidence class, never a strategy round trip
+            continue
         opening = fills.get(lot["originating_fill_id"])
         if opening is None:
             problems.append("lot_missing_opening_fill")
@@ -458,13 +468,13 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
                 classifications.get(fills[fid].get('broker_fill_id')) not in ELIGIBLE_MEMBERSHIPS
                 for lot in lots for fid in {lot['originating_fill_id'], *lot['closures']} if fid in fills)):
             continue
-        if any(asset_identity_key(hydrate("fills", fills[lot["originating_fill_id"]]).asset) in unreconciled_assets for lot in lots):
+        if any(asset_identity_key(hydrate("position_lots", lot).asset) in unreconciled_assets for lot in lots):
             continue  # unresolved positions never contribute eligible round trips or net results
         if not cash_integrity_valid and any(lot['asset']['asset_class'] == 'crypto' for lot in lots):
             continue
-        if any(asset_identity_key(hydrate('fills', fills[lot['originating_fill_id']]).asset) in cash_invalid_assets for lot in lots):
+        if any(asset_identity_key(hydrate('position_lots', lot).asset) in cash_invalid_assets for lot in lots):
             continue
-        crypto_keys = {asset_identity_key(hydrate('fills', fills[lot['originating_fill_id']]).asset)
+        crypto_keys = {asset_identity_key(hydrate('position_lots', lot).asset)
                        for lot in lots}
         epoch_valid = True
         for key in crypto_keys:
@@ -664,7 +674,8 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
             "performance_authorities": {
                 "modeled_trade_net": "Gross eligible completed round-trip PnL minus frozen fee/slippage overlay; win rate and expectancy authority.",
                 "observed_generation_net": "Generation gross realized PnL minus authoritative actual expenses; account profitability authority. The modeled overlay is not deducted."},
-            "observed_generation_bridge": bridge}
+            "observed_generation_bridge": bridge,
+            "adoptions": sorted(lot["lot_id"] for lot in adopted_lots)}
 
 
 def observed_generation_result(rows, fills, native_receipts, valid_native_receipts, native_basis, cash_entries, records_by_id):

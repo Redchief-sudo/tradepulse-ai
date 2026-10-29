@@ -35,6 +35,7 @@ TABLES = {
     "short_exposure_liabilities", "unmanaged_long_inventory", "quarantine_executions", "quarantine_resolutions",
     "quarantine_fee_allocations", "quarantine_fee_recognitions", "legacy_lot_conversions",
     "unresolved_broker_executions", "unresolved_execution_outcomes", "fill_cursor_bootstrap",
+    "position_adoptions",  # Rev.142, append-only
 }
 STATUS_TABLES = {"trade_intents", "orders", "settlements", "trading_sessions", "scan_runs", "integrity_holds"}
 STATUS_TABLES |= {"accounting_epochs", "broker_activity_cursors"}
@@ -707,6 +708,7 @@ class PersistenceRepositories:
     unresolved_broker_executions: RecordRepository
     unresolved_execution_outcomes: RecordRepository
     fill_cursor_bootstrap: RecordRepository
+    position_adoptions: RecordRepository
 
     @classmethod
     def create(cls, database: AsyncSQLiteDatabase) -> PersistenceRepositories:

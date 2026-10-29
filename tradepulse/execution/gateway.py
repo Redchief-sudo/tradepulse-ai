@@ -216,6 +216,10 @@ class ExecutionGateway:
     def alerts(self) -> TelegramAlerter:
         return self._alerts
 
+    @property
+    def account_ref(self) -> str:
+        return self._lease.ref.key
+
     async def _entry_window(self, asset: AssetIdentity, market_clock: BrokerClock) -> EntryWindow:
         """CAL-I1. With no completed check for today yet (a one-shot command,
         or the first entry of a new NY date), the daily check runs here
@@ -277,6 +281,13 @@ class ExecutionGateway:
                 return ExecutionResult("rejected", None, ["EXECUTION_RESERVATION_REQUIRED"], Decimal("0"), None)
             if quarantined:
                 return ExecutionResult("rejected", None, ["UNSUPPORTED_SHORT_POSITION"], Decimal("0"), None)
+        if request.side == Side.BUY:
+            # Rev.142 §3.9 Q2: no strategy re-entry into an adopted asset.
+            from tradepulse.adoption import reentry_excluded
+
+            key = asset_identity_key(request.asset)
+            if await self._repositories.position_adoptions.database.run(lambda c: reentry_excluded(c, self._lease.ref.key, key)):
+                return ExecutionResult("rejected", None, ["ADOPTED_ASSET_REENTRY_BLOCKED"], Decimal("0"), None)
         if request.side == Side.SELL:
             authorized = await self._authorize_sell(request, existing.trade_intent_id if existing else None)
             if isinstance(authorized, ExecutionResult):

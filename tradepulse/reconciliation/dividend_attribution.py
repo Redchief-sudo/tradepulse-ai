@@ -93,10 +93,13 @@ class Inherited:
     established: bool
     quantity: Decimal | None  # I, when established
     reason: str | None = None
+    bucket: str = "opening_unadopted"  # "adopted" once Rev.142 adopted the opening inventory
+    holder_id: str = "opening_unadopted"  # the adoption ID for "adopted"
 
 
 def inherited_quantity(checkpoint: Mapping[str, Any] | None, population: Mapping[str, Any] | None, observed_at: datetime | None,
-                       settled_fill_ids: frozenset[str], asset_key: str, ex_date: date) -> Inherited | None:
+                       settled_fill_ids: frozenset[str], asset_key: str, ex_date: date, *,
+                       adopted_closings: Mapping[str, Decimal] | None = None, adoption_id: str | None = None) -> Inherited | None:
     """E1: a bound checkpoint opened before the ex-date's trade date began,
     and a complete activity population through the end of the trade date
     before it with no quantity change except fills TradePulse settled.
@@ -126,7 +129,9 @@ def inherited_quantity(checkpoint: Mapping[str, Any] | None, population: Mapping
         if kind == "FILL":
             if raw["id"] not in settled_fill_ids:
                 return Inherited(False, None, "unsettled_fill:" + raw["id"])
-            continue  # Rev.140 never sells inherited inventory, so a settled fill is all strategy
+            # Rev.140 never sells unadopted inherited inventory; Rev.142's
+            # adopted exits do, and are counted below. Others are strategy.
+            continue
         if isinstance(kind, str) and (kind.startswith("DIV") or kind in QUANTITY_SAFE_TYPES):
             continue
         return Inherited(False, None, f"quantity_activity:{kind}:{raw['id']}")
@@ -134,6 +139,12 @@ def inherited_quantity(checkpoint: Mapping[str, Any] | None, population: Mapping
     for position in checkpoint.get("positions", []):
         if asset_key_from_broker_symbol(AssetClass(position["asset_class"]), position["symbol"]) == asset_key:
             quantity += Decimal(position["qty"])
+    for raw in population["activities"]:  # adopted exits settled before the ex-date's trade date
+        sold = (adopted_closings or {}).get(raw["id"])
+        if sold is not None and raw.get("transaction_time") and _instant(raw["transaction_time"]) < boundary:
+            quantity -= sold
+    if adoption_id is not None:
+        return Inherited(True, quantity, bucket="adopted", holder_id=adoption_id)
     return Inherited(True, quantity)
 
 
@@ -295,8 +306,8 @@ def decide(*, symbol: str, credit: date, group: Sequence[Member], announcements:
         weights: dict[str, Decimal] = dict(strategy)
         buckets = {lot_id: ("strategy", "fills") for lot_id in strategy}
         if inherited.quantity:
-            weights["opening_unadopted"] = inherited.quantity
-            buckets["opening_unadopted"] = ("opening_unadopted", "checkpoint_plus_activity")
+            weights[inherited.holder_id] = inherited.quantity
+            buckets[inherited.holder_id] = (inherited.bucket, "checkpoint_plus_activity")
         status: Literal["verified", "excluded_unallocated"] = "verified"
         entitlement: Literal["established", "not_established"] = "established"
     elif s_total == 0:
@@ -426,7 +437,21 @@ def _context(connection: sqlite3.Connection) -> dict[str, Any]:
         "SELECT payload FROM reconciliation_records WHERE json_extract(payload,'$.reconciliation_type')='generation_membership' "
         "ORDER BY rowid DESC LIMIT 1").fetchone()
     population = decode_payload(membership[0]) if membership else None
-    return {"receipts": receipts, "statuses": statuses(connection), "lots": lots,
+    adopted_closings: dict[str, Decimal] = {}
+    adoption_by_asset: dict[str, str] = {}
+    for (payload,) in connection.execute("SELECT payload FROM position_lots"):
+        lot = hydrate("position_lots", decode_payload(payload))
+        if lot.origin != "adopted":
+            continue
+        for fill_id, quantity in lot.closures.items():
+            if fill_id in fills and fills[fill_id].broker_fill_id:
+                adopted_closings[fills[fill_id].broker_fill_id] = quantity
+    for (payload,) in connection.execute("SELECT payload FROM position_adoptions"):
+        adoption = decode_payload(payload)
+        if adoption["classification"] == "opening_inventory":
+            adoption_by_asset[adoption["asset_key"]] = adoption["adoption_id"]
+    return {"adopted_closings": adopted_closings, "adoption_by_asset": adoption_by_asset,
+            "receipts": receipts, "statuses": statuses(connection), "lots": lots,
             "checkpoint": load_bound_opening_checkpoint(connection),
             "population": population["actual"] if population else None,
             "observed_at": datetime.fromisoformat(population["occurred_at"]) if population else None,
@@ -528,7 +553,9 @@ async def attribute_dividends(repositories: Any, broker: Any, alerts: Any, now: 
 
             def e1(ex_date: date, asset_key: str = asset_key) -> Inherited | None:
                 return inherited_quantity(snapshot["checkpoint"], snapshot["population"], snapshot["observed_at"],
-                                          snapshot["settled_fill_ids"], asset_key, ex_date)
+                                          snapshot["settled_fill_ids"], asset_key, ex_date,
+                                          adopted_closings=snapshot["adopted_closings"],
+                                          adoption_id=snapshot["adoption_by_asset"].get(asset_key))
 
             decision = decide(symbol=symbol, credit=credit, group=members, announcements=announcements,
                               consumed=frozenset(consumed_by_symbol.get(symbol, set())), lots=snapshot["lots"].get(asset_key, []),

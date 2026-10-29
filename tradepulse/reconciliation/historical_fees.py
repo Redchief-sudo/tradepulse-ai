@@ -36,6 +36,10 @@ def preview_fee_replay(lots, settlements, fees):
     events = {e.fill_id: e for e in settlements}
     if len(events) != len(settlements):
         raise AssetFeeIntegrityError('ASSET_FEE_DUPLICATE_FILL')
+    if any(lot.origin == 'adopted' for lot in lots):
+        # Rev.142: an adopted lot has no opening fill to replay coin fees
+        # against; fail closed rather than reconstruct one.
+        raise AssetFeeIntegrityError('ASSET_FEE_ADOPTED_LOT_UNSUPPORTED')
     origins = {lot.originating_fill_id: lot for lot in lots}
     if len(origins) != len(lots):
         raise AssetFeeIntegrityError('ASSET_FEE_DUPLICATE_OPENING')

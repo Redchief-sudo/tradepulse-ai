@@ -65,6 +65,9 @@ class Settings:
     # Rev.140 §3.1a: the overlap read reaches back this far from C. A cost
     # choice, not a proven bound; the daily full re-read covers the rest.
     fill_overlap_days: int = 7
+    # Rev.142: adopt unmanaged long positions for protective management.
+    # Frozen in a verification run's configuration; default off.
+    adopt_unmanaged_positions: bool = False
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -120,4 +123,5 @@ class Settings:
             options_universe_path=values.get("TRADEPULSE_OPTIONS_UNIVERSE_PATH") or None,
             alpaca_market_data_tier=alpaca_market_data_tier,
             fill_overlap_days=_int(values, "TRADEPULSE_FILL_OVERLAP_DAYS", 7, 1),
+            adopt_unmanaged_positions=_bool(values, "TRADEPULSE_ADOPT_UNMANAGED_POSITIONS"),
         )

@@ -153,6 +153,12 @@ async def _rebuild_holding_from_lots(
 
     oldest_lot = min(open_lots, key=lambda lot: lot.opened_at)  # PROTECTIVE_THRESHOLD_POLICY = "first_entry"
     stop_loss = target_price = None
+    if oldest_lot.origin == "adopted":  # Rev.142 §3.6.1: the adoption row, never a fill
+        from tradepulse.adoption import adoption_for_lot
+
+        adoption = await repositories.position_adoptions.database.run(lambda c: adoption_for_lot(c, oldest_lot))
+        return Holding(asset=asset, quantity=total_signed, average_price=avg_price, updated_at=now,
+                       stop_loss=Decimal(adoption["stop_loss"]), target_price=None)
     fill_row = await repositories.fills.get(oldest_lot.originating_fill_id)
     if fill_row is not None:
         fill = hydrate("fills", fill_row["payload"])
@@ -920,6 +926,8 @@ async def run_reconciliation(
         return ReconciliationSummary('degraded', error=reason)
     if generation_membership is not None:
         await _attribute_dividends(repositories, broker, alerts, now)
+    from tradepulse.adoption.accounting import recompute_attributions  # Rev.142 §3.6.2: a projection
+    await repositories.position_adoptions.database.run(lambda c: recompute_attributions(c, now), write=True)
     from tradepulse.settlement.accounting import accounting_issues, replay_accounting
     projection_error = None
     try:

@@ -57,6 +57,16 @@ class TradeAttribution:
     # agree).
     entry_context: Mapping[str, Any] = field(default_factory=dict)
 
+    @property
+    def origin(self) -> str:
+        """Rev.142: an adopted lot's closes are inherited, never strategy
+        results; derived from the lot's identity, never stored."""
+        return "adopted" if self.lot_id.startswith("adopted:") else "fill"
+
+    @property
+    def adoption_id(self) -> str | None:
+        return self.lot_id[len("adopted:"):] if self.origin == "adopted" else None
+
     def __post_init__(self) -> None:
         for name in ("attribution_id", "lot_id", "opening_trade_intent_id", "closing_trade_intent_id", "closing_fill_id"):
             object.__setattr__(self, name, require_text(getattr(self, name), name))

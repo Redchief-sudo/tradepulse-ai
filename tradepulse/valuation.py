@@ -142,10 +142,17 @@ def _generation_invariants(connection, account, positions):
     opening_quantities = {}
     prior_inventory_change = Decimal(0)
     current = {asset_key_from_broker_symbol(p.asset_class, p.symbol): p for p in positions}
+    from tradepulse.adoption.accounting import adopted_opening_exclusions
     from tradepulse.models import AssetClass
+    adopted = adopted_opening_exclusions(connection, opening, current)
     for old in opening['positions']:
         key = asset_key_from_broker_symbol(AssetClass(old['asset_class']), old['symbol'])
         quantity = Decimal(old['qty'])
+        if key in adopted:
+            # Rev.142 §3.8: adopted, so its lots carry it; X = R x mark + N - V0.
+            opening_quantities[key] = Decimal(0)
+            prior_inventory_change += adopted[key]
+            continue
         opening_quantities[key] = quantity
         if quantity:
             position = current.get(key)
@@ -253,10 +260,13 @@ async def marked_snapshot(
     lot_quantities = {}
     from tradepulse.quarantine.legacy import converted_lots
     converted = await converted_lots(repositories)
+    adopted_keys = set()
     for row in await paginate_all_rows(repositories.position_lots):
         lot = hydrate('position_lots', row['payload'])
         if lot.lot_id in converted:
             continue  # Rev.140 §3.9: valued as its liability
+        if lot.origin == 'adopted':
+            adopted_keys.add(asset_identity_key(lot.asset))
         key = asset_identity_key(lot.asset)
         lot_quantities[key] = lot_quantities.get(key, Decimal(0)) + lot.signed_quantity
     broker_quantities = {asset_key_from_broker_symbol(p.asset_class, p.symbol): p.qty for p in positions}
@@ -289,9 +299,9 @@ async def marked_snapshot(
                'broker_equity': 'matched' if difference == 0 else 'failed',
                'position_quantities': quantities, 'holdings_versus_lots': lots_result,
                'fee_finality': states,
-               'prove_edge': {key: 'ineligible' if quantities[key] != 'matched' or lots_result[key] != 'matched'
+               'prove_edge': {key: 'ineligible_adopted' if key in adopted_keys else ('ineligible' if quantities[key] != 'matched' or lots_result[key] != 'matched'
                              or states.get(key) != 'reconciled_net' or bool(projection_issues) or bool(holds)
-                             else 'requires_trade_evidence_verification' for key in identities}}
+                             else 'requires_trade_evidence_verification') for key in identities}}
     results['broker_observation'] = {
         'account': decode_payload(encode_payload(account)),
         'positions': [decode_payload(encode_payload(position)) for position in positions],
