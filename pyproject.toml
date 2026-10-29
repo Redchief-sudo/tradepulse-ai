@@ -8,13 +8,13 @@ version = "0.1.0"
 description = "Standalone, production-oriented TradePulse trading runtime"
 requires-python = ">=3.12"
 authors = [{ name = "Damien Johnson Fisher" }]
-dependencies = ["httpx>=0.27"]
+dependencies = ["httpx>=0.27", "exchange_calendars==4.13.2"]  # Rev.144: pinned; the calendar fingerprint depends on it
 
 [project.scripts]
 tradepulse = "tradepulse.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "respx>=0.21", "ruff>=0.6", "mypy>=1.11", "exchange_calendars>=4.5"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "respx>=0.21", "ruff>=0.6", "mypy>=1.11"]
 web = ["fastapi>=0.115", "uvicorn>=0.30"]
 
 [tool.setuptools.packages.find]

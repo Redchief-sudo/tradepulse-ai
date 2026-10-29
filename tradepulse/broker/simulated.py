@@ -340,9 +340,8 @@ class SimSession:
 
     @classmethod
     def from_exchange_calendar(cls, code: str, start: date, end: date) -> SimSession:
-        """Sessions from exchange_calendars (a dev-only dependency, imported
-        here so production never needs it), including holidays, early closes
-        and daylight-saving changes."""
+        """Sessions from exchange_calendars (a runtime dependency since
+        Rev.144), including holidays, early closes and daylight-saving changes."""
         import exchange_calendars
 
         calendar = exchange_calendars.get_calendar(code, start=start.isoformat(), end=end.isoformat())
