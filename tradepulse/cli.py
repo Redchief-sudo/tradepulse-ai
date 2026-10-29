@@ -1095,6 +1095,14 @@ async def _run_application(settings: Settings, port: int, open_browser: bool, *,
                 logger.error("run_already_active", extra={"event": "run_already_active"})
                 return 1
             try:
+                from tradepulse.reconciliation.unresolved import relatch_if_open_unresolved
+
+                # Rev.140 I8: a previous process may have recorded an
+                # unresolved execution and lost its latch call. Re-latch
+                # before any lane can trade.
+                if await relatch_if_open_unresolved(repositories, datetime.now(UTC)):
+                    logger.error("startup_relatched_unresolved_broker_execution",
+                                 extra={"event": "startup_relatched_unresolved_broker_execution"})
                 return await run_with_lock_renewal(database, RUN_LOCK_KEY, owner_token, RUN_LOCK_TTL_SECONDS, work(lease))
             finally:
                 await release_lock(database, RUN_LOCK_KEY, owner_token)

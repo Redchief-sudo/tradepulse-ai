@@ -38,11 +38,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter, alert_once
@@ -475,7 +475,38 @@ async def _reconcile_fills(
             clock=lambda: now,
         )
 
+    if lease_lost is None or not lease_lost.is_set():
+        await _advance_fill_cursor(repositories, alerts, broker, activities, now)
     return fills_checked, missed_fills, late_fills_recovered
+
+
+async def _advance_fill_cursor(repositories: PersistenceRepositories, alerts: TelegramAlerter, broker: BrokerPort,
+                               lookback: Sequence[AlpacaActivity], now: datetime) -> None:
+    """Rev.140 §3.1a: the lookback window above matches recent fills; the
+    durable cursor C makes sure nothing older escapes. Every FILL after C is
+    recorded as unresolved unless exactly accounted for, then C advances, in
+    one transaction, from a page proven complete. Nothing happens until C
+    has been bootstrapped."""
+    from .unresolved import fill_cursor, open_unresolved, record_pass, write_outcome_if_proven
+
+    cursor = await fill_cursor(repositories)
+    if cursor is None:
+        return
+    pages: list[Any] = []
+    after = await broker.get_activities(activity_type="FILL", after_id=cursor, page_evidence=pages)
+    proven = bool(pages) and pages[-1]["terminal"] and not any(page["terminal"] for page in pages[:-1])
+    result = await record_pass(repositories, after, page_proven=proven, pass_id=str(uuid4()), now=now)
+    if result.recorded:
+        ids = ", ".join(result.recorded)
+        await _alert_once(
+            repositories, alerts, event_type="unresolved_broker_execution", subject=result.recorded[0], window=_utc_day(now),
+            severity="critical", message=f"Reconciliation: UNRESOLVED BROKER EXECUTION -- {ids} has no exact local record.",
+            details={"activity_ids": list(result.recorded)}, now=now)
+        await latch_financial_integrity_block(repositories, f"UNRESOLVED_BROKER_EXECUTION: {ids}", clock=lambda: now)
+    open_ids = {row.activity_id for row in await open_unresolved(repositories)}
+    for activity in [*lookback, *after]:
+        if activity.activity_id in open_ids:
+            await write_outcome_if_proven(repositories, activity, now=now)
 
 
 async def _reverify_pending_holds(

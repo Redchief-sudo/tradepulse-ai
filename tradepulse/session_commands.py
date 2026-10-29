@@ -251,6 +251,16 @@ async def run_reset_integrity(settings: Settings, *, force: bool) -> int:
         logger.error("reset_integrity_force_refused", extra={"event": "reset_integrity_force_refused",
                      "reason": "independent accounting verification is mandatory"})
         return 1
+    from tradepulse.reconciliation.unresolved import open_unresolved
+
+    # Rev.140 §3.1a: an unaccounted broker execution blocks the reset at any
+    # age, whatever fill_lookback would still show, and before any broker call.
+    unresolved_executions = await open_unresolved(repositories)
+    if unresolved_executions:
+        logger.error("reset_integrity_refused_unresolved_broker_execution", extra={
+            "event": "reset_integrity_refused_unresolved_broker_execution", "reason": "UNRESOLVED_BROKER_EXECUTION",
+            "activity_ids": sorted(row.activity_id for row in unresolved_executions)})
+        return 1
 
     from tradepulse.persistence.codec import encode_payload
     from tradepulse.reconciliation.epochs import require_unlock_proof, unlock_proof
