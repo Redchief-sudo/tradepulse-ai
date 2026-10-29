@@ -191,6 +191,21 @@ CREATE TABLE IF NOT EXISTS instrument_hours (
   UNIQUE(check_id, broker, instrument_key, date)
 );
 CREATE INDEX IF NOT EXISTS idx_instrument_hours ON instrument_hours(broker, instrument_key, date, checked_at);
+-- Rev.143 §3.10: announcements and attribution rows are immutable; the
+-- per-activity status row is the one mutable dividend record.
+CREATE TABLE IF NOT EXISTS corporate_action_announcements (
+  record_id TEXT PRIMARY KEY, announcement_id TEXT NOT NULL, sha256 TEXT NOT NULL, symbol TEXT NOT NULL,
+  payload TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(announcement_id, sha256)
+);
+CREATE TABLE IF NOT EXISTS dividend_attributions (
+  record_id TEXT PRIMARY KEY, activity_id TEXT NOT NULL, component TEXT NOT NULL CHECK(component IN ('income','withholding')),
+  bucket TEXT NOT NULL CHECK(bucket IN ('strategy','adopted','opening_unadopted','excluded_unallocated')),
+  holder_id TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(activity_id, component, bucket, holder_id)
+);
+CREATE TABLE IF NOT EXISTS dividend_attribution_status (
+  record_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 """
 
 # These triggers record provenance even if an operator later deletes all rows.
@@ -207,7 +222,8 @@ EVIDENCE_TABLES = (
 
 QUARANTINE_TABLES = EVIDENCE_TABLES[-10:]
 CALENDAR_TABLES = ("calendar_check_events", "calendar_check_dates", "instrument_hours")
-APPEND_ONLY_TABLES = QUARANTINE_TABLES + CALENDAR_TABLES
+DIVIDEND_TABLES = ("corporate_action_announcements", "dividend_attributions")
+APPEND_ONLY_TABLES = QUARANTINE_TABLES + CALENDAR_TABLES + DIVIDEND_TABLES
 
 # Rev.144 §3.7: at most one terminal event per check, and date or hours rows
 # only for a check already completed in the same transaction.

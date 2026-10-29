@@ -86,6 +86,7 @@ async def observe_broker_valuation(broker, *, attempts: int = 3) -> tuple[Alpaca
 
 def _generation_invariants(connection, account, positions):
     """Reconcile an official population against its immutable opening balances."""
+    from tradepulse.reconciliation.dividends import dividend_receipt, validate_generation_dividend
     from tradepulse.reconciliation.generation_fees import (
         adjustment_receipt,
         cash_fee_receipt,
@@ -130,6 +131,9 @@ def _generation_invariants(connection, account, positions):
         if adjustment_receipt(raw) is not None:
             validate_generation_adjustment(record('generation_adjustment:' + raw['id']),
                                            entries['broker:adjustment:' + raw['id']], raw=raw, checkpoint=opening)
+        if dividend_receipt(raw) is not None:  # Rev.143 §3.3
+            validate_generation_dividend(record('generation_dividend:' + raw['id']),
+                                         entries['broker:dividend:' + raw['id']], raw=raw, checkpoint=opening)
     cash_movement = sum((broker_settled_cash(r) for r in entries.values()), Decimal(0))
     if any(r['currency'] != 'USD' for r in entries.values()):
         raise ValueError('generation_cash_currency_unverified')

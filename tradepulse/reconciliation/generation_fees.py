@@ -120,6 +120,9 @@ def persist_generation_fees(connection, activities, membership, *, now):
                                (record_id, encode_payload(record), now.isoformat()))
         recorded.add(identifier)
     _persist_generation_adjustments(connection, activities, membership, now=now)
+    from .dividends import persist_generation_dividends  # Rev.143 §3.3
+
+    persist_generation_dividends(connection, activities, membership, now=now)
     return recorded
 
 
@@ -223,7 +226,9 @@ def generation_adjustment_totals(connection):
     from tradepulse.verification.opening import load_bound_opening_checkpoint
 
     checkpoint = load_bound_opening_checkpoint(connection)
-    totals = {'capital_flows': Decimal(0), 'profit_adjustments': Decimal(0)}
+    from .dividends import dividend_totals
+
+    totals = {'capital_flows': Decimal(0), 'profit_adjustments': Decimal(0), 'dividend_income': dividend_totals(connection)}
     for row in connection.execute("SELECT payload FROM reconciliation_records WHERE record_id LIKE 'generation_adjustment:%'"):
         record = decode_payload(row['payload'])
         cash = connection.execute('SELECT payload FROM cash_ledger WHERE record_id=?',
