@@ -50,8 +50,13 @@ def _startup_record(directory: Path, checkpoint: dict) -> dict | None:
 
 
 def comparable_context(context: dict) -> dict:
-    """Distinct databases are required; every other frozen setting is equal."""
-    return {key: value for key, value in context.items() if key != "database_path"}
+    """Distinct databases are required; every other frozen setting is equal.
+    Runs open on different dates, so their calendar fingerprints are compared
+    by library version (Rev.144 §3.2)."""
+    comparable = {key: value for key, value in context.items() if key != "database_path"}
+    if isinstance(comparable.get("market_calendar_fingerprint"), dict):
+        comparable["market_calendar_fingerprint"] = comparable["market_calendar_fingerprint"]["library_version"]
+    return comparable
 
 
 def slippage_evidence(fills: list[dict]) -> dict:

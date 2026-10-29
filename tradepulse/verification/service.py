@@ -5,7 +5,7 @@ import asyncio
 import logging
 import sqlite3
 from dataclasses import fields
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from tradepulse.config import Settings
@@ -40,7 +40,18 @@ def store_for(settings: Settings) -> Path:
     return database.parent / (database.name + ".paper-verification")
 
 
-def context_for(settings: Settings) -> dict:
+def market_calendar_fingerprint(anchor: date | None = None) -> dict:
+    """Rev.144 §3.2: the calendar a run trades by, frozen for its opening date.
+    Recomputed later for that same anchor, so the window never moves with
+    the date, and a library change mid-run is frozen_configuration_mismatch."""
+    from tradepulse.calendar import market_calendar, ny_date
+
+    anchor = anchor or ny_date(datetime.now(UTC))
+    calendar = market_calendar()
+    return {"anchor": anchor.isoformat(), "library_version": calendar.library_version, "sha256": calendar.fingerprint(anchor)}
+
+
+def context_for(settings: Settings, *, calendar_anchor: date | None = None) -> dict:
     # Secrets are never serialized. Account credentials are bound by a digest
     # so replacing them cannot silently route one generation to another account.
     secret_fields = {field.name for field in fields(settings) if any(part in field.name for part in ("key", "secret", "token", "chat_id"))}
@@ -51,7 +62,18 @@ def context_for(settings: Settings) -> dict:
     for name in ("equity_universe_path", "crypto_universe_path", "options_universe_path"):
         path = getattr(settings, name)
         context[name] = {"path": str(Path(path).resolve()), "sha256": digest(Path(path).read_bytes())} if path else None
+    context["market_calendar_fingerprint"] = market_calendar_fingerprint(calendar_anchor)
     return context
+
+
+def context_matches(frozen: dict, settings: Settings) -> bool:
+    """The frozen context against the current one. A context frozen before
+    Rev.144 (A0's) has no calendar fingerprint and is compared without one."""
+    recorded = frozen.get("market_calendar_fingerprint")
+    current = context_for(settings, calendar_anchor=date.fromisoformat(recorded["anchor"]) if recorded else None)
+    if recorded is None:
+        current.pop("market_calendar_fingerprint")
+    return frozen == current
 
 
 def _fresh_identity(database: Path, generation: str) -> dict:
@@ -189,7 +211,7 @@ class Verification:
                 raise VerificationError("generation_binding_mismatch")
             result = verify_source(self.root, self.directory)
             if (self.settings.execution_mode != "paper" or self.settings.live_trading_enabled
-                    or manifest["context"] != context_for(self.settings)):
+                    or not context_matches(manifest["context"], self.settings)):
                 raise VerificationError("frozen_configuration_mismatch")
             if manifest["policy"]["thresholds"] != VerificationPolicy().as_dict():
                 raise VerificationError("frozen_threshold_mismatch")

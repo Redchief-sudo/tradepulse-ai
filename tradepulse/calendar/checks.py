@@ -16,7 +16,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from hashlib import sha256
 from typing import Any, Literal
 from uuid import uuid4
@@ -357,3 +357,28 @@ async def entry_window_open(gate: CalendarGate, broker: str, asset: AssetIdentit
     if not broker_clock.is_open:
         return EntryWindow(False, None, "OPTION_MARKET_CLOSED" if venue == Venue.US_OPTION else "EQUITY_MARKET_CLOSED")
     return EntryWindow(False, None, "CALENDAR_SESSION_CLOSED")
+
+
+async def session_deadline(gate: CalendarGate, first_observed_at: datetime, n: int = 3) -> tuple[datetime, str]:
+    """§3.8, for Rev.143: the close of the n-th session after the first
+    observation. If any date up to it is contested, unverified or beyond the
+    horizon, the earlier of that and n weekdays (16:00 ET): early, never late.
+    Returns (deadline, deadline_source)."""
+    from . import ny_time
+
+    day = ny_date(first_observed_at)
+    weekdays = day
+    for _ in range(n):
+        weekdays += timedelta(days=1)
+        while weekdays.weekday() >= 5:
+            weekdays += timedelta(days=1)
+    bound = ny_time(weekdays, time(16))
+    try:
+        target = gate.calendar.nth_session_after(Venue.US_EQUITY, first_observed_at, n)
+    except CalendarHorizonExceeded:
+        return bound, "weekday_bound"
+    span = [day + timedelta(days=k) for k in range(1, (target.date - day).days + 1)]
+    verified = all([await gate.status(Venue.US_EQUITY, d, first_observed_at) == "verified" for d in span])
+    if verified or target.close <= bound:
+        return target.close, "market_calendar"
+    return bound, "weekday_bound"
