@@ -219,7 +219,11 @@ async def _reconcile_positions(
             return asset_by_key[key].symbol
         return holdings_by_asset_key[key].asset.symbol
 
-    asset_keys = set(broker_by_asset_key) | set(asset_by_key) | set(holdings_by_asset_key) | set(opening_positions)
+    # Rev.140 I2: broker quantity = open long lots + open unmanaged long - open liabilities.
+    from tradepulse.quarantine import quarantined_positions, signed_quantities
+    quarantined = signed_quantities(await quarantined_positions(repositories))
+    asset_keys = (set(broker_by_asset_key) | set(asset_by_key) | set(holdings_by_asset_key) | set(opening_positions)
+                  | set(quarantined))
 
     positions_checked = 0
     view_drift_corrected = 0
@@ -233,10 +237,11 @@ async def _reconcile_positions(
         actual_broker_qty = broker_by_asset_key[key].qty if key in broker_by_asset_key else Decimal("0")
         broker_qty = actual_broker_qty - opening_positions.get(key, Decimal(0))
         lots_qty = open_lots_by_asset_key.get(key, Decimal("0"))
+        explained_qty = lots_qty + quarantined.get(key, Decimal("0"))
         holding = holdings_by_asset_key.get(key)
         holding_qty = holding.quantity if holding is not None else Decimal("0")
 
-        if broker_qty == lots_qty == holding_qty:
+        if broker_qty == explained_qty and lots_qty == holding_qty:
             await _record(
                 repositories, reconciliation_type="position", subject_id=key, outcome=ReconciliationOutcome.MATCHED,
                 expected={"broker_qty": str(broker_qty)}, actual={"lots_qty": str(lots_qty), "holding_qty": str(holding_qty)},
@@ -244,7 +249,7 @@ async def _reconcile_positions(
             )
             continue
 
-        if broker_qty == lots_qty:
+        if broker_qty == explained_qty:
             # VIEW_DRIFT: the accounting (lots) already agrees with Alpaca --
             # only the materialized Holding is stale. Safe to rebuild it.
             await _record(
@@ -290,7 +295,12 @@ async def _reconcile_positions(
                          f"position (broker={broker_qty}, lots={lots_qty}). NOT auto-corrected -- investigate missing/duplicate fills."),
                 details={"symbol": display_symbol, "broker_qty": str(broker_qty), "lots_qty": str(lots_qty)}, now=now,
             )
-            if asset_by_key[key].asset_class == AssetClass.CRYPTO:
+            if broker_qty < 0 or key in quarantined:
+                # A short the liabilities do not explain (spec §3.5).
+                await latch_financial_integrity_block(
+                    repositories, f"UNEXPLAINED_SHORT_POSITION: {display_symbol} broker={broker_qty}, "
+                                  f"lots={lots_qty}, quarantined={quarantined.get(key, Decimal(0))}", clock=lambda: now)
+            elif asset_by_key[key].asset_class == AssetClass.CRYPTO:
                 from .epochs import block_asset
                 await block_asset(repositories, asset_by_key[key],
                                   f"POSITION_QUANTITY_MISMATCH: broker={broker_qty}, lots={lots_qty}", now=now)
@@ -352,6 +362,15 @@ async def _reconcile_fills(
     missed_fills = 0
     late_fills_recovered = 0
     matched: set[str] = set()
+    # Rev.140 R8: exact matching only on an asset with quarantined inventory
+    # or an unaccounted execution; a heuristic could pair a cover with an
+    # unrelated fill.
+    from tradepulse.broker.symbols import broker_symbol_asset_key
+    from tradepulse.quarantine import quarantined_positions
+
+    from .unresolved import open_unresolved
+    exact_only = ({record.asset_key for record in await quarantined_positions(repositories)}
+                  | {row.asset_key for row in await open_unresolved(repositories)})
 
     for activity in activities:
         if generation_membership is not None:
@@ -373,7 +392,7 @@ async def _reconcile_fills(
         fills_checked += 1
         match = _find_exact_id_match(activity, local_fills, matched)
         match_method = "exact_id"
-        if match is None and generation_membership is None:
+        if match is None and generation_membership is None and broker_symbol_asset_key(activity.symbol) not in exact_only:
             match = _find_heuristic_match(activity, local_fills, matched)
             match_method = "heuristic"
         if match is not None:

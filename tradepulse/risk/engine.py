@@ -488,6 +488,14 @@ async def build_portfolio_snapshot(
         sector = holding.sector or "Other"
         sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + notional
 
+    # Rev.140 §3.3: quarantined inventory is real exposure, always at the
+    # adverse (higher) of its last confirmed and current mark.
+    from tradepulse.quarantine import quarantined_positions
+    for record in await quarantined_positions(repositories):
+        exposure = record.exposure(mark_prices.get(record.asset_key, record.last_confirmed_mark or record.reference_price))
+        holdings_value += exposure
+        sector_exposure["Quarantined"] = sector_exposure.get("Quarantined", Decimal("0")) + exposure
+
     sectors_by_key = {asset_identity_key(h.asset): h.sector or "Other" for h in holdings}
     for key in pending_keys:
         position = broker_positions.get(key)
