@@ -88,6 +88,7 @@ when TRADEPULSE_EXECUTION_MODE is live.
 
 from __future__ import annotations
 
+import asyncio
 import bisect
 import decimal
 import heapq
@@ -96,8 +97,8 @@ import random
 import re
 import uuid
 from collections import Counter
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -157,6 +158,16 @@ class Fault(StrEnum):
     LOOKUP_TIMEOUT = "lookup_timeout"  # ReadTimeout
     RATE_LIMITED = "rate_limited"  # 429
     DISCONNECTED = "disconnected"  # every network call: ConnectError until reconnect()
+    # Rev.140 test faults (R12): broker behaviour the sellable bound must
+    # survive. Only ACCEPT_OVERSELL is queued through inject(); the others
+    # take parameters and are set through their own methods. Each is
+    # recorded in fired_faults when it changes a call's outcome.
+    ACCEPT_OVERSELL = "accept_oversell"  # place_order skips the insufficient-qty 403
+    POSITIONS_LAG = "positions_lag"  # lag_positions(): get_positions serves an older view
+    STEP_BETWEEN = "step_between"  # step_before(): an action runs just before a named call
+    OVERFILL = "overfill"  # overfill_next(): a fill executes more than was ordered
+    WITHHOLD_ACTIVITY = "withhold_activity"  # withhold_activity(): an activity is not yet listed
+    HOLD_CALL = "hold_call"  # hold_call(): place_order blocks until released
 
 
 _SUBMIT = frozenset({"place_order"})
@@ -167,6 +178,11 @@ _FAULT_SCOPE: dict[Fault, frozenset[str] | None] = {  # None: any network-depend
     Fault.LOOKUP_TIMEOUT: frozenset({"get_order", "get_order_by_client_order_id"}),
     Fault.RATE_LIMITED: None,
     Fault.DISCONNECTED: None,
+    Fault.ACCEPT_OVERSELL: _SUBMIT,
+}
+_METHOD_FAULTS = {  # set through a method, never queued
+    Fault.POSITIONS_LAG: "lag_positions", Fault.STEP_BETWEEN: "step_before", Fault.OVERFILL: "overfill_next",
+    Fault.WITHHOLD_ACTIVITY: "withhold_activity", Fault.HOLD_CALL: "hold_call",
 }
 _OPERATION_NAMES = {  # the network-dependent calls, with AlpacaClient's operation labels
     "get_clock": "getClock", "get_account": "getAccount", "get_positions": "getPositions",
@@ -446,10 +462,13 @@ class _Order:
     fill_events: int = 0
     checked_filled_qty: Decimal = Decimal(0)
     terminal_snapshot: dict[str, Any] | None = None
+    oversell: bool = False  # ACCEPT_OVERSELL: a sell may take the position below zero
+    overfill: Decimal = Decimal(0)  # OVERFILL: executed beyond qty on the order's next fill
+    overfilled: Decimal = Decimal(0)  # what OVERFILL actually executed beyond qty
 
     @property
     def remaining(self) -> Decimal:
-        return self.qty - self.filled_qty
+        return max(self.qty - self.filled_qty, Decimal(0))
 
     def raw(self) -> dict[str, Any]:
         """The Order schema of POST/GET /v2/orders (docs.alpaca.markets/reference/postorder)."""
@@ -538,6 +557,13 @@ class SimulatedBroker:
         self._batches: dict[tuple[str, str, date], _FeeBatch] = {}
         self._faults: list[tuple[Fault, int]] = []
         self._disconnected = False
+        self.fired_faults: list[Fault] = []
+        self._positions_lag = 0
+        self._before_execution: list[_State] = []  # the state just before each fill, for POSITIONS_LAG
+        self._steps: dict[str, list[Callable[[], None]]] = {}
+        self._overfill_pending: Decimal | None = None
+        self._holds: dict[str, list[asyncio.Event]] = {}
+        self._withheld: set[str] = set()
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -551,6 +577,9 @@ class SimulatedBroker:
         first, then raises."""
         if self._closed:
             raise RuntimeError("SimulatedBroker is closed")
+        if self._steps.get(method):
+            self.fired_faults.append(Fault.STEP_BETWEEN)
+            self._steps[method].pop(0)()
         operation = _OPERATION_NAMES[method]
         if self._disconnected:
             raise httpx.ConnectError(f"simulated: disconnected ({operation})")
@@ -563,7 +592,8 @@ class SimulatedBroker:
                 del self._faults[index]
             else:
                 self._faults[index] = (fault, remaining - 1)
-            if fault == Fault.SUBMIT_AMBIGUOUS_ACCEPTED:
+            self.fired_faults.append(fault)
+            if fault in (Fault.SUBMIT_AMBIGUOUS_ACCEPTED, Fault.ACCEPT_OVERSELL):
                 return fault
             if fault == Fault.SUBMIT_AMBIGUOUS_NOT_ACCEPTED:
                 raise httpx.ConnectError(f"simulated: connection refused ({operation})")
@@ -580,6 +610,8 @@ class SimulatedBroker:
         fails until reconnect(). Local calls are never faulted."""
         if times < 1:
             raise ValueError("a fault fires at least once")
+        if fault in _METHOD_FAULTS:
+            raise ValueError(f"{fault.name} takes parameters: use the {_METHOD_FAULTS[fault]}() method")
         if fault == Fault.DISCONNECTED:
             self._disconnected = True
         else:
@@ -587,6 +619,46 @@ class SimulatedBroker:
 
     def reconnect(self) -> None:
         self._disconnected = False
+
+    def lag_positions(self, executions: int) -> None:
+        """POSITIONS_LAG: get_positions serves the holdings from ``executions``
+        fills ago, until lag_positions(0). Cash and activities stay current."""
+        if executions < 0:
+            raise ValueError("a lag counts executions, at least 0")
+        self._positions_lag = executions
+
+    def step_before(self, call: str, action: Callable[[], None]) -> None:
+        """STEP_BETWEEN: run ``action`` once, immediately before the next call
+        named ``call`` (get_open_orders, get_positions or get_activities)."""
+        if call not in ("get_open_orders", "get_positions", "get_activities"):
+            raise ValueError(f"step_before does not model {call!r}")
+        self._steps.setdefault(call, []).append(action)
+
+    def overfill_next(self, extra: Decimal) -> None:
+        """OVERFILL: the next order placed executes ``extra`` more than ordered
+        on its next fill. The order's own qty is unchanged."""
+        self._overfill_pending = _decimal(extra, "extra", positive=True)
+
+    def withhold_activity(self, activity_id: str, until: datetime) -> None:
+        """WITHHOLD_ACTIVITY: get_activities omits the activity until the clock
+        reaches ``until``. Positions and cash already reflect it, and its ID is
+        unchanged, so it sorts before activities created meanwhile."""
+        until = _aware_utc(until, "until")
+        for index, activity in enumerate(self._activities):
+            if activity.id == activity_id:
+                self._activities[index] = replace(activity, visible_at=max(activity.visible_at, until))
+                self._withheld.add(activity_id)
+                return
+        raise ValueError(f"no activity {activity_id!r} to withhold")
+
+    def hold_call(self, call: str) -> Callable[[], None]:
+        """HOLD_CALL: the next ``call`` blocks until the returned release
+        function runs. The order is accepted when the call is entered."""
+        if call != "place_order":
+            raise ValueError(f"hold_call does not model {call!r}")
+        event = asyncio.Event()
+        self._holds.setdefault(call, []).append(event)
+        return event.set
 
     @property
     def queued_faults(self) -> tuple[tuple[Fault, int], ...]:
@@ -762,7 +834,13 @@ class SimulatedBroker:
         now = self._clock()
         self._materialize(now)
         positions = []
-        for symbol, holding in self._state_at(now).holdings:
+        holdings = self._state_at(now).holdings
+        if self._positions_lag:
+            done = [state for state in self._before_execution if state.at <= now]
+            if done:
+                holdings = done[-min(self._positions_lag, len(done))].holdings
+                self.fired_faults.append(Fault.POSITIONS_LAG)
+        for symbol, holding in holdings:
             mark = self._mark(symbol, holding, now)
             market_value = holding.qty * mark * holding.multiplier
             cost_basis = holding.qty * holding.avg_entry_price * holding.multiplier
@@ -933,11 +1011,15 @@ class SimulatedBroker:
         qty = event.qty if event.qty is not None else order.remaining
         if qty <= 0 or qty > order.remaining:
             raise SimulatorScriptError(f"fill of {qty} exceeds the {order.remaining} still open on {order.id}")
+        if order.overfill:
+            qty += order.overfill
+            order.overfilled, order.overfill = order.overfill, Decimal(0)
+            self.fired_faults.append(Fault.OVERFILL)
 
         order.filled_qty += qty
         order.notional += qty * price
         order.filled_avg_price = order.notional / order.filled_qty
-        order.status = "filled" if order.filled_qty == order.qty else "partially_filled"
+        order.status = "filled" if order.filled_qty >= order.qty else "partially_filled"
         order.updated_at = at
         if order.status == "filled":
             order.filled_at = at
@@ -967,26 +1049,27 @@ class SimulatedBroker:
 
     def _book_fill(self, order: _Order, at: datetime, qty: Decimal, price: Decimal) -> None:
         state = self._state_at(at)
+        self._before_execution.append(state)
         holdings = dict(state.holdings)
         held = holdings.get(order.symbol)
         cash = state.cash
-        if order.side == Side.BUY:
-            cash -= qty * price * order.multiplier
-            if held is None:
-                holdings[order.symbol] = _Holding(order.asset_class, qty, price, order.multiplier)
-            else:
-                new_qty = held.qty + qty
-                average = (held.qty * held.avg_entry_price + qty * price) / new_qty
-                holdings[order.symbol] = _Holding(held.asset_class, new_qty, average, held.multiplier)
-        else:
-            if held is None or held.qty < qty:
-                raise SimulatorScriptError(f"sell of {qty} {order.symbol} exceeds the position at {at.isoformat()}")
-            cash += qty * price * order.multiplier
-            if held.qty == qty:
-                del holdings[order.symbol]
-            else:
-                holdings[order.symbol] = _Holding(held.asset_class, held.qty - qty, held.avg_entry_price,
-                                                  held.multiplier)
+        signed = qty if order.side == Side.BUY else -qty
+        cash -= signed * price * order.multiplier
+        if order.side == Side.SELL and (held.qty if held is not None else Decimal(0)) < qty \
+                and not (order.oversell or order.overfilled):
+            raise SimulatorScriptError(f"sell of {qty} {order.symbol} exceeds the position at {at.isoformat()}")
+        before = held.qty if held is not None else Decimal(0)
+        after = before + signed
+        if after == 0:
+            holdings.pop(order.symbol, None)
+        elif held is None or (before > 0) != (after > 0):
+            # A new position, or one that crossed zero: the remainder opened at this price.
+            holdings[order.symbol] = _Holding(order.asset_class, after, price, order.multiplier)
+        elif abs(after) > abs(before):  # adding in the same direction
+            average = (before * held.avg_entry_price + signed * price) / after
+            holdings[order.symbol] = _Holding(held.asset_class, after, average, held.multiplier)
+        else:  # reducing: the entry price of what remains is unchanged
+            holdings[order.symbol] = _Holding(held.asset_class, after, held.avg_entry_price, held.multiplier)
         self._record(_State(at, cash, tuple(sorted(holdings.items(), key=lambda item: item[0]))))
 
     # --- fees -----------------------------------------------------------------------
@@ -1122,7 +1205,7 @@ class SimulatedBroker:
         fills_by_order = Counter(a.raw["order_id"] for a in self._activities if a.raw["activity_type"] == "FILL")
         for order in self._orders.values():
             problem = None
-            if not 0 <= order.filled_qty <= order.qty:
+            if not 0 <= order.filled_qty <= order.qty + order.overfilled:
                 problem = f"filled_qty {order.filled_qty} outside [0, {order.qty}]"
             elif order.filled_qty < order.checked_filled_qty:
                 problem = f"filled_qty went down from {order.checked_filled_qty} to {order.filled_qty}"
@@ -1132,7 +1215,7 @@ class SimulatedBroker:
                 problem = "an unfilled order has an average price"
             elif fills_by_order[order.id] != order.fill_events:
                 problem = f"{fills_by_order[order.id]} FILL activities for {order.fill_events} fills"
-            elif (order.status == "filled") != (order.filled_qty == order.qty):
+            elif (order.status == "filled") != (order.filled_qty >= order.qty):
                 problem = f"status {order.status} with {order.filled_qty} of {order.qty} filled"
             elif order.terminal_snapshot is not None and order.raw() != order.terminal_snapshot:
                 problem = "a terminal order changed"
@@ -1162,12 +1245,15 @@ class SimulatedBroker:
 
     async def place_order(self, order: AlpacaOrderRequest) -> AlpacaOrderResponse:
         fault = self._enter("place_order")
-        placed = self._place(order)
+        placed = self._place(order, oversell=fault == Fault.ACCEPT_OVERSELL)
+        if self._holds.get("place_order"):
+            self.fired_faults.append(Fault.HOLD_CALL)
+            await self._holds["place_order"].pop(0).wait()
         if fault == Fault.SUBMIT_AMBIGUOUS_ACCEPTED:
             raise httpx.ConnectError("simulated: connection lost after the order was accepted")
         return placed
 
-    def _place(self, order: AlpacaOrderRequest) -> AlpacaOrderResponse:
+    def _place(self, order: AlpacaOrderRequest, *, oversell: bool = False) -> AlpacaOrderResponse:
         now = self._clock()
         self._materialize(now)
         symbol, asset_class = self._classify(order.symbol)
@@ -1189,7 +1275,7 @@ class SimulatedBroker:
             committed = sum((o.remaining for o in self._orders.values()
                              if o.symbol == symbol and o.side == Side.SELL and o.status in OPEN_STATUSES), Decimal(0))
             available = (held.qty if held is not None else Decimal(0)) - committed
-            if order.qty > available:
+            if order.qty > available and not oversell:
                 raise AlpacaError(
                     f"insufficient qty available for order (requested: {_fmt(order.qty)}, available: {_fmt(available)})",
                     403, None, None, "placeOrder")
@@ -1217,7 +1303,9 @@ class SimulatedBroker:
             limit_price=order.limit_price if order.order_type == "limit" else None,
             multiplier=self._multiplier(symbol, asset_class), created_at=now, seq=self._seq,
             status="new" if open_now else "accepted", submitted_at=now if open_now else None, updated_at=now,
+            oversell=oversell, overfill=self._overfill_pending or Decimal(0),
         )
+        self._overfill_pending = None
         self._orders[placed.id] = placed
         self._by_client_id[client_order_id] = placed.id
 
@@ -1285,6 +1373,8 @@ class SimulatedBroker:
         self._enter("get_activities")
         now = self._clock()
         self._materialize(now)
+        if any(a.id in self._withheld and a.visible_at > now for a in self._activities):
+            self.fired_faults.append(Fault.WITHHOLD_ACTIVITY)
 
         async def fetch_page(params: dict[str, str]) -> Any:
             types = set(params["activity_types"].split(",")) if "activity_types" in params else None

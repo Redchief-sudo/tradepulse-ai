@@ -1139,3 +1139,155 @@ async def test_disconnection_fails_exactly_the_network_calls_and_spares_local_on
     broker.set_market_data_feeds(equity_feed="sip", option_feed="opra")
     assert broker.rate_limit_snapshot is None
     await broker.aclose()
+
+
+# --- Rev.140 test faults (R12: reachable only through SimulatedBroker methods) ---
+
+def _held(clock: ManualClock, qty: str = "10") -> SimulatedBroker:
+    broker = SimulatedBroker(clock=clock, session=_session())
+    _quote(broker, "AAPL", "100", "100.10", T0)
+    broker.seed_position("AAPL", AssetClass.EQUITY, Decimal(qty), Decimal("90"))
+    return broker
+
+
+async def _qty(broker: SimulatedBroker, symbol: str = "AAPL") -> Decimal | None:
+    return next((p.qty for p in await broker.get_positions() if p.symbol == symbol), None)
+
+
+async def test_positions_lag_serves_previous_view() -> None:
+    broker = _held(ManualClock(T0))
+    await broker.place_order(_order("AAPL", "4", Side.SELL, coid="s1"))
+    assert await _qty(broker) == Decimal("6")
+    broker.lag_positions(1)
+    assert await _qty(broker) == Decimal("10")
+    assert Fault.POSITIONS_LAG in broker.fired_faults
+    broker.lag_positions(0)
+    assert await _qty(broker) == Decimal("6")
+
+
+async def test_step_before_runs_once_before_named_call() -> None:
+    clock = ManualClock(T0)
+    broker = _held(clock)
+    broker.schedule_fills("s1", [(timedelta(seconds=5), Decimal("4"), None)])
+    await broker.place_order(_order("AAPL", "4", Side.SELL, coid="s1"))
+    assert len(await broker.get_open_orders()) == 1
+    runs: list[int] = []
+    broker.step_before("get_open_orders", lambda: (runs.append(1), clock.advance(timedelta(seconds=10))))
+    assert await broker.get_open_orders() == []
+    await broker.get_open_orders()
+    assert runs == [1]
+    assert Fault.STEP_BETWEEN in broker.fired_faults
+
+
+async def test_accept_oversell_skips_insufficient_qty() -> None:
+    broker = _held(ManualClock(T0))
+    with pytest.raises(AlpacaError) as refused:
+        await broker.place_order(_order("AAPL", "12", Side.SELL, coid="s0"))
+    assert refused.value.status_code == 403
+    broker.inject(Fault.ACCEPT_OVERSELL)
+    await broker.place_order(_order("AAPL", "12", Side.SELL, coid="s1"))
+    positions = await broker.get_positions()
+    assert [(p.qty, p.raw["side"]) for p in positions] == [(Decimal("-2"), "short")]
+    assert Fault.ACCEPT_OVERSELL in broker.fired_faults
+
+
+async def test_overfill_next_fills_more_than_ordered() -> None:
+    broker = _held(ManualClock(T0))
+    broker.overfill_next(Decimal("2"))
+    placed = await broker.place_order(_order("AAPL", "10", Side.SELL, coid="s1"))
+    fills = [a for a in await broker.get_activities() if a.raw.get("order_id") == placed.broker_order_id]
+    assert [a.qty for a in fills] == [Decimal("12")]
+    assert (await broker.get_order(placed.broker_order_id)).raw["qty"] == "10"
+    assert await _qty(broker) == Decimal("-2")
+    assert Fault.OVERFILL in broker.fired_faults
+
+
+async def test_open_order_raw_carries_qty_and_client_id() -> None:
+    broker = _held(ManualClock(T0))
+    await broker.place_order(_order("AAPL", "10", Side.SELL, coid="s1", order_type="limit", limit_price=Decimal("150")))
+    (open_order,) = await broker.get_open_orders()
+    assert open_order.raw["qty"] == "10"
+    assert open_order.raw["client_order_id"] == "s1"
+
+
+async def test_withhold_activity_hidden_until_then_visible() -> None:
+    clock = ManualClock(T0)
+    broker = _held(clock)
+    await broker.place_order(_order("AAPL", "4", Side.SELL, coid="s1"))
+    (fill,) = await broker.get_activities()
+    broker.withhold_activity(fill.activity_id, T0 + timedelta(days=2))
+    assert await _qty(broker) == Decimal("6")
+    assert await broker.get_activities() == []
+    assert Fault.WITHHOLD_ACTIVITY in broker.fired_faults
+    clock.set(T0 + timedelta(days=2))
+    assert [a.activity_id for a in await broker.get_activities()] == [fill.activity_id]
+
+
+async def test_hold_call_blocks_until_released() -> None:
+    broker = _held(ManualClock(T0))
+    release = broker.hold_call("place_order")
+    task = asyncio.create_task(broker.place_order(
+        _order("AAPL", "10", Side.SELL, coid="s1", order_type="limit", limit_price=Decimal("150"))))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not task.done()
+    assert [o.raw["client_order_id"] for o in await broker.get_open_orders()] == ["s1"]
+    release()
+    assert (await task).raw["client_order_id"] == "s1"
+    assert Fault.HOLD_CALL in broker.fired_faults
+
+
+def test_parameterized_faults_are_not_queued_through_inject() -> None:
+    broker = _broker()
+    for fault in (Fault.POSITIONS_LAG, Fault.STEP_BETWEEN, Fault.OVERFILL, Fault.WITHHOLD_ACTIVITY, Fault.HOLD_CALL):
+        with pytest.raises(ValueError, match="method"):
+            broker.inject(fault)
+
+
+def test_faults_unreachable_from_settings_env_or_cli() -> None:
+    """R12: no Settings key, environment variable or CLI flag can enable a
+    fault. No production module imports the simulator, so nothing outside
+    tests can construct one or reach a fault, and no setting is named after
+    a fault."""
+    import ast
+    from pathlib import Path
+
+    import tradepulse
+    from tradepulse.config.settings import Settings
+
+    root = Path(tradepulse.__file__).parent
+    for path in root.rglob("*.py"):
+        if path == root / "broker" / "simulated.py":
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom):
+                module = ("." * node.level) + (node.module or "")
+                assert not module.endswith("simulated") and "simulated" not in [a.name for a in node.names], path
+            elif isinstance(node, ast.Import):
+                assert not any(a.name.endswith(".simulated") for a in node.names), path
+    names = {f.name.lower() for f in Fault} | {f.value for f in Fault}
+    assert not {field.lower() for field in Settings.__dataclass_fields__} & names
+
+
+@pytest.mark.parametrize("mode", ["paper", "live"])
+def test_build_broker_never_returns_simulator(mode: str) -> None:
+    from types import SimpleNamespace
+
+    from tradepulse.broker import AlpacaClient
+    from tradepulse.session_commands import build_broker
+
+    settings = SimpleNamespace(alpaca_api_key="k", alpaca_api_secret="s", execution_mode=mode, broker_timeout_seconds=5)
+    broker = build_broker(settings)  # type: ignore[arg-type]
+    assert isinstance(broker, AlpacaClient) and not isinstance(broker, SimulatedBroker)
+
+
+async def test_buying_back_an_oversell_returns_the_position_to_flat_then_long() -> None:
+    broker = _held(ManualClock(T0))
+    broker.inject(Fault.ACCEPT_OVERSELL)
+    await broker.place_order(_order("AAPL", "12", Side.SELL, coid="s1"))
+    await broker.place_order(_order("AAPL", "1", coid="b1"))
+    (short,) = await broker.get_positions()
+    assert (short.qty, short.avg_entry_price) == (Decimal("-1"), Decimal("100"))  # reduced: entry price kept
+    await broker.place_order(_order("AAPL", "3", coid="b2"))
+    (long,) = await broker.get_positions()
+    assert (long.qty, long.avg_entry_price) == (Decimal("2"), Decimal("100.10"))  # crossed zero: opened at the fill
