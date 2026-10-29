@@ -334,6 +334,7 @@ async def _reconcile_fills(
     alerts: TelegramAlerter, now: datetime, lookback: timedelta,
     lease_lost: asyncio.Event | None = None,
     generation_membership=None,
+    fill_overlap_days: int = 7,
 ) -> tuple[int, int, int]:
     activities = await broker.get_activities(activity_type="FILL", since=None if generation_membership is not None else now - lookback)
     # FIN-090-01: scoped to the actual match window (_find_heuristic_match
@@ -477,6 +478,10 @@ async def _reconcile_fills(
 
     if lease_lost is None or not lease_lost.is_set():
         await _advance_fill_cursor(repositories, alerts, broker, activities, now)
+        from .completeness import completeness_pass, full_pass_due, last_full_pass
+
+        full = full_pass_due(now, await last_full_pass(repositories))
+        await completeness_pass(repositories, broker, alerts, now=now, full=full, overlap_days=fill_overlap_days)
     return fills_checked, missed_fills, late_fills_recovered
 
 
@@ -803,6 +808,7 @@ async def run_reconciliation(
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     lease_lost: asyncio.Event | None = None,
     reconcile_lease: tuple[str, str] | None = None,
+    fill_overlap_days: int = 7,
 ) -> ReconciliationSummary:
     now = aware_utc(clock(), field_name='reconciliation_observed_at')
     generation_membership = None
@@ -854,7 +860,8 @@ async def run_reconciliation(
 
     try:
         fills_checked, missed_fills_detected, late_fills_recovered = await _reconcile_fills(
-            repositories, broker, settlement, alerts, now, fill_lookback, lease_lost, generation_membership
+            repositories, broker, settlement, alerts, now, fill_lookback, lease_lost, generation_membership,
+            fill_overlap_days=fill_overlap_days,
         )
     except Exception as exc:  # noqa: BLE001 - same principle for the activities call
         await _alert_once(repositories, alerts, event_type="reconciliation_degraded", subject="activities", window=_utc_hour(now),

@@ -197,3 +197,15 @@ def test_lemma_seeded_interleavings() -> None:
         # sellable is clamped at 0, so when pending sells already exceed holdings (W < 0) the claim is 0.
         assert decision.sellable <= max(Decimal(0), held - outstanding), (start, orders, intents, settled, decision)
         checked += 1
+
+
+def test_option_orders_are_keyed_as_options_not_equities() -> None:
+    """OCC symbols keep the option asset key (and so its multiplier)."""
+    option = AssetIdentity(asset_class=AssetClass.OPTION, symbol="IWM261030C00286000",
+                           native_asset_id="alpaca:IWM261030C00286000")
+    from tradepulse.models.market import asset_identity_key
+
+    key = asset_identity_key(option)
+    order = _order("o1", qty="1", symbol="IWM261030C00286000")
+    assert build_pending_set(key, [order], [order], [], {}) == (PendingSell("o1", Decimal(1), None, None, Decimal(0)),)
+    assert build_pending_set("equity:default:alpaca:IWM261030C00286000", [order], [order], [], {}) == ()

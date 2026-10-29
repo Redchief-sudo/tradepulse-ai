@@ -23,9 +23,9 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
 from tradepulse.broker.port import OrderState
-from tradepulse.broker.symbols import infer_alpaca_asset_class
+from tradepulse.broker.symbols import broker_symbol_asset_key
 from tradepulse.models import Side, TradeIntent, TradeIntentStatus
-from tradepulse.models.market import asset_identity_key, asset_key_from_broker_symbol
+from tradepulse.models.market import asset_identity_key
 
 _TERMINAL = frozenset({TradeIntentStatus.FILLED, TradeIntentStatus.CANCELED, TradeIntentStatus.EXPIRED,
                        TradeIntentStatus.REJECTED, TradeIntentStatus.FAILED})
@@ -82,7 +82,7 @@ def _order_quantity(order: OrderState) -> Decimal:
 
 def _sells_of(asset_key: str, orders: Sequence[OrderState]) -> dict[str, OrderState]:
     return {order.broker_order_id: order for order in orders if order.side == Side.SELL
-            and asset_key_from_broker_symbol(infer_alpaca_asset_class(order.symbol), order.symbol) == asset_key}
+            and broker_symbol_asset_key(order.symbol) == asset_key}
 
 
 def build_pending_set(asset_key: str, open_orders_1: Sequence[OrderState], open_orders_2: Sequence[OrderState],

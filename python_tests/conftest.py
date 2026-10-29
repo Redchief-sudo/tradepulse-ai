@@ -100,3 +100,14 @@ def held_lease(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.Mon
             yield lease
         finally:
             lease_support.HELD = None
+
+
+@pytest.fixture
+def fill_cursor_bootstrapped(monkeypatch: pytest.MonkeyPatch):
+    """For runtime-command tests that are not about Rev.140's bootstrap gate:
+    treat the database as bootstrapped. The gate itself is tested in
+    test_rev140_bootstrap.py and test_cli.py."""
+    async def bootstrapped(repositories, lease) -> bool:
+        return True
+
+    monkeypatch.setattr("tradepulse.cli._require_fill_cursor", bootstrapped)

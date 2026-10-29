@@ -521,6 +521,7 @@ class SimulatedBroker:
         fee_scenario: FeeScenario | None = None, seed: int = 0,
         day_order_end_status: Literal["expired", "canceled"] = "expired",
         paper_cancel_terminal_returns_204: bool = False, duplicate_client_order_id_status: int = 422,
+        opening_journal: bool = False,
     ) -> None:
         if os.environ.get("TRADEPULSE_EXECUTION_MODE", "").strip().lower() == "live":
             raise RuntimeError("SimulatedBroker refuses to exist when TRADEPULSE_EXECUTION_MODE is live")
@@ -564,6 +565,14 @@ class SimulatedBroker:
         self._overfill_pending: Decimal | None = None
         self._holds: dict[str, list[asyncio.Event]] = {}
         self._withheld: set[str] = set()
+        if opening_journal and self._history[0].cash > 0:
+            # A real paper account is funded by a cash journal; the starting
+            # cash is then explained by the activity history (Rev.140 P1).
+            created_ny = self._created_at.astimezone(NEW_YORK)
+            raw = {"activity_type": "JNLC", "currency": "USD", "date": created_ny.date().isoformat(),
+                   "description": "Cash journal", "net_amount": str(self._history[0].cash), "status": "executed",
+                   "created_at": _ts(self._created_at), "id": f"{created_ny:%Y%m%d}000000000::{self._uuid()}"}
+            self._activities.append(_Activity(raw["id"], self._created_at, self._created_at, dict(sorted(raw.items()))))
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -818,6 +827,7 @@ class SimulatedBroker:
         last_equity = self._equity_at(reference)[0]
         raw: dict[str, Any] = {
             "id": self._account_id, "account_number": self._account_number, "status": "ACTIVE", "currency": "USD",
+            "created_at": _ts(self._created_at),
             "cash": str(cash), "equity": str(equity), "last_equity": str(last_equity), "buying_power": str(cash),
             "portfolio_value": str(equity), "long_market_value": str(long_value),
             "short_market_value": str(short_value),

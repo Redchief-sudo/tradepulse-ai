@@ -289,6 +289,7 @@ async def test_each_order_capable_command_refuses_when_the_lease_is_held(
     assert len(held) == 3 and all("another runtime" in r.detail for r in held)  # type: ignore[attr-defined]
 
 
+@pytest.mark.usefixtures("fill_cursor_bootstrapped")
 async def test_lease_released_only_after_order_capable_tasks_finish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:

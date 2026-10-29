@@ -234,6 +234,7 @@ def _stub_account(monkeypatch, number: str = "CLITEST") -> None:
 
 
 @respx.mock
+@pytest.mark.usefixtures("fill_cursor_bootstrapped")
 async def test_scan_leg_skipped_when_its_lock_is_held_but_monitor_leg_still_runs(tmp_path, monkeypatch) -> None:
     """A held scan lease must short-circuit the scan leg before any AI/broker
     order call is made -- if it didn't, this test would fail via respx's
@@ -255,6 +256,7 @@ async def test_scan_leg_skipped_when_its_lock_is_held_but_monitor_leg_still_runs
 
 
 @respx.mock
+@pytest.mark.usefixtures("fill_cursor_bootstrapped")
 async def test_three_lane_concurrent_scan_locks_independently_and_survives_one_crash(tmp_path, monkeypatch) -> None:
     """The parallel multi-asset supervisor: three lanes fan out from ONE
     `_run_scan` call, each independently lock-protected (proven by each
@@ -289,6 +291,7 @@ async def test_three_lane_concurrent_scan_locks_independently_and_survives_one_c
 
 
 @respx.mock
+@pytest.mark.usefixtures("fill_cursor_bootstrapped")
 async def test_market_data_capabilities_resolved_once_before_lane_fanout(tmp_path, monkeypatch) -> None:
     """Capability resolution is a single broker-level fact, not a per-lane
     one -- it must happen exactly once, before the scan legs fan out, never
@@ -317,6 +320,7 @@ async def test_market_data_capabilities_resolved_once_before_lane_fanout(tmp_pat
 
 
 @respx.mock
+@pytest.mark.usefixtures("fill_cursor_bootstrapped")
 async def test_monitor_exits_cleanly_when_lock_is_held(tmp_path, monkeypatch) -> None:
     _stub_account(monkeypatch)
     database_url = f"sqlite:///{tmp_path}/test.db"
@@ -1002,6 +1006,7 @@ def _stub_build_dashboard_server(state: Any, port: int, log_level: str) -> Any:
     return object()
 
 
+@pytest.mark.usefixtures("fill_cursor_bootstrapped")
 async def test_run_application_lock_lifecycle_refuses_duplicate_and_releases_on_shutdown(tmp_path, monkeypatch) -> None:
     """Per review: run_with_lock_renewal only ever RENEWS an already-held
     lease -- _run_application must explicitly acquire_lock before it and
@@ -1047,6 +1052,7 @@ async def test_run_application_lock_lifecycle_refuses_duplicate_and_releases_on_
     assert await acquire_lock(database, RUN_LOCK_KEY, "post-check", "run", ttl_seconds=60) is True
 
 
+@pytest.mark.usefixtures("fill_cursor_bootstrapped")
 async def test_run_application_still_starts_supervisor_when_session_activation_refused(tmp_path, monkeypatch) -> None:
     """Rev.115: a refused `run_start()` (RISK_STOPPED, FINANCIAL_INTEGRITY_BLOCKED,
     broker unreachable, ...) must never leave open positions without a monitor,
@@ -1086,6 +1092,7 @@ async def test_run_application_still_starts_supervisor_when_session_activation_r
     assert supervisor_calls == 1  # protection (monitor/settle/reconcile) must run; scan lanes idle until the session is active
 
 
+@pytest.mark.usefixtures("fill_cursor_bootstrapped")
 async def test_run_application_starts_supervisor_when_session_already_market_closed(tmp_path, monkeypatch) -> None:
     """Regression test for a live defect: a session already sitting in
     MARKET_CLOSED (the routine overnight state sync_market_session leaves
@@ -1127,6 +1134,7 @@ async def test_run_application_starts_supervisor_when_session_already_market_clo
     assert supervisor_calls == 1  # crypto/monitor/settle must still get scheduled
 
 
+@pytest.mark.usefixtures("fill_cursor_bootstrapped")
 async def test_run_application_still_gates_activation_but_starts_supervisor_from_a_fresh_disabled_session(tmp_path, monkeypatch) -> None:
     """Symmetry check: the MARKET_CLOSED bypass above must not accidentally
     widen to every state -- a brand-new (DISABLED) session still goes
@@ -1213,3 +1221,32 @@ async def test_verification_reconcile_tick_records_rate_limit_headroom(tmp_path,
     assert details["rate_limited_responses"] == before + 1
     from tradepulse.broker.alpaca_client import RATE_LIMIT_PROCESS_ID
     assert details["rate_limit_process_id"] == RATE_LIMIT_PROCESS_ID
+
+
+@respx.mock
+@pytest.mark.parametrize("command", ["monitor", "scan"])
+async def test_order_capable_commands_refuse_before_the_fill_cursor_is_bootstrapped(tmp_path, monkeypatch, caplog, command) -> None:
+    """Rev.140 §3.1a step 7: never half-protected by a runtime that cannot
+    authorize sells. The refusal names the remedy."""
+    from tradepulse.models import AssetClass
+
+    _stub_account(monkeypatch)
+    database_url = f"sqlite:///{tmp_path}/test.db"
+    await AsyncSQLiteDatabase(database_url).initialize()
+    with caplog.at_level("ERROR"):
+        if command == "monitor":
+            exit_code = await _run_monitor(_settings(database_url))
+        else:
+            from tradepulse.cli import _run_scan
+            exit_code = await _run_scan(_settings(database_url), [AssetClass.EQUITY])
+    assert exit_code == 1
+    refusals = [r for r in caplog.records if r.getMessage() == "fill_cursor_not_bootstrapped"]
+    assert len(refusals) == 1 and refusals[0].reason == "FILL_CURSOR_NOT_BOOTSTRAPPED"
+
+
+def test_bootstrap_command_requires_a_reason() -> None:
+    from tradepulse.cli import _build_parser
+
+    args = _build_parser().parse_args(["reconcile", "bootstrap-fill-cursor", "--reason", "first Rev.140 deployment"])
+    assert (args.action, args.reason) == ("bootstrap-fill-cursor", "first Rev.140 deployment")
+    assert _build_parser().parse_args(["reconcile"]).action is None

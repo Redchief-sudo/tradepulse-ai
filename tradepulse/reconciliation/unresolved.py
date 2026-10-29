@@ -17,8 +17,7 @@ from hashlib import sha256
 from typing import Literal
 
 from tradepulse.broker.port import BrokerActivity
-from tradepulse.broker.symbols import infer_alpaca_asset_class
-from tradepulse.models.market import asset_key_from_broker_symbol
+from tradepulse.broker.symbols import broker_symbol_asset_key
 from tradepulse.models.quarantine import UnresolvedBrokerExecution, UnresolvedExecutionOutcome
 from tradepulse.persistence import PersistenceRepositories, hydrate, paginate_all_rows
 from tradepulse.persistence.codec import decode_payload, encode_payload
@@ -77,7 +76,7 @@ async def record_pass(repositories: PersistenceRepositories, activities: Sequenc
                 raise ValueError(f"INVENTORY_EVIDENCE_INVALID: unparsable FILL {activity.activity_id}")
             record = UnresolvedBrokerExecution(
                 activity_id=activity.activity_id,
-                asset_key=asset_key_from_broker_symbol(infer_alpaca_asset_class(activity.symbol), activity.symbol),
+                asset_key=broker_symbol_asset_key(activity.symbol),
                 side=activity.side, quantity=activity.qty, price=activity.price,
                 transaction_time=activity.transaction_time, raw_sha256=raw_digest(activity),
                 first_seen_at=now, pass_id=pass_id)

@@ -71,6 +71,7 @@ async def test_supervisor_starts_every_lane_including_plain_reconcile(monkeypatc
     assert sorted(started) == ["crypto", "equity", "monitor", "option", "reconcile", "settle"]
 
 
+@pytest.mark.usefixtures("fill_cursor_bootstrapped")
 async def test_refused_activation_still_starts_the_supervisor_and_keeps_the_process_up(tmp_path, monkeypatch):
     _stub_account(monkeypatch)
     settings = _settings(f"sqlite:///{tmp_path}/test.db")
@@ -95,6 +96,7 @@ async def test_refused_activation_still_starts_the_supervisor_and_keeps_the_proc
     assert len(supervisor_calls) == 1
 
 
+@pytest.mark.usefixtures("fill_cursor_bootstrapped")
 async def test_resume_does_not_activate_a_stopped_session_but_still_starts_the_supervisor(tmp_path, monkeypatch):
     _stub_account(monkeypatch)
     repositories = await _repositories(tmp_path)

@@ -37,5 +37,22 @@ def infer_alpaca_asset_class(symbol: str, declared: AssetClass | None = None) ->
     return AssetClass.CRYPTO if _CRYPTO_TICKER_PATTERN.match(raw) else AssetClass.EQUITY
 
 
+_OCC_OPTION_SYMBOL = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+
+
+def broker_symbol_asset_class(symbol: str) -> AssetClass:
+    """The asset class of a bare broker symbol, OCC options included.
+    infer_alpaca_asset_class predates options and keys an OCC symbol as an
+    equity, which loses the contract multiplier (Rev.140 finding)."""
+    raw = str(symbol or "").strip().upper()
+    return AssetClass.OPTION if _OCC_OPTION_SYMBOL.match(raw) else infer_alpaca_asset_class(raw)
+
+
+def broker_symbol_asset_key(symbol: str) -> str:
+    from tradepulse.models.market import asset_key_from_broker_symbol
+
+    return asset_key_from_broker_symbol(broker_symbol_asset_class(symbol), symbol)
+
+
 def default_time_in_force(asset_class: AssetClass) -> str:
     return "gtc" if asset_class == AssetClass.CRYPTO else "day"

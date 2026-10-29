@@ -8,8 +8,8 @@ from typing import Any, Literal
 from .base import immutable_metadata, require_aware, require_text
 from .enums import ReconciliationOutcome
 
-ReconciliationType = Literal["order", "position", "position_view", "position_accounting", "fill", "equity", "asset_fee", "accounting_projection", "accounting_population", "accounting_migration", "generation_membership"]
-_TYPES = {"order", "position", "position_view", "position_accounting", "fill", "equity", "asset_fee", "accounting_projection", "accounting_population", "accounting_migration", "generation_membership"}
+ReconciliationType = Literal["order", "position", "position_view", "position_accounting", "fill", "equity", "asset_fee", "accounting_projection", "accounting_population", "accounting_migration", "generation_membership", "late_activity", "activity_history"]
+_TYPES = {"order", "position", "position_view", "position_accounting", "fill", "equity", "asset_fee", "accounting_projection", "accounting_population", "accounting_migration", "generation_membership", "late_activity", "activity_history"}
 
 
 @dataclass(frozen=True, slots=True)

@@ -62,6 +62,9 @@ class Settings:
     crypto_universe_path: str | None
     options_universe_path: str | None
     alpaca_market_data_tier: str
+    # Rev.140 §3.1a: the overlap read reaches back this far from C. A cost
+    # choice, not a proven bound; the daily full re-read covers the rest.
+    fill_overlap_days: int = 7
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -116,4 +119,5 @@ class Settings:
             crypto_universe_path=values.get("TRADEPULSE_CRYPTO_UNIVERSE_PATH") or None,
             options_universe_path=values.get("TRADEPULSE_OPTIONS_UNIVERSE_PATH") or None,
             alpaca_market_data_tier=alpaca_market_data_tier,
+            fill_overlap_days=_int(values, "TRADEPULSE_FILL_OVERLAP_DAYS", 7, 1),
         )

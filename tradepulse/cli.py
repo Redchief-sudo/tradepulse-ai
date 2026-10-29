@@ -426,6 +426,52 @@ async def _enter_account_lease(stack: contextlib.ExitStack, broker: BrokerPort, 
     return lease
 
 
+async def _require_fill_cursor(repositories: PersistenceRepositories, lease: AccountLease) -> bool:
+    """Rev.140 §3.1a step 7: no order-capable command starts before the fill
+    cursor is bootstrapped. Positions are never half-protected by a runtime
+    that cannot authorize sells."""
+    from tradepulse.reconciliation.bootstrap import FillHistoryIncomplete, require_bootstrapped
+
+    try:
+        await require_bootstrapped(repositories, lease.ref.key)
+    except FillHistoryIncomplete as exc:
+        logger.error("fill_cursor_not_bootstrapped", extra={
+            "event": "fill_cursor_not_bootstrapped", "reason": exc.reason,
+            "remedy": "tradepulse reconcile bootstrap-fill-cursor --reason \"...\""})
+        return False
+    return True
+
+
+async def _run_bootstrap_fill_cursor(settings: Settings, reason: str) -> int:
+    """`tradepulse reconcile bootstrap-fill-cursor --reason`: creates C from
+    complete broker history, holding the account lease itself, so no runtime
+    can be running."""
+    from tradepulse.reconciliation.bootstrap import FillHistoryIncomplete, bootstrap_fill_cursor
+
+    _require_credentials(settings, require_ai=False)
+    database = AsyncSQLiteDatabase(settings.database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    broker = _build_broker(settings)
+    stack = contextlib.ExitStack()
+    try:
+        lease = await _enter_account_lease(stack, broker, "tradepulse reconcile bootstrap-fill-cursor")
+        if lease is None:
+            return 1
+        with stack:
+            try:
+                record = await bootstrap_fill_cursor(repositories, broker, lease, reason=reason, now=datetime.now(UTC))
+            except FillHistoryIncomplete as exc:
+                logger.error("fill_cursor_bootstrap_refused", extra={"event": "fill_cursor_bootstrap_refused", "reason": exc.reason})
+                return 1
+            logger.info("fill_cursor_bootstrapped", extra={
+                "event": "fill_cursor_bootstrapped", "boundary_activity_id": record.boundary_activity_id,
+                "activity_count": record.activity_count})
+            return 0
+    finally:
+        await broker.aclose()
+
+
 async def _run_scan(settings: Settings, asset_classes: list[AssetClass]) -> int:
     """`tradepulse scan --asset-class=... [asset-class ...]`: one or more
     lanes' discovery plus the stop/target position monitor, all CONCURRENTLY
@@ -454,6 +500,8 @@ async def _run_scan(settings: Settings, asset_classes: list[AssetClass]) -> int:
     try:
         lease = await _enter_account_lease(stack, broker, "tradepulse scan")
         if lease is None:
+            return 1
+        if not await _require_fill_cursor(repositories, lease):
             return 1
         with stack:  # every leg below finishes before the account lease is released
             capabilities = await _resolve_and_apply_market_data_feeds(broker, settings)
@@ -495,6 +543,8 @@ async def _run_monitor(settings: Settings) -> int:
     try:
         lease = await _enter_account_lease(stack, broker, "tradepulse monitor")
         if lease is None:
+            return 1
+        if not await _require_fill_cursor(repositories, lease):
             return 1
         with stack:
             await _resolve_and_apply_market_data_feeds(broker, settings)
@@ -580,6 +630,7 @@ async def _run_reconcile(settings: Settings) -> int:
             summary = await run_with_lock_renewal(
                 database, RECONCILE_LOCK_KEY, owner_token, RECONCILE_LOCK_TTL_SECONDS,
                 run_reconciliation(repositories, broker, settlement, alerts, lease_lost=lease_lost,
+                                   fill_overlap_days=settings.fill_overlap_days,
                                    reconcile_lease=(RECONCILE_LOCK_KEY, owner_token)),
                 on_renewal_failed=on_lease_lost,
             )
@@ -1089,6 +1140,8 @@ async def _run_application(settings: Settings, port: int, open_browser: bool, *,
         lease = await _enter_account_lease(stack, broker, "tradepulse run")
         if lease is None:
             return 1
+        if not await _require_fill_cursor(repositories, lease):
+            return 1
         with stack:
             owner_token = str(uuid4())
             if not await acquire_lock(database, RUN_LOCK_KEY, owner_token, "run", RUN_LOCK_TTL_SECONDS):
@@ -1126,6 +1179,9 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("settle", help="drain any due settlement retries and exit")
     reconcile_parser = subparsers.add_parser("reconcile", help="run one reconciliation pass against Alpaca's real state and exit")
     reconcile_parser.add_argument("--verification-generation", help="verify the bound paper generation before and after reconciliation")
+    reconcile_parser.add_argument("action", nargs="?", choices=["bootstrap-fill-cursor"],
+                                  help="bootstrap-fill-cursor: create the fill cursor from complete broker history (Rev.140)")
+    reconcile_parser.add_argument("--reason", help="why the fill cursor is being bootstrapped (required with bootstrap-fill-cursor)")
     subparsers.add_parser("start", help="activate the trading session (refuses from RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED/SYSTEM_DEGRADED/MARKET_CLOSED)")
     subparsers.add_parser("stop", help="deactivate the trading session (never downgrades an active safety block)")
     subparsers.add_parser("status", help="report the current trading session state and exit")
@@ -1284,6 +1340,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "verification":
             return asyncio.run(verification_command(settings, args))
+        if args.command == "reconcile" and getattr(args, "action", None) == "bootstrap-fill-cursor":
+            if generation is not None or not (args.reason or "").strip():
+                print("tradepulse: bootstrap-fill-cursor needs --reason and no --verification-generation", file=sys.stderr)
+                return 1
+            return asyncio.run(_run_bootstrap_fill_cursor(settings, args.reason))
         if args.command == "reconcile" and generation is not None:
             return asyncio.run(run_official(settings, generation, lambda verification: _run_reconcile(settings),
                                             reconciliation_only=True))
