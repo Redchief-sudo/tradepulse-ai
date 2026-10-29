@@ -16,7 +16,7 @@ from tradepulse.settlement.engine import _infer_exit_reason, _parse_int_or_none
 from tradepulse.time import aware_utc
 
 from .asset_fees import AssetFeeIntegrityError, AssetFeePending
-from .cash_fees import allocate_cash_fees
+from .cash_fees import allocate_cash_fees_with_quarantine
 from .fee_population import validate_fee_population
 from .historical_fees import preview_fee_replay
 
@@ -91,6 +91,11 @@ async def replay_asset_fees(repositories, asset, activities, broker_quantity, *,
         old_quantity = sum((lot.signed_quantity for lot in lots), Decimal(0))
         if (holding.quantity if holding else Decimal(0)) != old_quantity:
             raise AssetFeeIntegrityError('ASSET_FEE_HOLDING_LOT_MISMATCH')
+        if fees and any(asset_identity_key(hydrate('short_exposure_liabilities', decode_payload(row['payload'])).asset) == key
+                        for row in connection.execute('SELECT payload FROM short_exposure_liabilities')):
+            # Rev.140 §3.6: in-asset fee units never fall on short excess;
+            # the asset holds until its liabilities are resolved.
+            raise AssetFeeIntegrityError('ASSET_FEE_UNSUPPORTED_SHORT_INVENTORY')
         new_lots, realized = preview_fee_replay(lots, events, fees)
         quantity = sum((lot.signed_quantity for lot in new_lots), Decimal(0))
         from .membership import opening_quantities
@@ -201,7 +206,14 @@ async def replay_asset_fees(repositories, asset, activities, broker_quantity, *,
             change('holdings', key, decode_payload(holding_row['payload']), updated)
         elif quantity:
             raise AssetFeeIntegrityError('ASSET_FEE_HOLDING_MISSING')
-        cash_plans = allocate_cash_fees(proof, desired_attrs.values())
+        # Rev.140 §3.6: an oversell's liability is a final allocation target of its order's fees.
+        quarantined: dict[str, list[tuple[str, Decimal]]] = {}
+        for row in connection.execute('SELECT payload FROM short_exposure_liabilities'):
+            liability = hydrate('short_exposure_liabilities', decode_payload(row['payload']))
+            quarantined.setdefault(liability.trade_intent_id, []).append((liability.liability_id, liability.proceeds))
+        cash_plans, quarantine_shares = allocate_cash_fees_with_quarantine(proof, desired_attrs.values(), quarantined)
+        from tradepulse.quarantine.fees import insert_allocations
+        insert_allocations(connection, quarantine_shares, now.isoformat())
         cash_records = []
         cash_entries = []
         cash_allocation_versions = {}
