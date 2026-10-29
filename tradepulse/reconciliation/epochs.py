@@ -439,6 +439,8 @@ def checkpoint_issues(connection):
                 tables[table][row['record_id']] = decode_payload(row['payload'])
             except (ValueError, TypeError) as exc:
                 issues[table + ':' + row['record_id']] = str(exc)
+    from tradepulse.quarantine.legacy import converted_lot_ids
+    converted = converted_lot_ids(connection)
     fills = tables['fills']
     intents = tables['trade_intents']
     records = tables['reconciliation_records']
@@ -458,7 +460,8 @@ def checkpoint_issues(connection):
                         raise ValueError('CHECKPOINT_FILL_IDENTITY_MISMATCH')
                     destination[key].add(identifier)
                 elif table == 'position_lots':
-                    destination[key] += item.signed_quantity
+                    if item.lot_id not in converted:  # Rev.140 §3.9
+                        destination[key] += item.signed_quantity
                 else:
                     if key != identifier:
                         raise ValueError('CHECKPOINT_HOLDING_IDENTITY_MISMATCH')

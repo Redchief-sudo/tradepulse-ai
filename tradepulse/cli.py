@@ -504,6 +504,35 @@ async def _run_quarantine_resolve(settings: Settings, activity_id: str, reason: 
         await broker.aclose()
 
 
+async def _run_adopt_legacy_lot(settings: Settings, lot_id: str, reason: str) -> int:
+    """`tradepulse quarantine adopt-legacy-lot <lot_id> --reason` (Rev.140 §3.9),
+    holding the account lease itself."""
+    from tradepulse.quarantine.legacy import AdoptRefused, adopt_legacy_lot
+
+    _require_credentials(settings, require_ai=False)
+    database = AsyncSQLiteDatabase(settings.database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    broker = _build_broker(settings)
+    stack = contextlib.ExitStack()
+    try:
+        lease = await _enter_account_lease(stack, broker, "tradepulse quarantine adopt-legacy-lot")
+        if lease is None:
+            logger.error("legacy_lot_adoption_refused", extra={"event": "legacy_lot_adoption_refused", "reason": "ACCOUNT_LEASE_HELD"})
+            return 1
+        with stack:
+            try:
+                conversion = await adopt_legacy_lot(repositories, broker, lease, lot_id, reason, datetime.now(UTC))
+            except AdoptRefused as exc:
+                logger.error("legacy_lot_adoption_refused", extra={"event": "legacy_lot_adoption_refused", "reason": exc.reason})
+                return 1
+            logger.info("legacy_lot_adopted", extra={
+                "event": "legacy_lot_adopted", "lot_id": lot_id, "liability_id": conversion.liability_id})
+            return 0
+    finally:
+        await broker.aclose()
+
+
 async def _run_scan(settings: Settings, asset_classes: list[AssetClass]) -> int:
     """`tradepulse scan --asset-class=... [asset-class ...]`: one or more
     lanes' discovery plus the stop/target position monitor, all CONCURRENTLY
@@ -1188,6 +1217,11 @@ async def _run_application(settings: Settings, port: int, open_browser: bool, *,
                 if await relatch_if_open_unresolved(repositories, datetime.now(UTC)):
                     logger.error("startup_relatched_unresolved_broker_execution",
                                  extra={"event": "startup_relatched_unresolved_broker_execution"})
+                from tradepulse.quarantine.legacy import latch_legacy_short_lots
+
+                if await latch_legacy_short_lots(repositories, datetime.now(UTC)):
+                    logger.error("startup_relatched_quarantined_inventory",
+                                 extra={"event": "startup_relatched_quarantined_inventory"})
                 return await run_with_lock_renewal(database, RUN_LOCK_KEY, owner_token, RUN_LOCK_TTL_SECONDS, work(lease))
             finally:
                 await release_lock(database, RUN_LOCK_KEY, owner_token)
@@ -1215,9 +1249,11 @@ def _build_parser() -> argparse.ArgumentParser:
                                   help="bootstrap-fill-cursor: create the fill cursor from complete broker history (Rev.140)")
     reconcile_parser.add_argument("--reason", help="why the fill cursor is being bootstrapped (required with bootstrap-fill-cursor)")
     quarantine_parser = subparsers.add_parser("quarantine", help="controlled resolution of quarantined inventory (Rev.140)")
-    quarantine_parser.add_argument("action", choices=["resolve"],
-                                   help="resolve: account for one broker execution against quarantined inventory")
-    quarantine_parser.add_argument("--activity", required=True, help="the broker FILL activity ID")
+    quarantine_parser.add_argument("action", choices=["resolve", "adopt-legacy-lot"],
+                                   help="resolve: account for one broker execution against quarantined inventory; "
+                                        "adopt-legacy-lot: convert a pre-Rev.140 short lot into a liability")
+    quarantine_parser.add_argument("lot_id", nargs="?", help="the legacy short lot (adopt-legacy-lot)")
+    quarantine_parser.add_argument("--activity", help="the broker FILL activity ID (resolve)")
     quarantine_parser.add_argument("--reason", required=True, help="why this execution resolves the inventory")
     subparsers.add_parser("start", help="activate the trading session (refuses from RISK_STOPPED/FINANCIAL_INTEGRITY_BLOCKED/SYSTEM_DEGRADED/MARKET_CLOSED)")
     subparsers.add_parser("stop", help="deactivate the trading session (never downgrades an active safety block)")
@@ -1386,10 +1422,14 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(run_official(settings, generation, lambda verification: _run_reconcile(settings),
                                             reconciliation_only=True))
         if args.command == "quarantine":
-            if not args.reason.strip():
-                print("tradepulse: quarantine resolve needs a non-empty --reason", file=sys.stderr)
+            target = args.activity if args.action == "resolve" else args.lot_id
+            if not args.reason.strip() or not target or (args.action == "resolve") == (args.lot_id is not None):
+                print("tradepulse: quarantine resolve --activity <id> --reason, or adopt-legacy-lot <lot_id> --reason",
+                      file=sys.stderr)
                 return 1
-            return asyncio.run(_run_quarantine_resolve(settings, args.activity, args.reason))
+            if args.action == "adopt-legacy-lot":
+                return asyncio.run(_run_adopt_legacy_lot(settings, target, args.reason))
+            return asyncio.run(_run_quarantine_resolve(settings, target, args.reason))
         if args.command == "reset-integrity":
             return asyncio.run(_run_reset_integrity(settings, force=args.force))
         if args.command == "scan":

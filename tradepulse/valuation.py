@@ -237,8 +237,12 @@ async def marked_snapshot(
         if key not in states or state != 'reconciled_net':
             states[key] = state
     lot_quantities = {}
+    from tradepulse.quarantine.legacy import converted_lots
+    converted = await converted_lots(repositories)
     for row in await paginate_all_rows(repositories.position_lots):
         lot = hydrate('position_lots', row['payload'])
+        if lot.lot_id in converted:
+            continue  # Rev.140 §3.9: valued as its liability
         key = asset_identity_key(lot.asset)
         lot_quantities[key] = lot_quantities.get(key, Decimal(0)) + lot.signed_quantity
     broker_quantities = {asset_key_from_broker_symbol(p.asset_class, p.symbol): p.qty for p in positions}

@@ -20,10 +20,11 @@ from tradepulse.broker.symbols import broker_symbol_asset_key
 CORPORATE_ACTION_ACTIVITY_TYPES = frozenset({
     "MA", "NC", "SC", "SSO", "SSP", "REORG", "ACATS", "JNLS", "FOPT", "OPASN", "OPEXP", "OPXRC",
 })
-# Executions, fees and cash flows: none changes the instrument's quantity.
+# Executions, fees and account cash flows. A distribution naming the
+# instrument (DIV, DIVFEE, DIVNRA, CGD) is not harmless: on a short liability
+# it is a payment in lieu owed (§3.10), so it blocks like any unknown type.
 HARMLESS_ACTIVITY_TYPES = frozenset({
-    "FILL", "FEE", "CFEE", "PTC", "PTR", "JNLC", "JNL", "ACATC", "CSD", "CSW", "TRANS",
-    "DIV", "DIVFEE", "DIVNRA", "CGD", "INT", "INTNRA", "INTTW",
+    "FILL", "FEE", "CFEE", "PTC", "PTR", "JNLC", "ACATC", "CSD", "CSW", "TRANS", "INT", "INTNRA", "INTTW",
 })
 
 
@@ -44,7 +45,7 @@ def corporate_action_blocks(activities: Sequence[BrokerActivity], asset_key: str
     for activity in activities:
         if not activity.symbol or broker_symbol_asset_key(activity.symbol) != asset_key:
             continue
-        if activity.activity_type in HARMLESS_ACTIVITY_TYPES and activity.activity_type not in CORPORATE_ACTION_ACTIVITY_TYPES:
+        if activity.activity_type in HARMLESS_ACTIVITY_TYPES:
             continue
         when = _activity_date(activity)
         if when is not None and when < since.date():

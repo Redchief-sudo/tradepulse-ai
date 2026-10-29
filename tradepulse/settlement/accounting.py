@@ -58,9 +58,11 @@ def pnl_evidence(connection, event):
     allocated = Decimal(0)
     realized = Decimal(0)
     expected_attrs = set()
+    from tradepulse.quarantine.legacy import converted_lot_ids
+    converted = converted_lot_ids(connection)  # Rev.140 §3.9: its liability counts instead (I3)
     for row in connection.execute('SELECT payload FROM position_lots'):
         lot = hydrate('position_lots', decode_payload(row['payload']))
-        if asset_identity_key(lot.asset) != key:
+        if asset_identity_key(lot.asset) != key or lot.lot_id in converted:
             continue
         if lot.originating_fill_id == fill.fill_id:
             if (lot.acquisition_price != fill.price or lot.opened_at != fill.filled_at

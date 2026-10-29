@@ -456,11 +456,14 @@ async def run_position_monitor(
     # protective-stop monitoring. Open/closed is determined below via the
     # payload's own Decimal-based lot.status property, never a SQL-side
     # numeric filter.
+    from tradepulse.quarantine.legacy import converted_lots
+
     lot_rows = await paginate_all_rows(repositories.position_lots)
+    converted = await converted_lots(repositories)
     open_lots_by_asset: dict[str, list[PositionLot]] = {}
     for row in lot_rows:
         lot = hydrate("position_lots", row["payload"])
-        if lot.status in ("open", "partially_closed"):
+        if lot.status in ("open", "partially_closed") and lot.lot_id not in converted:
             open_lots_by_asset.setdefault(asset_identity_key(lot.asset), []).append(lot)
 
     # Detection pass first: an unprotected position is reported before any

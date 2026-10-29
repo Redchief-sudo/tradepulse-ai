@@ -136,9 +136,12 @@ async def _rebuild_holding_from_lots(
     duplicate over reaching into another module's private internals, same
     as execution/gateway.py's own `symbol.upper()` holding-key convention)."""
     # FIN-090-01: asset-scoped, unbounded pagination -- NOT list_all(limit=N).
+    from tradepulse.quarantine.legacy import converted_lots
+
     lot_rows = await list_all_by_asset(repositories.position_lots, asset)
+    converted = await converted_lots(repositories)
     lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
-    open_lots = [lot for lot in lots if lot.status in _OPEN_LOT_STATUSES]
+    open_lots = [lot for lot in lots if lot.status in _OPEN_LOT_STATUSES and lot.lot_id not in converted]
     if not open_lots:
         return None
 
@@ -178,8 +181,11 @@ async def _reconcile_positions(
     # FIN-090-01: unbounded, whole-table pagination -- cross-asset by
     # design (every held asset compared at once). Open/closed determined
     # below via the payload's own Decimal-based lot.status property.
+    from tradepulse.quarantine.legacy import converted_lots
+
     lot_rows = await paginate_all_rows(repositories.position_lots)
-    all_lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
+    converted = await converted_lots(repositories)  # Rev.140 §3.9: a converted lot is its liability now
+    all_lots = [lot for lot in (hydrate("position_lots", row["payload"]) for row in lot_rows) if lot.lot_id not in converted]
     open_lots_by_asset_key: dict[str, Decimal] = {}
     asset_by_key: dict[str, AssetIdentity] = {}
     for lot in all_lots:
@@ -880,6 +886,8 @@ async def run_reconciliation(
     except Exception as exc:
         projection_error = 'CANONICAL_ACCOUNTING_REPLAY_FAILED:' + str(exc)
         await latch_financial_integrity_block(repositories, projection_error, clock=lambda: now)
+    from tradepulse.quarantine.legacy import latch_legacy_short_lots
+    await latch_legacy_short_lots(repositories, now)  # Rev.140 I8, every pass
     await _recover_stranded_intents(repositories, broker, alerts, now, lease_lost, reconcile_lease=reconcile_lease)
     await _recover_inflight_orders(repositories, broker, settlement, alerts, now, lease_lost)
     fee_error = None

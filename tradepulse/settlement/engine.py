@@ -68,6 +68,12 @@ from .stages import (
 logger = logging.getLogger(__name__)
 
 
+async def _converted_lots(repositories: PersistenceRepositories) -> frozenset[str]:
+    from tradepulse.quarantine.legacy import converted_lots
+
+    return await converted_lots(repositories)
+
+
 async def _project_lot(repositories: PersistenceRepositories, event: SettlementEvent) -> Mapping[str, Any]:
     # FIN-090-01: asset-scoped, unbounded pagination -- NOT list_all(limit=N),
     # which is oldest-first and would silently drop this asset's lots once
@@ -75,7 +81,8 @@ async def _project_lot(repositories: PersistenceRepositories, event: SettlementE
     # already-closed) must be visible here for closure.get(event.fill_id)
     # replay-protection below.
     lot_rows = await list_all_by_asset(repositories.position_lots, event.asset)
-    symbol_lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
+    converted = await _converted_lots(repositories)  # Rev.140 §3.9: a converted lot is its liability now
+    symbol_lots = [lot for lot in (hydrate("position_lots", row["payload"]) for row in lot_rows) if lot.lot_id not in converted]
     plan = plan_signed_lot_fill(symbol_lots, event)
     if any(closure.lot.position_side == "short" for closure in plan.closures):
         # Rev.140: TradePulse never covers a short. A legacy short lot is
@@ -326,8 +333,9 @@ async def _project_holding(repositories: PersistenceRepositories, event: Settlem
     # Decimal-based lot.status filter (never a SQL numeric cast) -- see
     # persistence/repositories.py::paginate_all_rows's docstring for why.
     lot_rows = await list_all_by_asset(repositories.position_lots, event.asset)
+    converted = await _converted_lots(repositories)
     lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
-    open_lots = [lot for lot in lots if lot.status in ("open", "partially_closed")]
+    open_lots = [lot for lot in lots if lot.status in ("open", "partially_closed") and lot.lot_id not in converted]
 
     record_id = _holding_record_id(event.asset)
     existing_row = await repositories.holdings.get(record_id)
@@ -428,8 +436,9 @@ async def _verify_integrity(repositories: PersistenceRepositories, event: Settle
     # produce a false-negative HOLDING_LOT_MISMATCH (the exact failure mode
     # this whole fix is about).
     lot_rows = await list_all_by_asset(repositories.position_lots, event.asset)
+    converted = await _converted_lots(repositories)
     lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
-    open_lots = [lot for lot in lots if lot.status in ("open", "partially_closed")]
+    open_lots = [lot for lot in lots if lot.status in ("open", "partially_closed") and lot.lot_id not in converted]
     lot_qty = sum((lot.signed_quantity for lot in open_lots), Decimal("0"))
 
     holding_row = await repositories.holdings.get(_holding_record_id(event.asset))
