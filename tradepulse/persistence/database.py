@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypeVar
@@ -138,6 +138,38 @@ CREATE INDEX IF NOT EXISTS idx_fills_filled_at ON fills(json_extract(payload,'$.
 CREATE INDEX IF NOT EXISTS idx_equity_total_equity_real ON equity_snapshots(CAST(json_extract(payload,'$.total_equity') AS REAL));
 CREATE INDEX IF NOT EXISTS idx_scan_runs_status ON scan_runs(status, created_at, record_id);
 CREATE INDEX IF NOT EXISTS idx_integrity_holds_status ON integrity_holds(status, created_at, record_id);
+-- Rev.140 quarantine evidence: append-only, enforced by the triggers
+-- create_quarantine_triggers writes and verify_schema_triggers checks.
+CREATE TABLE IF NOT EXISTS short_exposure_liabilities (
+  record_id TEXT PRIMARY KEY, fill_id TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS unmanaged_long_inventory (
+  record_id TEXT PRIMARY KEY, cover_activity_id TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quarantine_executions (
+  record_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quarantine_resolutions (
+  record_id TEXT PRIMARY KEY, resolution_key TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quarantine_fee_allocations (
+  record_id TEXT PRIMARY KEY, allocation_key TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quarantine_fee_recognitions (
+  record_id TEXT PRIMARY KEY, recognition_key TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS legacy_lot_conversions (
+  record_id TEXT PRIMARY KEY, lot_id TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS unresolved_broker_executions (
+  record_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS unresolved_execution_outcomes (
+  record_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fill_cursor_bootstrap (
+  record_id TEXT PRIMARY KEY, account_ref TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
 """
 
 # These triggers record provenance even if an operator later deletes all rows.
@@ -147,7 +179,40 @@ EVIDENCE_TABLES = (
     "opportunities", "trade_intents", "orders", "fills", "settlements", "holdings",
     "position_lots", "cash_ledger", "pnl_records", "reconciliation_records",
     "scan_runs", "equity_snapshots", "trade_attributions", "integrity_holds",
+    "short_exposure_liabilities", "unmanaged_long_inventory", "quarantine_executions", "quarantine_resolutions",
+    "quarantine_fee_allocations", "quarantine_fee_recognitions", "legacy_lot_conversions",
+    "unresolved_broker_executions", "unresolved_execution_outcomes", "fill_cursor_bootstrap",
 )
+
+QUARANTINE_TABLES = EVIDENCE_TABLES[-10:]
+
+
+def _quarantine_trigger(table: str, operation: str) -> tuple[str, str]:
+    """The one template for both creating and verifying a trigger. Written on
+    one line so SQLite stores it in sqlite_master exactly as given."""
+    name = f"quarantine_no_{operation.lower()}_{table}"
+    return name, (f"CREATE TRIGGER {name} BEFORE {operation} ON {table} "
+                  f"BEGIN SELECT RAISE(ABORT, '{table} is append-only'); END")
+
+
+def create_quarantine_triggers(connection: sqlite3.Connection, tables: Iterable[str]) -> None:
+    """Only for tables created in the same initialize: re-creating a missing
+    trigger on an existing table would hide exactly what verification exists
+    to catch."""
+    for table in tables:
+        for operation in ("UPDATE", "DELETE"):
+            connection.execute(_quarantine_trigger(table, operation)[1])
+
+
+def verify_schema_triggers(connection: sqlite3.Connection) -> None:
+    """Every quarantine table refuses UPDATE and DELETE (spec §3.11, I9).
+    Raises SCHEMA_TRIGGER_MISSING when a trigger is absent or its SQL differs."""
+    for table in QUARANTINE_TABLES:
+        for operation in ("UPDATE", "DELETE"):
+            name, expected = _quarantine_trigger(table, operation)
+            row = connection.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()
+            if row is None or row[0] != expected:
+                raise DatabaseError(f"SCHEMA_TRIGGER_MISSING:{name}")
 
 
 def initialize_identity(connection: sqlite3.Connection, *, legacy: bool) -> None:
@@ -210,8 +275,11 @@ class AsyncSQLiteDatabase:
             connection = self._connect()
             try:
                 with connection:
+                    present = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                     connection.executescript(SCHEMA)
                     initialize_identity(connection, legacy=existed)
+                    create_quarantine_triggers(connection, [t for t in QUARANTINE_TABLES if t not in present])
+                verify_schema_triggers(connection)
             finally:
                 connection.close()
 

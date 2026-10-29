@@ -31,6 +31,10 @@ TABLES = {
     "trading_sessions", "audit_events", "scan_runs", "equity_snapshots", "ai_responses",
     "trade_attributions", "rejected_candidates", "integrity_holds",
     "accounting_epochs", "broker_activity_inbox", "broker_activity_cursors",
+    # Rev.140 quarantine evidence (append-only: create_once only)
+    "short_exposure_liabilities", "unmanaged_long_inventory", "quarantine_executions", "quarantine_resolutions",
+    "quarantine_fee_allocations", "quarantine_fee_recognitions", "legacy_lot_conversions",
+    "unresolved_broker_executions", "unresolved_execution_outcomes", "fill_cursor_bootstrap",
 }
 STATUS_TABLES = {"trade_intents", "orders", "settlements", "trading_sessions", "scan_runs", "integrity_holds"}
 STATUS_TABLES |= {"accounting_epochs", "broker_activity_cursors"}
@@ -41,6 +45,13 @@ UNIQUE_FIELDS = {
     "settlements": "fill_id",
     "position_lots": "originating_fill_id",
     "cash_ledger": "idempotency_key",
+    "short_exposure_liabilities": "fill_id",
+    "unmanaged_long_inventory": "cover_activity_id",
+    "quarantine_resolutions": "resolution_key",
+    "quarantine_fee_allocations": "allocation_key",
+    "quarantine_fee_recognitions": "recognition_key",
+    "legacy_lot_conversions": "lot_id",
+    "fill_cursor_bootstrap": "account_ref",
 }
 
 
@@ -686,6 +697,16 @@ class PersistenceRepositories:
     accounting_epochs: RecordRepository
     broker_activity_inbox: RecordRepository
     broker_activity_cursors: RecordRepository
+    short_exposure_liabilities: RecordRepository
+    unmanaged_long_inventory: RecordRepository
+    quarantine_executions: RecordRepository
+    quarantine_resolutions: RecordRepository
+    quarantine_fee_allocations: RecordRepository
+    quarantine_fee_recognitions: RecordRepository
+    legacy_lot_conversions: RecordRepository
+    unresolved_broker_executions: RecordRepository
+    unresolved_execution_outcomes: RecordRepository
+    fill_cursor_bootstrap: RecordRepository
 
     @classmethod
     def create(cls, database: AsyncSQLiteDatabase) -> PersistenceRepositories:

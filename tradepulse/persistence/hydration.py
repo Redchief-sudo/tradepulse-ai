@@ -51,6 +51,18 @@ from tradepulse.models import (
     TradeIntentStatus,
     TradingSession,
 )
+from tradepulse.models.quarantine import (
+    FillCursorBootstrap,
+    LegacyLotConversion,
+    QuarantineExecution,
+    QuarantineFeeAllocation,
+    QuarantineFeeRecognition,
+    QuarantineResolution,
+    ShortExposureLiability,
+    UnmanagedLongInventory,
+    UnresolvedBrokerExecution,
+    UnresolvedExecutionOutcome,
+)
 from tradepulse.time import aware_utc
 
 HydrateFn = Callable[[Mapping[str, Any]], Any]
@@ -457,3 +469,43 @@ register("ai_responses", decode_ai_response)
 register("trade_attributions", decode_trade_attribution)
 register("rejected_candidates", decode_rejected_candidate)
 register("integrity_holds", decode_integrity_hold)
+
+
+# --- Rev.140 quarantine records -------------------------------------------------
+
+register("short_exposure_liabilities", lambda d: ShortExposureLiability(
+    liability_id=d["liability_id"], fill_id=d["fill_id"], broker_order_id=d["broker_order_id"],
+    trade_intent_id=d["trade_intent_id"], asset=_asset_identity(d["asset"]), quantity=d["quantity"],
+    sale_price=d["sale_price"], multiplier=d["multiplier"], proceeds=d["proceeds"],
+    opened_at=_datetime(d["opened_at"])))
+register("unmanaged_long_inventory", lambda d: UnmanagedLongInventory(
+    record_id=d["record_id"], cover_activity_id=d["cover_activity_id"], asset=_asset_identity(d["asset"]),
+    quantity=d["quantity"], cost_price=d["cost_price"], multiplier=d["multiplier"],
+    opened_at=_datetime(d["opened_at"])))
+register("quarantine_executions", lambda d: QuarantineExecution(
+    activity_id=d["activity_id"], kind=d["kind"], asset=_asset_identity(d["asset"]), side=Side(d["side"]),
+    quantity=d["quantity"], price=d["price"], executed_at=_datetime(d["executed_at"]), raw_sha256=d["raw_sha256"]))
+register("quarantine_resolutions", lambda d: QuarantineResolution(
+    record_id=d["record_id"], activity_id=d["activity_id"], quantity=d["quantity"], price=d["price"],
+    realized_pnl=d["realized_pnl"], resolved_at=_datetime(d["resolved_at"])))
+register("quarantine_fee_allocations", lambda d: QuarantineFeeAllocation(
+    fee_canonical_id=d["fee_canonical_id"], record_id=d["record_id"], pool=d["pool"], amount=d["amount"]))
+register("quarantine_fee_recognitions", lambda d: QuarantineFeeRecognition(
+    record_id=d["record_id"], event_id=d["event_id"], pool=d["pool"], amount=d["amount"],
+    recognized_at=_datetime(d["recognized_at"])))
+register("legacy_lot_conversions", lambda d: LegacyLotConversion(
+    lot_id=d["lot_id"], liability_id=d["liability_id"], lot_digest=d["lot_digest"],
+    converted_at=_datetime(d["converted_at"]), reason=d["reason"]))
+register("unresolved_broker_executions", lambda d: UnresolvedBrokerExecution(
+    activity_id=d["activity_id"], asset_key=d["asset_key"], side=Side(d["side"]), quantity=d["quantity"],
+    price=d["price"], transaction_time=_datetime(d["transaction_time"]), raw_sha256=d["raw_sha256"],
+    first_seen_at=_datetime(d["first_seen_at"]), pass_id=d["pass_id"]))
+register("unresolved_execution_outcomes", lambda d: UnresolvedExecutionOutcome(
+    activity_id=d["activity_id"], outcome=d["outcome"], matched_record_id=d["matched_record_id"],
+    evidence_sha256=d["evidence_sha256"], resolved_at=_datetime(d["resolved_at"])))
+register("fill_cursor_bootstrap", lambda d: FillCursorBootstrap(
+    account_ref=d["account_ref"], boundary_activity_id=d["boundary_activity_id"],
+    activity_count=d["activity_count"], page_sha256s=tuple(d["page_sha256s"]),
+    position_results=d["position_results"], cash_result=d["cash_result"],
+    database_sha256_before=d["database_sha256_before"], reason=d["reason"], created_at=_datetime(d["created_at"])))
+
