@@ -103,15 +103,15 @@ def _population(*groups: tuple[int, int]) -> list[dict[str, object]]:
 
 
 def _alpaca(population: list[dict[str, object]], *, ignore_after: bool = False):
-    """GET /v2/orders as documented: after and until exclusive on submitted_at,
-    ascending, at most `limit` rows."""
+    """GET /v2/orders as measured on 2026-10-26: ``after`` inclusive and
+    ``until`` exclusive on submitted_at, ascending, at most `limit` rows."""
     requests: list[dict[str, str]] = []
 
     async def get(params: dict[str, str]) -> list[dict[str, object]]:
         requests.append(params)
         after, until = datetime.fromisoformat(params["after"]), datetime.fromisoformat(params["until"])
         rows = sorted((o for o in population
-                       if (ignore_after or after < datetime.fromisoformat(str(o["submitted_at"])))
+                       if (ignore_after or after <= datetime.fromisoformat(str(o["submitted_at"])))
                        and datetime.fromisoformat(str(o["submitted_at"])) < until),
                       key=lambda o: (datetime.fromisoformat(str(o["submitted_at"])), str(o["id"])))
         return rows[: int(params["limit"])]
@@ -131,6 +131,13 @@ async def test_order_paging_is_complete_across_page_edges(groups: list[tuple[int
     fetched = await census_script.fetch_orders(get, RUN_START, RUN_END)
     assert [o["id"] for o in fetched] == [o["id"] for o in population]
     assert all(r["status"] == "all" and r["direction"] == "asc" and r["limit"] == "500" for r in requests)
+
+
+async def test_an_order_submitted_exactly_at_the_run_start_is_counted() -> None:
+    at_start = _order("o-start", "c-start", RUN_START.isoformat().replace("+00:00", "Z"))
+    get, _ = _alpaca([at_start, *_population((1, 1))])
+    fetched = await census_script.fetch_orders(get, RUN_START, RUN_END)
+    assert [o["id"] for o in fetched] == ["o-start", "o00000"]
 
 
 @pytest.mark.parametrize("groups", [

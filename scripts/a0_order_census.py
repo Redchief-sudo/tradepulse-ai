@@ -80,10 +80,11 @@ class IncompleteOrderHistory(RuntimeError):
 
 async def fetch_orders(get: Callable[[dict[str, str]], Awaitable[list[dict[str, Any]]]],
                        start: datetime, end: datetime) -> list[dict[str, Any]]:
-    """Every order submitted in (start, end), or IncompleteOrderHistory.
+    """Every order submitted in [start, end), or IncompleteOrderHistory.
 
-    Alpaca's GET /v2/orders has no continuation token, only ``after`` and
-    ``until`` (both exclusive, on submitted_at) and ``limit`` (at most 500).
+    Alpaca's GET /v2/orders has no continuation token, only ``after``
+    (inclusive), ``until`` (exclusive), both on submitted_at and measured on
+    2026-10-26, and ``limit`` (at most 500).
     A page shorter than the limit is the whole remaining interval. After a
     full page, the next request starts one microsecond before that page's
     latest submitted_at -- Alpaca's timestamps carry microseconds -- so every
@@ -106,7 +107,7 @@ async def fetch_orders(get: Callable[[dict[str, str]], Awaitable[list[dict[str, 
             if not isinstance(order, dict) or not isinstance(order.get("id"), str) or not order.get("submitted_at"):
                 raise IncompleteOrderHistory(f"order without an id or submitted_at: {order!r}")
             stamp = datetime.fromisoformat(order["submitted_at"])
-            if not after < stamp < end:
+            if not after <= stamp < end:
                 raise IncompleteOrderHistory(f"order {order['id']} at {stamp.isoformat()} is outside the request")
             stamps.append(stamp)
             new += order["id"] not in orders

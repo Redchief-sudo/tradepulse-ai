@@ -358,6 +358,13 @@ async def _reconcile_fills(
             membership_status = generation_membership['classifications'].get(activity.activity_id)
             if membership_status == 'pre_generation' or membership_status == 'post_generation':
                 continue
+            if membership_status is None:
+                # Newer than this cycle's population snapshot (this FILL read
+                # comes later): unclassified, not unresolved. The next cycle's
+                # population classifies it, or fails closed there.
+                logger.info("fill_activity_deferred_to_next_population",
+                            extra={"event": "fill_activity_deferred_to_next_population", "activity_id": activity.activity_id})
+                continue
             if membership_status not in ELIGIBLE_MEMBERSHIPS:
                 raise ValueError('UNRESOLVED_GENERATION_MEMBERSHIP:' + activity.activity_id)
         if lease_lost is not None and lease_lost.is_set():

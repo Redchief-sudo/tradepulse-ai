@@ -193,6 +193,41 @@ async def test_old_external_generation_fill_is_not_hidden_by_reconciliation_look
     assert 'external' in (await load_session(repositories)).halt_reason
 
 
+async def _reconcile_one_fill(tmp_path, classifications):
+    from unittest.mock import AsyncMock
+
+    from test_settlement_engine import _no_op_alerter, _repositories
+
+    from tradepulse.broker import AlpacaActivity
+    from tradepulse.models import Side
+    from tradepulse.reconciliation.coordinator import _reconcile_fills
+
+    repositories = await _repositories(tmp_path)
+    raw = {'id': 'fresh', 'activity_type': 'FILL', 'order_id': 'fresh-order', 'symbol': 'JPM',
+           'side': 'buy', 'qty': '7', 'price': '336.25', 'transaction_time': OPENED.isoformat()}
+    broker = AsyncMock()
+    broker.get_activities.return_value = [AlpacaActivity('fresh', 'FILL', 'JPM', Side.BUY,
+        Decimal(7), Decimal('336.25'), OPENED, raw)]
+    return repositories, await _reconcile_fills(repositories, broker, AsyncMock(), _no_op_alerter(),
+        OPENED + timedelta(seconds=1), timedelta(days=1), generation_membership={'classifications': classifications})
+
+
+async def test_fill_newer_than_the_cycle_population_is_deferred_not_unresolved(tmp_path):
+    """A fill that lands between the cycle's population snapshot and this
+    later FILL read is not yet classified. It waits for the next cycle's
+    population instead of degrading reconciliation (A0 run, 2026-10-27)."""
+    from tradepulse.risk import load_session
+
+    repositories, result = await _reconcile_one_fill(tmp_path, classifications={})
+    assert result == (0, 0, 0)
+    assert (await load_session(repositories)).halt_reason is None
+
+
+async def test_fill_classified_unresolved_still_fails_closed(tmp_path):
+    with pytest.raises(ValueError, match='UNRESOLVED_GENERATION_MEMBERSHIP:fresh'):
+        await _reconcile_one_fill(tmp_path, classifications={'fresh': 'unresolved_generation_membership'})
+
+
 @pytest.mark.parametrize('asset_kind', ['equity', 'option'])
 @pytest.mark.parametrize('receipt_kind', ['missing', 'account_fee', 'explicit_zero'])
 async def test_noncrypto_sell_requires_receipt_backed_fee_evidence(tmp_path, asset_kind, receipt_kind):
