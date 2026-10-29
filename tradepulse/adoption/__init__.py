@@ -369,4 +369,22 @@ def reentry_excluded(connection: sqlite3.Connection, account_ref: str | None, ke
         if payload["source_id"] == checkpoint["checkpoint_id"] or datetime.fromisoformat(payload["adopted_at"]) >= \
                 datetime.fromisoformat(checkpoint["opened_at"]):
             return True
+        if not _obligations_settled(connection, payload):
+            return True  # an earlier generation's adoption is released only once fully closed and settled
     return False
+
+
+def _obligations_settled(connection: sqlite3.Connection, adoption: dict[str, Any]) -> bool:
+    """The new-generation release condition (§3.9): the adopted lot is closed,
+    no intent on the asset is open, and no dividend on it is pending or unresolved."""
+    row = connection.execute("SELECT payload FROM position_lots WHERE record_id=?", (ADOPTED_LOT_PREFIX + adoption["adoption_id"],)).fetchone()
+    if row is None or hydrate("position_lots", decode_payload(row[0])).remaining_quantity != 0:
+        return False
+    for (payload,) in connection.execute("SELECT payload FROM trade_intents WHERE status NOT IN ('filled','canceled','expired','rejected','failed')"):
+        if asset_identity_key(hydrate("trade_intents", decode_payload(payload)).asset) == adoption["asset_key"]:
+            return False
+    for (payload,) in connection.execute("SELECT payload FROM dividend_attribution_status"):
+        status = decode_payload(payload)
+        if status["asset_key"] == adoption["asset_key"] and status["attribution_status"] in ("pending", "unresolved"):
+            return False
+    return True
