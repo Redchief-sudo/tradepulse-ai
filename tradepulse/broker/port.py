@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal, Protocol, runtime_checkable
 
+from tradepulse.calendar import BrokerSession
 from tradepulse.models import AssetClass
 from tradepulse.models.market import canonical_venue
 
@@ -54,6 +55,8 @@ class BrokerPort(Protocol):
     async def get_positions(self) -> list[BrokerPosition]: ...
 
     async def get_clock(self) -> BrokerClock: ...
+
+    async def get_calendar(self, start: date, end: date) -> list[BrokerSession]: ...
 
     async def place_order(self, order: OrderRequest) -> OrderState: ...
 

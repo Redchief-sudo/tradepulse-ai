@@ -12,13 +12,14 @@ import logging
 import random
 import re
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Any, Literal
 from uuid import uuid4
 
 import httpx
 
+from tradepulse.calendar import BrokerSession
 from tradepulse.models import AssetClass, Side
 from tradepulse.time import aware_utc
 
@@ -219,6 +220,29 @@ class AlpacaClient:
             next_close=_parse_timestamp(data.get("next_close")),
             timestamp=_parse_timestamp(data.get("timestamp")),
         )
+
+    async def get_calendar(self, start: date, end: date) -> list[BrokerSession]:
+        """Rev.144 §3.3: ``GET /v2/calendar``. ``open`` and ``close`` are New
+        York local ``HH:MM`` (G0, 2026-10-29); holidays are absent. One
+        session per venue served: US equities and US options share the
+        exchange session days and close."""
+        from tradepulse.calendar import Venue, ny_time
+
+        response = await self._request("GET", f"{self._trading_base}/calendar",
+                                       params={"start": start.isoformat(), "end": end.isoformat()})
+        if not response.is_success:
+            raise_alpaca_error(response, "getCalendar")
+        sessions = []
+        for row in response.json():
+            try:
+                day = date.fromisoformat(row["date"])
+                open_at = ny_time(day, time.fromisoformat(row["open"]))
+                close_at = ny_time(day, time.fromisoformat(row["close"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise AlpacaDataIntegrityError(f"getCalendar: unparsable row {row!r}") from exc
+            for venue in (Venue.US_EQUITY, Venue.US_OPTION):
+                sessions.append(BrokerSession(venue, day, open_at, close_at, "alpaca:/v2/calendar"))
+        return sessions
 
     async def get_account(self) -> AlpacaAccount:
         response = await self._request("GET", f"{self._trading_base}/account")

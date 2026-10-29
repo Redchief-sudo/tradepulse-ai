@@ -107,6 +107,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from tradepulse.calendar import BrokerSession
 from tradepulse.models import AssetClass, Side
 from tradepulse.models.market import canonical_venue
 
@@ -185,7 +186,7 @@ _METHOD_FAULTS = {  # set through a method, never queued
     Fault.WITHHOLD_ACTIVITY: "withhold_activity", Fault.HOLD_CALL: "hold_call",
 }
 _OPERATION_NAMES = {  # the network-dependent calls, with AlpacaClient's operation labels
-    "get_clock": "getClock", "get_account": "getAccount", "get_positions": "getPositions",
+    "get_clock": "getClock", "get_calendar": "getCalendar", "get_account": "getAccount", "get_positions": "getPositions",
     "get_latest_quote": "getLatestQuote", "get_latest_option_quotes": "getLatestOptionQuotes",
     "get_options_chain": "getOptionsChain", "get_bars": "getBars", "place_order": "placeOrder",
     "get_order": "getOrder", "get_order_by_client_order_id": "getOrderByClientOrderId",
@@ -528,6 +529,7 @@ class SimulatedBroker:
         self.implementation = implementation
         self._clock = clock
         self._session = session
+        self._calendar_differences: dict[date, str | datetime] = {}
         self._account_number = account_number
         self._account_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"tradepulse-sim:{account_number}"))
         self._created_at = clock()
@@ -815,6 +817,36 @@ class SimulatedBroker:
         now = self._clock()
         return AlpacaClock(is_open=self._session.is_open(now), next_open=self._session.next_open(now),
                            next_close=self._session.next_close(now), timestamp=now)
+
+    async def get_calendar(self, start: date, end: date) -> list[BrokerSession]:
+        """Rev.144 §3.3: the scripted sessions, as Alpaca reports them (one
+        per US venue). An always-open simulator publishes no calendar.
+        ``inject_calendar_difference`` makes this broker disagree."""
+        from tradepulse.calendar import Venue, ny_date
+
+        self._enter("get_calendar")
+        sessions = []
+        for open_at, close_at in self._session.sessions:
+            day = ny_date(open_at)
+            if not start <= day <= end:
+                continue
+            change = self._calendar_differences.get(day)
+            if change == "holiday":
+                continue
+            if isinstance(change, datetime):
+                close_at = change
+            for venue in (Venue.US_EQUITY, Venue.US_OPTION):
+                sessions.append(BrokerSession(venue, day, open_at, close_at, "simulated:calendar"))
+        return sessions
+
+    def inject_calendar_difference(self, day: date, *, holiday: bool = False, close: datetime | None = None) -> None:
+        """Test hook: report ``day`` as a holiday, or with another close."""
+        if holiday == (close is not None):
+            raise ValueError("exactly one of holiday and close")
+        self._calendar_differences[day] = "holiday" if holiday else _aware_utc(close, "close")  # type: ignore[arg-type]
+
+    def clear_calendar_differences(self) -> None:
+        self._calendar_differences.clear()
 
     async def get_account(self) -> AlpacaAccount:
         self._enter("get_account")
