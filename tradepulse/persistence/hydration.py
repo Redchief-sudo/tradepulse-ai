@@ -231,6 +231,10 @@ def decode_settlement(d: Mapping[str, Any]) -> SettlementEvent:
         holding_projected=d.get("holding_projected", False),
         trade_projected=d.get("trade_projected", False),
         integrity_verified=d.get("integrity_verified", False),
+        # A settlement completed before Rev.140 cannot have had a liability
+        # (none existed), so its final stage counts as done; one stopped
+        # mid-way resumes through it.
+        liability_hold_projected=d.get("liability_hold_projected", d.get("status") == SettlementStatus.COMPLETED.value),
         realized_pnl=_decimal_or_none(d.get("realized_pnl")),
         attempt_count=d.get("attempt_count", 0),
         error_code=d.get("error_code"),

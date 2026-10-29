@@ -18,7 +18,9 @@ SETTLEMENT_STAGES: tuple[tuple[str, str], ...] = (
     ("holding_projected", "project_holding"),
     ("trade_projected", "project_trade"),
     ("integrity_verified", "verify_integrity"),
+    ("liability_hold_projected", "project_liability_hold"),
 )
+SETTLEMENT_FLAGS: tuple[str, ...] = tuple(flag for flag, _ in SETTLEMENT_STAGES)
 
 MAX_SETTLEMENT_ATTEMPTS = 8
 RETRY_BASE_SECONDS = 15

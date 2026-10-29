@@ -54,6 +54,9 @@ class IntegrityHoldType(StrEnum):
 
     VERIFICATION_PENDING = "verification_pending"
     FILL_QUANTITY_DISPUTED = "fill_quantity_disputed"
+    # Rev.140 §3.2: an oversell's broker order. Permanent until a verified
+    # `quarantine resolve`; never re-verified away by reconciliation.
+    SHORT_EXPOSURE = "short_exposure"
 
 
 class TradeIntentStatus(StrEnum):

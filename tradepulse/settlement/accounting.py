@@ -14,6 +14,7 @@ from tradepulse.models import CashLedgerEntry, PnlRecord, Side, asset_identity_k
 from tradepulse.persistence import hydrate
 from tradepulse.persistence.codec import decode_payload, encode_payload
 from tradepulse.persistence.repositories import _check_integrity_hold
+from tradepulse.settlement.stages import SETTLEMENT_FLAGS
 
 
 class ProjectionEvidenceError(ValueError):
@@ -102,6 +103,10 @@ def pnl_evidence(connection, event):
         records.append(PnlRecord('fill:pnl:' + identifier, fill.asset, gross, Decimal(0), fill.filled_at))
     actual_attrs = {r['record_id'] for r in connection.execute(
         "SELECT record_id FROM trade_attributions WHERE json_extract(payload,'$.closing_fill_id')=?", (fill.fill_id,))}
+    # Rev.140 I3: an oversell's excess is a liability, not a lot.
+    liability = connection.execute('SELECT payload FROM short_exposure_liabilities WHERE fill_id=?', (fill.fill_id,)).fetchone()
+    if liability is not None:
+        allocated += hydrate('short_exposure_liabilities', decode_payload(liability['payload'])).quantity
     if allocated != fill.quantity or actual_attrs != expected_attrs or event.realized_pnl != realized:
         raise ProjectionEvidenceError('ACCOUNTING_CLOSURE_CONSERVATION_FAILED:' + fill.fill_id)
     if fill.fees:
@@ -205,9 +210,7 @@ async def accounting_issues(repositories):
         for row in connection.execute('SELECT payload FROM settlements'):
             event = hydrate('settlements', decode_payload(row['payload']))
             try:
-                if event.status.value != 'completed' or not all(getattr(event, flag) for flag in (
-                        'lot_projected', 'attribution_projected', 'holding_projected',
-                        'cash_projected', 'trade_projected', 'integrity_verified')):
+                if event.status.value != 'completed' or not all(getattr(event, flag) for flag in SETTLEMENT_FLAGS):
                     raise ProjectionEvidenceError('ACCOUNTING_SETTLEMENT_INCOMPLETE')
                 project(connection, event, cash=True, trade=True)
             except (ValueError, ArithmeticError, KeyError) as exc:

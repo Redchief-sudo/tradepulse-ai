@@ -8,6 +8,7 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
+from tradepulse.settlement.stages import SETTLEMENT_FLAGS
 from tradepulse.time import aware_utc
 
 from .integrity import VerificationError, canonical, digest
@@ -353,16 +354,17 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     if invalid_projection_fills:
         problems.append('canonical_cash_or_pnl_projection_missing_or_conflicting')
 
+    def flagged(row):
+        # A pre-Rev.140 completed settlement has no liability_hold_projected (see hydration).
+        return all(row.get(key, key == "liability_hold_projected" and row["status"] == "completed") is True
+                   for key in SETTLEMENT_FLAGS)
+
     def settled(row):
-        return row is not None and row['fill_id'] not in invalid_projection_fills and row["status"] == "completed" and all(row.get(key) is True for key in (
-            "lot_projected", "attribution_projected", "cash_projected", "holding_projected", "trade_projected", "integrity_verified"
-        ))
+        return row is not None and row['fill_id'] not in invalid_projection_fills and row["status"] == "completed" and flagged(row)
 
     settlement_issues = sum(
         1 for row in rows["settlements"]
-        if row["status"] != "completed" or not all(row.get(key) is True for key in (
-            "lot_projected", "attribution_projected", "cash_projected", "holding_projected", "trade_projected", "integrity_verified"
-        ))
+        if row["status"] != "completed" or not flagged(row)
     ) + len(fills.keys() - settlements.keys())
     latest = {}
     for row in rows["reconciliation_records"]:

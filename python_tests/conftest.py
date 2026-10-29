@@ -145,3 +145,6 @@ def mock_cursor_read(cursor: str = "zzzz-test-cursor"):
 
     return respx.get("https://paper-api.alpaca.markets/v2/account/activities",
                      params__contains={"page_token": cursor}).mock(return_value=httpx.Response(200, json=[]))
+
+
+from rev140_support import rt  # noqa: F401 - the shared Rev.140 runtime fixture

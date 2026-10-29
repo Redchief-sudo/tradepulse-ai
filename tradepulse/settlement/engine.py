@@ -29,11 +29,14 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from tradepulse.alerts import TelegramAlerter
+from tradepulse.alerts import TelegramAlerter, alert_once
 from tradepulse.models import (
     AssetIdentity,
+    AuditEvent,
     ExitReason,
     Holding,
+    IntegrityHold,
+    IntegrityHoldType,
     PositionLot,
     SettlementEvent,
     SettlementStatus,
@@ -42,6 +45,7 @@ from tradepulse.models import (
     contract_multiplier_of,
     fold_price_extremum,
 )
+from tradepulse.models.quarantine import ShortExposureLiability
 from tradepulse.persistence import (
     PersistenceRepositories,
     hydrate,
@@ -54,6 +58,7 @@ from tradepulse.risk import latch_financial_integrity_block
 from .accounting import project, project_accounting
 from .lots import IntegrityViolationError, plan_signed_lot_fill
 from .stages import (
+    SETTLEMENT_FLAGS,
     StageHandler,
     classify_settlement_failure,
     is_settlement_processable,
@@ -72,6 +77,10 @@ async def _project_lot(repositories: PersistenceRepositories, event: SettlementE
     lot_rows = await list_all_by_asset(repositories.position_lots, event.asset)
     symbol_lots = [hydrate("position_lots", row["payload"]) for row in lot_rows]
     plan = plan_signed_lot_fill(symbol_lots, event)
+    if any(closure.lot.position_side == "short" for closure in plan.closures):
+        # Rev.140: TradePulse never covers a short. A legacy short lot is
+        # converted to a liability only through `quarantine adopt-legacy-lot`.
+        raise IntegrityViolationError("INTEGRITY_VIOLATION: UNSUPPORTED_SHORT_LOT")
 
     for closure in plan.closures:
         # mutate() (not update()) -- Outcome Attribution made position_lots a
@@ -94,7 +103,20 @@ async def _project_lot(repositories: PersistenceRepositories, event: SettlementE
             closure.lot.lot_id, _decide, guard_table="integrity_holds", guard_key=event.broker_order_id,
         )
 
-    if plan.opening_quantity > 0:
+    if plan.opening_quantity > 0 and plan.opening_direction == "short":
+        # Rev.140 §3.2: an actual broker oversell. Its excess is preserved
+        # whole as an append-only liability, never a short lot; the final
+        # stage latches the hold.
+        if not event.broker_order_id:
+            raise IntegrityViolationError("INTEGRITY_VIOLATION: oversell without a broker order ID")
+        multiplier = contract_multiplier_of(event.asset)
+        liability = ShortExposureLiability(
+            liability_id=f"liability:{event.fill_id}", fill_id=event.fill_id, broker_order_id=event.broker_order_id,
+            trade_intent_id=event.trade_intent_id, asset=event.asset, quantity=plan.opening_quantity,
+            sale_price=event.price, multiplier=multiplier, proceeds=plan.opening_quantity * event.price * multiplier,
+            opened_at=event.occurred_at)
+        await repositories.short_exposure_liabilities.create_once(liability.liability_id, liability, unique_value=event.fill_id)
+    elif plan.opening_quantity > 0:
         new_lot = PositionLot(
             lot_id=str(uuid4()),
             originating_fill_id=event.fill_id,
@@ -118,6 +140,28 @@ async def _project_lot(repositories: PersistenceRepositories, event: SettlementE
 
     return {"realized_pnl": plan.realized_pnl}
 
+
+
+async def _project_liability_hold(repositories: PersistenceRepositories, alerts: TelegramAlerter, event: SettlementEvent) -> None:
+    """The final stage (Rev.140 §3.2). Without a liability, nothing. With one:
+    latch FINANCIAL_INTEGRITY_BLOCKED, hold the broker order, alert once.
+    Each step is idempotent, so a resumed stage repeats none of them."""
+    row = await repositories.short_exposure_liabilities.find_by_unique(event.fill_id)
+    if row is None:
+        return
+    liability = hydrate("short_exposure_liabilities", row["payload"])
+    reason = f"UNSUPPORTED_SHORT_POSITION: {liability.liability_id}"
+    await latch_financial_integrity_block(repositories, reason, clock=lambda: event.occurred_at)
+    hold = IntegrityHold(broker_order_id=liability.broker_order_id, trade_intent_id=liability.trade_intent_id,
+                         hold_type=IntegrityHoldType.SHORT_EXPOSURE, reason=reason, created_at=event.occurred_at)
+    await repositories.integrity_holds.create_once(liability.broker_order_id, hold, status=hold.hold_type.value)
+    await alert_once(repositories.audit_events, alerts, AuditEvent(
+        event_id=f"unsupported_short_position:{liability.liability_id}", event_type="unsupported_short_position",
+        severity="critical", entity_type="short_exposure_liability", entity_id=liability.liability_id,
+        message=(f"UNSUPPORTED_SHORT_POSITION: {liability.asset.symbol} oversold by {liability.quantity} "
+                 f"(fill {liability.fill_id}); quarantined as {liability.liability_id}. Trading is blocked."),
+        occurred_at=event.occurred_at,
+        details={"liability_id": liability.liability_id, "quantity": str(liability.quantity), "fill_id": liability.fill_id}))
 
 def _parse_int_or_none(value: Any) -> int | None:
     """risk_snapshot values are always stored as strings (see
@@ -455,6 +499,9 @@ class SettlementProcessor:
         async def verify_integrity(state: SettlementEvent) -> None:
             await _verify_integrity(self._repositories, state)
 
+        async def project_liability_hold(state: SettlementEvent) -> None:
+            await _project_liability_hold(self._repositories, self._alerts, state)
+
         return {
             "project_lot": project_lot,
             "project_attribution": project_attribution,
@@ -462,6 +509,7 @@ class SettlementProcessor:
             "project_holding": project_holding,
             "project_trade": project_trade,
             "verify_integrity": verify_integrity,
+            "project_liability_hold": project_liability_hold,
         }
 
     async def _checkpoint(self, event: SettlementEvent) -> None:
@@ -470,9 +518,7 @@ class SettlementProcessor:
         def checkpoint(connection):
             # Re-read evidence and commit the checkpoint under the SAME write
             # lock. A successful handler alone is never evidence of durability.
-            if event.status == SettlementStatus.COMPLETED and not all(getattr(event, flag) for flag in (
-                    'lot_projected', 'attribution_projected', 'holding_projected',
-                    'cash_projected', 'trade_projected', 'integrity_verified')):
+            if event.status == SettlementStatus.COMPLETED and not all(getattr(event, flag) for flag in SETTLEMENT_FLAGS):
                 raise ValueError('ACCOUNTING_COMPLETED_PROJECTION_FLAGS_INCOMPLETE')
             project(connection, event, cash=event.cash_projected, trade=event.trade_projected)
             connection.execute(

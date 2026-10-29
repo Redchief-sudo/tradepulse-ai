@@ -44,6 +44,9 @@ class SettlementEvent:
     holding_projected: bool = False
     trade_projected: bool = False
     integrity_verified: bool = False
+    # Rev.140 §3.2: the final stage; latches the hold for an oversell's
+    # liability (a no-op without one).
+    liability_hold_projected: bool = False
     realized_pnl: Decimal | None = None
     attempt_count: int = 0
     error_code: str | None = None
