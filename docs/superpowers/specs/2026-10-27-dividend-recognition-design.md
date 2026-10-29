@@ -225,6 +225,18 @@ These are recorded in an evidence directory with a manifest, as in `2026-10-26-r
 - the first real dividend on the paper account is a **verification event**: its raw receipt is compared field by field with the fixtures before attribution is trusted;
 - until then, a receipt whose fields differ from the fixtures is `unresolved` (`DIVIDEND_RECEIPT_SHAPE_UNVERIFIED`).
 
+**G0 results (2026-10-29, read-only Alpaca paper; evidence `~/tradepulse-evidence/2026-10-29-rev143-g0/`, manifest SHA-256 prefix `956dd0fec91531a9`):**
+1. **No `DIV*` activity of any type** exists on the paper account. Items 1, 1a and 3 have no samples, so `DIVIDEND_REPRESENTATION = "unknown"`.
+   - Every dividend's cash is posted per activity, and attribution is refused (`DIVIDEND_REPRESENTATION_UNKNOWN`) until the first real dividend, the verification event, establishes the representation.
+   - The receipt fixtures cite Alpaca's account-activities documentation (accessed 2026-10-29).
+2. **Announcements** (`/v2/corporate_actions/announcements?ca_types=dividend`):
+   - fields: `id`, `corporate_action_id`, `ca_type`, `ca_sub_type` (`cash`), `initiating_symbol`, `target_symbol`, the CUSIPs, `declaration_date`, `effective_date`, `ex_date`, `record_date`, `payable_date`, `cash` (a decimal string, e.g. `"0.27"`), `old_rate` and `new_rate`;
+   - samples: AAPL (ex 08-10, payable 08-13, 0.27), MSFT (ex 08-20, payable 09-10, 0.91), JPM, SPY, UNH;
+   - `ex_date = record_date` in every sample (T+1);
+   - the `since`/`until` window does not filter by ex-date (a JPM ex-date of 07-06 is returned for a window starting 07-31), so candidates are filtered locally.
+4. **The market-data endpoint** (`data.alpaca.markets/v1/corporate-actions`, `cash_dividends`) also works, with `rate` as a JSON **number**. It is not adopted (no review); were it ever used, it would have to be parsed with `parse_float=Decimal`.
+5. **FILL activities have no trade-date field** (`transaction_time` only). The trade date is therefore the New York date of `transaction_time`, and a fill between 20:00 and 24:00 ET on the day before the ex-date is `DIVIDEND_TRADE_DATE_AMBIGUOUS`.
+
 ### 3.9 Effect on Rev.142 (rev. 3 edit, made on `rev142-adoption-design`)
 
 - **3.8a part 1** (the fail-closed placeholder, `adopted_income_unresolved`) is retired. Adopted dividends are attributed by Rev.143's `adopted` bucket and excluded through `D_excl`.
