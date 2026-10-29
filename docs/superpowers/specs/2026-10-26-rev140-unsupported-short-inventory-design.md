@@ -113,6 +113,26 @@ So the gateway does **not** try to reconstruct one consistent broker state. It c
 
 **Authorization:** sellable = max(0, min(*B*ₗ, *B*ᵦ)).
 
+**Amendment A1 (found during implementation, 2026-10-28; for reviewer confirmation).** *B*ₗ also subtracts every **external** open sell order in *Ω* at its full original quantity:
+
+  *B*ₗ = *L* − Σ over TradePulse members of (*a* − *s*) − Σ over external members of *q*
+
+- **Why:** rule S1 removes a TradePulse sell from *Ω* once it is terminal and fully settled, but positions can still lag that sell's fills. If an external order is also open, neither original bound is conservative:
+  - *B*ₗ does not subtract the external order;
+  - *B*ᵦ does not subtract the settled order's unreflected fills.
+- **Counterexample** (found by the seeded lemma test):
+  - H = 33; a settled TradePulse sell of 3, 2 of it not yet reflected (*P* = 35);
+  - 1 TradePulse share pending; an external open sell of 6;
+  - so W = 26.
+  - Originally *B*ₗ = 32 and *B*ᵦ = 28, so sellable 28 > W.
+  - Amended: *B*ₗ = 26, so sellable = 26.
+- **Proof of the amended bound:**
+  - *L* = *H* − (filled, unsettled buys) + (filled, unsettled TradePulse sells) + (fills of visible external orders, which *L* never sees).
+  - Each TradePulse member's (*a* − *s*) = its filled-unsettled part + its unfilled remainder. Each external member's *q* = its fills + its unfilled remainder.
+  - So *B*ₗ = *H* − Σ unfilled remainder − (filled, unsettled buys) = W − (filled, unsettled buys) ≤ W, **independent of position lag**.
+- *B*ᵦ is kept. It catches local inventory the broker does not hold.
+- **Verified:** 10,000 seeded worlds in `test_lemma_seeded_interleavings`, plus a further 200,000 over 20 seeds, with 0 violations of sellable ≤ max(0, W).
+
 **Lemma (stated for review; proved by the tests in section 7).** Let *H* be the broker's true long quantity when the order is submitted, and *W* = *H* − Σ the true unfilled remainder of every sell order outstanding then. If none of the refusals below fires, then sellable ≤ *W* for every order and execution that is either TradePulse's or visible in any of *O₁*, *O₂* or *A*.
 - **TradePulse's orders only:**
   - *L* = *H* − (filled, unsettled buys) + (filled, unsettled sells).
