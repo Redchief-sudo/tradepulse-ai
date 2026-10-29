@@ -21,6 +21,7 @@ from decimal import Decimal
 
 import httpx
 import respx
+from conftest import mock_cursor_read, mock_open_orders, seed_fill_cursor
 from lease_support import held_test_lease
 
 from tradepulse.alerts import TelegramAlerter
@@ -328,6 +329,8 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
 
     _mock_account(cash="100000")
     _mock_positions()  # no position yet -- Process A's buy is opening a fresh one
+    mock_open_orders()  # Rev.140's sell authorization reads, registered before the story's own routes
+    mock_cursor_read()
     _mock_quote()
     _mock_market_open()
 
@@ -369,6 +372,7 @@ async def test_full_story_scan_opens_monitor_protects_reconcile_confirms_clean(t
 
     # ---- Process A: scan discovers AAPL and opens a long position. ----
     _, repositories_a, broker_a, market_data_a, gateway_a, _, limits_a = await _fresh_gateway(db_url)
+    await seed_fill_cursor(repositories_a)  # the shared database, as every later process sees it
     ai_provider_a = AnthropicAIProvider("key", "claude-haiku-4-5", 10)
     await save_session(repositories_a, TradingSession("session", SessionState.ACTIVE, True, NOW))
     respx.post("https://api.anthropic.com/v1/messages").mock(

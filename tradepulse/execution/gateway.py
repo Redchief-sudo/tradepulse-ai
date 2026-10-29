@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 import httpx
@@ -36,11 +36,13 @@ from tradepulse.broker import (
     default_time_in_force,
     is_definitive_rejection,
 )
+from tradepulse.broker.symbols import broker_symbol_asset_key
 from tradepulse.models import (
     AssetClass,
     AssetIdentity,
     ExecutionMode,
     RiskLimits,
+    SettlementStatus,
     Side,
     TradeIntent,
     TradeIntentStatus,
@@ -55,6 +57,9 @@ from tradepulse.persistence import (
     RepositoryLeaseLostError,
     acquire_lock,
     hydrate,
+    list_all_by_asset,
+    list_all_by_json_field,
+    paginate_all_rows,
     release_lock,
     renew_lock,
 )
@@ -228,6 +233,24 @@ class ExecutionGateway:
                 # submission) or PROPOSED -- fall through and continue below,
                 # reusing this intent's id instead of creating a new one.
 
+        # Rev.140 §3.1, §3.1b: a sell, or any order on an asset holding
+        # quarantined inventory, is authorized under the caller's execution
+        # reservation by the conservative two-bound sellable quantity. Every
+        # refusal here comes before any intent row is written.
+        from tradepulse.quarantine import quarantined_positions
+
+        quarantined = await quarantined_positions(self._repositories, asset_identity_key(request.asset))
+        if request.side == Side.SELL or quarantined:
+            if request.symbol_lock_owner_token is None:
+                return ExecutionResult("rejected", None, ["EXECUTION_RESERVATION_REQUIRED"], Decimal("0"), None)
+            if quarantined:
+                return ExecutionResult("rejected", None, ["UNSUPPORTED_SHORT_POSITION"], Decimal("0"), None)
+        if request.side == Side.SELL:
+            authorized = await self._authorize_sell(request, existing.trade_intent_id if existing else None)
+            if isinstance(authorized, ExecutionResult):
+                return authorized
+            request = replace(request, requested_quantity=authorized)
+
         # Broker positions are the quantity AUTHORITY for protective-exit
         # classification -- the local Holding (see settlement/engine.py) can
         # be wrong during exactly the accounting-drift scenario that trips
@@ -262,9 +285,11 @@ class ExecutionGateway:
 
         held_position = positions_by_key.get(asset_identity_key(request.asset))
         held_quantity = held_position.qty if held_position is not None else Decimal("0")
-        protective_exit = (
-            request.side == Side.SELL and held_quantity > 0 and request.requested_quantity <= held_quantity
-        ) or (request.side == Side.BUY and held_quantity < 0 and request.requested_quantity <= abs(held_quantity))
+        # Rev.140 removed the cover path: TradePulse never buys against a
+        # short position, which exists only as quarantined broker inventory.
+        if request.side == Side.BUY and held_quantity < 0:
+            return ExecutionResult("rejected", None, ["UNSUPPORTED_SHORT_POSITION"], Decimal("0"), None)
+        protective_exit = request.side == Side.SELL and held_quantity > 0 and request.requested_quantity <= held_quantity
         # Same broker truth feeds portfolio exposure -- current market value,
         # not stale local cost basis (see risk/engine.py::build_portfolio_snapshot).
         # Keyed canonically to match how build_portfolio_snapshot looks it up.
@@ -579,6 +604,106 @@ class ExecutionGateway:
         await self._repositories.trade_intents.update(trade_intent_id, accepted, status=accepted.status.value)
 
         return await self._poll_and_settle(accepted)
+
+    async def _authorize_sell(self, request: ExecutionRequest, current_intent_id: str | None) -> Decimal | ExecutionResult:
+        """The sell quantity the evidence supports, or the refusal (spec §3.1).
+        Writes nothing and releases nothing; the caller's reservation is held
+        throughout."""
+        from tradepulse.execution.sellable import (
+            SellableEvidenceError,
+            SellableInputs,
+            build_pending_set,
+            compute_sellable,
+            size_sell,
+        )
+        from tradepulse.reconciliation.completeness import history_unproven
+        from tradepulse.reconciliation.unresolved import fill_cursor, open_unresolved
+
+        def refuse(reason: str) -> ExecutionResult:
+            return ExecutionResult("rejected", None, [reason], Decimal("0"), None)
+
+        database = self._repositories.trade_intents.database
+        assert request.symbol_lock_owner_token is not None
+        if not await renew_lock(database, execution_lock_key(request.asset), request.symbol_lock_owner_token,
+                                SYMBOL_LOCK_TTL_SECONDS):
+            return refuse("EXECUTION_RESERVATION_LOST")
+        key = asset_identity_key(request.asset)
+        if await open_unresolved(self._repositories, key):
+            return refuse("UNRESOLVED_BROKER_EXECUTION")
+        if await history_unproven(self._repositories, key):
+            return refuse("ACTIVITY_HISTORY_UNPROVEN")
+        intents = [intent for intent in (hydrate("trade_intents", row["payload"])
+                                         for row in await paginate_all_rows(self._repositories.trade_intents))
+                   if intent.side == Side.SELL and asset_identity_key(intent.asset) == key
+                   and intent.trade_intent_id != current_intent_id]
+        if any(intent.status in (TradeIntentStatus.SUBMITTED, TradeIntentStatus.SUBMISSION_UNKNOWN) for intent in intents):
+            return refuse("PRIOR_SUBMISSION_UNRESOLVED")  # S3: the monitor's in-flight rule, at the gateway
+        cursor = await fill_cursor(self._repositories)
+        if cursor is None:
+            return refuse("FILL_CURSOR_NOT_BOOTSTRAPPED")
+        settled = {}
+        for intent in intents:
+            rows = await list_all_by_json_field(self._repositories.settlements, "trade_intent_id", intent.trade_intent_id)
+            settled[intent.trade_intent_id] = sum(
+                (event.quantity for event in (hydrate("settlements", row["payload"]) for row in rows)
+                 if event.status == SettlementStatus.COMPLETED), Decimal(0))
+        local = sum((lot.remaining_quantity for lot in (hydrate("position_lots", row["payload"])
+                                                         for row in await list_all_by_asset(self._repositories.position_lots, request.asset))
+                     if lot.position_side == "long" and lot.status in ("open", "partially_closed")), Decimal(0))
+
+        for attempt in range(3):  # R10: an unstable snapshot is retried at most three times, then refused
+            try:
+                first = await self._broker.get_open_orders()
+            except (AlpacaError, AlpacaDataIntegrityError, httpx.HTTPError):
+                return refuse("BROKER_OPEN_ORDERS_UNAVAILABLE")
+            try:
+                positions = await self._broker.get_positions()
+            except (AlpacaError, AlpacaDataIntegrityError, httpx.HTTPError):
+                return refuse("BROKER_POSITIONS_UNAVAILABLE")
+            try:
+                second = await self._broker.get_open_orders()
+            except (AlpacaError, AlpacaDataIntegrityError, httpx.HTTPError):
+                return refuse("BROKER_OPEN_ORDERS_UNAVAILABLE")
+            pages: list[Any] = []
+            try:
+                activities = await self._broker.get_activities(activity_type="FILL", after_id=cursor, page_evidence=pages)
+            except (AlpacaError, AlpacaDataIntegrityError, httpx.HTTPError):
+                return refuse("BROKER_ACTIVITIES_UNAVAILABLE")
+            if not pages or not pages[-1]["terminal"] or any(page["terminal"] for page in pages[:-1]):
+                return refuse("ACTIVITY_PAGE_UNPROVEN")
+            for activity in (a for a in activities if a.activity_id > cursor):  # never trust the broker's filter alone
+                if broker_symbol_asset_key(activity.symbol) != key:
+                    continue
+                if await self._repositories.fills.get(activity.activity_id) is None \
+                        and await self._repositories.fills.find_by_unique(activity.activity_id) is None \
+                        and await self._repositories.quarantine_executions.get(activity.activity_id) is None:
+                    return refuse("UNRECONCILED_BROKER_ACTIVITY")
+            held = next((p.qty for p in positions if asset_key_from_broker_symbol(p.asset_class, p.symbol) == key), Decimal(0))
+            if held < 0:
+                return refuse("UNSUPPORTED_SHORT_POSITION")
+            try:
+                pending = build_pending_set(key, first, second, intents, settled)
+                decision = compute_sellable(SellableInputs(held, local, pending))
+            except SellableEvidenceError as exc:
+                if exc.reason == "SELLABLE_SNAPSHOT_UNSTABLE" and attempt < 2:
+                    continue
+                return refuse(exc.reason)
+            # Protective by purpose (the monitor names every exit's reason), or a
+            # sell within the broker position: reduced to sellable, never refused.
+            protective = held > 0 and (request.exit_reason is not None or request.requested_quantity <= held)
+            quantity, note = size_sell(decision, request.requested_quantity, protective=protective)
+            if quantity <= 0:
+                return refuse(f"{note} (local {decision.local_bound}, broker {decision.broker_bound}, "
+                              f"requested {request.requested_quantity})")
+            if note == "SELLABLE_BELOW_REQUESTED":
+                await self._alerts.send(
+                    "warning",
+                    f"SELLABLE_BELOW_REQUESTED: {request.asset.symbol} exit reduced from {request.requested_quantity} "
+                    f"to {quantity} (local bound {decision.local_bound}, broker bound {decision.broker_bound}).",
+                    {"symbol": request.asset.symbol, "requested": str(request.requested_quantity), "sellable": str(quantity),
+                     "local_bound": str(decision.local_bound), "broker_bound": str(decision.broker_bound)})
+            return quantity
+        return refuse("SELLABLE_SNAPSHOT_UNSTABLE")  # pragma: no cover - the loop returns on its last attempt
 
     async def _reject_before_submission(self, intent: TradeIntent, reason: str) -> ExecutionResult:
         """No order was placed. Close the intent so has_in_flight_intent never

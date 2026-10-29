@@ -498,7 +498,8 @@ async def _advance_fill_cursor(repositories: PersistenceRepositories, alerts: Te
     if cursor is None:
         return
     pages: list[Any] = []
-    after = await broker.get_activities(activity_type="FILL", after_id=cursor, page_evidence=pages)
+    after = [a for a in await broker.get_activities(activity_type="FILL", after_id=cursor, page_evidence=pages)
+             if a.activity_id > cursor]  # never trust the broker's filter alone
     proven = bool(pages) and pages[-1]["terminal"] and not any(page["terminal"] for page in pages[:-1])
     result = await record_pass(repositories, after, page_proven=proven, pass_id=str(uuid4()), now=now)
     if result.recorded:

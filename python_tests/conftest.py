@@ -111,3 +111,37 @@ def fill_cursor_bootstrapped(monkeypatch: pytest.MonkeyPatch):
         return True
 
     monkeypatch.setattr("tradepulse.cli._require_fill_cursor", bootstrapped)
+
+
+async def seed_fill_cursor(repositories, cursor: str = "zzzz-test-cursor") -> None:
+    """For gateway and monitor tests that are not about Rev.140's cursor: a
+    fill cursor beyond every mocked activity ID, so the sell authorization's
+    read after C is empty. No bootstrap record, so reconciliation's
+    completeness pass stays idle. Cursor behaviour itself is tested in
+    test_rev140_unresolved.py and test_rev140_bootstrap.py."""
+    from datetime import UTC, datetime
+
+    from tradepulse.reconciliation.unresolved import _advance_cursor
+
+    await repositories.broker_activity_cursors.database.run(
+        lambda connection: _advance_cursor(connection, cursor, "test", datetime.now(UTC)), write=True)
+
+
+def mock_open_orders(orders: list | None = None):
+    """GET /v2/orders?status=open for the sell authorization's two reads."""
+    import httpx
+    import respx
+
+    return respx.get("https://paper-api.alpaca.markets/v2/orders", params__contains={"status": "open"}).mock(
+        return_value=httpx.Response(200, json=orders or []))
+
+
+def mock_cursor_read(cursor: str = "zzzz-test-cursor"):
+    """The sell authorization's FILL read after a seeded cursor: empty. Matches
+    only that request (page_token = the cursor), so it never shadows a test's
+    own activities mock."""
+    import httpx
+    import respx
+
+    return respx.get("https://paper-api.alpaca.markets/v2/account/activities",
+                     params__contains={"page_token": cursor}).mock(return_value=httpx.Response(200, json=[]))

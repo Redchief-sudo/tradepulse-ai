@@ -5,6 +5,7 @@ from decimal import Decimal
 
 import httpx
 import respx
+from conftest import mock_cursor_read, mock_open_orders, seed_fill_cursor
 from lease_support import held_test_lease
 
 from tradepulse.alerts import TelegramAlerter
@@ -49,6 +50,9 @@ async def _setup(tmp_path):
     settlement = SettlementProcessor(repositories, alerts, clock=lambda: NOW)
     limits = risk_limits_for_profile("balanced")
     gateway = ExecutionGateway(repositories, broker, market_data, settlement, alerts, limits, ExecutionMode.PAPER, clock=lambda: NOW, lease=held_test_lease())
+    await seed_fill_cursor(repositories)  # Rev.140: sells are authorized against the fill cursor
+    mock_open_orders()
+    mock_cursor_read()
     return repositories, broker, market_data, gateway, alerts
 
 
@@ -153,6 +157,14 @@ async def _seed_lot(
         mae_price=Decimal(mae_price) if mae_price is not None else None,
     )
     await repositories.position_lots.create_once(lot_id, lot, unique_value=lot.originating_fill_id)
+
+
+async def _seed_asset_lot(repositories: PersistenceRepositories, asset: AssetIdentity, quantity: str) -> None:
+    """The open lot a holding is projected from (Rev.140: sells are bounded by local lots)."""
+    lot = PositionLot(lot_id=f"lot-{asset.symbol}", originating_fill_id=f"fill-lot-{asset.symbol}", asset=asset,
+                      position_side="long", opened_quantity=Decimal(quantity), remaining_quantity=Decimal(quantity),
+                      acquisition_price=Decimal("150"), opened_at=NOW)
+    await repositories.position_lots.create_once(lot.lot_id, lot, unique_value=lot.originating_fill_id)
 
 
 async def _get_lot(repositories: PersistenceRepositories, lot_id: str) -> PositionLot:
@@ -497,6 +509,7 @@ async def test_time_stop_and_near_expiry_interaction_submits_exactly_one_exit(tm
 @respx.mock
 async def test_long_position_breaching_stop_triggers_sell(tmp_path) -> None:
     repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
+    await _seed_asset_lot(repositories, _aapl(), "10")
     await _seed_holding(repositories)
     _mock_positions(qty="10", current_price="135")  # below stop_loss=140
     _mock_account()
@@ -522,6 +535,7 @@ async def test_long_position_breaching_stop_triggers_sell(tmp_path) -> None:
 @respx.mock
 async def test_long_position_breaching_target_triggers_sell(tmp_path) -> None:
     repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
+    await _seed_asset_lot(repositories, _aapl(), "10")
     await _seed_holding(repositories)
     _mock_positions(qty="10", current_price="175")  # above target_price=170
     _mock_account()
@@ -538,7 +552,9 @@ async def test_long_position_breaching_target_triggers_sell(tmp_path) -> None:
 
 
 @respx.mock
-async def test_short_position_breaching_inverted_thresholds_triggers_buy(tmp_path) -> None:
+async def test_short_position_breaching_inverted_thresholds_is_refused_not_covered(tmp_path) -> None:
+    """Rev.140 removed the cover path: a short exists only as quarantined
+    broker inventory, and TradePulse never buys against it automatically."""
     repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
     # short: stop is ABOVE entry, target is BELOW entry
     await _seed_holding(repositories, quantity="-10", stop_loss="160", target_price="130")
@@ -552,9 +568,8 @@ async def test_short_position_breaching_inverted_thresholds_triggers_buy(tmp_pat
     summary = await run_position_monitor(repositories, broker, market_data, gateway, alerts, LIMITS, clock=lambda: NOW)
     await broker.aclose()
 
-    assert summary.exits_triggered == 1
-    request_body = order_route.calls[0].request.content
-    assert b'"side":"buy"' in request_body
+    assert order_route.call_count == 0
+    assert [r.reasons for r in summary.execution_results] == [["UNSUPPORTED_SHORT_POSITION"]]
 
 
 @respx.mock
@@ -605,6 +620,7 @@ async def test_option_within_forced_close_window_exits_even_without_breach(tmp_p
         stop_loss=Decimal("1.00"), target_price=Decimal("5.00"),
     )
     await repositories.holdings.create_once(asset_identity_key(_aapl_call()), holding)
+    await _seed_asset_lot(repositories, _aapl_call(), str(holding.quantity))
     respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[{
         "symbol": "AAPL251219C00150000", "asset_class": "us_option", "qty": "1", "avg_entry_price": "2.00",
         "market_value": "0", "current_price": "2.50", "unrealized_pl": "0",
@@ -716,6 +732,7 @@ async def test_option_with_invalid_expiry_metadata_alerts_but_keeps_stop_target_
     )
     holding = Holding(asset=contract, quantity=Decimal("1"), average_price=Decimal("2.00"), updated_at=NOW, stop_loss=Decimal("1.00"))
     await repositories.holdings.create_once(asset_identity_key(contract), holding)
+    await _seed_asset_lot(repositories, contract, "1")
     respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[{
         "symbol": "AAPL251219C00150000", "asset_class": "us_option", "qty": "1", "avg_entry_price": "2.00",
         "market_value": "0", "current_price": "0.90", "unrealized_pl": "0",  # below stop_loss=1.00
@@ -902,6 +919,7 @@ async def test_stock_breach_outside_market_hours_is_alerted_and_deferred_not_sol
 @respx.mock
 async def test_stock_breach_in_session_still_exits(tmp_path) -> None:
     repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
+    await _seed_asset_lot(repositories, _aapl(), "10")
     await _seed_holding(repositories)
     _mock_clock(is_open=True)
     _mock_positions(qty="10", current_price="135")
@@ -927,6 +945,7 @@ async def test_crypto_is_managed_around_the_clock(tmp_path) -> None:
     holding = Holding(asset=btc, quantity=Decimal("0.1"), average_price=Decimal("60000"), updated_at=NOW,
                       stop_loss=Decimal("58000"))
     await repositories.holdings.create_once(asset_identity_key(btc), holding)
+    await _seed_asset_lot(repositories, btc, "0.1")
     _mock_clock(is_open=False)  # the stock market is closed; crypto is not
     respx.get("https://paper-api.alpaca.markets/v2/positions").mock(return_value=httpx.Response(200, json=[{
         "symbol": "BTCUSD", "asset_class": "crypto", "qty": "0.1", "avg_entry_price": "60000",

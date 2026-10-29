@@ -184,7 +184,7 @@ async def completeness_pass(repositories: PersistenceRepositories, broker: Broke
             history = await _read(broker)
             reads = history
         else:
-            since_baseline = await _read(broker, after_id=baseline[0])
+            since_baseline = [raw for raw in await _read(broker, after_id=baseline[0]) if str(raw["id"]) > baseline[0]]
             overlap = await _read(broker, since=activity_id_time(cursor) - timedelta(days=overlap_days))
             reads = list({str(raw["id"]): raw for raw in [*overlap, *since_baseline]}.values())
     except FillHistoryIncomplete as exc:

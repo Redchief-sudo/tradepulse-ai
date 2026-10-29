@@ -144,10 +144,13 @@ async def runtime(tmp_path: Path) -> AsyncIterator[Runtime]:
     clock = ManualClock(T0)
     broker = SimulatedBroker(
         clock=clock, session=SimSession.from_exchange_calendar("XNYS", date(2026, 9, 1), date(2026, 12, 31)),
-        fee_scenario=FeeScenario.observed_alpaca_2026(RATES, POSTING), seed=11,
+        fee_scenario=FeeScenario.observed_alpaca_2026(RATES, POSTING), seed=11, opening_journal=True,
     )
     alerts = TelegramAlerter(None, None)
     with account_lease(AccountRef("alpaca", "SIM0001"), holder="runtime-on-simulator", directory=tmp_path) as lease:
+        # Rev.140: the operator bootstraps the fill cursor before the first run.
+        from tradepulse.reconciliation.bootstrap import bootstrap_fill_cursor
+        await bootstrap_fill_cursor(repositories, broker, lease, reason="runtime on simulator", now=clock())
         sent: list[tuple[str, str]] = []
 
         def runtime_clock() -> datetime:
@@ -241,7 +244,8 @@ async def test_fee_posted_before_an_existing_cursor_is_captured(runtime: Runtime
     rt.advance_to(CLOSE + timedelta(minutes=5))
     pending = await rt.reconcile()  # the position is closed, its fees have not posted
     assert (pending.status, pending.error) == ("degraded", "ACCOUNTING_EPOCH_INCOMPLETE")
-    [cursor_row] = await rt.rows("broker_activity_cursors")
+    # The asset-fee cursor; Rev.140's fill cursor shares the table (its payload carries pass_id).
+    [cursor_row] = [row for row in await rt.rows("broker_activity_cursors") if "pass_id" not in row]
     cursor = json.dumps(cursor_row)
     last_fill = (await rt.broker.get_activities(activity_type="FILL"))[-1].activity_id
     assert last_fill in cursor and await rt.fee_ledger_entries() == Counter()

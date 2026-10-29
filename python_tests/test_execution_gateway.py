@@ -1,9 +1,12 @@
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from uuid import uuid4
 
 import httpx
 import respx
+from conftest import mock_cursor_read, mock_open_orders, seed_fill_cursor
 from lease_support import held_test_lease
 
 from tradepulse.alerts import TelegramAlerter
@@ -14,8 +17,10 @@ from tradepulse.execution import (
     PORTFOLIO_RISK_LOCK_TTL_SECONDS,
     ExecutionGateway,
     ExecutionRequest,
+    ExecutionResult,
     execution_lock_key,
 )
+from tradepulse.execution.idempotency import release_symbol_reservation, reserve_symbol_for_execution
 from tradepulse.models import (
     AssetClass,
     AssetIdentity,
@@ -51,7 +56,36 @@ async def _setup(tmp_path):
     settlement = SettlementProcessor(repositories, alerts, clock=lambda: NOW)
     limits = risk_limits_for_profile("balanced")
     gateway = ExecutionGateway(repositories, broker, market_data, settlement, alerts, limits, ExecutionMode.PAPER, clock=lambda: NOW, lease=held_test_lease())
+    # Rev.140: a sell is authorized against the fill cursor, under the execution
+    # reservation the monitor holds in production. Direct calls here get both.
+    await seed_fill_cursor(repositories)
+    mock_open_orders()
+    mock_cursor_read()
+    execute = gateway.execute_intent
+
+    async def reserved(request: ExecutionRequest) -> ExecutionResult:
+        if request.side != Side.SELL or request.symbol_lock_owner_token is not None:
+            return await execute(request)
+        token = f"test-{uuid4()}"
+        assert await reserve_symbol_for_execution(database, request.asset, token)
+        try:
+            return await execute(replace(request, symbol_lock_owner_token=token))
+        finally:
+            await release_symbol_reservation(database, request.asset, token)
+
+    gateway.execute_intent = reserved  # type: ignore[method-assign]
     return repositories, broker, gateway
+
+
+async def _seed_owned_lot(repositories: PersistenceRepositories, quantity: str, asset: AssetIdentity | None = None) -> None:
+    """The open long lot the shares being sold came from (Rev.140's local bound)."""
+    from tradepulse.models import PositionLot
+
+    asset = asset or _aapl()
+    lot = PositionLot(lot_id=f"owned-{asset.symbol}", originating_fill_id=f"owned-fill-{asset.symbol}", asset=asset,
+                      position_side="long", opened_quantity=Decimal(quantity), remaining_quantity=Decimal(quantity),
+                      acquisition_price=Decimal("150"), opened_at=NOW)
+    await repositories.position_lots.create_once(lot.lot_id, lot, unique_value=lot.originating_fill_id)
 
 
 def _mock_account(cash: str = "50000", equity: str = "100000", last_equity: str = "99500") -> None:
@@ -904,6 +938,7 @@ async def test_protective_exit_bypasses_only_the_session_gate_not_downstream_che
         TradingSession("session", SessionState.RISK_STOPPED, False, NOW, kill_switch_reason="daily loss", kill_switch_reset_required=True),
     )
     _mock_positions(_position_json(qty="5"))
+    await _seed_owned_lot(repositories, "5")
     _mock_quote()
     respx.get("https://paper-api.alpaca.markets/v2/account").mock(return_value=httpx.Response(500, json={"message": "internal error"}))
     order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
@@ -1060,6 +1095,7 @@ async def test_protective_exit_exempt_from_market_clock_check(tmp_path) -> None:
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
     _mock_positions(_position_json(qty="5"))
+    await _seed_owned_lot(repositories, "5")
     _mock_quote()
     _mock_market_open(is_open=False)
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -1077,11 +1113,11 @@ async def test_protective_exit_exempt_from_market_clock_check(tmp_path) -> None:
 
 @respx.mock
 async def test_protective_exit_uses_broker_quantity_not_understated_local_holding_even_when_integrity_blocked(tmp_path) -> None:
-    """The exact accounting-drift scenario finding 1 fixes: local Holding
-    understates the position (3) but Alpaca's real position is larger (10).
-    A protective SELL for the full broker quantity must still classify as a
-    protective exit -- and therefore must NOT be blocked by
-    FINANCIAL_INTEGRITY_BLOCKED, the very state this drift would trigger."""
+    """The accounting-drift scenario finding 1 fixes, under Rev.140's bound:
+    local lots prove 3 shares while Alpaca reports 10. The protective exit is
+    still not blocked by FINANCIAL_INTEGRITY_BLOCKED, but it sells only what
+    TradePulse can prove it owns -- min(local, broker) -- and alerts the
+    reduction. The unexplained 7 are reconciliation's to resolve."""
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession(
         "session", SessionState.FINANCIAL_INTEGRITY_BLOCKED, False, NOW,
@@ -1090,21 +1126,22 @@ async def test_protective_exit_uses_broker_quantity_not_understated_local_holdin
     await repositories.holdings.create_once(
         asset_identity_key(_aapl()), Holding(asset=_aapl(), quantity=Decimal("3"), average_price=Decimal("150"), updated_at=NOW)
     )
+    await _seed_owned_lot(repositories, "3")
     _mock_positions(_position_json(qty="10"))  # broker's real position is larger than the stale local Holding
     _mock_account()
     _mock_quote()
-    respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
-        return_value=httpx.Response(200, json={"id": "order-1", "status": "filled", "symbol": "AAPL", "side": "sell", "filled_qty": "10", "filled_avg_price": "199.60", "submitted_at": QUOTE_TS})
+        return_value=httpx.Response(200, json={"id": "order-1", "status": "filled", "symbol": "AAPL", "side": "sell", "filled_qty": "3", "filled_avg_price": "199.60", "submitted_at": QUOTE_TS})
     )
-    _mock_fill_activities(_fill_activity("act-1", side="sell", qty="10"))
+    _mock_fill_activities(_fill_activity("act-1", side="sell", qty="3"))
 
     request = ExecutionRequest(asset=_aapl(), side=Side.SELL, requested_quantity=Decimal("10"), strategy="test")
     result = await gateway.execute_intent(request)
     await broker.aclose()
 
-    assert result.status == "filled"
-
+    assert (result.status, result.filled_quantity) == ("filled", Decimal("3"))
+    assert b'"qty":"3"' in order_route.calls[0].request.content
 
 @respx.mock
 async def test_sell_not_covered_by_broker_quantity_is_not_protective_and_stays_blocked(tmp_path) -> None:
@@ -1124,7 +1161,9 @@ async def test_sell_not_covered_by_broker_quantity_is_not_protective_and_stays_b
     await broker.aclose()
 
     assert result.status == "rejected"
-    assert result.reasons == ["FINANCIAL_INTEGRITY_BLOCKED"]
+    # Rev.140: refused by the sellable bound before the session gate is reached;
+    # a sell above the broker position and without an exit reason is not protective.
+    assert result.reasons[0].startswith("INSUFFICIENT_SELLABLE_QUANTITY")
     assert order_route.call_count == 0
 
 
@@ -1166,6 +1205,7 @@ async def test_protective_exit_resolves_correct_position_when_broker_reports_sam
     bare-symbol match or dict-overwrite would have picked."""
     repositories, broker, gateway = await _setup(tmp_path)
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
+    await _seed_owned_lot(repositories, "5")
     _mock_positions(
         _position_json(symbol="AAPL", qty="5", current_price="150", asset_class="us_equity"),
         _position_json(symbol="AAPL", qty="2", current_price="60000", asset_class="crypto"),
@@ -1623,6 +1663,7 @@ async def test_protective_sell_executes_despite_portfolio_risk_lock_held(tmp_pat
     )
     _mock_account()
     _mock_positions(_position_json(qty="5"))
+    await _seed_owned_lot(repositories, "5")
     _mock_quote()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
     respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
@@ -1648,6 +1689,7 @@ async def test_covered_sell_executes_despite_portfolio_risk_lock_held(tmp_path) 
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     _mock_account()
     _mock_positions(_position_json(qty="5"))
+    await _seed_owned_lot(repositories, "5")
     _mock_quote()
     _mock_market_open()
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
@@ -1830,7 +1872,9 @@ async def test_crypto_protective_exit_position_reread_failure_closes_the_intent(
     _mock_account(cash="50000", equity="100000", last_equity="100000")
     position = {"symbol": "BTC/USD", "asset_class": "crypto", "qty": "1", "avg_entry_price": "60000",
                 "market_value": "60000", "current_price": "60000", "unrealized_pl": "0"}
+    await _seed_owned_lot(repositories, "1", _btc())
     respx.get("https://paper-api.alpaca.markets/v2/positions").mock(side_effect=[
+        httpx.Response(200, json=[position]),  # Rev.140's sell authorization read
         httpx.Response(200, json=[position]),
         httpx.Response(503, json={"message": "unavailable"}),
     ])
