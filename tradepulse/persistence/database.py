@@ -170,6 +170,27 @@ CREATE TABLE IF NOT EXISTS unresolved_execution_outcomes (
 CREATE TABLE IF NOT EXISTS fill_cursor_bootstrap (
   record_id TEXT PRIMARY KEY, account_ref TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, created_at TEXT NOT NULL
 );
+-- Rev.144 §3.7: the calendar cross-check lifecycle, append-only. Date and
+-- instrument rows exist only for a check with a completed event.
+CREATE TABLE IF NOT EXISTS calendar_check_events (
+  record_id TEXT PRIMARY KEY, check_id TEXT NOT NULL, event TEXT NOT NULL
+    CHECK(event IN ('started','fetched','completed','failed')),
+  broker TEXT NOT NULL, venue TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(check_id, event)
+);
+CREATE TABLE IF NOT EXISTS calendar_check_dates (
+  record_id TEXT PRIMARY KEY, check_id TEXT NOT NULL, broker TEXT NOT NULL, venue TEXT NOT NULL, date TEXT NOT NULL,
+  result TEXT NOT NULL CHECK(result IN ('agreed','contested')), checked_at TEXT NOT NULL,
+  payload TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(check_id, broker, venue, date)
+);
+CREATE INDEX IF NOT EXISTS idx_calendar_check_dates ON calendar_check_dates(broker, venue, date, checked_at);
+CREATE TABLE IF NOT EXISTS instrument_hours (
+  record_id TEXT PRIMARY KEY, check_id TEXT NOT NULL, broker TEXT NOT NULL, instrument_key TEXT NOT NULL,
+  date TEXT NOT NULL, checked_at TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(check_id, broker, instrument_key, date)
+);
+CREATE INDEX IF NOT EXISTS idx_instrument_hours ON instrument_hours(broker, instrument_key, date, checked_at);
 """
 
 # These triggers record provenance even if an operator later deletes all rows.
@@ -185,6 +206,23 @@ EVIDENCE_TABLES = (
 )
 
 QUARANTINE_TABLES = EVIDENCE_TABLES[-10:]
+CALENDAR_TABLES = ("calendar_check_events", "calendar_check_dates", "instrument_hours")
+APPEND_ONLY_TABLES = QUARANTINE_TABLES + CALENDAR_TABLES
+
+# Rev.144 §3.7: at most one terminal event per check, and date or hours rows
+# only for a check already completed in the same transaction.
+CALENDAR_INSERT_TRIGGERS = (
+    ("calendar_one_terminal_event",
+     "CREATE TRIGGER calendar_one_terminal_event BEFORE INSERT ON calendar_check_events "
+     "WHEN NEW.event IN ('completed','failed') AND EXISTS (SELECT 1 FROM calendar_check_events "
+     "WHERE check_id = NEW.check_id AND event IN ('completed','failed')) "
+     "BEGIN SELECT RAISE(ABORT, 'calendar check already ended'); END"),
+    *((f"calendar_rows_need_completed_{table}",
+       f"CREATE TRIGGER calendar_rows_need_completed_{table} BEFORE INSERT ON {table} "
+       f"WHEN NOT EXISTS (SELECT 1 FROM calendar_check_events WHERE check_id = NEW.check_id AND event = 'completed') "
+       f"BEGIN SELECT RAISE(ABORT, '{table} rows need a completed check'); END")
+      for table in ("calendar_check_dates", "instrument_hours")),
+)
 
 
 def _quarantine_trigger(table: str, operation: str) -> tuple[str, str]:
@@ -204,15 +242,22 @@ def create_quarantine_triggers(connection: sqlite3.Connection, tables: Iterable[
             connection.execute(_quarantine_trigger(table, operation)[1])
 
 
+def create_calendar_insert_triggers(connection: sqlite3.Connection, tables: Iterable[str]) -> None:
+    created = set(tables)
+    for name, sql in CALENDAR_INSERT_TRIGGERS:
+        if any(f" ON {table} " in sql for table in created):
+            connection.execute(sql)
+
+
 def verify_schema_triggers(connection: sqlite3.Connection) -> None:
     """Every quarantine table refuses UPDATE and DELETE (spec §3.11, I9).
     Raises SCHEMA_TRIGGER_MISSING when a trigger is absent or its SQL differs."""
-    for table in QUARANTINE_TABLES:
-        for operation in ("UPDATE", "DELETE"):
-            name, expected = _quarantine_trigger(table, operation)
-            row = connection.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()
-            if row is None or row[0] != expected:
-                raise DatabaseError(f"SCHEMA_TRIGGER_MISSING:{name}")
+    expected_triggers = [_quarantine_trigger(table, operation) for table in APPEND_ONLY_TABLES
+                         for operation in ("UPDATE", "DELETE")] + list(CALENDAR_INSERT_TRIGGERS)
+    for name, expected in expected_triggers:
+        row = connection.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()
+        if row is None or row[0] != expected:
+            raise DatabaseError(f"SCHEMA_TRIGGER_MISSING:{name}")
 
 
 def initialize_identity(connection: sqlite3.Connection, *, legacy: bool) -> None:
@@ -278,7 +323,9 @@ class AsyncSQLiteDatabase:
                     present = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                     connection.executescript(SCHEMA)
                     initialize_identity(connection, legacy=existed)
-                    create_quarantine_triggers(connection, [t for t in QUARANTINE_TABLES if t not in present])
+                    created = [t for t in APPEND_ONLY_TABLES if t not in present]
+                    create_quarantine_triggers(connection, created)
+                    create_calendar_insert_triggers(connection, created)
                 verify_schema_triggers(connection)
             finally:
                 connection.close()
