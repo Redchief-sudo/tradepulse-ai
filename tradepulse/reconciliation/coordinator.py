@@ -37,6 +37,7 @@ fill; that case is recorded and alerted, never auto-corrected.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -345,6 +346,12 @@ def _find_heuristic_match(activity: AlpacaActivity, local_fills: list[Fill], alr
     return None
 
 
+def _execution_issue(connection: Any, *, activity: AlpacaActivity) -> str | None:
+    from tradepulse.quarantine.resolve import execution_issue
+
+    return execution_issue(connection, activity)
+
+
 async def _reconcile_fills(
     repositories: PersistenceRepositories, broker: BrokerPort, settlement: SettlementProcessor,
     alerts: TelegramAlerter, now: datetime, lookback: timedelta,
@@ -414,9 +421,8 @@ async def _reconcile_fills(
         # resolve` matches by exact ID only, with its digest and its one cash
         # entry re-verified; nothing is written for it here.
         if await repositories.quarantine_executions.get(activity.activity_id) is not None:
-            from tradepulse.quarantine.resolve import execution_issue
-
-            issue = await repositories.quarantine_executions.database.run(lambda c, a=activity: execution_issue(c, a))
+            issue: str | None = await repositories.quarantine_executions.database.run(
+                functools.partial(_execution_issue, activity=activity))
             if issue is None:
                 await _record(
                     repositories, reconciliation_type="fill", subject_id=activity.activity_id, outcome=ReconciliationOutcome.MATCHED,

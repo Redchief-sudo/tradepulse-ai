@@ -249,9 +249,9 @@ async def marked_snapshot(
     # Rev.140 I2: broker quantity = open long lots + open unmanaged long - open liabilities.
     from tradepulse.quarantine import quarantined_positions, signed_quantities, snapshot_blocks
     quarantined = await quarantined_positions(repositories)
-    explained = dict(lot_quantities)
+    explained_quantities = dict(lot_quantities)
     for key, quantity in signed_quantities(quarantined).items():
-        explained[key] = explained.get(key, Decimal(0)) + quantity
+        explained_quantities[key] = explained_quantities.get(key, Decimal(0)) + quantity
     marks = {asset_key_from_broker_symbol(p.asset_class, p.symbol): p.current_price for p in positions}
     blocks = snapshot_blocks(quarantined, marks)
     if 'short_market_value' in components:
@@ -262,9 +262,9 @@ async def marked_snapshot(
     if generation is not None:
         for key, quantity in generation['opening_quantities'].items():
             broker_quantities[key] = broker_quantities.get(key, Decimal(0)) - quantity
-    identities = set(holdings) | set(explained) | set(broker_quantities)
+    identities = set(holdings) | set(explained_quantities) | set(broker_quantities)
     quantities = {key: 'matched' if broker_quantities.get(key, Decimal(0)) ==
-                  explained.get(key, Decimal(0)) else 'mismatch' for key in identities}
+                  explained_quantities.get(key, Decimal(0)) else 'mismatch' for key in identities}
     lots_result = {key: 'matched' if lot_quantities.get(key, Decimal(0)) ==
                    (holdings[key].quantity if key in holdings else Decimal(0)) else 'mismatch' for key in identities}
     from tradepulse.settlement.accounting import accounting_issues
