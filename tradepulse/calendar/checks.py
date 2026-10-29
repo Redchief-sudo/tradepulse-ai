@@ -74,12 +74,12 @@ def compare(calendar: MarketCalendar, venue: Venue, sessions: Sequence[BrokerSes
             library = calendar.session(venue, day)
         except CalendarHorizonExceeded:
             break  # nothing past the library window is verified
-        broker = by_day.get(day)
-        agreed = (library is None and broker is None) or (
-            library is not None and broker is not None and (library.open, library.close) == (broker.open, broker.close))
+        reported = by_day.get(day)
+        agreed = (library is None and reported is None) or (
+            library is not None and reported is not None and (library.open, library.close) == (reported.open, reported.close))
         rows.append({"date": day, "result": "agreed" if agreed else "contested",
-                     "broker_open": broker.open.isoformat() if broker else None,
-                     "broker_close": broker.close.isoformat() if broker else None,
+                     "broker_open": reported.open.isoformat() if reported else None,
+                     "broker_close": reported.close.isoformat() if reported else None,
                      "calendar_open": library.open.isoformat() if library else None,
                      "calendar_close": library.close.isoformat() if library else None})
         day += timedelta(days=1)
@@ -311,3 +311,49 @@ class CalendarGate:
         if not self.fresh(datetime.fromisoformat(checked_at), t) or close <= t or close < session.close:
             return None
         return close
+
+
+@dataclass(frozen=True, slots=True)
+class EntryWindow:
+    open: bool
+    basis: Literal["venue_regular_session", "verified_instrument_hours", "continuous"] | None
+    reason: str | None  # the rejection code when open is False
+
+
+LATE_CLOSE_WINDOW = timedelta(minutes=15)  # the longest known option late close (16:15 ET)
+_STATUS_REASONS = {"contested": "CALENDAR_DATE_CONTESTED", "unverified": "CALENDAR_UNVERIFIED",
+                   "beyond_horizon": "CALENDAR_HORIZON_EXCEEDED"}
+
+
+async def entry_window_open(gate: CalendarGate, broker: str, asset: AssetIdentity, t: datetime, broker_clock: Any,
+                            monitor: Any = None) -> EntryWindow:
+    """§3.5: the single entry-authorization question, in the spec's order.
+    Never asked for a protective exit (C-5)."""
+    from . import venue_for
+    from .disagreement import MONITOR
+
+    monitor = monitor if monitor is not None else MONITOR
+    venue = venue_for(asset)
+    if venue == Venue.CRYPTO:
+        return EntryWindow(True, "continuous", None)
+    day = ny_date(t)
+    status = await gate.status(venue, day, t)
+    if status != "verified":
+        return EntryWindow(False, None, _STATUS_REASONS[status])
+    if monitor.active:
+        return EntryWindow(False, None, "CALENDAR_CLOCK_DISAGREEMENT")
+    session = gate.calendar.session(venue, day)
+    in_session = session is not None and session.open <= t < session.close
+    if in_session and broker_clock.is_open:
+        return EntryWindow(True, "venue_regular_session", None)
+    after_close = venue == Venue.US_OPTION and session is not None and t >= session.close
+    if after_close:
+        close = await gate.instrument_close(broker, asset, t)
+        if (close is not None and not broker_clock.is_open and broker_clock.next_open is not None
+                and broker_clock.next_open > t and not monitor.episode_on(day)):
+            return EntryWindow(True, "verified_instrument_hours", None)
+        if session is not None and t < session.close + LATE_CLOSE_WINDOW:
+            return EntryWindow(False, None, "OPTION_INSTRUMENT_HOURS_UNVERIFIED")
+    if not broker_clock.is_open:
+        return EntryWindow(False, None, "OPTION_MARKET_CLOSED" if venue == Venue.US_OPTION else "EQUITY_MARKET_CLOSED")
+    return EntryWindow(False, None, "CALENDAR_SESSION_CLOSED")

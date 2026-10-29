@@ -17,7 +17,7 @@ from tradepulse.models.market import VENUES, asset_key_from_broker_symbol, canon
 
 ROOT = Path(__file__).resolve().parent.parent
 PORT_MEMBERS = {
-    "venue", "implementation", "get_account", "get_positions", "get_clock", "place_order", "get_order",
+    "venue", "implementation", "get_account", "get_positions", "get_clock", "get_calendar", "place_order", "get_order",
     "get_order_by_client_order_id", "get_open_orders", "cancel_order", "get_activities", "get_latest_quote",
     "get_latest_option_quotes", "get_options_chain", "get_bars", "set_market_data_feeds", "rate_limit_snapshot",
     "aclose",

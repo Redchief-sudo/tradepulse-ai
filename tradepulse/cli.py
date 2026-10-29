@@ -1086,6 +1086,9 @@ async def _run_application(settings: Settings, port: int, open_browser: bool, *,
             market_data = AlpacaMarketDataProvider(broker)
             gateway = _build_gateway(settings, repositories, broker, market_data, alerts, lease)
             settlement = SettlementProcessor(repositories, alerts)
+            from tradepulse.reconciliation.coordinator import run_calendar_checks
+
+            await run_calendar_checks(repositories, broker, alerts, datetime.now(UTC))  # Rev.144: before any entry
             dashboard_state = AppState(settings=settings, repositories=repositories, broker=broker, market_data=market_data)
             server = _build_dashboard_server(dashboard_state, port, settings.log_level)
 

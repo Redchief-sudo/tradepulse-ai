@@ -575,7 +575,7 @@ async def run_scan_cycle(
 
     session = await load_session(repositories)
     if session.state in (SessionState.ACTIVE, SessionState.MARKET_CLOSED):
-        synced = await sync_market_session(repositories, broker, clock)
+        synced = await sync_market_session(repositories, broker, clock, alerts=gateway.alerts)
         if synced is not None:
             session = synced
     hard_blocked_states = (SessionState.FINANCIAL_INTEGRITY_BLOCKED, SessionState.RISK_STOPPED)

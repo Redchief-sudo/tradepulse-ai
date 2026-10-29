@@ -44,6 +44,9 @@ from tradepulse.session_commands import (
     run_stop as _run_stop,
 )
 
+# Rev.144: written for a broker clock mocked as open on the wall clock.
+pytestmark = pytest.mark.usefixtures("open_market_calendar")
+
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)
 
 

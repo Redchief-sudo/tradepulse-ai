@@ -36,7 +36,10 @@ from tradepulse.broker import (
     default_time_in_force,
     is_definitive_rejection,
 )
+from tradepulse.broker.port import BrokerClock
 from tradepulse.broker.symbols import broker_symbol_asset_key
+from tradepulse.calendar import MarketCalendar
+from tradepulse.calendar.checks import EntryWindow
 from tradepulse.models import (
     AssetClass,
     AssetIdentity,
@@ -192,12 +195,14 @@ class ExecutionGateway:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         *,
         lease: AccountLease,
+        calendar: MarketCalendar | None = None,
     ) -> None:
         # Every submission is fenced by the account lease (runtime_lease.py);
         # a gateway can never exist without one, nor with one for another venue.
         if lease.ref.venue != broker.venue:
             raise ValueError(f"account lease is for venue {lease.ref.venue!r}, the broker is {broker.venue!r}")
         self._lease = lease
+        self._calendar = calendar  # None: the pinned process calendar for the current NY date (Rev.144)
         self._repositories = repositories
         self._broker = broker
         self._market_data = market_data
@@ -206,6 +211,33 @@ class ExecutionGateway:
         self._risk_limits = risk_limits
         self._execution_mode = execution_mode
         self._clock = clock
+
+    @property
+    def alerts(self) -> TelegramAlerter:
+        return self._alerts
+
+    async def _entry_window(self, asset: AssetIdentity, market_clock: BrokerClock) -> EntryWindow:
+        """CAL-I1. With no completed check for today yet (a one-shot command,
+        or the first entry of a new NY date), the daily check runs here
+        first, so an entry is never authorized by stale or absent evidence."""
+        from tradepulse.calendar import market_calendar, ny_date
+        from tradepulse.calendar.checks import (
+            CHECKED_VENUES,
+            CalendarGate,
+            checked_today,
+            entry_window_open,
+            run_daily_checks,
+        )
+
+        now = self._clock()
+        calendar = self._calendar or market_calendar(ny_date(now))
+        gate = CalendarGate(self._repositories, calendar, (self._broker.venue,))
+        window = await entry_window_open(gate, self._broker.venue, asset, now, market_clock)
+        if window.reason == "CALENDAR_UNVERIFIED" and not all(
+                [await checked_today(self._repositories, self._broker.venue, venue, now) for venue in CHECKED_VENUES]):
+            await run_daily_checks(self._repositories, self._broker, self._broker.venue, calendar, self._alerts, now)
+            window = await entry_window_open(gate, self._broker.venue, asset, now, market_clock)
+        return window
 
     async def execute_intent(self, request: ExecutionRequest) -> ExecutionResult:
         now = self._clock()
@@ -506,11 +538,12 @@ class ExecutionGateway:
                 rejected = replace(approved, status=TradeIntentStatus.REJECTED, rejection_reason=f"MARKET_CLOCK_UNAVAILABLE: {exc}")
                 await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
                 return ExecutionResult("rejected", trade_intent_id, [rejected.rejection_reason], Decimal("0"), None)
-            if not market_clock.is_open:
-                # Preserves the existing "EQUITY_MARKET_CLOSED" label exactly
-                # for equity (established, tested string) while giving
-                # options its own distinct, non-misleading reason.
-                reason = "EQUITY_MARKET_CLOSED" if request.asset.asset_class == AssetClass.EQUITY else "OPTION_MARKET_CLOSED"
+            # Rev.144 §3.5: one decision, the broker clock plus the calendar
+            # as a second witness. EQUITY_MARKET_CLOSED and
+            # OPTION_MARKET_CLOSED keep their established strings.
+            window = await self._entry_window(request.asset, market_clock)
+            if not window.open:
+                reason = window.reason or "CALENDAR_SESSION_CLOSED"
                 rejected = replace(approved, status=TradeIntentStatus.REJECTED, rejection_reason=reason)
                 await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
                 return ExecutionResult("rejected", trade_intent_id, [reason], Decimal("0"), None)

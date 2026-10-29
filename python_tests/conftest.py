@@ -148,3 +148,57 @@ def mock_cursor_read(cursor: str = "zzzz-test-cursor"):
 
 
 from rev140_support import rt  # noqa: F401 - the shared Rev.140 runtime fixture
+
+
+@pytest.fixture(autouse=True)
+def _reset_clock_calendar_monitor():
+    """Rev.144: the clock-calendar disagreement monitor is process state; no
+    test may inherit another's episode."""
+    from tradepulse.calendar.disagreement import MONITOR
+
+    MONITOR.reset()
+    yield
+    MONITOR.reset()
+
+
+def _open_calendar():
+    """Rev.144 test calendar: every New York day is a session, 00:01 to
+    23:59, so wall-clock tests with a mocked "open" broker clock agree with
+    the calendar at any hour. Alpaca and always-open simulators report the
+    same sessions, so the daily check verifies every date."""
+    from datetime import UTC, datetime, time, timedelta
+
+    from tradepulse.calendar import MarketCalendar, ny_date, ny_time
+
+    today = ny_date(datetime.now(UTC))
+    first, last = today - timedelta(days=400), today + timedelta(days=400)
+    sessions = {first + timedelta(days=n): (ny_time(first + timedelta(days=n), time(0, 1)), ny_time(first + timedelta(days=n), time(23, 59)))
+                for n in range((last - first).days + 1)}
+    return MarketCalendar(sessions, first=first, last=last, option_close_from_equity=True)
+
+
+@pytest.fixture
+def open_market_calendar(monkeypatch):
+    """For tests written before Rev.144 that mock the broker clock as open on
+    the real wall clock: the process calendar becomes the always-in-session
+    test calendar, and the mocked brokers report it. Rev.144's own tests use
+    the pinned library calendar instead."""
+    from tradepulse.broker import AlpacaClient
+    from tradepulse.broker.simulated import SimulatedBroker
+    from tradepulse.calendar import BrokerSession, Venue
+
+    calendar = _open_calendar()
+    monkeypatch.setattr("tradepulse.calendar.market_calendar", lambda today=None: calendar)
+
+    async def sessions(self, start, end):
+        return [BrokerSession(venue, s.date, s.open, s.close, "test:open_calendar")
+                for venue in (Venue.US_EQUITY, Venue.US_OPTION) for s in calendar.sessions_between(venue, start, end)]
+
+    real = SimulatedBroker.get_calendar
+
+    async def simulated(self, start, end):
+        return await sessions(self, start, end) if self._session.always else await real(self, start, end)
+
+    monkeypatch.setattr(AlpacaClient, "get_calendar", sessions)
+    monkeypatch.setattr(SimulatedBroker, "get_calendar", simulated)
+    return calendar

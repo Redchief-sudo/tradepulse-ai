@@ -76,7 +76,10 @@ class MarketCalendar:
     """Sessions for each venue from one library build."""
 
     def __init__(self, equity_sessions: dict[date, tuple[datetime, datetime]], *, first: date, last: date,
-                 library_version: str = LIBRARY_VERSION) -> None:
+                 library_version: str = LIBRARY_VERSION, option_close_from_equity: bool = False) -> None:
+        """``option_close_from_equity`` is for test calendars only: options
+        close with the equity session instead of at 16:00 (13:00) ET."""
+        self._option_close_from_equity = option_close_from_equity
         self._equity = dict(sorted(equity_sessions.items()))
         self._dates = list(self._equity)
         self.first, self.last = first, last
@@ -118,7 +121,7 @@ class MarketCalendar:
             return None
         open_at, close_at = hours
         early = close_at < ny_time(day, OPTION_CLOSE)
-        if venue == Venue.US_OPTION:
+        if venue == Venue.US_OPTION and not self._option_close_from_equity:
             close_at = ny_time(day, OPTION_EARLY_CLOSE if early else OPTION_CLOSE)
         return Session(venue, day, open_at, close_at, early)
 

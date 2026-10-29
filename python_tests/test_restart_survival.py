@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import httpx
+import pytest
 import respx
 from conftest import mock_cursor_read, mock_open_orders, seed_fill_cursor
 from lease_support import held_test_lease
@@ -52,6 +53,9 @@ from tradepulse.risk import save_session
 from tradepulse.scanner import run_scan_cycle
 from tradepulse.settlement import SettlementProcessor
 from tradepulse.strategy import ExecutableUniverse
+
+# Rev.144: written for a broker clock mocked as open on the wall clock.
+pytestmark = pytest.mark.usefixtures("open_market_calendar")
 
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)
 QUOTE_TS = NOW.isoformat().replace("+00:00", "Z")

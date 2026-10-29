@@ -352,6 +352,23 @@ def _execution_issue(connection: Any, *, activity: AlpacaActivity) -> str | None
     return execution_issue(connection, activity)
 
 
+async def run_calendar_checks(repositories: PersistenceRepositories, broker: BrokerPort, alerts: TelegramAlerter,
+                              now: datetime) -> None:
+    """The daily calendar cross-check. Its failures are recorded as failed
+    checks and degrade the calendar to unverified (entries refused, exits
+    unaffected); they never stop reconciliation."""
+    from tradepulse.calendar import market_calendar, ny_date
+    from tradepulse.calendar.checks import run_daily_checks
+
+    venue = getattr(broker, "venue", None)
+    if not isinstance(venue, str):
+        return
+    try:
+        await run_daily_checks(repositories, broker, venue, market_calendar(ny_date(now)), alerts, now)
+    except Exception as exc:  # noqa: BLE001 - the calendar never blocks reconciliation itself
+        logger.warning("calendar_check_unavailable", extra={"event": "calendar_check_unavailable", "error": str(exc)})
+
+
 async def _reconcile_fills(
     repositories: PersistenceRepositories, broker: BrokerPort, settlement: SettlementProcessor,
     alerts: TelegramAlerter, now: datetime, lookback: timedelta,
@@ -648,7 +665,10 @@ async def _recover_stranded_intents(repositories, broker, alerts, now, lease_los
     finality proof.
     """
     from tradepulse.execution import (
-        SYMBOL_LOCK_TTL_SECONDS, execution_lock_key, release_symbol_reservation, reserve_symbol_for_execution,
+        SYMBOL_LOCK_TTL_SECONDS,
+        execution_lock_key,
+        release_symbol_reservation,
+        reserve_symbol_for_execution,
     )
     from tradepulse.persistence import run_with_lock_renewal
 
@@ -781,7 +801,8 @@ def _commit_stranded(connection, original_payload, intent, updated, record, now,
     still be ours and unexpired; the stored payload must equal the re-read one
     in full; and no integrity hold may reference the intent or the adopted
     order."""
-    from datetime import UTC, datetime as _datetime
+    from datetime import UTC
+    from datetime import datetime as _datetime
 
     from tradepulse.persistence.codec import decode_payload, encode_payload
 
@@ -894,6 +915,7 @@ async def run_reconciliation(
         await latch_financial_integrity_block(repositories, projection_error, clock=lambda: now)
     from tradepulse.quarantine.legacy import latch_legacy_short_lots
     await latch_legacy_short_lots(repositories, now)  # Rev.140 I8, every pass
+    await run_calendar_checks(repositories, broker, alerts, now)  # Rev.144 §3.4: once per NY date
     await _recover_stranded_intents(repositories, broker, alerts, now, lease_lost, reconcile_lease=reconcile_lease)
     await _recover_inflight_orders(repositories, broker, settlement, alerts, now, lease_lost)
     fee_error = None

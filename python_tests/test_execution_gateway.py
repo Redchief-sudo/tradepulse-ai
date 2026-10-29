@@ -5,6 +5,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 import httpx
+import pytest
 import respx
 from conftest import mock_cursor_read, mock_open_orders, seed_fill_cursor
 from lease_support import held_test_lease
@@ -37,6 +38,9 @@ from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories,
 from tradepulse.providers import AlpacaMarketDataProvider
 from tradepulse.risk import load_session, save_session
 from tradepulse.settlement import SettlementProcessor
+
+# Rev.144: written for a broker clock mocked as open on the wall clock.
+pytestmark = pytest.mark.usefixtures("open_market_calendar")
 
 NOW = datetime(2026, 8, 24, 15, 0, tzinfo=UTC)
 QUOTE_TS = NOW.isoformat().replace("+00:00", "Z")

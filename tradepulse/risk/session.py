@@ -23,6 +23,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -219,8 +220,29 @@ async def latch_financial_integrity_block(
     return await transition_session(repositories, decide)
 
 
+async def _observe_clock_against_calendar(repositories: PersistenceRepositories, clock_is_open: bool, now: datetime,
+                                          alerts: Any) -> None:
+    """Rev.144 §3.5: a clock-calendar disagreement blocks new entries while
+    it lasts, with one critical alert per episode. The session itself still
+    follows only the broker clock."""
+    from tradepulse.alerts import TelegramAlerter
+    from tradepulse.alerts.once import alert_once
+    from tradepulse.calendar import market_calendar, ny_date
+    from tradepulse.calendar.disagreement import MONITOR
+
+    if not MONITOR.observe(market_calendar(ny_date(now)), clock_is_open, now):
+        return
+    event = AuditEvent(
+        event_id=f"calendar_clock_disagreement:{now.isoformat()}", event_type="calendar_clock_disagreement", severity="critical",
+        message=(f"CALENDAR_CLOCK_DISAGREEMENT: the broker clock says {'open' if clock_is_open else 'closed'} "
+                 "against the market calendar. New stock and option entries are blocked until they agree."),
+        occurred_at=now, entity_type="market_calendar", entity_id="clock", details={"clock_is_open": clock_is_open})
+    await alert_once(repositories.audit_events, alerts or TelegramAlerter(None, None), event)
+
+
 async def sync_market_session(
     repositories: PersistenceRepositories, broker: BrokerPort, clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    alerts: Any = None,
 ) -> TradingSession | None:
     """Keep the session's ACTIVE/MARKET_CLOSED distinction synchronized with
     Alpaca's own authoritative market clock -- equities must never be gated
@@ -247,6 +269,7 @@ async def sync_market_session(
     except (AlpacaError, httpx.HTTPError):
         return None
     now = clock()
+    await _observe_clock_against_calendar(repositories, market_clock.is_open, now, alerts)
 
     def decide(session: TradingSession) -> tuple[TradingSession, AuditEvent] | None:
         if session.state == SessionState.ACTIVE and not market_clock.is_open:
