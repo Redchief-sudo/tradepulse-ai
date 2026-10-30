@@ -1,6 +1,6 @@
 # DBAE: Dynamic Balance-Aware Execution (Alpaca)
 
-Status: design for review, rev. 3 (2026-10-30). No production code changes are made until this spec is approved. Changes from rev. 1 are listed in §17.
+Status: design for review, rev. 4 (2026-10-30). No production code changes are made until this spec is approved. Changes from rev. 1 are listed in §17.
 
 ## 1. Purpose and scope
 
@@ -204,7 +204,8 @@ When an entry's band differs from the band of the last `dbae_band_changed` event
 
 `AccountEvidence` is parsed from `/v2/account` and `/v2/account/configurations`, both fetched fresh:
 - `status`, `trading_blocked`, `account_blocked`, `trade_suspended_by_user`;
-- `equity`, `cash`, `buying_power`, `non_marginable_buying_power`, `multiplier`;
+- `equity`, `cash`, `buying_power`, `non_marginable_buying_power`;
+- `account_multiplier`, parsed from Alpaca's account `multiplier`. This is the account's buying-power classification and is never used in order notional (§7.2);
 - `crypto_status`, `options_trading_level`;
 - `suspend_trade`, `closing_transactions_only`, `fractional_trading`;
 - `received_at`.
@@ -214,7 +215,7 @@ When an entry's band differs from the band of the last `dbae_band_changed` event
 Every new entry needs all of the following. Otherwise the entry is refused with `DBAE_ACCOUNT_STATE_UNVERIFIED`, or with the named flag reason if a flag is present but blocking:
 - `status == "ACTIVE"`;
 - `trading_blocked`, `account_blocked`, `trade_suspended_by_user`, `suspend_trade` and `closing_transactions_only` all `False`;
-- `equity`, `cash`, `buying_power` and `multiplier` present.
+- `equity`, `cash`, `buying_power` and `account_multiplier` present.
 
 Requirements that depend on the asset class:
 
@@ -226,9 +227,16 @@ Requirements that depend on the asset class:
 
 Level 2 is Alpaca's level for buying calls and puts. TradePulse opens only single-leg long options (§2.3). A missing options or crypto field never blocks an otherwise verified equity order.
 
-### 5.3 Cash accounts
+### 5.3 Account type
 
-`multiplier == 1` is refused with `DBAE_CASH_ACCOUNT_SETTLEMENT_UNVERIFIED`. Buying with unsettled sale proceeds can cause a good-faith violation, and the paper account (a margin account) cannot show which field reports settled cash. This is a named limit, to be lifted by its own evidence later.
+**Accepted values.** Only `account_multiplier` values of 2 or 4, which Alpaca uses for margin accounts, are accepted.
+
+**`account_multiplier == 1` is refused** with `DBAE_ACCOUNT_TYPE_UNVERIFIED`.
+- Alpaca uses 1 for limited-margin accounts as well as cash accounts, so on its own it does not prove an account is cash-only. DBAE does not try to classify it.
+- The refusal stands until the account type and its settled-funds rules are verified by their own evidence. Buying with unsettled sale proceeds in a cash account can cause a good-faith violation, and the paper account (multiplier 4) cannot show which field reports settled cash.
+- This is a named limitation of the initial rollout. It may exclude some genuine $20 accounts.
+
+**Any other value** (missing, 0, 3, or unparsable) gives `DBAE_ACCOUNT_STATE_UNVERIFIED`.
 
 ## 6. Asset eligibility
 
@@ -280,9 +288,17 @@ The shaped and submitted quantities are equal by construction. The original requ
 
 A buy's funding commitment is its trade intent, persisted as `RISK_APPROVED` before submission, under the portfolio-risk lock, by the lease-fenced write. Its `risk_snapshot.dbae.max_funding` records:
 
-`submitted_quantity × reference_price × multiplier × (1 + slippage_allowance) + projected_fees`
+`submitted_quantity × reference_price × contract_multiplier × (1 + slippage_allowance) + projected_fees`
 
-where `slippage_allowance` is the profile's `slippage_limit_for(asset_class)` as a fraction. For example, a request for $20 that is approved and shaped to $3.50 reserves about $3.50 plus its allowance and fees, never $20.
+where `slippage_allowance` is the profile's `slippage_limit_for(asset_class)` as a fraction.
+
+**`contract_multiplier` (DBAE-R3-01)** is the instrument's units per quantity. It always comes from `contract_multiplier_of(asset)` (`models/market.py`), the system's single source for converting quantity × price to dollars. That gives:
+- 1 for equities, whole or fractional, and for crypto;
+- for an option, the multiplier on Alpaca's contract record (`providers/alpaca_market_data.py` stores `contract.multiplier`), never an assumed 100. An option without one raises and is refused, as today.
+
+The account's `account_multiplier` (Alpaca's `multiplier`, for example 4) is a buying-power classification. It is **never** used in any order-notional, funding, reservation or exit-value calculation. A test pins this: with `account_multiplier = 4`, a $10 equity order reserves about $10 plus its allowance and fees, not $40.
+
+For example, a request for $20 that is approved and shaped to $3.50 reserves about $3.50 plus its allowance and fees, never $20.
 
 ### 7.3 Funding components and their sources (DBAE-R1-03)
 
@@ -304,7 +320,7 @@ where `slippage_allowance` is the profile's `slippage_limit_for(asset_class)` as
 
 `pending_buy_funding(repositories) -> Decimal` sums, over every buy intent in `RISK_APPROVED`, `SUBMITTED`, `ACCEPTED`, `PARTIALLY_FILLED` or `SUBMISSION_UNKNOWN`, across all symbols:
 
-`(submitted_quantity − attributed_quantity) × reference_price × multiplier × (1 + slippage_allowance) + unattributed projected fees`
+`(submitted_quantity − attributed_quantity) × reference_price × contract_multiplier × (1 + slippage_allowance) + unattributed projected fees`
 
 - `attributed_quantity` comes from the intent's SettlementEvents, the same ground truth and the same shared bucket helper as RISK-091-01. It is never taken from `filled_quantity`.
 - A `CANCELED` or `EXPIRED` intent leaves the set only once the broker has confirmed that terminal state. Its attributed part is then already in cash and holdings.
@@ -364,7 +380,7 @@ An entry is allowed only if its protective exit is a supported order:
 - **Crypto:** a `market` `gtc` sell of the full quantity. The quantity must be at least `min_order_size` and a multiple of `min_trade_increment`, which holds by construction after §8.2.
 - **Option:** a whole-contract `market` sell.
 
-**Sub-minimum liquidation.** If the position's value at its stop (`shaped_qty × stop_price × multiplier`) is below `max($1, min_order_size × stop_price)`, the entry depends on the broker accepting a sell below the entry minimum.
+**Sub-minimum liquidation.** If the position's value at its stop (`shaped_qty × stop_price × contract_multiplier`) is below `max($1, min_order_size × stop_price)`, the entry depends on the broker accepting a sell below the entry minimum.
 
 **Scoped evidence (DBAE-R2-02).** Sub-minimum liquidation evidence is a recorded table in `tradepulse/dbae/evidence.py`, `SUB_MINIMUM_LIQUIDATION_EVIDENCE: Mapping[LiquidationScope, LiquidationVerdict]`, following the pattern of Rev.143's `DIVIDEND_REPRESENTATION`.
 
@@ -451,7 +467,7 @@ Refusals never block exits, cancel orders or change holdings.
 | `DBAE_ACCOUNT_TRADING_BLOCKED` | `trading_blocked`, `account_blocked`, `trade_suspended_by_user` or `suspend_trade` |
 | `DBAE_ACCOUNT_CLOSING_ONLY` | `closing_transactions_only` |
 | `DBAE_ACCOUNT_NOT_ACTIVE` | `status != ACTIVE` |
-| `DBAE_CASH_ACCOUNT_SETTLEMENT_UNVERIFIED` | `multiplier == 1` |
+| `DBAE_ACCOUNT_TYPE_UNVERIFIED` | `account_multiplier == 1` (limited-margin or cash; §5.3) |
 | `DBAE_SESSION_BASELINE_UNVERIFIED` | no verified baseline for the current session (§4.3) |
 | `DBAE_ASSET_CLASS_LOCKED` | class not unlocked by the band |
 | `DBAE_ASSET_NOT_TRADABLE` | `active` or `tradable` not `True` |
@@ -536,6 +552,9 @@ All tests are deterministic: simulated broker data, a fixed clock and the Rev.14
    - A fee correction changes the reservation exactly once.
    - A crash between `RISK_APPROVED` and submission: the restart derives the same reservation.
    - Crypto uses `non_marginable_buying_power`.
+   - **Contract multiplier vs account multiplier:** with `account_multiplier = 4`, a $10 equity order's `max_funding` is $10 × (1 + allowance) + fees, not $40. The same holds for a crypto order.
+   - An option with contract multiplier 100 reserves 100 × premium × quantity. An option whose contract record has a non-standard multiplier (for example 10) uses that value. An option with no contract multiplier is refused.
+   - A static check (an AST test, as in Rev.142's T26) asserts that no `dbae/` or funding code reads `account_multiplier` except §5.3's account-type check.
    - A missing or negative input gives `DBAE_FUNDING_UNVERIFIED`.
    - **Request vs authorised quantity:** a $20 request risk-approved at $3.50 reserves the $3.50 order's obligation only. `risk_snapshot` holds all four quantities, and the submitted quantity equals the shaped one.
    - **Shaping:** a quantity floored by the increment has `max_funding` computed on the floored quantity. A floor that breaks the $1 minimum lot or the cost rule gives `DBAE_SHAPED_QUANTITY_NOT_REAPPROVED`.
@@ -559,7 +578,7 @@ All tests are deterministic: simulated broker data, a fixed clock and the Rev.14
 4. **Account restrictions.**
    - Each blocking flag on its own refuses entries and leaves a protective exit able to proceed.
    - Missing options fields block only options, and missing crypto fields block only crypto.
-   - A cash account is refused.
+   - `account_multiplier == 1` gives `DBAE_ACCOUNT_TYPE_UNVERIFIED`; 3, 0 or missing gives `DBAE_ACCOUNT_STATE_UNVERIFIED`; 2 and 4 pass.
    - Stale evidence is refused.
 5. **Minimums and exits.**
    - A non-fractionable equity is floored; a result of 0 gives `WHOLE_SHARE_UNAFFORDABLE`.
@@ -623,8 +642,16 @@ DBAE is built in a worktree and never edited during a run.
   - "keep one day trade in reserve" superseded by the PDT retirement evidence (§2.2) and approved by the reviewer.
 - **Rev. 1 forensic audit:** DBAE-R1-01 to R1-04 (§17).
 - **Rev. 2 forensic audit:** DBAE-R2-01 and R2-02, plus G1 completed (§13.1, §17).
+- **Rev. 3 forensic audit:** DBAE-R3-01 and the multiplier-1 clarification (§17).
 
 ## 17. Change log
+
+**Rev. 4 (2026-10-30)** answers the rev. 3 audit.
+
+| Finding | Change | Where |
+|---|---|---|
+| DBAE-R3-01, funding multiplier | Every notional formula now names `contract_multiplier`, sourced only from `contract_multiplier_of(asset)`: 1 for equities and crypto, and Alpaca's contract record for options, never an assumed 100. The account's buying-power multiplier is renamed `account_multiplier` and banned from every notional calculation, with a static test. Tests: a $10 order with `account_multiplier` 4 reserves about $10; options with standard, non-standard and missing multipliers. | §5.1, §7.2, §7.4, §8.3, §14.2 |
+| Multiplier-1 clarification | `account_multiplier == 1` is no longer called a cash account. It is refused as `DBAE_ACCOUNT_TYPE_UNVERIFIED`, because Alpaca uses 1 for limited-margin accounts too, until the account type and settled-funds rules are verified. Only 2 and 4 are accepted. | §5.3, §10, §14.4 |
 
 **Rev. 3 (2026-10-30)** answers the rev. 2 audit.
 
