@@ -41,6 +41,11 @@ async def fetch_authoritative_quote(
             f"quote age {age_seconds:.0f}s exceeds {max_age}s", retryable=True,
         )
 
+    if quote.bid is None or quote.ask is None:  # the provider refuses these already; never priced from a missing side
+        raise ProviderDataFailure(
+            "alpaca", asset.symbol, "fetch_authoritative_quote", "ALPACA_QUOTE_INVALID",
+            f"invalid bid/ask for {asset.symbol}: bid={quote.bid} ask={quote.ask}", retryable=True,
+        )
     mid = (quote.bid + quote.ask) / 2
     reference_price = quote.ask if side == Side.BUY else quote.bid
     estimated_slippage_pct = ((quote.ask - quote.bid) / 2 / mid) * 100 if mid > 0 else Decimal("0")

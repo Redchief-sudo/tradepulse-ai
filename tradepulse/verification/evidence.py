@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 from tradepulse.settlement.stages import SETTLEMENT_FLAGS
 from tradepulse.time import aware_utc
@@ -44,7 +45,7 @@ TABLES = (
 )
 
 
-def snapshot_database(path: Path) -> dict:
+def snapshot_database(path: Path) -> dict[str, Any]:
     """One read transaction: no mixed-version pagination and no hidden row limit."""
     import json
 
@@ -52,9 +53,9 @@ def snapshot_database(path: Path) -> dict:
     try:
         connection.execute("BEGIN")
         from tradepulse.persistence import hydrate
-        result = {}
+        tables: dict[str, list[dict[str, Any]]] = {}
         for table in TABLES:
-            result[table] = []
+            tables[table] = []
             connection.row_factory = sqlite3.Row
             order = "rowid" if table in {"reconciliation_records", "audit_events"} else "record_id"
             for row in connection.execute(f"SELECT * FROM {table} ORDER BY {order}"):
@@ -72,10 +73,9 @@ def snapshot_database(path: Path) -> dict:
                     hydrate(table, payload)  # canonical model validation, never a synthetic default row
                 if table != 'accounting_epochs' and "status" in row.keys() and row["status"] != payload.get("status", payload.get("state", payload.get("hold_type"))):
                     raise VerificationError("persisted_status_mismatch")
-                result[table].append(payload)
+                tables[table].append(payload)
         from .opening import load_bound_opening_checkpoint
-        result['generation_opening_checkpoint'] = load_bound_opening_checkpoint(connection)
-        return result
+        return {**tables, 'generation_opening_checkpoint': load_bound_opening_checkpoint(connection)}
     finally:
         connection.close()
 
@@ -90,7 +90,7 @@ def number(value) -> Decimal:
     return result
 
 
-def timestamp(value: str) -> datetime:
+def timestamp(value: str | datetime | None) -> datetime:
     try:
         return aware_utc(value, field_name='evidence_timestamp')
     except (TypeError, ValueError) as exc:
@@ -152,7 +152,7 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     attrs = defaultdict(list)
     for row in rows["trade_attributions"]:
         attrs[(row["lot_id"], row["closing_fill_id"])].append(row)
-    allocated = defaultdict(lambda: Decimal(0))
+    allocated: defaultdict[str, Decimal] = defaultdict(lambda: Decimal(0))
     for lot in rows["position_lots"]:
         if not _adopted(lot):  # Rev.142: an adopted lot has no opening fill; only its closures are fills
             allocated[lot["originating_fill_id"]] += number(lot["opened_quantity"])
@@ -168,8 +168,8 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
             problems.append("settlement_fill_mismatch")
     if settlements.keys() - fills.keys() or allocated.keys() - fills.keys():
         problems.append("missing_authoritative_fill")
-    fee_allocations = defaultdict(dict)
-    fee_basis = defaultdict(lambda: Decimal(0))
+    fee_allocations: defaultdict[str, dict[str, Decimal]] = defaultdict(dict)
+    fee_basis: defaultdict[str, Decimal] = defaultdict(lambda: Decimal(0))
     for lot in rows["position_lots"]:
         for fee_id, quantity in lot.get("asset_fee_quantities", {}).items():
             amount = number(quantity)
@@ -199,9 +199,9 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
         try:
             fee = parse_asset_fee(row["actual"]["activity"])
             population_id = memberships.get(fee.activity_id) or row['actual'].get('population_record_id')
-            population = populations[population_id]
-            proof = population['actual']
-            if population['outcome'] != 'matched' or proof.get('method') != 'complete_instrument_activity_population':
+            fee_population = populations[population_id]
+            proof = fee_population['actual']
+            if fee_population['outcome'] != 'matched' or proof.get('method') != 'complete_instrument_activity_population':
                 raise ValueError('fee population authority invalid')
             checked_fees, checked_proof = validate_fee_population(fee.asset, proof['activities'],
                 [hydrate('fills', item) for item in fills.values()],
@@ -251,7 +251,7 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
         if row['record_id'].startswith('asset_cash_fee_membership:') and row['outcome'] == 'matched':
             cash_memberships[row['subject_id']] = row['actual'].get('population_record_id')
             cash_allocation_versions[row['subject_id']] = row['actual'].get('allocation_record_id')
-    cash_expenses = defaultdict(lambda: Decimal(0))
+    cash_expenses: defaultdict[str, Decimal] = defaultdict(lambda: Decimal(0))
     cash_integrity_valid = True
     cash_invalid_assets = set()
     def cash_asset(fee_id):
@@ -349,8 +349,8 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
                 or cash.get('idempotency_key') != 'fill:cash:' + fid or cash.get('occurred_at') != fill['filled_at']):
             invalid_projection_fills.add(fid)
         if number(fill['fees']):
-            fee = pnl_by_id.get('fill:fee:' + fid)
-            if fee is None or number(fee['realized']) != -number(fill['fees']):
+            fee_record = pnl_by_id.get('fill:fee:' + fid)
+            if fee_record is None or number(fee_record['realized']) != -number(fill['fees']):
                 invalid_projection_fills.add(fid)
     for attribution in rows['trade_attributions']:
         pnl = pnl_by_id.get('fill:pnl:' + attribution['attribution_id'])
@@ -372,7 +372,7 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
         1 for row in rows["settlements"]
         if row["status"] != "completed" or not flagged(row)
     ) + len(fills.keys() - settlements.keys())
-    latest = {}
+    latest: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows["reconciliation_records"]:
         kind = "position" if row["reconciliation_type"].startswith("position") else row["reconciliation_type"]
         key = (kind, row["subject_id"])
@@ -384,7 +384,7 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     # needs a broker comparison at or after its latest fill, including closed lots.
     from tradepulse.models import asset_identity_key
     from tradepulse.persistence import hydrate
-    latest_fill_by_asset = {}
+    latest_fill_by_asset: dict[str, datetime] = {}
     for fill in fills.values():
         key = asset_identity_key(hydrate("fills", fill).asset)
         at = timestamp(fill["filled_at"])
@@ -414,10 +414,10 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     # that fill's proven lot population by quantity, preserving the receipt
     # precision and assigning the exact remainder to the final lot.
     from decimal import ROUND_DOWN
-    fill_fee_expenses = defaultdict(lambda: Decimal(0))
+    fill_fee_expenses: defaultdict[str, Decimal] = defaultdict(lambda: Decimal(0))
     for fid, fill in fills.items():
-        fee = number(fill['fees'])
-        if not fee:
+        fill_fee = number(fill['fees'])
+        if not fill_fee:
             continue
         portions = []
         for lot in rows['position_lots']:
@@ -429,10 +429,13 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
         if sum((qty for _, qty in portions), Decimal(0)) != number(fill['quantity']):
             problems.append('fill_fee_population_incomplete')
             continue
-        remaining = fee
-        quantum = Decimal(1).scaleb(fee.as_tuple().exponent)
+        remaining = fill_fee
+        exponent = fill_fee.as_tuple().exponent
+        if not isinstance(exponent, int):  # number() already refuses these; same refusal
+            raise VerificationError("nonfinite_evidence")
+        quantum = Decimal(1).scaleb(exponent)
         for i, (lot_id, qty) in enumerate(portions):
-            expense = remaining if i == len(portions)-1 else (fee*qty/number(fill['quantity'])).quantize(quantum, rounding=ROUND_DOWN)
+            expense = remaining if i == len(portions)-1 else (fill_fee*qty/number(fill['quantity'])).quantize(quantum, rounding=ROUND_DOWN)
             fill_fee_expenses[lot_id] += expense
             remaining -= expense
     groups = defaultdict(list)
@@ -454,7 +457,7 @@ def assess(rows: dict, started_at: str, now: datetime, costs: dict | None) -> di
     net_results: list[Decimal] = []
     population: list[str] = []
     costs_available = costs is not None
-    if costs_available:
+    if costs is not None:
         if set(costs) != {"fee_bps", "slippage_bps"} or any(number(v) < 0 for v in costs.values()):
             raise VerificationError("invalid_frozen_cost_model")
         cost_rate = (number(costs["fee_bps"]) + number(costs["slippage_bps"])) / Decimal("10000")
@@ -697,7 +700,7 @@ def observed_generation_result(rows, fills, native_receipts, valid_native_receip
             observations.append(record['actual']['activities'])
         elif record['record_id'].startswith('generation_membership:'):
             observations.append(record['actual']['activities'])
-    raw_by_id = {}
+    raw_by_id: dict[str, Any] = {}
     for population in observations:
         for raw in population:
             identifier = raw['id']

@@ -222,7 +222,7 @@ def _infer_exit_reason(
     target_hit = target_price is not None and ((exit_price >= target_price) if is_long else (exit_price <= target_price))
     if target_hit:
         return "target_price"
-    if time_stop_eligible and held_days >= max_hold_days:
+    if max_hold_days is not None and max_hold_days > 0 and held_days is not None and held_days >= max_hold_days:
         return "time_stop"
     return "other"
 
@@ -458,7 +458,7 @@ async def _verify_integrity(repositories: PersistenceRepositories, event: Settle
     # stage's own financial write (position_lots/holdings/trade_intents),
     # not from this read-only check; this is a final confirming gate, not
     # the load-bearing mechanism.
-    hold_row = await repositories.integrity_holds.get(event.broker_order_id)
+    hold_row = await repositories.integrity_holds.get(event.broker_order_id) if event.broker_order_id is not None else None
     if hold_row is not None:
         prefix = "INTEGRITY_VIOLATION" if hold_row["status"] == "fill_quantity_disputed" else "VERIFICATION_PENDING"
         raise IntegrityViolationError(f"{prefix}: order-level integrity hold ({hold_row['status']}) active for {event.broker_order_id}")

@@ -58,8 +58,8 @@ def _session_blocker(session) -> Blocker | None:
 
 
 def _collect(connection: sqlite3.Connection) -> list[Blocker]:
-    def last_checked(*subjects: str) -> str | None:
-        subjects = tuple(s for s in subjects if s)
+    def last_checked(*candidates: str | None) -> str | None:
+        subjects = tuple(s for s in candidates if s)
         if not subjects:
             return None
         row = connection.execute(
@@ -130,12 +130,12 @@ def _collect(connection: sqlite3.Connection) -> list[Blocker]:
                 "Reconciliation fetches the order from Alpaca every pass and releases the asset once Alpaca reports "
                 "it final; fills are recorded from Alpaca's activities."))
             continue
-        event = unresolved.get(row["record_id"])
-        if event is not None:
-            reason = (event.get("details") or {}).get("reason", "unprovable")
+        stranded = unresolved.get(row["record_id"])
+        if stranded is not None:
+            reason = (stranded.get("details") or {}).get("reason", "unprovable")
             blockers.append(Blocker(
                 "stranded_intent", symbol, f"{row['status']} intent {row['record_id']} cannot be proven ({reason})",
-                _ORDER_BLOCK, row["created_at"], checked or event.get("occurred_at"), False,
+                _ORDER_BLOCK, row["created_at"], checked or stranded.get("occurred_at"), False,
                 "Check Alpaca for an order with this client_order_id. If one exists and is this intent's, or none "
                 "exists, resolve the intent by hand; the sweep never guesses."))
             continue

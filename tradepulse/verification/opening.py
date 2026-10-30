@@ -103,10 +103,10 @@ def validate_checkpoint(checkpoint: dict) -> dict:
         raise VerificationError("opening_positions_invalid")
     identities = set()
     for position in checkpoint["positions"]:
-        identity = (position["asset_class"], position["symbol"])
-        if not all(identity) or identity in identities:
+        position_identity = (position["asset_class"], position["symbol"])
+        if not all(position_identity) or position_identity in identities:
             raise VerificationError("opening_position_identity_invalid")
-        identities.add(identity)
+        identities.add(position_identity)
         if aware_utc(position.get("received_at"), field_name="position_received_at").isoformat() != checkpoint["positions_received_at"]:
             raise VerificationError("opening_position_receipt_mismatch")
         for field in ("qty", "market_value", "avg_entry_price"):

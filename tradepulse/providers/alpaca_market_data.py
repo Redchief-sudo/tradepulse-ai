@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 from decimal import InvalidOperation
+from typing import Literal
 
 from tradepulse.broker import AlpacaError, BrokerPort
 from tradepulse.broker.types import RawQuote
@@ -115,7 +116,12 @@ class AlpacaMarketDataProvider:
 
         summaries: list[OptionContractSummary] = []
         for contract in raw_contracts:
-            if contract.option_type not in ("call", "put"):
+            option_type: Literal["call", "put"]
+            if contract.option_type == "call":
+                option_type = "call"
+            elif contract.option_type == "put":
+                option_type = "put"
+            else:
                 continue
             try:
                 expiry = date.fromisoformat(contract.expiration_date)
@@ -124,7 +130,7 @@ class AlpacaMarketDataProvider:
             summaries.append(
                 OptionContractSummary(
                     occ_symbol=contract.occ_symbol, underlying_symbol=contract.underlying_symbol,
-                    option_type=contract.option_type, strike=contract.strike_price, expiry=expiry,
+                    option_type=option_type, strike=contract.strike_price, expiry=expiry,
                     contract_multiplier=contract.multiplier,
                 )
             )

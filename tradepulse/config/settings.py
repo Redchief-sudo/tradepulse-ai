@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from os import environ
+from typing import Literal
 
 
 class SettingsError(ValueError):
@@ -35,7 +36,7 @@ ALPACA_MARKET_DATA_TIER_IDS = frozenset({"auto", "basic", "algo_trader_plus"})
 class Settings:
     database_url: str
     log_level: str
-    execution_mode: str
+    execution_mode: Literal["paper", "live"]
     live_trading_enabled: bool
     market_data_timeout_seconds: int
     broker_timeout_seconds: int
@@ -72,8 +73,13 @@ class Settings:
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
         values = environ if env is None else env
-        mode = values.get("TRADEPULSE_EXECUTION_MODE", "paper").strip().lower()
-        if mode not in {"paper", "live"}:
+        raw_mode = values.get("TRADEPULSE_EXECUTION_MODE", "paper").strip().lower()
+        mode: Literal["paper", "live"]
+        if raw_mode == "paper":
+            mode = "paper"
+        elif raw_mode == "live":
+            mode = "live"
+        else:
             raise SettingsError("TRADEPULSE_EXECUTION_MODE must be paper or live")
         live_enabled = _bool(values, "TRADEPULSE_LIVE_TRADING_ENABLED", False)
         alpaca_key = values.get("ALPACA_API_KEY") or None

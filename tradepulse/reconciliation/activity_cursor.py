@@ -5,6 +5,7 @@ cannot prove completeness. Resume that cursor, then also audit the unfiltered
 history; neither a wall-clock delay nor an ID cutoff establishes fee finality.
 """
 from hashlib import sha256
+from typing import Any
 
 from tradepulse.persistence.codec import encode_payload
 
@@ -30,11 +31,11 @@ def cursor_activity_id(cursor):
 async def activity_population(broker, cursor=None):
     if isinstance(cursor, dict):
         cursor = cursor_activity_id(cursor)
-    tail_pages = []
+    tail_pages: list[Any] = []
     tail = None
     if cursor:
         tail = await broker.get_activities(activity_type=None, after_id=cursor, page_evidence=tail_pages)
-    pages = []
+    pages: list[Any] = []
     full = await broker.get_activities(activity_type=None, page_evidence=pages)
     if not pages or not pages[-1]['terminal'] or any(p['terminal'] for p in pages[:-1]):
         raise AssetFeeIntegrityError('ACTIVITY_PAGINATION_INCOMPLETE')

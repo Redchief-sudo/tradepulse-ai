@@ -2,7 +2,7 @@
 from datetime import UTC, datetime
 
 
-def aware_utc(value: datetime | str, *, field_name: str = "timestamp") -> datetime:
+def aware_utc(value: datetime | str | None, *, field_name: str = "timestamp") -> datetime:
     """Reject missing, malformed and naive values; preserve the represented instant."""
     try:
         stamp = datetime.fromisoformat(value) if isinstance(value, str) else value

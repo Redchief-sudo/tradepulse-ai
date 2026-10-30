@@ -5,6 +5,7 @@ verified membership of every fee in the local accounting population.
 """
 from dataclasses import replace
 from decimal import Decimal
+from typing import Any
 
 from tradepulse.models import Side, asset_identity_key
 from tradepulse.settlement.lots import plan_signed_lot_fill
@@ -58,8 +59,8 @@ def preview_fee_replay(lots, settlements, fees):
         raise AssetFeeIntegrityError('ASSET_FEE_BROKER_ACTIVITY_ID_MISSING')
     chronology = [(e.occurred_at, e.broker_fill_id, 'fill', e) for e in settlements]
     chronology += [(f.occurred_at, f.activity_id, 'fee', f) for f in fees]
-    current = {}
-    realized = {}
+    current: dict[str, Any] = {}
+    realized: dict[str, Decimal] = {}
     for _, _, kind, event in sorted(chronology, key=lambda item: (item[0], item[1])):
         if kind == 'fee':
             remaining = event.quantity

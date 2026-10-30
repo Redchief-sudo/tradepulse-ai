@@ -24,9 +24,10 @@ def allocate_cash_fees(proof, attributions):
         raw = receipts[fee_id]
         expense = -Decimal(raw['net_amount'])
         total = sum((a.quantity*a.exit_price for a in selected), Decimal(0))
-        if expense <= 0 or total <= 0:
+        exponent = expense.as_tuple().exponent
+        if not isinstance(exponent, int) or expense <= 0 or total <= 0:  # a NaN/infinite receipt is refused before comparing
             raise AssetFeeIntegrityError('CASH_FEE_ALLOCATION_INVALID')
-        quantum = Decimal(1).scaleb(expense.as_tuple().exponent)
+        quantum = Decimal(1).scaleb(exponent)
         remaining = expense
         allocations = {}
         for i, attribution in enumerate(selected):
@@ -48,7 +49,7 @@ def allocate_cash_fees_with_quarantine(proof, attributions, quarantined):
     final one takes the exact remainder; ``quarantined`` maps a trade intent
     ID to its (record_id, proceeds). Every other fee is allocated exactly as
     before. Returns (plans, quarantine allocation shares)."""
-    from tradepulse.quarantine.fees import allocate_fee
+    from tradepulse.quarantine.fees import QuarantineFeeAllocation, allocate_fee
 
     linked = {fee_id for fee_id, order in proof.get('cash_fee_populations', {}).items()
               if any(quarantined.get(tid) for tid in order.get('trade_intent_ids', []))}
@@ -56,7 +57,7 @@ def allocate_cash_fees_with_quarantine(proof, attributions, quarantined):
     plain['cash_fee_populations'] = {k: v for k, v in proof.get('cash_fee_populations', {}).items() if k not in linked}
     plans = allocate_cash_fees(plain, attributions)
     receipts = {row['id']: row for row in proof['activities']}
-    shares = []
+    shares: list[QuarantineFeeAllocation] = []
     for fee_id in sorted(linked):
         order = proof['cash_fee_populations'][fee_id]
         if order.get('method') not in {'authoritative_order_link', 'authoritative_fill_link'}:

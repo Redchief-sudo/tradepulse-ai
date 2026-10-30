@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
 from tradepulse.models import AuditEvent
@@ -50,7 +50,7 @@ async def alert_once(audit_events: RecordRepository, alerts: TelegramAlerter, ev
     try:
         if await audit_events.get(marker_id) is not None:
             return first_sighting  # delivered between our check and our lease
-        severity = "critical" if event.severity == "critical" else "warning"
+        severity: Literal["warning", "critical"] = "critical" if event.severity == "critical" else "warning"
         if await alerts.send(severity, event.message, dict(event.details)):
             marker = replace(event, event_id=marker_id, event_type="alert_delivered", severity="info",
                              message=f"Alert delivered: {event.event_id}", details={"alert_event_id": event.event_id})

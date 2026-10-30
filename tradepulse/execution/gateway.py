@@ -170,9 +170,12 @@ class ExecutionRequest:
     regime_snapshot: Mapping[str, str | int | None] | None = None
 
 
+ExecutionStatus = Literal["filled", "partially_filled", "rejected", "skipped", "pending"]
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionResult:
-    status: Literal["filled", "partially_filled", "rejected", "skipped", "pending"]
+    status: ExecutionStatus
     trade_intent_id: str | None
     reasons: list[str]
     filled_quantity: Decimal
@@ -463,7 +466,7 @@ class ExecutionGateway:
             # that computed it -- gone the moment this function returns, and
             # unrecoverable for any later "why was this sized this way"
             # read (a dashboard, an audit, a human).
-            risk_snapshot = {
+            risk_snapshot: dict[str, Any] = {
                 "reasons": list(risk.reasons),
                 "confidence": str(request.confidence) if request.confidence is not None else None,
                 "entry_price": str(quote.price),
@@ -546,9 +549,10 @@ class ExecutionGateway:
             try:
                 market_clock = await self._broker.get_clock()
             except (AlpacaError, httpx.HTTPError) as exc:
-                rejected = replace(approved, status=TradeIntentStatus.REJECTED, rejection_reason=f"MARKET_CLOCK_UNAVAILABLE: {exc}")
+                reason = f"MARKET_CLOCK_UNAVAILABLE: {exc}"
+                rejected = replace(approved, status=TradeIntentStatus.REJECTED, rejection_reason=reason)
                 await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
-                return ExecutionResult("rejected", trade_intent_id, [rejected.rejection_reason], Decimal("0"), None)
+                return ExecutionResult("rejected", trade_intent_id, [reason], Decimal("0"), None)
             # Rev.144 §3.5: one decision, the broker clock plus the calendar
             # as a second witness. EQUITY_MARKET_CLOSED and
             # OPTION_MARKET_CLOSED keep their established strings.
@@ -630,7 +634,7 @@ class ExecutionGateway:
                 reason = f"BROKER_SUBMIT_ERROR: {exc.message}" if isinstance(exc, AlpacaError) else f"BROKER_SUBMIT_ERROR: {exc}"
                 rejected = replace(submitted, status=TradeIntentStatus.REJECTED, rejection_reason=reason)
                 await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
-                return ExecutionResult("rejected", trade_intent_id, [rejected.rejection_reason], Decimal("0"), None)
+                return ExecutionResult("rejected", trade_intent_id, [reason], Decimal("0"), None)
             # Ambiguous outcome (429, 5xx, network/timeout/DNS error, etc.) --
             # Alpaca's actual acceptance of the order cannot be established
             # from this error alone. Never assume rejection or resubmit.
@@ -784,7 +788,8 @@ class ExecutionGateway:
             await self._repositories.trade_intents.update(intent.trade_intent_id, accepted, status=accepted.status.value)
             return await self._poll_and_settle(accepted)
 
-        unknown = replace(intent, status=TradeIntentStatus.SUBMISSION_UNKNOWN, rejection_reason=f"SUBMISSION_UNKNOWN: {cause}")
+        unknown_reason = f"SUBMISSION_UNKNOWN: {cause}"
+        unknown = replace(intent, status=TradeIntentStatus.SUBMISSION_UNKNOWN, rejection_reason=unknown_reason)
         await self._repositories.trade_intents.update(intent.trade_intent_id, unknown, status=unknown.status.value)
         await self._alerts.send(
             "critical",
@@ -793,10 +798,10 @@ class ExecutionGateway:
             "the order's outcome, and a mismatch needs manual review",
             {"trade_intent_id": intent.trade_intent_id, "cause": str(cause)},
         )
-        return ExecutionResult("pending", intent.trade_intent_id, [unknown.rejection_reason], Decimal("0"), None)
+        return ExecutionResult("pending", intent.trade_intent_id, [unknown_reason], Decimal("0"), None)
 
     def _result_from_intent(self, intent: TradeIntent) -> ExecutionResult:
-        status_map: dict[TradeIntentStatus, str] = {
+        status_map: dict[TradeIntentStatus, ExecutionStatus] = {
             TradeIntentStatus.FILLED: "filled",
             TradeIntentStatus.REJECTED: "rejected",
             TradeIntentStatus.CANCELED: "rejected",
@@ -828,14 +833,16 @@ class ExecutionGateway:
         )
 
     async def _poll_and_settle(self, intent: TradeIntent) -> ExecutionResult:
-        assert intent.broker_order_id is not None
+        broker_order_id = intent.broker_order_id  # an order's broker id never changes while it is polled
+        if broker_order_id is None:
+            raise ValueError("POLL_REQUIRES_BROKER_ORDER_ID")
         current = intent
         last_filled_qty = intent.filled_quantity
         deadline = time.monotonic() + self.FILL_TIMEOUT_SECONDS
 
         while time.monotonic() < deadline:
             try:
-                order = await self._broker.get_order(current.broker_order_id)
+                order = await self._broker.get_order(broker_order_id)
             except AlpacaError:
                 await asyncio.sleep(self.POLL_INTERVAL_SECONDS)
                 continue

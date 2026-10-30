@@ -842,6 +842,9 @@ async def run_scan_cycle(
                 if isinstance(option_quote, ProviderError):
                     quote_errors.append(str(option_quote))
                     continue
+                if option_quote.bid is None or option_quote.ask is None:  # the provider refuses these already
+                    quote_errors.append(f"{option_asset.symbol}: OPTION_QUOTE_MISSING_SIDE")
+                    continue
                 quoted_contracts.append((option, option_quote.bid, option_quote.ask, option_asset, option_quote))
             chosen = choose_liquid_contract([row[:3] for row in quoted_contracts],
                                             risk_limits.spread_limit_for(AssetClass.OPTION))

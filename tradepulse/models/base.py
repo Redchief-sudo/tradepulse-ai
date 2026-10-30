@@ -13,7 +13,7 @@ class DomainValidationError(ValueError):
     """Canonical model invariant violation."""
 
 
-def require_text(value: str, field: str) -> str:
+def require_text(value: str | None, field: str) -> str:
     normalized = str(value or "").strip()
     if not normalized:
         raise DomainValidationError(f"{field} is required")

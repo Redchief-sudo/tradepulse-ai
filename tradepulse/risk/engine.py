@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
+from typing import Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -483,8 +484,11 @@ async def build_portfolio_snapshot(
 
     from tradepulse.reconciliation.epochs import pending_assets
     pending_keys = await pending_assets(repositories)
-    if pending_keys and (broker_positions is None or account_equity is None):
-        raise ValueError("PENDING_CRYPTO_REQUIRES_BROKER_EXPOSURE")
+    pending_positions: Mapping = {}
+    if pending_keys:
+        if broker_positions is None or account_equity is None:
+            raise ValueError("PENDING_CRYPTO_REQUIRES_BROKER_EXPOSURE")
+        pending_positions = broker_positions
 
     holdings_value = Decimal("0")
     sector_exposure: dict[str, Decimal] = {}
@@ -507,7 +511,7 @@ async def build_portfolio_snapshot(
 
     sectors_by_key = {asset_identity_key(h.asset): h.sector or "Other" for h in holdings}
     for key in pending_keys:
-        position = broker_positions.get(key)
+        position = pending_positions.get(key)
         if position is None:
             continue  # complete broker response proves zero current inventory
         notional = abs(position.market_value)
@@ -635,6 +639,7 @@ async def build_portfolio_snapshot(
     # exit must not use up the day's allowance for new positions.
     trades_today = len({f.trade_intent_id for f in fills if f.side == Side.BUY})
 
+    source: Literal["broker", "holdings"]
     if broker_prev_close_equity and broker_prev_close_equity > 0 and account_equity and account_equity > 0:
         daily_pnl_pct = ((account_equity - broker_prev_close_equity) / broker_prev_close_equity) * 100
         source = "broker"

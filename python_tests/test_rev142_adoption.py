@@ -292,3 +292,50 @@ async def test_unexpected_position_after_the_cursor_stays_protected_not_sellable
     if orders_before is not None:
         assert len(await rig.broker.list_orders(status="all")) == orders_before
     print(events[0]["details"]["reasons"])
+
+
+async def test_missing_holding_restores_only_what_the_lot_proves(rig: Rig, monkeypatch: Any) -> None:
+    """With the holding gone and the adopted lot open, the rebuild restores the
+    scale-out and a break-even floor proved by the lot's sale, never repeats
+    the scale-out, and raises ADOPTED_PROTECTIVE_STATE_UNVERIFIED for the
+    trail it cannot verify."""
+    import tradepulse.monitor.coordinator as monitor_module
+    from tradepulse.reconciliation.coordinator import _reconcile_positions
+
+    async def atr(_market_data: Any, _asset: Any) -> Decimal:
+        return Decimal(2)
+
+    monkeypatch.setattr(monitor_module, "_fetch_atr", atr)
+    for _ in range(2):
+        await adoption_pass(rig.repositories, await rig.broker.get_positions(), rig.config, rig.alerts, rig.clock())
+    rig.quote("108.90", "109")
+    assert (await rig.monitor()).exits_triggered == 1
+    await rig.settlement.process_pending(force_retry=True)
+    rig.quote("119.90", "120")
+    await rig.monitor()
+    assert (await _holding(rig)).current_stop > 100  # trailed above break-even
+    await rig.repositories.holdings.delete(KEY)
+    await _reconcile_positions(rig.repositories, rig.broker, rig.alerts, rig.clock())
+    rebuilt = await _holding(rig)
+    assert (rebuilt.quantity, rebuilt.scaled_out, rebuilt.current_stop) == (Decimal(5), True, Decimal(100))
+    events = [r["payload"] for r in await paginate_all_rows(rig.repositories.audit_events)
+              if r["payload"]["event_type"] == "adopted_protective_state_unverified"]
+    assert len(events) == 1 and events[0]["severity"] == "critical"
+    rig.quote("119.90", "120")
+    assert (await rig.monitor()).exits_triggered == 0  # no second scale-out
+    assert len((await rig.lot()).closures) == 1
+
+
+async def test_missing_holding_before_any_sale(rig: Rig) -> None:
+    """No sale: nothing is proved beyond the adoption's stop; the alert still fires."""
+    from tradepulse.reconciliation.coordinator import _reconcile_positions
+
+    for _ in range(2):
+        await adoption_pass(rig.repositories, await rig.broker.get_positions(), rig.config, rig.alerts, rig.clock())
+    stop_loss = (await _holding(rig)).stop_loss
+    await rig.repositories.holdings.delete(KEY)
+    await _reconcile_positions(rig.repositories, rig.broker, rig.alerts, rig.clock())
+    rebuilt = await _holding(rig)
+    assert (rebuilt.quantity, rebuilt.stop_loss, rebuilt.current_stop, rebuilt.scaled_out) == (Decimal(10), stop_loss, None, False)
+    assert any(r["payload"]["event_type"] == "adopted_protective_state_unverified"
+               for r in await paginate_all_rows(rig.repositories.audit_events))

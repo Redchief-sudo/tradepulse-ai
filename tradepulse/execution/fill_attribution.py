@@ -99,26 +99,40 @@ class AttributedFills:
     avg_price: Decimal | None
 
 
-def _is_valid_fill_activity(activity: AlpacaActivity, current: TradeIntent) -> bool:
+@dataclass(frozen=True, slots=True)
+class ValidatedFill:
+    """A broker FILL activity admitted by _validated_fill: its quantity,
+    price and time are proven present, so no later step re-checks them."""
+
+    activity: AlpacaActivity
+    qty: Decimal
+    price: Decimal
+    transaction_time: datetime
+
+
+def _validated_fill(activity: AlpacaActivity, current: TradeIntent) -> ValidatedFill | None:
     """A broker activity becoming a financial ledger record is an
     accounting boundary -- validate every available field before
-    admitting it, rather than trusting order_id alone."""
+    admitting it, rather than trusting order_id alone. None when any
+    field fails."""
     if not activity.activity_id:
-        return False
+        return None
     if activity.symbol != current.asset.symbol:
-        return False
+        return None
     if activity.side != current.side:
-        return False
+        return None
     if activity.qty is None or activity.qty <= 0:
-        return False
+        return None
     if activity.price is None or activity.price <= 0:
-        return False
+        return None
+    if activity.transaction_time is None:
+        return None
     from tradepulse.time import aware_utc
     try:
         aware_utc(activity.transaction_time, field_name="fill.transaction_time")
     except ValueError:
-        return False
-    return True
+        return None
+    return ValidatedFill(activity, activity.qty, activity.price, activity.transaction_time)
 
 
 def _activity_costs(activity: AlpacaActivity, current: TradeIntent) -> tuple[Decimal, str | None, str]:
@@ -176,24 +190,28 @@ async def attribute_order_fills(
     PositionLot/Holding/TradeIntent accounting before anyone notices.
     Default False preserves every existing caller/test that doesn't need
     this (no broker order lookup, identical behavior to before)."""
+    order_id = current.broker_order_id
+    if order_id is None:  # every caller checks first; attributing to no order would silently match nothing
+        raise ValueError("FILL_ATTRIBUTION_REQUIRES_BROKER_ORDER_ID")
     activities = await broker.get_activities(activity_type="FILL", since=current.created_at)
-    order_activities = [a for a in activities if str(a.raw.get("order_id") or "") == current.broker_order_id]
+    order_activities = [a for a in activities if str(a.raw.get("order_id") or "") == order_id]
 
-    validated: list[AlpacaActivity] = []
+    validated: list[ValidatedFill] = []
     for activity in order_activities:
-        if not _is_valid_fill_activity(activity, current):
+        admitted = _validated_fill(activity, current)
+        if admitted is None:
             await alerts.send(
                 "critical",
                 f"BROKER_FILL_INTEGRITY_MISMATCH: Alpaca FILL activity {activity.activity_id} is linked to "
-                f"order {current.broker_order_id} but its symbol/side/qty/price/timestamp don't match the "
+                f"order {order_id} but its symbol/side/qty/price/timestamp don't match the "
                 f"expected trade -- excluded from attribution, not recorded as a Fill.",
-                {"trade_intent_id": current.trade_intent_id, "broker_order_id": current.broker_order_id, "activity_id": activity.activity_id},
+                {"trade_intent_id": current.trade_intent_id, "broker_order_id": order_id, "activity_id": activity.activity_id},
             )
             continue
-        validated.append(activity)
-    validated.sort(key=lambda a: (a.transaction_time, a.activity_id))
+        validated.append(admitted)
+    validated.sort(key=lambda v: (v.transaction_time, v.activity.activity_id))
 
-    total_qty = sum((a.qty for a in validated), Decimal("0"))
+    total_qty = sum((v.qty for v in validated), Decimal("0"))
 
     # FIN-094-01/095-01/095-02: fetched AFTER activities (never accepted as
     # a caller-supplied, pre-fetched value) -- this is what actually closes
@@ -220,7 +238,7 @@ async def attribute_order_fills(
     quantity_disputed = False
     if verify_order_filled_qty:
         try:
-            order = await broker.get_order(current.broker_order_id)
+            order = await broker.get_order(order_id)
             quantity_disputed = total_qty > order.filled_qty
             if not quantity_disputed:
                 # Verification succeeded and confirmed consistency -- clear
@@ -230,9 +248,9 @@ async def attribute_order_fills(
                 # is permanent, cleared only by the operator-driven
                 # reset-integrity flow, never automatically by a later
                 # successful check.
-                existing_hold_row = await repositories.integrity_holds.get(current.broker_order_id)
+                existing_hold_row = await repositories.integrity_holds.get(order_id)
                 if existing_hold_row is not None and existing_hold_row["status"] == IntegrityHoldType.VERIFICATION_PENDING.value:
-                    await repositories.integrity_holds.delete(current.broker_order_id)
+                    await repositories.integrity_holds.delete(order_id)
         except AlpacaError:
             # Verification unavailable is NOT the same epistemic state as
             # "checked and consistent" -- do not fabricate consistency, but
@@ -242,23 +260,23 @@ async def attribute_order_fills(
             # everything else keeps running normally.
             await alerts.send(
                 "warning",
-                f"ORDER_FILL_VERIFICATION_UNAVAILABLE: could not fetch order {current.broker_order_id} for "
+                f"ORDER_FILL_VERIFICATION_UNAVAILABLE: could not fetch order {order_id} for "
                 f"{current.asset.symbol} to verify attributed fill quantity ({total_qty}) against broker "
                 "truth -- Fill/SettlementEvent still recorded as PENDING, but settlement projection is held "
                 "for this order until a later verification succeeds.",
-                {"trade_intent_id": current.trade_intent_id, "broker_order_id": current.broker_order_id, "attributed_qty": str(total_qty)},
+                {"trade_intent_id": current.trade_intent_id, "broker_order_id": order_id, "attributed_qty": str(total_qty)},
             )
-            existing_hold_row = await repositories.integrity_holds.get(current.broker_order_id)
+            existing_hold_row = await repositories.integrity_holds.get(order_id)
             if existing_hold_row is None:
                 pending_hold = IntegrityHold(
-                    broker_order_id=current.broker_order_id, trade_intent_id=current.trade_intent_id,
+                    broker_order_id=order_id, trade_intent_id=current.trade_intent_id,
                     hold_type=IntegrityHoldType.VERIFICATION_PENDING,
                     reason=f"Could not verify order-level fill-quantity consistency for {current.asset.symbol} "
-                    f"order {current.broker_order_id} (attributed quantity so far: {total_qty}).",
+                    f"order {order_id} (attributed quantity so far: {total_qty}).",
                     created_at=clock(),
                 )
                 await repositories.integrity_holds.create_once(
-                    current.broker_order_id, pending_hold, status=pending_hold.hold_type.value,
+                    order_id, pending_hold, status=pending_hold.hold_type.value,
                 )
             # else: a hold (of either type) already exists -- never
             # downgrade a proven dispute, and an existing verification_pending
@@ -300,35 +318,36 @@ async def attribute_order_fills(
         # covers events already existing at this exact moment.
         disputed_reason = (
             f"INTEGRITY_VIOLATION: attributed fill quantity ({total_qty}) exceeds broker order.filled_qty for "
-            f"{current.asset.symbol} order {current.broker_order_id} -- broker evidence is contradictory; "
+            f"{current.asset.symbol} order {order_id} -- broker evidence is contradictory; "
             "withholding settlement projection until reconciled."
         )
         disputed_hold = IntegrityHold(
-            broker_order_id=current.broker_order_id, trade_intent_id=current.trade_intent_id,
+            broker_order_id=order_id, trade_intent_id=current.trade_intent_id,
             hold_type=IntegrityHoldType.FILL_QUANTITY_DISPUTED, reason=disputed_reason, created_at=clock(),
         )
         created = await repositories.integrity_holds.create_once(
-            current.broker_order_id, disputed_hold, status=disputed_hold.hold_type.value,
+            order_id, disputed_hold, status=disputed_hold.hold_type.value,
         )
         if not created:
             # A hold already existed (verification_pending from an earlier
             # call, or already disputed) -- upgrade it in place. Never
             # downgrades: this branch only ever sets fill_quantity_disputed.
             await repositories.integrity_holds.update(
-                current.broker_order_id, disputed_hold, status=disputed_hold.hold_type.value,
+                order_id, disputed_hold, status=disputed_hold.hold_type.value,
             )
 
         await latch_financial_integrity_block(repositories, disputed_reason, clock=clock)
 
-    for activity in validated:
+    for admitted in validated:
+        activity = admitted.activity
         reference_price, reference_bid, reference_ask, reference_observed_at = _reference_evidence(current)
         fees, fee_currency, fee_source = _activity_costs(activity, current)
-        slippage = abs(activity.price - reference_price) if reference_price is not None else Decimal("0")
+        slippage = abs(admitted.price - reference_price) if reference_price is not None else Decimal("0")
         fill = Fill(
-            fill_id=activity.activity_id, trade_intent_id=current.trade_intent_id, order_id=current.broker_order_id,
+            fill_id=activity.activity_id, trade_intent_id=current.trade_intent_id, order_id=order_id,
             asset=current.asset, side=current.side, execution_mode=current.execution_mode,
-            quantity=activity.qty, price=activity.price, fees=fees, slippage=slippage,
-            filled_at=activity.transaction_time, broker_fill_id=activity.activity_id,
+            quantity=admitted.qty, price=admitted.price, fees=fees, slippage=slippage,
+            filled_at=admitted.transaction_time, broker_fill_id=activity.activity_id,
             reference_price=reference_price, reference_bid=reference_bid, reference_ask=reference_ask,
             reference_observed_at=reference_observed_at, submitted_at=current.submitted_at,
             order_type=current.order_type, fee_currency=fee_currency, fee_source=fee_source,
@@ -357,14 +376,14 @@ async def attribute_order_fills(
         event = SettlementEvent(
             settlement_event_id=fill.fill_id, fill_id=fill.fill_id, trade_intent_id=current.trade_intent_id,
             asset=current.asset, side=current.side, execution_mode=current.execution_mode,
-            quantity=fill.quantity, price=fill.price, occurred_at=activity.transaction_time,
+            quantity=fill.quantity, price=fill.price, occurred_at=admitted.transaction_time,
             fees=fill.fees,
-            broker_order_id=current.broker_order_id, broker_fill_id=activity.activity_id,
+            broker_order_id=order_id, broker_fill_id=activity.activity_id,
             client_order_id=current.client_order_id, sector=current.sector,
         )
         await repositories.settlements.create_once(fill.fill_id, event, status=event.status.value, unique_value=fill.fill_id)
 
-    total_notional = sum((a.qty * a.price for a in validated), Decimal("0"))
+    total_notional = sum((v.qty * v.price for v in validated), Decimal("0"))
     avg_price = total_notional / total_qty if total_qty > 0 else None
     return AttributedFills(quantity=total_qty, avg_price=avg_price)
 

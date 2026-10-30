@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import overload
 
 from tradepulse.models import Candle
 
@@ -51,6 +52,10 @@ def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
     return max(lo, min(hi, value))
 
 
+@overload
+def _dec(value: float) -> Decimal: ...
+@overload
+def _dec(value: float | None) -> Decimal | None: ...
 def _dec(value: float | None) -> Decimal | None:
     return None if value is None else Decimal(str(round(value, 6)))
 

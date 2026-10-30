@@ -201,7 +201,7 @@ class RecordRepository:
             if status is None:
                 raise ValueError(f"status is required for {self.table}")
             sql = f"UPDATE {self.table} SET payload=?, status=?, updated_at=? WHERE record_id=?"
-            values = (encode_payload(payload), status, now, record_id)
+            values: tuple[str, ...] = (encode_payload(payload), status, now, record_id)
         elif self.table in {"holdings", "position_lots"}:
             sql = f"UPDATE {self.table} SET payload=?, updated_at=? WHERE record_id=?"
             values = (encode_payload(payload), now, record_id)
@@ -319,7 +319,7 @@ class RecordRepository:
             rows = connection.execute(
                 f"SELECT * FROM {self.table} ORDER BY created_at ASC LIMIT ?", (limit,)
             ).fetchall()
-            result = []
+            result: list[Mapping[str, Any]] = []
             for row in rows:
                 item = dict(row)
                 item["payload"] = decode_payload(item["payload"])
@@ -342,7 +342,7 @@ class RecordRepository:
             rows = connection.execute(
                 f"SELECT * FROM {self.table} ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
-            result = []
+            result: list[Mapping[str, Any]] = []
             for row in rows:
                 item = dict(row)
                 item["payload"] = decode_payload(item["payload"])
@@ -362,7 +362,7 @@ class RecordRepository:
                 f"SELECT * FROM {self.table} WHERE status=? ORDER BY created_at ASC LIMIT ?",
                 (status, limit),
             ).fetchall()
-            result = []
+            result: list[Mapping[str, Any]] = []
             for row in rows:
                 item = dict(row)
                 item["payload"] = decode_payload(item["payload"])
@@ -401,7 +401,7 @@ class RecordRepository:
             rows = connection.execute(
                 f"SELECT * FROM {self.table} WHERE {where} ORDER BY created_at ASC, record_id ASC LIMIT ?", params,
             ).fetchall()
-            result = []
+            result: list[Mapping[str, Any]] = []
             for row in rows:
                 item = dict(row)
                 item["payload"] = decode_payload(item["payload"])
@@ -437,7 +437,7 @@ class RecordRepository:
             rows = connection.execute(
                 f"SELECT * FROM {self.table} WHERE {where} ORDER BY created_at ASC, record_id ASC LIMIT ?", params,
             ).fetchall()
-            result = []
+            result: list[Mapping[str, Any]] = []
             for row in rows:
                 item = dict(row)
                 item["payload"] = decode_payload(item["payload"])
@@ -533,7 +533,7 @@ class RecordRepository:
             rows = connection.execute(
                 f"SELECT * FROM {self.table} WHERE {where} ORDER BY created_at ASC, record_id ASC LIMIT ?", params,
             ).fetchall()
-            result = []
+            result: list[Mapping[str, Any]] = []
             for row in rows:
                 item = dict(row)
                 item["payload"] = decode_payload(item["payload"])
@@ -565,7 +565,7 @@ class RecordRepository:
             rows = connection.execute(
                 f"SELECT * FROM {self.table} WHERE {where} ORDER BY created_at ASC, record_id ASC LIMIT ?", params,
             ).fetchall()
-            result = []
+            result: list[Mapping[str, Any]] = []
             for row in rows:
                 item = dict(row)
                 item["payload"] = decode_payload(item["payload"])
@@ -597,7 +597,7 @@ class RecordRepository:
             rows = connection.execute(
                 f"SELECT * FROM {self.table} {where}ORDER BY created_at ASC, record_id ASC LIMIT ?", params,
             ).fetchall()
-            result = []
+            result: list[Mapping[str, Any]] = []
             for row in rows:
                 item = dict(row)
                 item["payload"] = decode_payload(item["payload"])

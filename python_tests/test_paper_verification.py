@@ -569,3 +569,15 @@ async def test_watch_checks_integrity_every_tick_but_assesses_only_on_its_interv
     assert calls["report"] == 1  # once at start, not every tick
     assert calls["check"] >= 5   # the source change was caught by a per-tick check
     generation.release()
+
+
+async def test_begin_refuses_without_a_bound_opening_checkpoint(generation, monkeypatch):
+    """begin()'s own guard (runtime_started refuses first in production): no
+    bound checkpoint is a named refusal, not a TypeError; nothing is written."""
+    assert await generation.start()
+    monkeypatch.setattr(generation, "check", lambda: {"integrity_valid": True})  # isolate begin(); the lease is real
+    monkeypatch.setattr("tradepulse.verification.service.load_opening_checkpoint", lambda _database: None)
+    with pytest.raises(VerificationError, match="generation_start_requires_bound_opening_checkpoint"):
+        generation.begin()
+    assert not (generation.directory / "started.json").exists()
+    generation.release()

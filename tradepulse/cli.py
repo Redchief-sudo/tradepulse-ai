@@ -597,10 +597,11 @@ async def _run_scan(settings: Settings, asset_classes: list[AssetClass]) -> int:
                 _run_scan_leg(database, repositories, ai_provider, market_data, broker, gateway, settings, alerts, asset_class, capabilities)
                 for asset_class in asset_classes
             ]
-            *scan_results, monitor_result = await asyncio.gather(
-                *scan_legs,
-                _run_monitor_leg(database, repositories, broker, market_data, gateway, alerts, settings),
-                return_exceptions=True,
+            # Both legs run concurrently; each gather keeps its own leg's result type.
+            scan_results, (monitor_result,) = await asyncio.gather(
+                asyncio.gather(*scan_legs, return_exceptions=True),
+                asyncio.gather(_run_monitor_leg(database, repositories, broker, market_data, gateway, alerts, settings),
+                               return_exceptions=True),
             )
     finally:
         await broker.aclose()
@@ -1191,8 +1192,7 @@ async def _run_application(settings: Settings, port: int, open_browser: bool, *,
                 trading_task = asyncio.create_task(
                     _run_trading_supervisor(
                         database, repositories, ai_provider, market_data, broker, gateway, settlement, settings, alerts,
-                        shutdown, capabilities,
-                        **({"verification_enabled": True} if verification is not None else {}),
+                        shutdown, capabilities, verification_enabled=verification is not None,
                     )
                 )
 

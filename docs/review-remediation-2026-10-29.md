@@ -52,6 +52,22 @@ Branch `rev142`; the remediation is one commit on top of `c8f9be21`.
 
 Through all of them `current_stop` never decreases, `stop_loss` is kept, and there is exactly one scale-out. On the old code, the check fails at step 4.
 
+### R-3: a missing adopted holding was rebuilt with no protective state (second review, fixed)
+
+**Defect.**
+- When the holding record was missing, but its adopted lot was still open, the rebuild used `current_stop=None` and `scaled_out=False`. This was found in the second review.
+- The position could then be scaled out a second time, and a raised stop fell back to `stop_loss`, with no alert.
+
+**Fix.**
+- The rebuild restores only what the lot itself proves. Any recorded sale of an adopted lot is either the scale-out or a partly filled exit. Either way it sets `scaled_out=True` and a floor of break-even (the average price).
+- The ATR trail can't be recovered, because the ATR value is not stored. It is not guessed: a critical `ADOPTED_PROTECTIVE_STATE_UNVERIFIED` alert names the restored stop, so the operator can check it.
+
+**Why not refuse to rebuild, as the review suggested.** With no holding, the monitor has nothing to protect: the position would be reported as unmanaged, with no stop at all. A provable floor plus an incident is strictly safer than no stop.
+
+**Tests.**
+- `test_missing_holding_restores_only_what_the_lot_proves`: break-even restored; no second scale-out; one critical alert. The old code failed on `scaled_out`.
+- `test_missing_holding_before_any_sale`: only the adoption's stop is restored, and the alert still fires.
+
 ### TP145-01: unexpected adopted positions cannot complete a protective sale (confirmed; behaviour kept, documented)
 
 **Status.** The behaviour is unchanged and deliberate. No broker fill is invented, no sellability check is bypassed, and no hold is cleared.
@@ -106,3 +122,8 @@ Through all of them `current_stop` never decreases, `stop_loss` is kept, and the
 3. Whether a view-drift rebuild should keep a strategy holding's ratcheted stop (R-2).
 4. The dashboard badge and P&L split.
 5. `parse_activity_row`'s OCC option symbols (carried over).
+
+## Operator acceptance (2026-10-29)
+
+- **TP145-01: accepted.** A position bought outside TradePulse after the fill cursor stays monitored, but cannot be sold automatically until the operator resolves its external execution. The operator's intent is that no trades happen outside the system.
+- **TP145-02: accepted as is.** Crypto adoption stays refused. No adopted-crypto Rev is queued; unmanaged crypto is reported as before Rev.142.

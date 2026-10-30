@@ -2,6 +2,7 @@
 from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
+from typing import Any
 
 from tradepulse.models import (
     PnlRecord,
@@ -144,8 +145,8 @@ async def replay_asset_fees(repositories, asset, activities, broker_quantity, *,
                     corrective_action='authoritative instrument-population fee replay'))
         # Preserve the entire before image of each changed derived row in the
         # immutable correction receipt; no source execution is replaced.
-        before = {}
-        after = {}
+        before: dict[str, dict[str, Any]] = {}
+        after: dict[str, dict[str, Any]] = {}
         def change(table, identifier, old, new):
             encoded = decode_payload(encode_payload(new)) if new is not None else None
             if old != encoded:

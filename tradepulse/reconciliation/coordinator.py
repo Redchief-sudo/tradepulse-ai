@@ -105,7 +105,7 @@ async def _record(repositories: PersistenceRepositories, **kwargs) -> None:
 
 
 async def _alert_once(repositories: PersistenceRepositories, alerts: TelegramAlerter, *, event_type: str, subject: str,
-                      window: str, severity: str, message: str, details: dict, now: datetime) -> bool:
+                      window: str, severity: Literal["info", "warning", "error", "critical"], message: str, details: dict, now: datetime) -> bool:
     """Send an alert at most once per (event_type, subject, window).
 
     Reconciliation runs every minute, so a condition that persists until an
@@ -126,6 +126,11 @@ def _utc_day(now: datetime) -> str:
 
 def _utc_hour(now: datetime) -> str:
     return now.astimezone(UTC).strftime("%Y-%m-%dT%H")
+
+
+async def _adopted_open_lots(repositories: PersistenceRepositories, asset: AssetIdentity) -> bool:
+    lots = [hydrate("position_lots", row["payload"]) for row in await list_all_by_asset(repositories.position_lots, asset)]
+    return any(lot.origin == "adopted" and lot.status in _OPEN_LOT_STATUSES for lot in lots)
 
 
 async def _rebuild_holding_from_lots(
@@ -160,10 +165,18 @@ async def _rebuild_holding_from_lots(
         # ADOPT-07: a rebuild never lowers the ratcheted stop or repeats a
         # scale-out. An adopted asset takes no buys (MIXED_LOT_ORIGIN), so
         # the earlier floor still belongs to this same position.
+        if previous is not None:
+            return Holding(asset=asset, quantity=total_signed, average_price=avg_price, updated_at=now,
+                           stop_loss=Decimal(adoption["stop_loss"]), target_price=None,
+                           current_stop=previous.current_stop, scaled_out=previous.scaled_out)
+        # No holding to carry from: restore only what the lot proves. A partial
+        # sale of an adopted lot is the scale-out (or a partly filled exit), and
+        # either way it means no second scale-out and a floor of at least
+        # break-even. An ATR trail is not recoverable; the caller raises it.
+        sold = any(lot.closures for lot in open_lots)
         return Holding(asset=asset, quantity=total_signed, average_price=avg_price, updated_at=now,
                        stop_loss=Decimal(adoption["stop_loss"]), target_price=None,
-                       current_stop=previous.current_stop if previous is not None else None,
-                       scaled_out=previous.scaled_out if previous is not None else False)
+                       current_stop=avg_price if sold else None, scaled_out=sold)
     fill_row = await repositories.fills.get(oldest_lot.originating_fill_id)
     if fill_row is not None:
         fill = hydrate("fills", fill_row["payload"])
@@ -291,6 +304,16 @@ async def _reconcile_positions(
                         await repositories.holdings.update(key, rebuilt)
                     else:
                         await repositories.holdings.create_once(key, rebuilt)
+                        if asset is not None and await _adopted_open_lots(repositories, asset):
+                            await _alert_once(
+                                repositories, alerts, event_type="adopted_protective_state_unverified", subject=key,
+                                window=_utc_day(now), severity="critical",
+                                message=(f"Reconciliation: the holding for adopted {display_symbol} was missing and was rebuilt from "
+                                         f"its lot. Stop restored to {rebuilt.current_stop or rebuilt.stop_loss}; any earlier "
+                                         "ATR trail cannot be verified and was not restored. Check the stop before relying on it."),
+                                details={"symbol": display_symbol, "stop_loss": str(rebuilt.stop_loss),
+                                         "current_stop": str(rebuilt.current_stop) if rebuilt.current_stop is not None else None,
+                                         "scaled_out": rebuilt.scaled_out}, now=now)
 
             view_drift_corrected += 1
             await _record(

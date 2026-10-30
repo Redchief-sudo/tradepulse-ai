@@ -10,6 +10,7 @@ import logging
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories
 from tradepulse.persistence.codec import decode_payload, encode_payload
@@ -20,7 +21,7 @@ async def run(database_path, apply, report_path, reconcile=False):
     database = AsyncSQLiteDatabase('sqlite:///' + str(database_path))
     repositories = PersistenceRepositories.create(database)
     before = await accounting_issues(repositories)
-    snapshots = {}
+    snapshots: dict[str, Any] = {}
     backup = None
     changed = 0
     summary = None

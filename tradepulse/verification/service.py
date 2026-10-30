@@ -7,6 +7,7 @@ import sqlite3
 from dataclasses import fields
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import IO
 
 from tradepulse.config import Settings
 from tradepulse.persistence import AsyncSQLiteDatabase
@@ -201,7 +202,7 @@ class Verification:
         self.root = root or source_root()
         self.directory = generation_path(store_for(settings), generation)
         self.database = AsyncSQLiteDatabase(settings.database_url).path
-        self._lease = None
+        self._lease: IO[str] | None = None
 
     def check(self) -> dict:
         try:
@@ -255,6 +256,8 @@ class Verification:
             self.started_at()
             return
         checkpoint = load_opening_checkpoint(self.database)
+        if checkpoint is None:
+            raise VerificationError("generation_start_requires_bound_opening_checkpoint")
         started = {"started_at": utc_now(), "verification_generation_id": self.generation,
                    "generation_opening_checkpoint_id": checkpoint["checkpoint_id"]}
         write_once(self.directory / "started.json", started)

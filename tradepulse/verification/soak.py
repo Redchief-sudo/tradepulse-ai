@@ -14,6 +14,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 from tradepulse.config.lanes import LANE_INTERVAL_SECONDS, LANE_MAX_GAP_SECONDS
 from tradepulse.time import aware_utc
@@ -98,7 +99,9 @@ def slippage_evidence(fills: list[dict]) -> dict:
 
 
 def _segments(events: list[dict], generation: str) -> tuple[list[dict], list[str]]:
-    starts, stops, errors = {}, {}, []
+    starts: dict[str, dict] = {}
+    stops: dict[str, dict] = {}
+    errors: list[str] = []
     for event in events:
         if event["event_type"] not in {"verification_runtime_started", "verification_runtime_stopped"}:
             continue
@@ -114,7 +117,7 @@ def _segments(events: list[dict], generation: str) -> tuple[list[dict], list[str
         if key in target:
             errors.append("duplicate_runtime_boundary")
         target[key] = event
-    result = []
+    result: list[dict[str, Any]] = []
     if starts.keys() != stops.keys():
         errors.append("runtime_shutdown_evidence_incomplete")
     for key in starts.keys() & stops.keys():
@@ -213,8 +216,8 @@ def _complete_market_session(events: list[dict], segments: list[dict], lanes: di
                      and (clock["timestamp"] - closed).total_seconds() <= maximum_gap]
             if not active or not after:
                 continue
-            stamps = [opened, *(clock["timestamp"] for clock in active), closed]
-            if any((right - left).total_seconds() > maximum_gap for left, right in zip(stamps, stamps[1:])):
+            boundaries = [opened, *(clock["timestamp"] for clock in active), closed]
+            if any((right - left).total_seconds() > maximum_gap for left, right in zip(boundaries, boundaries[1:])):
                 continue
             return {"complete": lanes.get("crypto", {}).get("continuous") is True,
                     "opened_at": opened.isoformat(), "closed_at": closed.isoformat(),
@@ -280,7 +283,7 @@ def analyze_soak_database(database: Path, *, run_number: int) -> dict:
     connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
     try:
         from tradepulse.persistence import hydrate
-        extra = {}
+        extra: dict[str, list[dict[str, Any]]] = {}
         for table in ("scan_runs", "opportunities"):
             extra[table] = []
             connection.row_factory = sqlite3.Row
@@ -327,7 +330,7 @@ def analyze_soak_database(database: Path, *, run_number: int) -> dict:
     integrity_names = ("reconciliation_issues", "settlement_issues", "integrity_issues", "missing_attributions",
                        "duplicate_attributions", "evidence_errors")
     invariants = {
-        "duration_met": bool(first) and first["duration_seconds"] >= MINIMUM_SECONDS[run_number],
+        "duration_met": first is not None and bool(first) and first["duration_seconds"] >= MINIMUM_SECONDS[run_number],
         "runtime_boundaries_complete": not boundary_errors and bool(segments) and started is not None,
         "all_lanes_continuous": all(row["continuous"] for row in lanes.values()),
         "restart_recovery_exercised": len(segments) >= 2 and not boundary_errors

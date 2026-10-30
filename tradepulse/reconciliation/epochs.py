@@ -3,8 +3,10 @@
 All state transitions execute under SQLite's write transaction. Execution facts
 remain immutable; an epoch is a separate statement about their finality.
 """
+from collections.abc import Mapping
 from decimal import Decimal
 from hashlib import sha256
+from typing import Any
 
 from tradepulse.models import AssetClass, asset_identity_key
 from tradepulse.persistence.codec import decode_payload, encode_payload
@@ -452,7 +454,7 @@ def checkpoint_issues(connection):
     from tradepulse.persistence import hydrate
 
     issues = {}
-    tables = {}
+    tables: dict[str, dict[str, Any]] = {}
     for table in ('fills', 'trade_intents', 'position_lots', 'holdings', 'reconciliation_records'):
         tables[table] = {}
         for row in connection.execute(f'SELECT record_id,payload FROM {table} ORDER BY record_id'):
@@ -465,13 +467,12 @@ def checkpoint_issues(connection):
     fills = tables['fills']
     intents = tables['trade_intents']
     records = tables['reconciliation_records']
-    fills_by_asset = defaultdict(set)
-    lots_by_asset = defaultdict(Decimal)
-    holdings_by_asset = defaultdict(Decimal)
-    epochs_by_asset = defaultdict(list)
-    covered = Counter()
-    for table, destination in (('fills', fills_by_asset), ('position_lots', lots_by_asset),
-                               ('holdings', holdings_by_asset)):
+    fills_by_asset: defaultdict[str, set[str]] = defaultdict(set)
+    lots_by_asset: defaultdict[str, Decimal] = defaultdict(Decimal)
+    holdings_by_asset: defaultdict[str, Decimal] = defaultdict(Decimal)
+    epochs_by_asset: defaultdict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    covered: Counter[str] = Counter()
+    for table in ('fills', 'position_lots', 'holdings'):
         for identifier, raw in tables[table].items():
             try:
                 item = hydrate(table, raw)
@@ -479,14 +480,14 @@ def checkpoint_issues(connection):
                 if table == 'fills':
                     if item.fill_id != identifier:
                         raise ValueError('CHECKPOINT_FILL_IDENTITY_MISMATCH')
-                    destination[key].add(identifier)
+                    fills_by_asset[key].add(identifier)
                 elif table == 'position_lots':
                     if item.lot_id not in converted:  # Rev.140 §3.9
-                        destination[key] += item.signed_quantity
+                        lots_by_asset[key] += item.signed_quantity
                 else:
                     if key != identifier:
                         raise ValueError('CHECKPOINT_HOLDING_IDENTITY_MISMATCH')
-                    destination[key] += item.quantity
+                    holdings_by_asset[key] += item.quantity
             except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
                 issues[table + ':' + identifier] = str(exc)
     for row in connection.execute('SELECT record_id,status,payload FROM accounting_epochs ORDER BY record_id'):

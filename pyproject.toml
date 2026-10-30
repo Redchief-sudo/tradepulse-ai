@@ -36,10 +36,11 @@ line-length = 120
 # because `strict` is not allowed inside an override.
 [tool.mypy]
 python_version = "3.12"
-files = ["tradepulse/broker", "python_tests/typing"]
+files = ["tradepulse", "python_tests/typing"]
 follow_imports = "silent"
 ignore_missing_imports = true
 warn_redundant_casts = true
+check_untyped_defs = true
 explicit_package_bases = true
 mypy_path = "."
 

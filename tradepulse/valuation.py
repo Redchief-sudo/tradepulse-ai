@@ -1,8 +1,9 @@
 """Broker reporting valuation; pending risk reservations are not held assets."""
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
+from typing import Any
 from uuid import uuid4
 
 from tradepulse.broker.types import AlpacaAccount, AlpacaPosition
@@ -116,7 +117,7 @@ def _generation_invariants(connection, account, positions):
     classifications = verify_membership_record(opening, latest)
     if any(s == 'unresolved_generation_membership' for s in classifications.values()):
         raise ValueError('unresolved_generation_membership')
-    def record(record_id: str) -> dict:
+    def record(record_id: str) -> Mapping[str, Any]:
         row = connection.execute('SELECT payload FROM reconciliation_records WHERE record_id=?', (record_id,)).fetchone()
         if row is None:
             raise KeyError(record_id)
@@ -190,8 +191,8 @@ async def marked_snapshot(
     holdings = {r['record_id']: hydrate('holdings', r['payload']) for r in await paginate_all_rows(repositories.holdings)}
     market = Decimal(0)
     cost = Decimal(0)
-    sectors = {}
-    sector_cost = {}
+    sectors: dict[str, Decimal] = {}
+    sector_cost: dict[str, Decimal] = {}
     errors = []
     generation = None
     generation_failed = False
@@ -257,7 +258,7 @@ async def marked_snapshot(
         key, state = row['payload']['canonical_asset_key'], row['payload']['fee_accounting_status']
         if key not in states or state != 'reconciled_net':
             states[key] = state
-    lot_quantities = {}
+    lot_quantities: dict[str, Decimal] = {}
     from tradepulse.quarantine.legacy import converted_lots
     converted = await converted_lots(repositories)
     adopted_keys = set()
@@ -321,12 +322,12 @@ async def marked_snapshot(
     results['mandatory_invariants'] = 'matched' if mandatory_match else 'incomplete_or_mismatched'
     if generation is not None and not mandatory_match:
         results['generation_equity']['status'] = 'incomplete_or_mismatched'
-    gross_by_asset = {}
+    gross_by_asset: dict[str, Decimal] = {}
     for row in await paginate_all_rows(repositories.trade_attributions):
         attr = hydrate('trade_attributions', row['payload'])
         key = asset_identity_key(attr.asset)
         gross_by_asset[key] = gross_by_asset.get(key, Decimal(0)) + attr.realized_pnl
-    known_by_asset = {}
+    known_by_asset: dict[str, Decimal] = {}
     for row in await paginate_all_rows(repositories.pnl_records):
         pnl = hydrate('pnl_records', row['payload'])
         key = asset_identity_key(pnl.asset)
@@ -358,8 +359,11 @@ def reconciliation_outcome(snapshot: PortfolioSnapshot) -> ReconciliationOutcome
     results = snapshot.reconciliation_results
     if snapshot.equity_reconciliation_difference not in (None, Decimal(0)):
         return ReconciliationOutcome.UNRESOLVED_MISMATCH
-    if any(value != 'matched' for field in ('position_quantities', 'holdings_versus_lots')
-           for value in results.get(field, {}).values()) or results.get('integrity_holds'):
+    for field in ('position_quantities', 'holdings_versus_lots'):
+        states = results.get(field, {})
+        if not isinstance(states, Mapping) or any(value != 'matched' for value in states.values()):
+            return ReconciliationOutcome.UNRESOLVED_MISMATCH  # a malformed result is never matched
+    if results.get('integrity_holds'):
         return ReconciliationOutcome.UNRESOLVED_MISMATCH
     if (snapshot.equity_reconciliation_difference is None or results.get('projection_evidence')
             or results.get('mandatory_invariants') != 'matched'):
