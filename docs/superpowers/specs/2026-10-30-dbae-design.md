@@ -1,6 +1,6 @@
 # DBAE: Dynamic Balance-Aware Execution (Alpaca)
 
-Status: design for review, rev. 1 (2026-10-30). No production code changes are made until this spec is approved.
+Status: design for review, rev. 2 (2026-10-30). No production code changes are made until this spec is approved. Changes from rev. 1 are listed in §17.
 
 ## 1. Purpose and scope
 
@@ -175,9 +175,12 @@ Boundaries are inclusive at the lower edge. `band_for(Decimal("19.99")) == BELOW
 
 **Capture and restart.** The baseline is captured at the first non-protective buy decision of session *D* and reused afterwards, including after a restart. Because it describes the *previous* close, the time of capture is irrelevant: starting at noon after a morning deposit still yields yesterday's close.
 
-**When verification fails.** No baseline row is written for *D*.
-- If an earlier baseline exists, the band for that entry is `min(band_for(band_equity_now), band of the latest stored baseline)`, where `band_equity_now` uses the latest stored `previous_close_equity`. The reason is `DBAE_SESSION_BASELINE_UNVERIFIED_CAPPED`.
-- If no earlier baseline exists, there are no new entries: `DBAE_SESSION_BASELINE_UNVERIFIED`.
+**When verification fails (DBAE-R1-02).**
+- No baseline row is written for *D*, and there are no new entries in session *D*: `DBAE_SESSION_BASELINE_UNVERIFIED`.
+- An older stored baseline never authorises an entry in a later session. There is no fallback path.
+- Capture is retried at the next non-protective buy decision. A baseline verified later in the session takes effect from then on.
+- **New accounts.** An account with no closing bar for the previous trading date (for example, funded today) cannot open entries until the next session. This is deliberate: there is no evidence from before the session.
+- Protective exits never depend on a baseline (§9).
 
 **Crypto.** Crypto has no session boundary of its own. On weekends and holidays, crypto entries use the baseline of the most recent equity trading date. Upgrades therefore happen only at an equity trading-day boundary, while downgrades still apply at once (§4.2).
 
@@ -234,26 +237,59 @@ An entry needs:
 
 ## 7. Funding (DBAE-S2-01, DBAE-S2-R1)
 
-### 7.1 The commitment record
+### 7.1 Quantities (DBAE-R1-01)
+
+Four quantities are recorded separately on every approved buy, in `risk_snapshot`:
+
+| Quantity | Meaning | Recorded as |
+|---|---|---|
+| original request | what the strategy asked for | `requested_quantity` (existing key) |
+| risk-approved | `evaluate_risk`'s first `approved_quantity` | `approved_quantity` (existing key) |
+| shaped | after §8.2's round-down | `dbae.shaped_quantity` |
+| submitted | what the order carries | the intent's `requested_quantity` field |
+
+Today the gateway already overwrites the intent's `requested_quantity` with the risk-approved quantity at `RISK_APPROVED` (`gateway.py`, the `approved = replace(...)` write) and submits that quantity. DBAE changes the overwrite to the **shaped and re-approved** quantity, so the submitted and shaped quantities are always equal. The original request never reserves funding.
+
+**Re-approval after shaping.** When shaping changes the quantity, `evaluate_risk` runs again on the same snapshot, inside the same lock, with `requested_quantity = shaped_quantity`.
+- The result must approve exactly the shaped quantity, otherwise the entry is refused with `DBAE_SHAPED_QUANTITY_NOT_REAPPROVED`.
+- Rounding down cannot break the caps, but it can break the $1 minimum lot and the cost-to-risk rule, which the second run catches.
+
+### 7.2 The commitment record
 
 A buy's funding commitment is its trade intent, persisted as `RISK_APPROVED` before submission, under the portfolio-risk lock, by the lease-fenced write. Its `risk_snapshot.dbae.max_funding` records:
 
-`requested_quantity × reference_price × multiplier × (1 + slippage_allowance) + projected_fees`
+`submitted_quantity × reference_price × multiplier × (1 + slippage_allowance) + projected_fees`
 
-where `slippage_allowance` is the profile's `slippage_limit_for(asset_class)` as a fraction.
+where `slippage_allowance` is the profile's `slippage_limit_for(asset_class)` as a fraction. For example, a request for $20 that is approved and shaped to $3.50 reserves about $3.50 plus its allowance and fees, never $20.
 
-### 7.2 What is still reserved
+### 7.3 Funding components and their sources (DBAE-R1-03)
+
+| Component | Source | Changes when |
+|---|---|---|
+| `cash` | broker, `/v2/account` | Alpaca lowers it on a fill; see G2 below |
+| `buying_power` (crypto: `non_marginable_buying_power`) | broker, `/v2/account` | Alpaca lowers it for open orders and fills; see G2 below |
+| attributed quantity | TradePulse SettlementEvents | a validated fill is attributed |
+| outstanding commitment `P` | TradePulse intents (§7.4) | an intent is approved, gets a fill attributed, or reaches a broker-confirmed terminal state |
+| projected fees | the existing fee estimator (`_FEE_PCT_PER_SIDE` for crypto; zero commission and the regulatory sell-side fees for equities) | an actual fee is attributed, which replaces the estimate |
+
+**What DBAE never does.** It never releases any part of `P` because a broker figure changed. The only things that reduce `P` are an attributed fill, or a terminal state confirmed by the broker.
+
+**Broker behaviour to confirm.** The "changes when" column for `cash` and `buying_power` is Alpaca's documented behaviour, not yet observed on this account. G2 (§13) records the account before submission, after acceptance and after each fill, and the record states the observed behaviour.
+- If G2 shows `cash` drops on acceptance rather than on fill, the subtraction stays as it is. It becomes stricter, never looser, and the spec records the observation.
+- No relaxation of §7.5 is made without that evidence and a new Rev.
+
+### 7.4 What is still reserved
 
 `pending_buy_funding(repositories) -> Decimal` sums, over every buy intent in `RISK_APPROVED`, `SUBMITTED`, `ACCEPTED`, `PARTIALLY_FILLED` or `SUBMISSION_UNKNOWN`, across all symbols:
 
-`(requested_quantity − attributed_quantity) × reference_price × multiplier × (1 + slippage_allowance) + unpaid projected fees`
+`(submitted_quantity − attributed_quantity) × reference_price × multiplier × (1 + slippage_allowance) + unattributed projected fees`
 
 - `attributed_quantity` comes from the intent's SettlementEvents, the same ground truth and the same shared bucket helper as RISK-091-01. It is never taken from `filled_quantity`.
 - A `CANCELED` or `EXPIRED` intent leaves the set only once the broker has confirmed that terminal state. Its attributed part is then already in cash and holdings.
 - A `SUBMISSION_UNKNOWN` intent stays fully reserved until it is resolved.
 - The figure is derived from durable records on every evaluation. There is no separate running total to drift or restore after a crash.
 
-### 7.3 Funding available
+### 7.5 Funding available
 
 ```
 equity / option:  funding_available = min(cash − P, buying_power − P)
@@ -263,7 +299,12 @@ crypto:           funding_available = min(cash − P, non_marginable_buying_powe
 where `P = pending_buy_funding`. It is passed to `evaluate_risk` as `available_cash`, replacing raw `account.cash`. `check_cash_sufficiency` then applies its existing 1% buffer and the new order's fees.
 
 - A negative or missing input refuses entries: `DBAE_FUNDING_UNVERIFIED`. A result at or below zero gives the existing `INSUFFICIENT_CASH`.
-- **Double counting is one-directional.** Alpaca lowers `buying_power` for open orders and lowers `cash` on fills. Between a broker fill and its attribution, the filled part is counted in both `P` and the broker figure. This only makes the check stricter, it ends at attribution, and it never charges a fill twice once it is attributed. For example, a $10 order with $6 attributed reserves $4, and cash already shows the $6.
+- **Where overlap occurs, it only ever makes the check stricter.**
+  - **`buying_power` and accepted orders:** Alpaca's figure already excludes an accepted, unfilled order, and `P` excludes it again. So that order counts twice in the `buying_power` term until it fills and is attributed. For a market order in regular hours, that is seconds.
+  - **Between a fill and its attribution:** the filled part is in both `P` and the broker's lowered `cash`. This ends at attribution.
+  - **After attribution:** a fill is never charged twice. For example, a $10 order with $6 attributed reserves $4, and `cash` already shows the $6.
+  - DBAE deliberately accepts this transient over-count instead of releasing reservations based on unverified broker semantics (§7.3).
+- **Small accounts.** Below $2,000 equity, Reg T allows no margin, so Alpaca's so `buying_power` is close to `cash`. While an order is open, the `buying_power` term can bind at about `cash − 2 × order`. This delays a second entry until the first fills; it never approves an unfunded one.
 - **Not a guarantee.** This bounds TradePulse's own commitments to cash. It does not claim a margin deficit is impossible: maintenance changes, fees and broker-side adjustments remain. Alpaca's pre-trade margin rejection and the existing reconciliation and margin monitoring stay as independent safeguards.
 
 ## 8. Sizing, minimums and exits (DBAE-S2-03, DBAE-S2-R3)
@@ -280,7 +321,9 @@ Wherever this spec writes `max($1, min_order_size × price)`, the second term ap
 4. Funding (§7).
 5. `evaluate_risk`, unchanged, with `available_cash = funding_available`.
 6. Shaping the quantity (§8.2).
-7. Exit feasibility (§8.3).
+7. Re-approval of the shaped quantity (§7.1).
+8. Exit feasibility (§8.3), on the shaped quantity.
+9. The lease-fenced `RISK_APPROVED` write, which stores the four quantities (§7.1) and `max_funding` (§7.2).
 
 The first failure refuses the entry. Every reason is recorded (§10).
 
@@ -289,7 +332,7 @@ The first failure refuses the entry. Every reason is recorded (§10).
 - **Equity, fractionable** (and `fractional_trading` true): the engine's 0.001 precision.
 - **Equity, not fractionable:** floored to whole shares. If that leaves 0, the entry is refused with `WHOLE_SHARE_UNAFFORDABLE`.
 - **Crypto:** floored to a multiple of `min_trade_increment`. If the result is below `min_order_size`, the entry is refused with `DBAE_BELOW_ASSET_MINIMUM`.
-- After shaping, the entry must still pass the $1 `min_lot_notional` and the cost-to-risk rule, re-evaluated on the shaped quantity.
+- After shaping, every risk limit is re-checked by the second `evaluate_risk` run (§7.1).
 - The quantity is never rounded up.
 
 ### 8.3 Exit feasibility at entry (DBAE-02)
@@ -346,6 +389,12 @@ There is never a second sell while the first is unresolved.
 
 **Never assumed closed.** The position is never assumed closed. Only attributed sell fills reduce it.
 
+**Below the entry minimum.** When the account falls below $20 (`BELOW_MINIMUM`), or into any band that would not unlock the held asset class, every existing position keeps full protective management:
+- stops, the ratchet, the time stop and full exits are unaffected;
+- band membership is read only by new entries.
+
+A scale-out is still governed only by §8.4.
+
 ## 10. Refusal reasons and failure handling
 
 Every refusal:
@@ -362,8 +411,7 @@ Refusals never block exits, cancel orders or change holdings.
 | `DBAE_ACCOUNT_CLOSING_ONLY` | `closing_transactions_only` |
 | `DBAE_ACCOUNT_NOT_ACTIVE` | `status != ACTIVE` |
 | `DBAE_CASH_ACCOUNT_SETTLEMENT_UNVERIFIED` | `multiplier == 1` |
-| `DBAE_SESSION_BASELINE_UNVERIFIED` | no verified baseline and none stored |
-| `DBAE_SESSION_BASELINE_UNVERIFIED_CAPPED` | an informational reason when the band is capped at the last stored baseline (the entry may proceed) |
+| `DBAE_SESSION_BASELINE_UNVERIFIED` | no verified baseline for the current session (§4.3) |
 | `DBAE_ASSET_CLASS_LOCKED` | class not unlocked by the band |
 | `DBAE_ASSET_NOT_TRADABLE` | `active` or `tradable` not `True` |
 | `DBAE_WHOLE_SHARES_NOT_ALLOWED_IN_BAND` | non-fractionable equity in `MICRO` or `MICRO_PLUS` |
@@ -375,6 +423,7 @@ Refusals never block exits, cancel orders or change holdings.
 | `WHOLE_SHARE_UNAFFORDABLE` | floor to whole shares leaves 0 |
 | `DBAE_BELOW_ASSET_MINIMUM` | crypto below `min_order_size` after flooring |
 | `DBAE_SUB_MINIMUM_LIQUIDATION_UNVERIFIED` | §8.3 |
+| `DBAE_SHAPED_QUANTITY_NOT_REAPPROVED` | the second `evaluate_risk` run did not approve exactly the shaped quantity (§7.1) |
 
 A broker read that fails (timeout, 5xx or malformed data) is treated as unknown evidence, never as permission, and the entry is skipped for that cycle.
 
@@ -386,7 +435,8 @@ A broker read that fails (timeout, 5xx or malformed data) is treated as unknown 
 - **`risk_snapshot.dbae`** on every approved buy, holding:
   - band, band equity, session date, baseline id;
   - `funding_available`, `pending_buy_funding`, `max_funding`;
-  - shaped quantity and shaping rule;
+  - the broker figures used (`cash`, `buying_power` or `non_marginable_buying_power`) with their `received_at`;
+  - `shaped_quantity`, the shaping rule, and the re-approval result (§7.1), alongside the existing `requested_quantity` and `approved_quantity`;
   - exit-feasibility result;
   - evidence `received_at` times.
 
@@ -407,7 +457,7 @@ DBAE has no on/off flag. It replaces the ladder, and every entry passes through 
 | Gate | What | Authorization |
 |---|---|---|
 | G1 | Read-only probes: `/v2/account/portfolio/history?timeframe=1D` shape and bar dates. Confirm `last_equity` equals the previous trading date's closing bar. Evidence saved with no identifiers. | Read only. Runs before the build. |
-| G2 | Paper sub-$1 liquidation: buy ≈ $1.10 of one fractionable stock (notional market, regular hours). Sell ≈ $0.50 of it by quantity. Sell the remainder by quantity. All through the gateway or an approved direct order, with responses and fills saved. The account ends flat. | **The operator approves each exact order beforehand.** Never during a verification run. Paper behaviour may differ from live; the record says so. |
+| G2 | Paper sub-$1 liquidation and funding behaviour. Buy ≈ $1.10 of one fractionable stock (notional market, regular hours). Sell ≈ $0.50 of it by quantity. Sell the remainder by quantity. All through the gateway or an approved direct order, with order responses and fills saved. A read-only account snapshot (`cash`, `buying_power`, `non_marginable_buying_power`) is saved before each submission, after acceptance and after each fill, to establish §7.3's broker behaviour. The account ends flat. | **The operator approves each exact order beforehand.** Never during a verification run. Paper behaviour may differ from live; the record says so. |
 | G3 | Full test suite green; mypy zero over the package; Ruff with no new findings. | — |
 
 G2's outcome sets `SUB_MINIMUM_FULL_LIQUIDATION` (`"verified"` if both sub-$1 sells fill, `"refused"` if Alpaca rejects either). G2 is not required for the build; until it passes, §8.3 refuses the entries that depend on it.
@@ -426,12 +476,18 @@ All tests are deterministic: simulated broker data, a fixed clock and the Rev.14
    - A crash between `RISK_APPROVED` and submission: the restart derives the same reservation.
    - Crypto uses `non_marginable_buying_power`.
    - A missing or negative input gives `DBAE_FUNDING_UNVERIFIED`.
+   - **Request vs authorised quantity:** a $20 request risk-approved at $3.50 reserves the $3.50 order's obligation only. `risk_snapshot` holds all four quantities, and the submitted quantity equals the shaped one.
+   - **Shaping:** a quantity floored by the increment has `max_funding` computed on the floored quantity. A floor that breaks the $1 minimum lot or the cost rule gives `DBAE_SHAPED_QUANTITY_NOT_REAPPROVED`.
+   - **Partial fill with a lowered broker figure:** a partly filled order with `buying_power` already reduced releases nothing that isn't attributed, and the attributed part never stays in `P`.
+   - **Restart after an ambiguous buy:** the same `P`, and no second buy for that intent.
 3. **Baseline.**
    - A gain during the session gives no upgrade.
    - A deposit then a restart gives no upgrade.
    - A $50 close with a +$500 deposit and a first start at noon stays `MICRO_PLUS`.
    - A loss during the session downgrades at once.
-   - Portfolio history disagreeing with `last_equity` gives the capped result, or a refusal when no baseline is stored.
+   - Portfolio history disagreeing with `last_equity`, or a missing previous-date bar, refuses entries for the session, even with an older stored baseline.
+   - A baseline verified later in the same session allows entries from then on.
+   - A new account with no previous close is refused until the next session.
    - The first session after a holiday uses the close of the last trading date.
    - A crypto entry on Saturday uses Friday's session baseline.
    - Write-once under concurrent capture.
@@ -452,16 +508,41 @@ All tests are deterministic: simulated broker data, a fixed clock and the Rev.14
    - A timeout where the order is later found continues with no second order.
    - A timeout where the order is never found gives `SUBMISSION_UNKNOWN` and no second sell across cycles and a restart.
    - Reconciliation proves the order terminal, after which a new exit is allowed.
+   - With equity dropped below $20, the stop exit of an existing position is submitted, and no DBAE reason appears.
 7. **Retired setting.** Setting `TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY` (any value) fails settings parsing with the migration error. The ladder symbols no longer exist.
-8. **Property test.** Over random balances, prices, minimums and pending sets: shaped quantity ≤ approved quantity; total reserved ≤ funding; no approval when any required field is `None`.
+8. **Activation.**
+   - Binding or resuming a generation frozen without `dbae_policy_version` gives `generation_predates_dbae`.
+   - Changing a band threshold after the freeze gives `frozen_configuration_mismatch`.
+9. **Small accounts with G2 unverified.** At $20 under `conservative`, the entry is refused with `DBAE_SUB_MINIMUM_LIQUIDATION_UNVERIFIED`, nothing is submitted, and no limit is changed to force it.
+10. **Property test.** Over random balances, prices, minimums and pending sets: shaped quantity ≤ approved quantity; total reserved ≤ funding; no approval when any required field is `None`.
 
-## 15. Verification-run compatibility
+## 15. Verification activation (DBAE-R1-04)
 
-- The paper account (about $100k) is in `FULL`. For the 24 h run, DBAE changes only:
-  - the funding check (§7), which is stricter;
-  - the new audit events and `risk_snapshot.dbae`.
-- The run's opening position (the 1-share buy) is taken before the cursor bootstrap and is unaffected.
-- DBAE is built in a worktree and never edited during a run. G2 never runs during a run.
+DBAE changes the executable decision path: new account fields, session baselines, fresh asset reads, shaping with re-approval, and stricter funding. It is therefore treated as a new release, never as a change inside a running generation.
+
+**What already exists.** A verification generation freezes:
+- the protected source files (`freeze_source`, an aggregate sha256);
+- the settings context (`context_for`).
+
+A later mismatch fails with `frozen_configuration_mismatch`. A runtime with DBAE source cannot continue a generation frozen without it.
+
+**What DBAE adds.**
+- The frozen `policy` records `dbae_policy_version = "dbae-1"`, the band thresholds, `DBAE_EVIDENCE_MAX_AGE_SECONDS` and `SUB_MINIMUM_FULL_LIQUIDATION`. A change to any of them is a configuration mismatch.
+- A runtime with DBAE refuses to bind or resume a generation whose frozen policy has no `dbae_policy_version`: `generation_predates_dbae`. That prevents DBAE from entering an existing generation, even one that is reopened.
+- No migration converts an existing generation.
+
+**Release order:**
+1. DBAE merged.
+2. G3 green.
+3. The `dbae_session_baselines` collection created by the normal schema bootstrap.
+4. A fresh generation frozen and bound on the final configuration and schema.
+5. The 24 h run.
+
+G1 runs before the build. G2, if the operator authorises it, runs before the fresh generation is frozen, never inside it.
+
+**Effect on the run.** The paper account (about $100k) is in `FULL`, so DBAE refuses no asset class there. It changes the funding check (§7), which is stricter, and adds the new audit events and `risk_snapshot.dbae`. The run's opening 1-share buy goes through the gateway before the cursor bootstrap, as planned.
+
+DBAE is built in a worktree and never edited during a run.
 
 ## 16. Review trail
 
@@ -472,3 +553,16 @@ All tests are deterministic: simulated broker data, a fixed clock and the Rev.14
   - gradual unlocks;
   - scan cost not in DBAE;
   - "keep one day trade in reserve" superseded by the PDT retirement evidence (§2.2) and approved by the reviewer.
+- **Rev. 1 forensic audit:** DBAE-R1-01 to R1-04 (§17).
+
+## 17. Change log
+
+**Rev. 2 (2026-10-30)** answers the rev. 1 audit.
+
+| Finding | Change | Where |
+|---|---|---|
+| DBAE-R1-01, authorised funding quantity | The four quantities (request, risk-approved, shaped, submitted) are recorded separately. Funding is reserved on the submitted (shaped and re-approved) quantity, never the request. A second `evaluate_risk` run on the shaped quantity must approve it exactly (`DBAE_SHAPED_QUANTITY_NOT_REAPPROVED`). The existing gateway overwrite of the intent's quantity is now documented. | §7.1, §7.2, §8.1, §8.2, §10, §11, §14.2 |
+| DBAE-R1-02, session baseline | The stale-baseline fallback and `DBAE_SESSION_BASELINE_UNVERIFIED_CAPPED` are removed. An unverified current-session baseline refuses new entries for that session. A new account waits one session. | §4.3, §10, §14.3 |
+| DBAE-R1-03, funding conservation | A table of components with sources and when each changes. `P` is released only by attribution or a broker-confirmed terminal state, never because a broker figure moved. The over-count from `buying_power` and accepted orders is stated, with its small-account effect. G2 now records account snapshots around each order to establish broker behaviour. No relaxation without that evidence and a new Rev. | §7.3, §7.5, §13, §14.2 |
+| DBAE-R1-04, verification activation | DBAE is a new release. The frozen generation policy carries `dbae_policy_version` and DBAE's constants. A pre-DBAE generation cannot be bound or resumed (`generation_predates_dbae`). The release order ends in a fresh frozen generation. | §15, §14.8 |
+| Added tests | A $20 request approved at $3.50; increment shaping; a partial fill with a lowered broker figure; a missing current baseline; G2 unverified at $20 conservative; activation into an old generation; restart after an ambiguous buy; stop exits below $20. | §14 |
