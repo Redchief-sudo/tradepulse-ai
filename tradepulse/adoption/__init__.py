@@ -33,7 +33,9 @@ from tradepulse.models.portfolio import ADOPTED_LOT_PREFIX, ADOPTION_FILL_PREFIX
 from tradepulse.persistence import PersistenceRepositories, hydrate
 from tradepulse.persistence.codec import decode_payload, encode_payload
 
-ADOPTABLE_CLASSES = (AssetClass.EQUITY, AssetClass.OPTION, AssetClass.CRYPTO)
+# TP145-02: crypto is not adopted until coin-denominated fees on an adopted
+# lot have an accounting model (historical and fee replay refuse them).
+ADOPTABLE_CLASSES = (AssetClass.EQUITY, AssetClass.OPTION)
 IDENTIFIER_KEYS = frozenset({"account_id", "account_number", "asset_id"})
 
 
@@ -117,6 +119,8 @@ def _eligible(connection: sqlite3.Connection, position: Any, key: str) -> str | 
 
     if position.qty <= 0:
         return "UNSUPPORTED_SHORT_POSITION" if position.qty < 0 else "FLAT"
+    if position.asset_class == AssetClass.CRYPTO:
+        return "CRYPTO_ADOPTION_UNSUPPORTED"
     if position.asset_class not in ADOPTABLE_CLASSES:
         return "ASSET_CLASS_UNSUPPORTED"
     if connection.execute("SELECT 1 FROM holdings WHERE record_id=?", (key,)).fetchone() or _open_lots(connection, key):

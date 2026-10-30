@@ -723,9 +723,21 @@ def observed_generation_result(rows, fills, native_receipts, valid_native_receip
     generation_records = {record['record_id'].removeprefix('generation_fee:'): record
                           for record in rows['reconciliation_records']
                           if record['record_id'].startswith('generation_fee:')}
+    # Rev.142: an adopted lot's closes are inherited inventory, excluded from
+    # run equity through X(k); its closing fills, their fees and the fee
+    # receipts linked to them are excluded here too, never run performance.
+    adopted_fill_ids = {fill_id for lot in rows.get('position_lots', []) if _adopted(lot) for fill_id in lot['closures']}
+    adopted_orders = {fills[fill_id]['order_id'] for fill_id in adopted_fill_ids if fill_id in fills}
+    adopted_broker_fills = {fills[fill_id].get('broker_fill_id') for fill_id in adopted_fill_ids if fill_id in fills} - {None}
+
+    def adopted_fee(record):
+        relation = record['actual']['authoritative_relationship']
+        return relation.get('order_id') in adopted_orders or relation.get('fill_id') in adopted_broker_fills
+
     expected = set()
     unallocated = Decimal(0)
     attributed = Decimal(0)
+    adopted_fees = Decimal(0)
     try:
         for identifier, raw in raw_by_id.items():
             fee = cash_fee_receipt(raw)
@@ -735,7 +747,9 @@ def observed_generation_result(rows, fills, native_receipts, valid_native_receip
             record = generation_records[identifier]
             entry = cash_entries['broker:fee:' + identifier]
             verified = validate_generation_fee(record, entry, raw=raw, checkpoint=checkpoint)
-            if verified['fee_classification'] == 'unallocated_account_fee':
+            if adopted_fee(record):
+                adopted_fees -= verified['amount']
+            elif verified['fee_classification'] == 'unallocated_account_fee':
                 unallocated -= verified['amount']
             else:
                 attributed -= verified['amount']
@@ -754,7 +768,8 @@ def observed_generation_result(rows, fills, native_receipts, valid_native_receip
     if expected_native != native_receipts.keys() or native_receipts.keys() != valid_native_receipts:
         errors.append('generation_native_fee_authority_invalid')
     native_expense = sum((native_basis[identifier] for identifier in valid_native_receipts), Decimal(0))
-    explicit_fill_expense = sum((number(fill['fees']) for fill in fills.values()), Decimal(0))
+    explicit_fill_expense = sum((number(fill['fees']) for identifier, fill in fills.items() if identifier not in adopted_fill_ids), Decimal(0))
+    adopted_fill_fees = sum((number(fills[identifier]['fees']) for identifier in adopted_fill_ids if identifier in fills), Decimal(0))
     # A nonzero fill fee plus a separate linked activity could represent the
     # same expense. Without an immutable expense identity bridge, fail closed
     # rather than deducting two representations of one charge.
@@ -764,7 +779,10 @@ def observed_generation_result(rows, fills, native_receipts, valid_native_receip
                 relation.get('fill_id') == fill.get('broker_fill_id') or
                 relation.get('order_id') == fill.get('order_id')) for fill in fills.values()):
             errors.append('fill_fee_activity_overlap_requires_expense_identity_bridge')
-    gross = sum((number(row['realized_pnl']) for row in rows['trade_attributions']), Decimal(0))
+    gross = sum((number(row['realized_pnl']) for row in rows['trade_attributions']
+                 if not str(row.get('lot_id', '')).startswith('adopted:')), Decimal(0))
+    adopted_gross = sum((number(row['realized_pnl']) for row in rows['trade_attributions']
+                         if str(row.get('lot_id', '')).startswith('adopted:')), Decimal(0))
     verified_adjustments = Decimal(0)
     capital_flows = Decimal(0)
     expected_adjustments = set()
@@ -802,7 +820,9 @@ def observed_generation_result(rows, fills, native_receipts, valid_native_receip
               'crypto_native_asset_fee_basis': str(native_expense),
               'verified_adjustments_and_expenses': str(verified_adjustments),
               'capital_flows_excluded_from_pnl': str(capital_flows),
-              'modeled_overlay_deducted': False, 'cash_fee_activity_ids': sorted(expected)}
+              'modeled_overlay_deducted': False, 'cash_fee_activity_ids': sorted(expected),
+              'adopted_excluded': {'realized_pnl': str(adopted_gross), 'cash_fees': str(adopted_fees),
+                                   'fill_fees': str(adopted_fill_fees)}}
     observed = gross - attributed - unallocated - explicit_fill_expense - native_expense + verified_adjustments
     return (None if errors else observed), bridge, errors
 

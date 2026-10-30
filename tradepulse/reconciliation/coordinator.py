@@ -129,7 +129,7 @@ def _utc_hour(now: datetime) -> str:
 
 
 async def _rebuild_holding_from_lots(
-    repositories: PersistenceRepositories, asset: AssetIdentity, now: datetime
+    repositories: PersistenceRepositories, asset: AssetIdentity, now: datetime, previous: Holding | None = None
 ) -> Holding | None:
     """Mirrors settlement/engine.py::_project_holding's own recompute (not
     imported directly -- that function is keyed off a SettlementEvent this
@@ -157,8 +157,13 @@ async def _rebuild_holding_from_lots(
         from tradepulse.adoption import adoption_for_lot
 
         adoption = await repositories.position_adoptions.database.run(lambda c: adoption_for_lot(c, oldest_lot))
+        # ADOPT-07: a rebuild never lowers the ratcheted stop or repeats a
+        # scale-out. An adopted asset takes no buys (MIXED_LOT_ORIGIN), so
+        # the earlier floor still belongs to this same position.
         return Holding(asset=asset, quantity=total_signed, average_price=avg_price, updated_at=now,
-                       stop_loss=Decimal(adoption["stop_loss"]), target_price=None)
+                       stop_loss=Decimal(adoption["stop_loss"]), target_price=None,
+                       current_stop=previous.current_stop if previous is not None else None,
+                       scaled_out=previous.scaled_out if previous is not None else False)
     fill_row = await repositories.fills.get(oldest_lot.originating_fill_id)
     if fill_row is not None:
         fill = hydrate("fills", fill_row["payload"])
@@ -280,7 +285,7 @@ async def _reconcile_positions(
                     await repositories.holdings.delete(key)
             else:
                 asset = asset_by_key.get(key)
-                rebuilt = await _rebuild_holding_from_lots(repositories, asset, now) if asset is not None else None
+                rebuilt = await _rebuild_holding_from_lots(repositories, asset, now, holding) if asset is not None else None
                 if rebuilt is not None:
                     if holding is not None:
                         await repositories.holdings.update(key, rebuilt)

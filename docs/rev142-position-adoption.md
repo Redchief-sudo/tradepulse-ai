@@ -25,19 +25,17 @@ With `TRADEPULSE_ADOPT_UNMANAGED_POSITIONS=true`, every eligible long broker pos
 
 ## Deviations and findings (for the reviewer)
 
-1. **Cross-spec finding: an adopted `unexpected_external` position cannot be sold under Rev.140 today.** Its originating broker FILL is not TradePulse's, so Rev.140 records it as an unresolved broker execution and refuses every sell of the asset until exact evidence resolves it. No Rev.140 outcome type covers "adopted". The position is protected (stop and monitoring), but its exit is refused with `ADOPTED_EXIT_REFUSED` until the operator resolves the execution.
+1. **Cross-spec finding (TP145-01): `unexpected_external` adoption is monitored and quarantined, not automatically exit-capable.** Its originating broker FILL is not TradePulse's, so Rev.140 records it as an unresolved broker execution and refuses every sell of the asset until exact evidence resolves it. No Rev.140 outcome type covers "adopted". The position is protected (stop and monitoring), but its exit is refused with `ADOPTED_EXIT_REFUSED` until the operator resolves the execution.
    - Opening inventory is unaffected: the cursor bootstrap's baseline explains it.
    - The 24 h run's planned position is opening inventory: the 1-share buy is placed before the bootstrap. The tests use the same setup.
    - A future Rev should add an `adopted_position` outcome, or the reviewer should confirm this behaviour.
 2. **Identity is derived, not stored.** `origin` and `adoption_id` are properties computed from `lot_id = adopted:<id>` and `originating_fill_id = adoption:<id>`, and `__post_init__` checks that the two agree. The spec stores them in the payload. Deriving them keeps every existing lot payload byte-identical, so the Rev.140 replays and digests are unaffected, and no path can drop the identity (AD-I13). `TradeAttribution.origin` is derived the same way, from its `lot_id`.
-3. **Coin-denominated (crypto) fees on an adopted lot fail closed** (`ASSET_FEE_ADOPTED_LOT_UNSUPPORTED`). Historical fee replay and fee replay are built around an opening fill. Spec §3.9's coin-fee attribution to the adopted epoch is therefore not built; such an asset stays fee-pending.
-4. **Adopted closing fees** in `N(k)` and the P&L projection are the closing fill's own fee plus every broker cash fee linked to its order or fill. An adopted asset has a single lot, so no proportional split is needed.
+3. **Crypto is not adopted (TP145-02).** `_eligible` refuses it with `CRYPTO_ADOPTION_UNSUPPORTED`, so it stays reported as unmanaged, as before Rev.142. Historical fee replay and fee replay are built around an opening fill, and spec §3.9's coin-fee attribution to the adopted epoch is not built. Their `ASSET_FEE_ADOPTED_LOT_UNSUPPORTED` checks stay as a second guard.
+4. **Adopted closing fees (TP145-03)** in `N(k)` and the P&L projection come from `closing_fee_allocation`. It takes each fill's own fee, plus each broker fee receipt exactly once: a receipt naming a fill goes to that fill, and a receipt naming only an order is split across that order's fills by quantity (largest remainder).
 5. **The startup gate is cached per process,** and runs at `run` startup and before the first adoption of a `scan` or `monitor` command.
 6. **`unexpected_external` adoption IDs** are a hash of the episode ID; opening-inventory IDs are a hash of the checkpoint and asset. The `UNIQUE(account_ref, asset_key, source_id)` constraint is unchanged.
-7. **Not built:**
-   - the dashboard badge and P&L split (§3.12);
-   - the separate tests T11 (one per site), T12/T13 (the ratchet, unchanged monitor code), T18 (a fee-replay late correction; covered as a late fee via the projection) and T20/T21.
-   The record lists them so the reviewer can require them.
+7. **Not built:** the dashboard badge and P&L split (§3.12), and T11 as one test per site (the T26 guard and the runtime tests cover the sites). T12, T13, T18, T20 (as today's behaviour) and T21 were added in the remediation; see `docs/review-remediation-2026-10-29.md`.
+8. **Remediation (2026-10-29):** adopted closes are left out of `observed_generation_net` (R-1), and a stale-view rebuild keeps an adopted holding's `current_stop` and `scaled_out` (R-2).
 
 ## Tests
 

@@ -81,3 +81,26 @@ Evidence: `~/tradepulse-evidence/2026-10-29-rev143-g0/` (manifest SHA-256 prefix
 
 - **The first real dividend is the verification event.** Compare its raw receipt with the fixture shape, establish `DIVIDEND_REPRESENTATION` and the rounding rule, and record the cash dividend's `activity_sub_type`.
 - **Rev.142:** the `adopted` bucket in the same structures (spec §3.9).
+
+## First real dividend: evidence and acceptance (TP145-04)
+
+`DIVIDEND_REPRESENTATION` stays `"unknown"` until an operator accepts the first real dividend. Until then, no dividend is attributed.
+
+**What happens when it arrives:**
+- **A receipt that validates:** its cash is recorded once (`broker:dividend:<id>`), and its attribution is `unresolved` with reason `DIVIDEND_REPRESENTATION_UNKNOWN`. The amount is held in `D_unresolved`, the snapshot is `INCOMPLETE_EVIDENCE`, and a critical alert fires at the deadline.
+- **A receipt whose shape fails validation** (`DIVIDEND_RECEIPT_INVALID`): no cash is recorded, so the cash check fails under that named reason, not silently. No fallback guesses the shape.
+
+**Evidence to collect,** read-only, under `~/tradepulse-evidence/<date>-first-dividend/` with a manifest, account numbers redacted:
+1. The raw activity of the dividend income, every withholding activity for the same symbol and pay date, and their `activity_type` and `activity_sub_type`.
+2. The matching corporate-action announcement: `cash` rate, ex-date, record date and payable date.
+3. The position quantity held at the ex-date, from the lots and the broker.
+4. Whether the income is gross with a separate withholding, or net with a withholding record, and the field that carries the withheld amount.
+5. The rounding: compare quantity × rate with the credited amount, to the cent.
+
+**Acceptance,** by the operator, in one Rev:
+1. Set `DIVIDEND_REPRESENTATION` to the observed representation, and, if needed, `withheld_amount` to the observed field.
+2. Add the real receipt, redacted, as a fixture, with a test that `decide` attributes it exactly, residual included.
+3. Run the full suite and the Rev.140 replay.
+4. The operator signs off in the Rev record.
+
+Only then are dividends attributed. The unresolved rows from before acceptance are re-decided by the normal attribution pass.

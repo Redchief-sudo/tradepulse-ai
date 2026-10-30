@@ -18,28 +18,66 @@ def _adopted_lots(connection: sqlite3.Connection) -> list[Any]:
     return [lot for lot in lots if lot.origin == "adopted"]
 
 
-def closing_fees(connection: sqlite3.Connection, fill: Any) -> Decimal:
-    """The closing fill's own fee plus every broker cash fee linked to its
-    order or fill (positive amounts). An adopted asset has one lot, so all
-    of a closing fill's fees belong to it."""
-    total = fill.fees
-    for (payload,) in connection.execute("SELECT payload FROM reconciliation_records WHERE record_id LIKE 'generation_fee:%'"):
-        relation = decode_payload(payload)["actual"]["authoritative_relationship"]
-        if relation.get("order_id") == fill.order_id or (fill.broker_fill_id and relation.get("fill_id") == fill.broker_fill_id):
-            total += -Decimal(decode_payload(payload)["actual"]["cash_debit"])
-    return total
+def _split(amount: Decimal, weights: Mapping[str, Decimal]) -> dict[str, Decimal]:
+    """Largest remainder in the amount's own smallest unit (at least a cent),
+    ties broken by fill ID; the parts sum to the amount exactly."""
+    exponent = amount.as_tuple().exponent
+    unit = min(Decimal("0.01"), Decimal(1).scaleb(exponent if isinstance(exponent, int) else -2))
+    total = sum(weights.values(), Decimal(0))
+    units = int(abs(amount) / unit)
+    exact = {key: Decimal(units) * weight / total for key, weight in weights.items()}
+    floors = {key: int(value) for key, value in exact.items()}
+    for key in sorted(exact, key=lambda k: (-(exact[k] - floors[k]), k))[:units - sum(floors.values())]:
+        floors[key] += 1
+    sign = -1 if amount < 0 else 1
+    return {key: sign * count * unit for key, count in floors.items()}
+
+
+def closing_fee_allocation(connection: sqlite3.Connection, fills: list[Any]) -> dict[str, Decimal]:
+    """Each fill's fees (positive amounts): its own fee, plus each broker cash
+    fee receipt allocated exactly once. A receipt naming a known fill goes to
+    that fill; a receipt naming only an order is split across all of that
+    order's fills by quantity (largest remainder), so an order-level fee is
+    never counted once per fill."""
+    order_ids = {fill.order_id for fill in fills}
+    order_fills: dict[str, list[Any]] = {}
+    for (payload,) in connection.execute("SELECT payload FROM fills ORDER BY record_id"):
+        fill = hydrate("fills", decode_payload(payload))
+        if fill.order_id in order_ids:
+            order_fills.setdefault(fill.order_id, []).append(fill)
+    by_broker_id = {fill.broker_fill_id: fill for group in order_fills.values() for fill in group if fill.broker_fill_id}
+    allocation = {fill.fill_id: fill.fees for group in order_fills.values() for fill in group}
+    for (payload,) in connection.execute("SELECT payload FROM reconciliation_records WHERE record_id LIKE 'generation_fee:%' ORDER BY record_id"):
+        actual = decode_payload(payload)["actual"]
+        relation, fee = actual["authoritative_relationship"], -Decimal(actual["cash_debit"])
+        named = by_broker_id.get(relation["fill_id"]) if relation.get("fill_id") else None
+        if named is not None:
+            allocation[named.fill_id] += fee
+        elif relation.get("order_id") in order_fills:
+            group = order_fills[relation["order_id"]]
+            for fill_id, part in _split(fee, {fill.fill_id: fill.quantity for fill in group}).items():
+                allocation[fill_id] += part
+    return allocation
+
+
+def _closing_fills(connection: sqlite3.Connection, lot: Any) -> dict[str, Any]:
+    fills = {}
+    for fill_id in lot.closures:
+        row = connection.execute("SELECT payload FROM fills WHERE record_id=?", (fill_id,)).fetchone()
+        if row is None:
+            raise ValueError("ADOPTED_CLOSING_FILL_MISSING:" + fill_id)
+        fills[fill_id] = hydrate("fills", decode_payload(row[0]))
+    return fills
 
 
 def net_closing_proceeds(connection: sqlite3.Connection, lot: Any) -> Decimal:
     """N: net proceeds of the adopted lot's closing fills only, identified by its closures."""
+    fills = _closing_fills(connection, lot)
+    fees = closing_fee_allocation(connection, list(fills.values()))
     total = Decimal(0)
     for fill_id, quantity in lot.closures.items():
-        row = connection.execute("SELECT payload FROM fills WHERE record_id=?", (fill_id,)).fetchone()
-        if row is None:
-            raise ValueError("ADOPTED_CLOSING_FILL_MISSING:" + fill_id)
-        fill = hydrate("fills", decode_payload(row[0]))
-        share = quantity / fill.quantity
-        total += quantity * fill.price * contract_multiplier_of(lot.asset) - closing_fees(connection, fill) * share
+        fill = fills[fill_id]
+        total += quantity * fill.price * contract_multiplier_of(lot.asset) - fees[fill.fill_id] * quantity / fill.quantity
     return total
 
 
@@ -79,9 +117,11 @@ def recompute_attributions(connection: sqlite3.Connection, now: Any) -> int:
         adoption = rows[lot.adoption_id or ""]
         basis, mark = Decimal(adoption["broker_avg_entry_price"]), Decimal(adoption["adoption_mark_price"])
         multiplier = contract_multiplier_of(lot.asset)
+        fills = _closing_fills(connection, lot)
+        allocation = closing_fee_allocation(connection, list(fills.values()))
         for fill_id, quantity in lot.closures.items():
-            fill = hydrate("fills", decode_payload(connection.execute("SELECT payload FROM fills WHERE record_id=?", (fill_id,)).fetchone()[0]))
-            fees = closing_fees(connection, fill) * quantity / fill.quantity
+            fill = fills[fill_id]
+            fees = allocation[fill.fill_id] * quantity / fill.quantity
             payload = {"adoption_id": lot.adoption_id, "closing_fill_id": fill_id, "qty": str(quantity), "fill_price": str(fill.price),
                        "allocated_fees": str(fees),
                        "broker_basis_pnl": str((fill.price - basis) * quantity * multiplier - fees),

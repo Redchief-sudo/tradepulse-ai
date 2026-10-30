@@ -154,3 +154,19 @@ def test_every_originating_fill_id_read_is_approved() -> None:
     reads = _reads()
     assert reads - set(APPROVED_READS) == set(), "unlisted originating_fill_id reads"
     assert set(APPROVED_READS) - reads == set(), "listed sites that no longer exist"
+
+
+def test_crypto_is_not_adopted() -> None:
+    """TP145-02: a long crypto position is refused with its own reason
+    until adopted coin-denominated fees have an accounting model."""
+    from types import SimpleNamespace
+
+    from tradepulse.adoption import _eligible
+    from tradepulse.persistence.database import SCHEMA, initialize_identity
+
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(SCHEMA)
+    initialize_identity(connection, legacy=False)
+    btc = SimpleNamespace(qty=Decimal("0.5"), asset_class=AssetClass.CRYPTO)
+    assert _eligible(connection, btc, "crypto:default:alpaca:BTC/USD") == "CRYPTO_ADOPTION_UNSUPPORTED"
+    assert _eligible(connection, SimpleNamespace(qty=Decimal(1), asset_class=AssetClass.EQUITY), "equity:default:alpaca:AAPL") is None

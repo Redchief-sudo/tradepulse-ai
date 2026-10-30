@@ -219,3 +219,76 @@ async def test_setting_off_changes_nothing(rig: Rig) -> None:
     assert summary.exits_triggered == 0
     assert await paginate_all_rows(rig.repositories.position_lots) == []
     assert [r["payload"]["event_type"] for r in await paginate_all_rows(rig.repositories.audit_events)] == ["unmanaged_broker_position"]
+
+
+async def _holding(rig: Rig) -> Any:
+    return hydrate("holdings", (await rig.repositories.holdings.get(KEY))["payload"])
+
+
+async def test_ratchet_partial_sale_replay_and_restart_never_lower_the_stop(rig: Rig, monkeypatch: Any) -> None:
+    """T12, T13 (ADOPT-07): the 1R scale-out keeps stop_loss and moves
+    current_stop to at least break-even; the ATR trail, settlement replay, a
+    stale-view rebuild and a fresh monitor never lower it or repeat the scale-out."""
+    import tradepulse.monitor.coordinator as monitor_module
+    from tradepulse.reconciliation.coordinator import _reconcile_positions
+
+    async def atr(_market_data: Any, _asset: Any) -> Decimal:
+        return Decimal(2)
+
+    monkeypatch.setattr(monitor_module, "_fetch_atr", atr)
+    for _ in range(2):
+        await adoption_pass(rig.repositories, await rig.broker.get_positions(), rig.config, rig.alerts, rig.clock())
+    stop_loss = (await _holding(rig)).stop_loss
+    stops: list[Decimal] = []
+    rig.quote("108.90", "109")  # +9%: past 1R (the 8% stop) and the 4% break-even trigger
+    assert (await rig.monitor()).exits_triggered == 1
+    await rig.settlement.process_pending(force_retry=True)
+    holding = await _holding(rig)
+    assert (holding.quantity, holding.stop_loss, holding.scaled_out) == (Decimal(5), stop_loss, True)
+    assert holding.current_stop >= holding.average_price
+    stops.append(holding.current_stop)
+    rig.quote("119.90", "120")
+    assert (await rig.monitor()).exits_triggered == 0
+    stops.append((await _holding(rig)).current_stop)
+    assert stops[-1] > stops[0]  # the trail moved up
+    for _ in range(2):
+        await rig.settlement.process_pending(force_retry=True)  # replay
+    stops.append((await _holding(rig)).current_stop)
+
+    def stale(current: Any) -> Any:
+        from dataclasses import replace
+        return replace(current, quantity=Decimal(7), current_stop=current.current_stop)
+
+    await rig.repositories.holdings.mutate(KEY, stale)
+    await _reconcile_positions(rig.repositories, rig.broker, rig.alerts, rig.clock())  # view drift: rebuilt from lots
+    rebuilt = await _holding(rig)
+    assert (rebuilt.quantity, rebuilt.scaled_out, rebuilt.stop_loss) == (Decimal(5), True, stop_loss)
+    stops.append(rebuilt.current_stop)
+    rig.quote("115.90", "116")  # a restart's first cycle, below the high but above the trail
+    assert (await rig.monitor()).exits_triggered == 0
+    stops.append((await _holding(rig)).current_stop)
+    assert stops == sorted(stops), stops
+    assert len((await rig.lot()).closures) == 1  # never scaled out twice
+
+
+async def test_unexpected_position_after_the_cursor_stays_protected_not_sellable(rig: Rig) -> None:
+    """T20 as Rev.140 allows today (TP145-01): shares bought outside
+    TradePulse after the cursor are adopted and monitored, but their exit is
+    refused while the external execution is unresolved; the holding stays,
+    ADOPTED_EXIT_REFUSED is raised, and nothing is submitted."""
+    await _external(rig.broker, rig.clock, Side.BUY, "2", "after-cursor")
+    for _ in range(2):
+        await adoption_pass(rig.repositories, await rig.broker.get_positions(), rig.config, rig.alerts, rig.clock())
+    assert (await rig.lot()).opened_quantity == 12
+    orders_before = len(await rig.broker.list_orders(status="all")) if hasattr(rig.broker, "list_orders") else None
+    rig.quote("80", "80.10")
+    summary = await rig.monitor()
+    assert summary.exits_triggered == 0
+    events = [r["payload"] for r in await paginate_all_rows(rig.repositories.audit_events)
+              if r["payload"]["event_type"] == "adopted_exit_refused"]
+    assert len(events) == 1
+    assert await rig.repositories.holdings.get(KEY) is not None
+    assert (await rig.lot()).remaining_quantity == 12
+    if orders_before is not None:
+        assert len(await rig.broker.list_orders(status="all")) == orders_before
+    print(events[0]["details"]["reasons"])
