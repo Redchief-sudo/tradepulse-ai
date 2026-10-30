@@ -1,6 +1,6 @@
 # DBAE: Dynamic Balance-Aware Execution (Alpaca)
 
-Status: design for review, rev. 2 (2026-10-30). No production code changes are made until this spec is approved. Changes from rev. 1 are listed in §17.
+Status: design for review, rev. 3 (2026-10-30). No production code changes are made until this spec is approved. Changes from rev. 1 are listed in §17.
 
 ## 1. Purpose and scope
 
@@ -171,7 +171,13 @@ Boundaries are inclusive at the lower edge. `band_for(Decimal("19.99")) == BELOW
 **When a baseline is verified.** The baseline for *D* is verified only if all of these hold:
 1. The calendar verifies *D* (Rev.144).
 2. The portfolio-history bar exists for exactly the previous trading date, and its equity is finite and at least zero.
-3. That equity agrees with the account's `last_equity` within $0.01. G1 (§13) confirms that `last_equity` means the previous close; if G1 shows otherwise, this cross-check is removed from the spec before the build.
+3. That equity agrees with the account's `last_equity` within $0.01.
+
+**Mapping a bar to its trading date (G1, §13.1).** A daily bar's `timestamp` is 00:00 UTC on the day after the trading date. Its trading date is the New York calendar date of that timestamp. For example, the bar at `2026-10-30T00:00:00Z` is New York 2026-10-29 20:00, so it is trading date 2026-10-29.
+- The bar used must be the one whose mapped date equals the previous trading date from the Rev.144 calendar.
+- A bar for the current session, if one appears, is never used.
+
+**Before Alpaca updates `last_equity`.** If a capture happens before Alpaca has rolled `last_equity` over (for example, pre-market), the check in 3 fails. The entry is refused and capture is retried at the next buy decision, as in "When verification fails" below. It never falls back to an older baseline.
 
 **Capture and restart.** The baseline is captured at the first non-protective buy decision of session *D* and reused afterwards, including after a restart. Because it describes the *previous* close, the time of capture is irrelevant: starting at noon after a morning deposit still yields yesterday's close.
 
@@ -239,16 +245,32 @@ An entry needs:
 
 ### 7.1 Quantities (DBAE-R1-01)
 
-Four quantities are recorded separately on every approved buy, in `risk_snapshot`:
+Every approved buy records four distinct quantities, each under its own name, in `risk_snapshot.dbae` (DBAE-R2-01):
 
-| Quantity | Meaning | Recorded as |
-|---|---|---|
-| original request | what the strategy asked for | `requested_quantity` (existing key) |
-| risk-approved | `evaluate_risk`'s first `approved_quantity` | `approved_quantity` (existing key) |
-| shaped | after §8.2's round-down | `dbae.shaped_quantity` |
-| submitted | what the order carries | the intent's `requested_quantity` field |
+| Field | Meaning |
+|---|---|
+| `original_requested_quantity` | the strategy's original request |
+| `risk_approved_quantity` | what the first `evaluate_risk` run approved |
+| `shaped_quantity` | after §8.2's round-down |
+| `submitted_quantity` | the quantity durably authorised for the broker order |
 
-Today the gateway already overwrites the intent's `requested_quantity` with the risk-approved quantity at `RISK_APPROVED` (`gateway.py`, the `approved = replace(...)` write) and submits that quantity. DBAE changes the overwrite to the **shaped and re-approved** quantity, so the submitted and shaped quantities are always equal. The original request never reserves funding.
+**Written once.** All four are written together, by the lease-fenced `RISK_APPROVED` write, and are never rewritten. A later status update copies `risk_snapshot` unchanged, as today.
+
+**The intent's own `requested_quantity` field.**
+- The gateway already overwrites this field with the risk-approved quantity at `RISK_APPROVED` (`gateway.py`, the `approved = replace(...)` write), and submits it. DBAE keeps that field rather than disturbing the gateway, but defines it: from `RISK_APPROVED` on, the intent's `requested_quantity` **is the executable submitted quantity**, and it equals `dbae.submitted_quantity`.
+- Before `RISK_APPROVED`, it holds the original request.
+- The existing snapshot keys `requested_quantity` and `approved_quantity` keep their current values and meaning, for the audit records already written. DBAE code never reads them; it reads only the four named fields.
+
+**Who reads which field.**
+- Broker submission, `order_matches_intent`, `_recover_unknown_submission`, `_poll_and_settle` and fill attribution read the intent's `requested_quantity`, as today. That is the submitted quantity.
+- `pending_buy_funding` (§7.4) and `max_funding` (§7.2) use `dbae.submitted_quantity`, and check that it equals the intent's field.
+- Audit and replay use the four named fields.
+
+**A mismatch** between the intent field and `dbae.submitted_quantity` is an integrity fault. Funding reserves the larger of the two, a critical `DBAE_QUANTITY_IDENTITY_MISMATCH` alert fires once per intent, and new entries are refused until the operator resolves it.
+
+**Older intents.** An intent from before DBAE (no `dbae` block) is reserved on its `requested_quantity`, which is what was submitted.
+
+The shaped and submitted quantities are equal by construction. The original request never reserves funding.
 
 **Re-approval after shaping.** When shaping changes the quantity, `evaluate_risk` runs again on the same snapshot, inside the same lock, with `requested_quantity = shaped_quantity`.
 - The result must approve exactly the shaped quantity, otherwise the entry is refused with `DBAE_SHAPED_QUANTITY_NOT_REAPPROVED`.
@@ -344,9 +366,28 @@ An entry is allowed only if its protective exit is a supported order:
 
 **Sub-minimum liquidation.** If the position's value at its stop (`shaped_qty × stop_price × multiplier`) is below `max($1, min_order_size × stop_price)`, the entry depends on the broker accepting a sell below the entry minimum.
 
-`SUB_MINIMUM_FULL_LIQUIDATION` is a recorded broker-evidence constant in `tradepulse/dbae/evidence.py`, with values `"unknown"`, `"verified"` or `"refused"`, following the same pattern as Rev.143's `DIVIDEND_REPRESENTATION`:
-- While it is `"unknown"` or `"refused"`, that entry is refused with `DBAE_SUB_MINIMUM_LIQUIDATION_UNVERIFIED`.
-- Once G2 (§13) sets it to `"verified"`, the entry proceeds with no extra buffer.
+**Scoped evidence (DBAE-R2-02).** Sub-minimum liquidation evidence is a recorded table in `tradepulse/dbae/evidence.py`, `SUB_MINIMUM_LIQUIDATION_EVIDENCE: Mapping[LiquidationScope, LiquidationVerdict]`, following the pattern of Rev.143's `DIVIDEND_REPRESENTATION`.
+
+`LiquidationScope` is a frozen dataclass with these fields:
+
+| Field | Values |
+|---|---|
+| `broker_environment` | `"alpaca-paper"` or `"alpaca-live"` |
+| `account_type` | `"margin"` (cash accounts are refused by §5.3) |
+| `asset_class` | `equity`, `crypto` or `option` |
+| `quantity_kind` | `"fractional"` or `"whole"` |
+| `order_type` | `"market"` |
+| `time_in_force` | `"day"` or `"gtc"` |
+| `session` | `"regular"` |
+| `minimum_kind` | `"notional_below_1_usd"` (equity) or `"notional_below_1_usd_qty_at_or_above_min_order_size"` (crypto) |
+
+`LiquidationVerdict` is `"verified"` or `"refused"`, with the evidence path and manifest digest.
+
+How it is used:
+- An entry whose stop value falls below the threshold looks up the exact scope its protective exit would use. If there is no entry for that scope, or the entry is `"refused"`, it is refused with `DBAE_SUB_MINIMUM_LIQUIDATION_UNVERIFIED`. Only an exact `"verified"` match lets it proceed, with no extra buffer.
+- There is no wildcard, no inheritance between scopes, and no paper-to-live inheritance.
+- The table starts empty.
+- G2 can add at most one row: `alpaca-paper / margin / equity / fractional / market / day / regular / notional_below_1_usd`. It never covers crypto, options, whole-share quantities, other order types, outside regular hours, or a live account.
 
 DBAE never promises a position's value at its stop. Gaps can invalidate any such prediction, which is why the evidence is about the broker accepting the sell, not about price.
 
@@ -456,11 +497,31 @@ DBAE has no on/off flag. It replaces the ladder, and every entry passes through 
 
 | Gate | What | Authorization |
 |---|---|---|
-| G1 | Read-only probes: `/v2/account/portfolio/history?timeframe=1D` shape and bar dates. Confirm `last_equity` equals the previous trading date's closing bar. Evidence saved with no identifiers. | Read only. Runs before the build. |
+| G1 | Read-only probes of `/v2/account/portfolio/history?timeframe=1D` and `last_equity`. **Done 2026-10-30; see §13.1.** A repeat (G1b) is taken read-only on the first session day after the build, on an account that is not flat. | Read only. |
 | G2 | Paper sub-$1 liquidation and funding behaviour. Buy ≈ $1.10 of one fractionable stock (notional market, regular hours). Sell ≈ $0.50 of it by quantity. Sell the remainder by quantity. All through the gateway or an approved direct order, with order responses and fills saved. A read-only account snapshot (`cash`, `buying_power`, `non_marginable_buying_power`) is saved before each submission, after acceptance and after each fill, to establish §7.3's broker behaviour. The account ends flat. | **The operator approves each exact order beforehand.** Never during a verification run. Paper behaviour may differ from live; the record says so. |
 | G3 | Full test suite green; mypy zero over the package; Ruff with no new findings. | — |
 
-G2's outcome sets `SUB_MINIMUM_FULL_LIQUIDATION` (`"verified"` if both sub-$1 sells fill, `"refused"` if Alpaca rejects either). G2 is not required for the build; until it passes, §8.3 refuses the entries that depend on it.
+G2's outcome adds its single scope row to `SUB_MINIMUM_LIQUIDATION_EVIDENCE` (§8.3): `"verified"` if both sub-$1 sells fill, `"refused"` if Alpaca rejects either. G2 is not required for the build; until it passes, §8.3 refuses the entries that depend on it.
+
+### 13.1 G1 result (2026-10-30, 10:49 ET, regular session)
+
+Evidence: `~/tradepulse-evidence/2026-10-30-dbae-g1/` (manifest sha256 prefix `8c687d283405b346`, no identifiers).
+
+**Response shape.** `GET /v2/account/portfolio/history?period=1M&timeframe=1D` returns `timestamp`, `equity`, `profit_loss`, `profit_loss_pct`, `base_value`, `base_value_asof` and `timeframe`. The default, `intraday_reporting=market_hours` and `intraday_reporting=extended_hours` return identical daily bars.
+
+**Bar dates.** Daily bars are stamped 00:00 UTC on the day after each trading date:
+- the bars present are UTC 10-21, 22, 23, 24, 27, 28, 29 and 30;
+- this maps to trading dates 10-20, 21, 22, 23, 26, 27, 28 and 29;
+- there are no bars for weekends;
+- there is no bar for the current session (10-30) during it.
+
+**Agreement.** `last_equity` = 101480.03, exactly the bar for trading date 10-29. The 10-28 bar is 101422.20, which shows `last_equity` had rolled over to the previous close, not to an earlier one.
+
+**Limitation.** The account was flat (it was closed 10-29), so current equity also equalled `last_equity`. This observation cannot tell "previous close" apart from "current equity". The 10-28/10-29 difference shows the rollover, but only one instant was observed, and the pre-market rollover time was not. Hence:
+- G1b, on a day the account holds positions;
+- the fail-closed retry in §4.3.
+
+**Decision.** The §4.3 contract stands as written: the bar mapped by New York date is primary, and `last_equity` is the cross-check within $0.01. If G1b shows `last_equity` disagreeing with the mapped bar during a session, the spec is revised before DBAE is activated (§15).
 
 ## 14. Tests
 
@@ -480,11 +541,15 @@ All tests are deterministic: simulated broker data, a fixed clock and the Rev.14
    - **Shaping:** a quantity floored by the increment has `max_funding` computed on the floored quantity. A floor that breaks the $1 minimum lot or the cost rule gives `DBAE_SHAPED_QUANTITY_NOT_REAPPROVED`.
    - **Partial fill with a lowered broker figure:** a partly filled order with `buying_power` already reduced releases nothing that isn't attributed, and the attributed part never stays in `P`.
    - **Restart after an ambiguous buy:** the same `P`, and no second buy for that intent.
+   - **Quantity identity:** a buy with request 10, risk-approved 7.3 and shaped and submitted 7 is persisted, the process restarts, and the intent is reloaded through `hydrate`. All four `dbae` fields are distinct and unchanged. The intent's `requested_quantity` is 7. Recovery and `order_matches_intent` use 7. `pending_buy_funding` uses 7. A status update (accepted, then partly filled) leaves the four fields byte-identical.
+   - **Identity mismatch:** an intent whose field disagrees with `dbae.submitted_quantity` reserves the larger, alerts `DBAE_QUANTITY_IDENTITY_MISMATCH` once, and refuses new entries.
 3. **Baseline.**
    - A gain during the session gives no upgrade.
    - A deposit then a restart gives no upgrade.
    - A $50 close with a +$500 deposit and a first start at noon stays `MICRO_PLUS`.
    - A loss during the session downgrades at once.
+   - Bar mapping: a bar at `2026-10-30T00:00:00Z` is trading date 10-29. A Monday session uses the bar stamped Saturday 00:00 UTC (Friday's trading date). A bar for the current session is ignored.
+   - A pre-market capture before `last_equity` has rolled over is refused, and the same session's retry succeeds once they agree.
    - Portfolio history disagreeing with `last_equity`, or a missing previous-date bar, refuses entries for the session, even with an older stored baseline.
    - A baseline verified later in the same session allows entries from then on.
    - A new account with no previous close is refused until the next session.
@@ -500,7 +565,10 @@ All tests are deterministic: simulated broker data, a fixed clock and the Rev.14
    - A non-fractionable equity is floored; a result of 0 gives `WHOLE_SHARE_UNAFFORDABLE`.
    - Crypto is floored to the increment; below the minimum gives `DBAE_BELOW_ASSET_MINIMUM`.
    - `MICRO` refuses a whole-share-only stock.
-   - A stop value below $1 is refused while the constant is `"unknown"`, and allowed when it is `"verified"`.
+   - A stop value below $1 is refused with an empty evidence table.
+   - It is allowed for an equity fractional market day order on paper once that exact scope is `"verified"`.
+   - With only the G2 equity row present, it is still refused for: crypto; a whole-share equity; an option; the same equity scope on `alpaca-live`.
+   - A `"refused"` row refuses.
    - A scale-out leaving a part too small is skipped; a crypto scale-out off the increment is skipped.
    - A residual below $1 alerts once, and its full exit is still submitted.
 6. **Exit recovery.**
@@ -527,7 +595,7 @@ DBAE changes the executable decision path: new account fields, session baselines
 A later mismatch fails with `frozen_configuration_mismatch`. A runtime with DBAE source cannot continue a generation frozen without it.
 
 **What DBAE adds.**
-- The frozen `policy` records `dbae_policy_version = "dbae-1"`, the band thresholds, `DBAE_EVIDENCE_MAX_AGE_SECONDS` and `SUB_MINIMUM_FULL_LIQUIDATION`. A change to any of them is a configuration mismatch.
+- The frozen `policy` records `dbae_policy_version = "dbae-1"`, the band thresholds, `DBAE_EVIDENCE_MAX_AGE_SECONDS` and the full `SUB_MINIMUM_LIQUIDATION_EVIDENCE` table. A change to any of them is a configuration mismatch.
 - A runtime with DBAE refuses to bind or resume a generation whose frozen policy has no `dbae_policy_version`: `generation_predates_dbae`. That prevents DBAE from entering an existing generation, even one that is reopened.
 - No migration converts an existing generation.
 
@@ -554,8 +622,17 @@ DBAE is built in a worktree and never edited during a run.
   - scan cost not in DBAE;
   - "keep one day trade in reserve" superseded by the PDT retirement evidence (§2.2) and approved by the reviewer.
 - **Rev. 1 forensic audit:** DBAE-R1-01 to R1-04 (§17).
+- **Rev. 2 forensic audit:** DBAE-R2-01 and R2-02, plus G1 completed (§13.1, §17).
 
 ## 17. Change log
+
+**Rev. 3 (2026-10-30)** answers the rev. 2 audit.
+
+| Finding | Change | Where |
+|---|---|---|
+| DBAE-R2-01, quantity identity | Four distinct fields, written once: `original_requested_quantity`, `risk_approved_quantity`, `shaped_quantity`, `submitted_quantity`. The intent's `requested_quantity` is defined as the executable submitted quantity from `RISK_APPROVED` on. Readers are listed. A mismatch is an integrity fault (`DBAE_QUANTITY_IDENTITY_MISMATCH`). Restart and serialization tests added. | §7.1, §14.2 |
+| DBAE-R2-02, liquidation evidence scope | The global `SUB_MINIMUM_FULL_LIQUIDATION` constant is replaced by `SUB_MINIMUM_LIQUIDATION_EVIDENCE`, keyed by an exact `LiquidationScope` (environment, account type, asset class, quantity kind, order type, time in force, session, minimum kind). There is no wildcard and no inheritance. G2 can verify only the paper fractional-equity market-day scope. | §8.3, §13, §15, §14.5 |
+| G1 dependency | G1 was run read-only and recorded. It establishes bar-to-trading-date mapping by New York date and `last_equity` agreement, and states its limitation (flat account, single instant). A read-only G1b is added on a non-flat day, with a fail-closed pre-market retry. | §4.3, §13, §13.1, §14.3 |
 
 **Rev. 2 (2026-10-30)** answers the rev. 1 audit.
 
