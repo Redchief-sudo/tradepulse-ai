@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
@@ -109,6 +109,37 @@ async def _refuse(repositories: PersistenceRepositories, session_date: date, che
     return BaselineRefusal(reason=BASELINE_REASON, check=check)
 
 
+async def _record_captured(repositories: PersistenceRepositories, baseline: SessionBaseline) -> None:
+    """§11 ``dbae_session_baseline_captured``, once per session date. Written
+    on every path that returns a baseline, so a failure between the row and
+    the event is repaired by the next call (create_once is idempotent by id)."""
+    key = baseline.session_date.isoformat()
+    event_id = f"dbae_baseline_captured:{key}"
+    previous = baseline.previous_trading_date.isoformat()
+    await repositories.audit_events.create_once(event_id, AuditEvent(
+        event_id=event_id, event_type="dbae_session_baseline_captured", severity="info",
+        message=f"DBAE session baseline for {key}: previous close {baseline.previous_close_equity} on {previous}.",
+        occurred_at=baseline.captured_at, entity_type="dbae_session_baseline", entity_id=key,
+        details={"session_date": key, "previous_close_equity": baseline.previous_close_equity,
+                 "previous_trading_date": previous, "last_equity": baseline.last_equity,
+                 "difference": abs(baseline.previous_close_equity - baseline.last_equity), "agreement": "agreed",
+                 "source": baseline.source}))
+
+
+async def _stored_baseline(repositories: PersistenceRepositories, row: Mapping[str, Any], session_date: date,
+                           now: datetime) -> SessionBaseline | BaselineRefusal:
+    """A stored row as a baseline, or ``baseline_corrupt`` if it cannot be
+    decoded. The row is append-only and is never replaced."""
+    try:
+        baseline = decode_session_baseline(row["payload"])
+    except (KeyError, TypeError, ValueError, InvalidOperation):
+        return await _refuse(repositories, session_date, "baseline_corrupt", now, {})
+    if baseline.session_date != session_date:
+        return await _refuse(repositories, session_date, "baseline_corrupt", now, {})
+    await _record_captured(repositories, baseline)
+    return baseline
+
+
 async def _read_bars(history: PortfolioHistory) -> list[DailyEquityBar] | None:
     """None when the read fails: timeout, HTTP failure or malformed data (§10)."""
     try:
@@ -122,7 +153,12 @@ async def load_or_capture_baseline(repositories: PersistenceRepositories, gate: 
                                    now: datetime) -> SessionBaseline | BaselineRefusal:
     """The verified baseline for the current session, captured on first use
     and reused afterwards (including after a restart), or the refusal naming
-    the first check that failed (§4.3)."""
+    the first check that failed (§4.3).
+
+    ``now`` must be timezone-aware: a naive value raises ValueError before
+    any read or write, since it would misplace the session date and store an
+    undecodable row in an append-only table."""
+    now = aware_utc(now, field_name="now")
     calendar = gate.calendar
     try:
         session_date = session_date_for(calendar, now)
@@ -135,7 +171,7 @@ async def load_or_capture_baseline(repositories: PersistenceRepositories, gate: 
 
     stored = await repositories.dbae_session_baselines.get(key)
     if stored is not None:
-        return decode_session_baseline(stored["payload"])
+        return await _stored_baseline(repositories, stored, session_date, now)
 
     status = await gate.status(Venue.US_EQUITY, session_date, now)
     if status != "verified":
@@ -173,13 +209,6 @@ async def load_or_capture_baseline(repositories: PersistenceRepositories, gate: 
         winner = await repositories.dbae_session_baselines.get(key)
         if winner is None:
             raise RuntimeError(f"dbae_session_baselines: {key} neither inserted nor present")
-        return decode_session_baseline(winner["payload"])
-    event_id = f"dbae_baseline_captured:{key}"
-    await repositories.audit_events.create_once(event_id, AuditEvent(
-        event_id=event_id, event_type="dbae_session_baseline_captured", severity="info",
-        message=f"DBAE session baseline for {key}: previous close {close} on {previous_date.isoformat()}.",
-        occurred_at=now, entity_type="dbae_session_baseline", entity_id=key,
-        details={"session_date": key, "previous_close_equity": close, "previous_trading_date": previous_date.isoformat(),
-                 "last_equity": last_equity, "difference": difference, "agreement": "agreed",
-                 "source": _SOURCE}))
+        return await _stored_baseline(repositories, winner, session_date, now)
+    await _record_captured(repositories, baseline)
     return baseline

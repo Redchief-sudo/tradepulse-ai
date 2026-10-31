@@ -318,3 +318,64 @@ async def test_stored_row_round_trips_and_is_append_only(repositories: Persisten
     for statement in ("UPDATE dbae_session_baselines SET payload='{}'", "DELETE FROM dbae_session_baselines"):
         with pytest.raises(DatabaseError, match="append-only"):
             await database.run(lambda c, sql=statement: c.execute(sql), write=True)
+
+
+# --- fix round 1 ------------------------------------------------------------------
+
+
+async def test_naive_now_raises_before_any_write(repositories: PersistenceRepositories) -> None:
+    gate = await verified_gate(repositories, TUE)
+    audit_before = len(await paginate_all_rows(repositories.audit_events))
+    with pytest.raises(ValueError, match="now: mandatory aware timestamp invalid"):
+        await load_or_capture_baseline(repositories, gate, history((MON, "60")), Decimal(60), ny(TUE, 10).replace(tzinfo=None))
+    assert await baseline_rows(repositories) == []
+    assert len(await paginate_all_rows(repositories.audit_events)) == audit_before
+    later = await load_or_capture_baseline(repositories, gate, history((MON, "60")), Decimal(60), ny(TUE, 10))
+    assert isinstance(later, SessionBaseline) and later.captured_at == ny(TUE, 10)
+
+
+async def test_captured_event_repaired_after_failed_audit_write(repositories: PersistenceRepositories,
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """The row commits, the captured event write fails: the next call returns
+    the stored row and writes the §11 event then, once."""
+    gate = await verified_gate(repositories, TUE)
+    real = type(repositories.audit_events).create_once
+
+    async def failing(self: Any, record_id: str, payload: Any, **kwargs: Any) -> bool:
+        if record_id.startswith("dbae_baseline_captured:"):
+            raise DatabaseError("disk I/O error")
+        return await real(self, record_id, payload, **kwargs)
+
+    monkeypatch.setattr(type(repositories.audit_events), "create_once", failing)
+    with pytest.raises(DatabaseError):
+        await load_or_capture_baseline(repositories, gate, history((MON, "60")), Decimal(60), ny(TUE, 10))
+    assert len(await baseline_rows(repositories)) == 1
+    assert await events(repositories, "dbae_session_baseline_captured") == []
+    monkeypatch.setattr(type(repositories.audit_events), "create_once", real)
+    stored = await load_or_capture_baseline(repositories, gate, history((MON, "60")), Decimal(60), ny(TUE, 11))
+    again = await load_or_capture_baseline(repositories, gate, history((MON, "60")), Decimal(60), ny(TUE, 12))
+    assert isinstance(stored, SessionBaseline) and stored == again and stored.captured_at == ny(TUE, 10)
+    captured = await events(repositories, "dbae_session_baseline_captured")
+    assert [row["record_id"] for row in captured] == [f"dbae_baseline_captured:{TUE.isoformat()}"]
+    details = captured[0]["payload"]["details"]
+    assert Decimal(details["previous_close_equity"]) == Decimal(60) and details["previous_trading_date"] == MON.isoformat()
+
+
+@pytest.mark.parametrize("payload", [
+    {"session_date": "2026-11-10"},  # fields missing
+    {"session_date": "2026-11-10", "previous_trading_date": "2026-11-09", "previous_close_equity": "abc",
+     "last_equity": "60", "source": "portfolio_history", "captured_at": "2026-11-10T15:00:00+00:00"},
+    {"session_date": "2026-11-10", "previous_trading_date": "2026-11-09", "previous_close_equity": "60",
+     "last_equity": "60", "source": "portfolio_history", "captured_at": "2026-11-10T15:00:00"},  # naive
+    {"session_date": "2026-11-09", "previous_trading_date": "2026-11-06", "previous_close_equity": "60",
+     "last_equity": "60", "source": "portfolio_history", "captured_at": "2026-11-09T15:00:00+00:00"},  # wrong date
+])
+async def test_corrupt_stored_row_refuses(repositories: PersistenceRepositories, payload: dict[str, Any]) -> None:
+    gate = await verified_gate(repositories, TUE)
+    await repositories.dbae_session_baselines.create_once(TUE.isoformat(), payload)
+    result = await load_or_capture_baseline(repositories, gate, history((MON, "60")), Decimal(60), ny(TUE, 10))
+    assert result == BaselineRefusal(reason="DBAE_SESSION_BASELINE_UNVERIFIED", check="baseline_corrupt")
+    assert len(await baseline_rows(repositories)) == 1  # no new row, the stored one untouched
+    assert [row["record_id"] for row in await events(repositories, "dbae_session_baseline_unverified")] == [
+        f"dbae_baseline_unverified:{TUE.isoformat()}:baseline_corrupt"]
+    assert await events(repositories, "dbae_session_baseline_captured") == []
