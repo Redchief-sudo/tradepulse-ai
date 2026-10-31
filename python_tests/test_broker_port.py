@@ -166,7 +166,10 @@ def test_every_venue_is_already_canonical() -> None:
 
 def test_only_construction_sites_import_alpaca_client() -> None:
     # Any code reference counts (import or annotation); docstrings do not.
-    allowed = {"tradepulse/broker/__init__.py", "tradepulse/broker/alpaca_client.py", "tradepulse/session_commands.py"}
+    allowed = {
+        "tradepulse/broker/__init__.py", "tradepulse/broker/alpaca_client.py", "tradepulse/broker/capabilities.py",
+        "tradepulse/session_commands.py",
+    }
     importers: set[str] = set()
     for path in sorted((ROOT / "tradepulse").rglob("*.py")):
         for node in ast.walk(ast.parse(path.read_text())):
