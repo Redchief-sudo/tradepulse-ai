@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from dbae_support import FullBandCapabilities
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker.port import AccountRef
@@ -88,7 +89,8 @@ async def rt(tmp_path: Path) -> AsyncIterator[Rt]:
         settlement = SettlementProcessor(repositories, alerts, clock=lambda: clock() - timedelta(milliseconds=1))
         gateway = ExecutionGateway(repositories, broker, AlpacaMarketDataProvider(broker), settlement, alerts,
                                    risk_limits_for_profile("balanced"), ExecutionMode.PAPER,
-                                   clock=lambda: clock() - timedelta(milliseconds=1), lease=lease)
+                                   clock=lambda: clock() - timedelta(milliseconds=1), lease=lease,
+                                   capabilities=FullBandCapabilities(broker, lambda: clock() - timedelta(milliseconds=1)))
         state = Rt(repositories, database, broker, clock, gateway, settlement, alerts)
 
         async def record(severity: str, message: str, details: object = None) -> None:

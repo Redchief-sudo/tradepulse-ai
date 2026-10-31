@@ -8,6 +8,7 @@ import httpx
 import pytest
 import respx
 from conftest import mock_cursor_read, mock_open_orders, seed_fill_cursor
+from dbae_support import FullBandCapabilities
 from lease_support import held_test_lease
 
 from tradepulse.alerts import TelegramAlerter
@@ -59,7 +60,8 @@ async def _setup(tmp_path):
     alerts = TelegramAlerter(None, None)
     settlement = SettlementProcessor(repositories, alerts, clock=lambda: NOW)
     limits = risk_limits_for_profile("balanced")
-    gateway = ExecutionGateway(repositories, broker, market_data, settlement, alerts, limits, ExecutionMode.PAPER, clock=lambda: NOW, lease=held_test_lease())
+    gateway = ExecutionGateway(repositories, broker, market_data, settlement, alerts, limits, ExecutionMode.PAPER, clock=lambda: NOW, lease=held_test_lease(),
+                               capabilities=FullBandCapabilities(broker, lambda: NOW))
     # Rev.140: a sell is authorized against the fill cursor, under the execution
     # reservation the monitor holds in production. Direct calls here get both.
     await seed_fill_cursor(repositories)
@@ -1938,7 +1940,8 @@ async def test_conservative_refuses_a_second_entry_while_the_first_is_unfilled(t
     gateway = ExecutionGateway(repositories, broker, AlpacaMarketDataProvider(broker),
                                SettlementProcessor(repositories, TelegramAlerter(None, None), clock=lambda: NOW),
                                TelegramAlerter(None, None), risk_limits_for_profile("conservative"),
-                               ExecutionMode.PAPER, clock=lambda: NOW, lease=held_test_lease())
+                               ExecutionMode.PAPER, clock=lambda: NOW, lease=held_test_lease(),
+                               capabilities=FullBandCapabilities(broker, lambda: NOW))
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     first = TradeIntent("first-entry", "idem-first", "corr-first", _aapl(), Side.BUY, ExecutionMode.PAPER, "test", NOW,
                         requested_quantity=Decimal("5"), stop_loss=Decimal("190"), status=TradeIntentStatus.SUBMITTED,

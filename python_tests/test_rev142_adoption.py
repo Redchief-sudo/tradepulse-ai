@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from dbae_support import FullBandCapabilities
 
 from tradepulse.adoption import (
     AdoptionConfig,
@@ -91,7 +92,8 @@ async def rig(tmp_path: Path) -> AsyncIterator[Rig]:
         settlement = SettlementProcessor(repositories, alerts, clock=lambda: clock() - timedelta(milliseconds=1))
         limits = risk_limits_for_profile("balanced")
         gateway = ExecutionGateway(repositories, broker, AlpacaMarketDataProvider(broker), settlement, alerts, limits,
-                                   ExecutionMode.PAPER, clock=lambda: clock() - timedelta(milliseconds=1), lease=lease)
+                                   ExecutionMode.PAPER, clock=lambda: clock() - timedelta(milliseconds=1), lease=lease,
+                                   capabilities=FullBandCapabilities(broker, lambda: clock() - timedelta(milliseconds=1)))
         await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, T0))
         yield Rig(repositories, broker, clock, gateway, settlement, alerts,
                   AdoptionConfig(lease.ref.key, limits, AlpacaMarketDataProvider(broker)))

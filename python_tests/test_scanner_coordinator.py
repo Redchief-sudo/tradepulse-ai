@@ -8,6 +8,7 @@ from decimal import Decimal
 import httpx
 import pytest
 import respx
+from dbae_support import FullBandCapabilities
 from lease_support import held_test_lease
 
 from tradepulse.alerts import TelegramAlerter
@@ -62,7 +63,8 @@ async def _setup(tmp_path, *, risk_limits: RiskLimits | None = None):
     alerts = TelegramAlerter(None, None)
     settlement = SettlementProcessor(repositories, alerts, clock=lambda: NOW)
     limits = risk_limits or risk_limits_for_profile("balanced")
-    gateway = ExecutionGateway(repositories, broker, market_data, settlement, alerts, limits, ExecutionMode.PAPER, clock=lambda: NOW, lease=held_test_lease())
+    gateway = ExecutionGateway(repositories, broker, market_data, settlement, alerts, limits, ExecutionMode.PAPER, clock=lambda: NOW, lease=held_test_lease(),
+                               capabilities=FullBandCapabilities(broker, lambda: NOW))
     return repositories, broker, ai_provider, market_data, gateway, limits
 
 

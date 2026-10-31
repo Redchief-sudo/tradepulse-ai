@@ -36,6 +36,7 @@ from tradepulse.broker import (
     default_time_in_force,
     is_definitive_rejection,
 )
+from tradepulse.broker.capabilities import DbaeCapabilities
 from tradepulse.broker.port import BrokerClock
 from tradepulse.broker.symbols import broker_symbol_asset_key
 from tradepulse.calendar import MarketCalendar
@@ -198,6 +199,7 @@ class ExecutionGateway:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         *,
         lease: AccountLease,
+        capabilities: DbaeCapabilities,
         calendar: MarketCalendar | None = None,
     ) -> None:
         # Every submission is fenced by the account lease (runtime_lease.py);
@@ -205,6 +207,9 @@ class ExecutionGateway:
         if lease.ref.venue != broker.venue:
             raise ValueError(f"account lease is for venue {lease.ref.venue!r}, the broker is {broker.venue!r}")
         self._lease = lease
+        # DBAE evidence (spec §3): read fresh inside the portfolio-risk lock
+        # for every new buy; never read for a protective exit.
+        self._capabilities = capabilities
         self._calendar = calendar  # None: the pinned process calendar for the current NY date (Rev.144)
         self._repositories = repositories
         self._broker = broker

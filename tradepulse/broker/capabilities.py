@@ -21,7 +21,7 @@ from tradepulse.models.base import DomainValidationError, decimal_value
 from tradepulse.models.market import AssetIdentity
 
 from .alpaca_client import AlpacaClient
-from .errors import AlpacaDataIntegrityError, raise_alpaca_error
+from .errors import AlpacaDataIntegrityError, AlpacaError, raise_alpaca_error
 
 _FRESH_PAST = timedelta(seconds=30)
 _FRESH_FUTURE = timedelta(seconds=5)
@@ -186,3 +186,30 @@ class AlpacaCapabilities:
                 continue
             bars.append(DailyEquityBar(trading_date=trading_date, equity=equity))
         return sorted(bars, key=lambda bar: bar.trading_date)
+
+
+
+
+class NoCapabilityEvidence:
+    """The evidence source of a broker that has none: every read fails as a
+    broker read would, so every new entry is refused as unknown evidence
+    (spec §3.2, §10). Protective exits never read it."""
+
+    async def get_account_evidence(self) -> AccountEvidence:
+        raise AlpacaError("no DBAE evidence source for this broker", 503, None, None, "getAccount")
+
+    async def get_asset_capabilities(self, asset: AssetIdentity) -> AssetTradingCapabilities:
+        raise AlpacaError("no DBAE evidence source for this broker", 503, None, None, "getAsset")
+
+    async def get_daily_equity_bars(self) -> list[DailyEquityBar]:
+        raise AlpacaError("no DBAE evidence source for this broker", 503, None, None, "getPortfolioHistory")
+
+
+def capabilities_for(broker: object) -> DbaeCapabilities:
+    """The DBAE evidence source for ``broker``: Alpaca's own endpoints for the
+    Alpaca client, and NoCapabilityEvidence for any other broker. Tests give
+    a simulated broker's gateway its SimulatedCapabilities directly; no
+    production module imports the simulator (R12)."""
+    if isinstance(broker, AlpacaClient):
+        return AlpacaCapabilities(broker)
+    return NoCapabilityEvidence()

@@ -21,6 +21,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from dbae_support import FullBandCapabilities
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker.port import AccountRef
@@ -160,7 +161,7 @@ async def runtime(tmp_path: Path) -> AsyncIterator[Runtime]:
         market_data = AlpacaMarketDataProvider(broker)
         gateway = ExecutionGateway(repositories, broker, market_data, settlement, alerts,
                                    risk_limits_for_profile("balanced"), ExecutionMode.PAPER, clock=runtime_clock,
-                                   lease=lease)
+                                   lease=lease, capabilities=FullBandCapabilities(broker, runtime_clock))
         rt = Runtime(repositories, database, broker, clock, gateway, settlement, market_data, alerts, sent)
 
         async def record(severity: str, message: str, details: object = None) -> None:
