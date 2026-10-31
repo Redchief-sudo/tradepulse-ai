@@ -880,6 +880,7 @@ async def test_regime_multiplier_none_and_regime_snapshot_none_leave_risk_snapsh
             "requested_quantity", "approved_quantity", "risk_profile", "max_hold_days",
             "reference_bid", "reference_ask", "reference_observed_at", "estimated_slippage_pct",
             "order_type", "signal_timestamp", "broker_account_number",
+            "dbae",  # DBAE's decision record on every approved buy (spec §7.1, §11)
     }
 
 
@@ -905,7 +906,9 @@ async def test_buy_rejected_when_daily_loss_exceeds_limit(tmp_path) -> None:
     assert session.state == SessionState.RISK_STOPPED  # a genuine kill-switch condition latches the durable session, not just this one rejection
     assert session.kill_switch_reset_required is True
     events = await repositories.audit_events.list_all(limit=10)
-    assert len(events) == 1
+    # One latch event; DBAE's own audit (spec §4.4, §11) precedes evaluate_risk.
+    assert sorted(e["payload"]["event_type"] for e in events) == [
+        "dbae_band_changed", "dbae_session_baseline_captured", "session_transition"]
 
 
 @respx.mock
@@ -928,7 +931,9 @@ async def test_ordinary_rejection_does_not_latch_risk_stop(tmp_path) -> None:
     assert result.status == "rejected"
     session = await load_session(repositories)
     assert session.state == SessionState.ACTIVE
-    assert (await repositories.audit_events.list_all(limit=10)) == []
+    # Nothing latched: only DBAE's own audit (spec §4.4, §11), which precedes evaluate_risk.
+    events = await repositories.audit_events.list_all(limit=10)
+    assert sorted(e["payload"]["event_type"] for e in events) == ["dbae_band_changed", "dbae_session_baseline_captured"]
 
 
 @respx.mock
@@ -1944,8 +1949,8 @@ async def test_conservative_refuses_a_second_entry_while_the_first_is_unfilled(t
                                capabilities=FullBandCapabilities(broker, lambda: NOW))
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     first = TradeIntent("first-entry", "idem-first", "corr-first", _aapl(), Side.BUY, ExecutionMode.PAPER, "test", NOW,
-                        requested_quantity=Decimal("5"), stop_loss=Decimal("190"), status=TradeIntentStatus.SUBMITTED,
-                        risk_snapshot={"entry_price": "199.55"})
+                        requested_quantity=Decimal("5"), reference_price=Decimal("199.55"), stop_loss=Decimal("190"),
+                        status=TradeIntentStatus.SUBMITTED, risk_snapshot={"entry_price": "199.55"})
     await repositories.trade_intents.create_once("first-entry", first, status=first.status.value, unique_value="idem-first")
     _mock_account()
     _mock_positions()

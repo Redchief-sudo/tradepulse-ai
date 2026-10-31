@@ -211,7 +211,12 @@ async def test_gateway_unverified_when_the_broker_calendar_is_unreachable(rt: Rt
     rt.clock.advance(timedelta(days=7))  # Monday 10-26, four sessions after the last check
     rt.quote()
     refused = await rt.buy("1")
-    assert (refused.status, refused.reasons) == ("rejected", ["CALENDAR_UNVERIFIED"])
+    # DBAE (spec §8.1) decides before the submission-time calendar window: the
+    # new session's baseline cannot be captured on an unverified calendar.
+    assert (refused.status, refused.reasons) == ("rejected", ["DBAE_SESSION_BASELINE_UNVERIFIED"])
+    unverified = [r["payload"]["details"]["check"] for r in await paginate_all_rows(rt.repositories.audit_events)
+                  if r["payload"]["event_type"] == "dbae_session_baseline_unverified"]
+    assert unverified == ["calendar_unverified"]
     rt.quote()
     assert (await rt.sell("5", "exit")).status == "filled"
     alerts = [r for r in await paginate_all_rows(rt.repositories.audit_events) if r["payload"]["event_type"] == "calendar_unverified"]

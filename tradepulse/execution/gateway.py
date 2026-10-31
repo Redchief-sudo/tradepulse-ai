@@ -36,15 +36,32 @@ from tradepulse.broker import (
     default_time_in_force,
     is_definitive_rejection,
 )
-from tradepulse.broker.capabilities import DbaeCapabilities
+from tradepulse.broker.capabilities import (
+    AccountEvidence,
+    AssetTradingCapabilities,
+    DbaeCapabilities,
+    evidence_fresh,
+)
 from tradepulse.broker.port import BrokerClock
 from tradepulse.broker.symbols import broker_symbol_asset_key
 from tradepulse.calendar import MarketCalendar
-from tradepulse.calendar.checks import EntryWindow
+from tradepulse.calendar.checks import CalendarGate, EntryWindow
+from tradepulse.dbae.bands import Band, unlocks
+from tradepulse.dbae.baseline import (
+    BASELINE_REASON,
+    BaselineRefusal,
+    SessionBaseline,
+    band_equity,
+    load_or_capture_baseline,
+)
+from tradepulse.dbae.funding import PendingFunding, funding_available, max_funding, pending_buy_funding
+from tradepulse.dbae.policy import EntryProposal, ExecutionPolicy, evaluate_entry_policy, exit_feasible, shape_quantity
 from tradepulse.models import (
     AssetClass,
     AssetIdentity,
+    AuditEvent,
     ExecutionMode,
+    PortfolioSnapshot,
     RiskLimits,
     SettlementStatus,
     Side,
@@ -57,6 +74,7 @@ from tradepulse.models import (
 )
 from tradepulse.persistence import (
     AsyncSQLiteDatabase,
+    DatabaseError,
     PersistenceRepositories,
     RepositoryLeaseLostError,
     acquire_lock,
@@ -70,6 +88,7 @@ from tradepulse.persistence import (
 from tradepulse.providers import AlpacaMarketDataProvider, ProviderError
 from tradepulse.risk import (
     RiskCheckInput,
+    RiskDecision,
     RiskEvalOptions,
     build_portfolio_snapshot,
     check_max_drawdown,
@@ -82,6 +101,7 @@ from tradepulse.risk import (
 )
 from tradepulse.runtime_lease import AccountLease, AccountLeaseUnavailable
 from tradepulse.settlement import SettlementProcessor
+from tradepulse.time import aware_utc
 
 from .fill_attribution import (
     TERMINAL_ORDER_STATUSES,
@@ -99,7 +119,7 @@ from .idempotency import (
     derive_idempotency_key,
     execution_lock_key,
 )
-from .quotes import fetch_authoritative_quote
+from .quotes import AuthoritativeQuote, fetch_authoritative_quote
 
 
 @asynccontextmanager
@@ -183,6 +203,33 @@ class ExecutionResult:
     filled_avg_price: Decimal | None
 
 
+DbaeSnapshotValue = str | bool | list[str] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _EntryEvidence:
+    """DBAE evidence read for one new buy (spec §3.3). None: the read failed,
+    which is unknown evidence and never permission (§10)."""
+
+    account: AccountEvidence | None
+    asset: AssetTradingCapabilities | None
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthorizedEntry:
+    """Spec §8.1 steps 1-4 passed: what steps 6-9 and the record need."""
+
+    policy: ExecutionPolicy
+    proposal: EntryProposal
+    account: AccountEvidence
+    asset: AssetTradingCapabilities
+    baseline: SessionBaseline
+    band_equity: Decimal
+    pending: PendingFunding
+    funding_available: Decimal
+    decided_at: datetime
+
+
 class ExecutionGateway:
     FILL_TIMEOUT_SECONDS = 20
     POLL_INTERVAL_SECONDS = 1
@@ -228,28 +275,224 @@ class ExecutionGateway:
     def account_ref(self) -> str:
         return self._lease.ref.key
 
+    def _calendar_gate(self, now: datetime) -> CalendarGate:
+        from tradepulse.calendar import market_calendar, ny_date
+
+        calendar = self._calendar or market_calendar(ny_date(now))
+        return CalendarGate(self._repositories, calendar, (self._broker.venue,))
+
+    async def _run_daily_checks_if_due(self, gate: CalendarGate, now: datetime) -> bool:
+        """CAL-I1: the daily check, when none has completed today for every
+        checked venue. True if it ran."""
+        from tradepulse.calendar.checks import CHECKED_VENUES, checked_today, run_daily_checks
+
+        if all([await checked_today(self._repositories, self._broker.venue, venue, now) for venue in CHECKED_VENUES]):
+            return False
+        await run_daily_checks(self._repositories, self._broker, self._broker.venue, gate.calendar, self._alerts, now)
+        return True
+
     async def _entry_window(self, asset: AssetIdentity, market_clock: BrokerClock) -> EntryWindow:
         """CAL-I1. With no completed check for today yet (a one-shot command,
         or the first entry of a new NY date), the daily check runs here
         first, so an entry is never authorized by stale or absent evidence."""
-        from tradepulse.calendar import market_calendar, ny_date
-        from tradepulse.calendar.checks import (
-            CHECKED_VENUES,
-            CalendarGate,
-            checked_today,
-            entry_window_open,
-            run_daily_checks,
-        )
+        from tradepulse.calendar.checks import entry_window_open
 
         now = self._clock()
-        calendar = self._calendar or market_calendar(ny_date(now))
-        gate = CalendarGate(self._repositories, calendar, (self._broker.venue,))
+        gate = self._calendar_gate(now)
         window = await entry_window_open(gate, self._broker.venue, asset, now, market_clock)
-        if window.reason == "CALENDAR_UNVERIFIED" and not all(
-                [await checked_today(self._repositories, self._broker.venue, venue, now) for venue in CHECKED_VENUES]):
-            await run_daily_checks(self._repositories, self._broker, self._broker.venue, calendar, self._alerts, now)
+        if window.reason == "CALENDAR_UNVERIFIED" and await self._run_daily_checks_if_due(gate, now):
             window = await entry_window_open(gate, self._broker.venue, asset, now, market_clock)
         return window
+
+    async def _read_entry_evidence(self, asset: AssetIdentity) -> _EntryEvidence:
+        """Spec §3.3: fresh account and asset evidence for a new buy. A failed
+        read (timeout, HTTP failure, malformed data) is unknown evidence."""
+        account: AccountEvidence | None
+        try:
+            account = await self._capabilities.get_account_evidence()
+        except (AlpacaError, AlpacaDataIntegrityError, httpx.HTTPError, ValueError):
+            account = None
+        capabilities: AssetTradingCapabilities | None
+        try:
+            capabilities = await self._capabilities.get_asset_capabilities(asset)
+        except (AlpacaError, AlpacaDataIntegrityError, httpx.HTTPError, ValueError):
+            capabilities = None
+        return _EntryEvidence(account, capabilities)
+
+    def _proposal(self, request: ExecutionRequest, quote: AuthoritativeQuote, sizing_stop: Decimal | None,
+                  now: datetime) -> EntryProposal:
+        """The entry as DBAE judges it. The stop is the one the entry is sized
+        against, or the profile's stop_loss_pct below the price when there is
+        no usable one, so exit feasibility is never skipped."""
+        if sizing_stop is not None and 0 < sizing_stop < quote.price:
+            stop_price = sizing_stop
+        else:
+            stop_price = quote.price * (1 - self._risk_limits.stop_loss_pct / 100)
+        environment: Literal["alpaca-paper", "alpaca-live"] = (
+            "alpaca-paper" if self._execution_mode == ExecutionMode.PAPER else "alpaca-live")
+        return EntryProposal(request.asset, quote.price, stop_price, environment, now)
+
+    async def _authorize_entry(self, request: ExecutionRequest, intent: TradeIntent, evidence: _EntryEvidence,
+                               last_equity: Decimal, quote: AuthoritativeQuote,
+                               sizing_stop: Decimal | None) -> _AuthorizedEntry | ExecutionResult:
+        """Spec §8.1 steps 1-4, under the portfolio-risk lock: account
+        evidence, the session baseline and band, asset eligibility, funding.
+        The first failure refuses the entry with every reason of its step."""
+        now = aware_utc(self._clock(), field_name="now")
+        proposal = self._proposal(request, quote, sizing_stop, now)
+        account = evidence.account
+        if account is None:
+            return await self._refuse_entry(intent, ["DBAE_ACCOUNT_STATE_UNVERIFIED"], evidence, None, None, now)
+        asset = evidence.asset or AssetTradingCapabilities(None, None, None, None, None, None, now)
+
+        gate = self._calendar_gate(now)
+        await self._run_daily_checks_if_due(gate, now)
+        baseline: SessionBaseline | BaselineRefusal
+        try:
+            baseline = await load_or_capture_baseline(self._repositories, gate, self._capabilities, last_equity, now)
+        except DatabaseError:
+            baseline = BaselineRefusal(reason=BASELINE_REASON, check="baseline_store_unavailable")
+        equity_for_band = band_equity(account.equity, baseline)
+
+        policy = evaluate_entry_policy(account, equity_for_band, asset, proposal)
+        if (equity_for_band is not None and account.equity is not None and isinstance(baseline, SessionBaseline)
+                and evidence_fresh(account.received_at, now)):
+            await self._record_band(intent, policy.band, equity_for_band, account.equity, baseline, now)
+        if not policy.allowed:
+            return await self._refuse_entry(intent, list(policy.reasons), evidence, policy.band, equity_for_band, now)
+        if equity_for_band is None or isinstance(baseline, BaselineRefusal):
+            # evaluate_entry_policy already refuses an unknown band equity; this only narrows the types.
+            return await self._refuse_entry(intent, [BASELINE_REASON], evidence, policy.band, equity_for_band, now)
+
+        reasons: list[str] = []
+        try:
+            pending = await pending_buy_funding(self._repositories, self._risk_limits)
+        except ValueError:  # PENDING_INTENT_QUANTITY_MISSING, or a pending buy with no dollar notional
+            return await self._refuse_entry(intent, ["DBAE_FUNDING_UNVERIFIED"], evidence, policy.band,
+                                            equity_for_band, now)
+        for mismatched in pending.mismatches:
+            await self._alert_quantity_identity_mismatch(mismatched, now)
+        if pending.mismatches:
+            reasons.append("DBAE_QUANTITY_IDENTITY_MISMATCH")
+        available = None if pending.unpriced else funding_available(account, request.asset.asset_class, pending.total)
+        if available is None:
+            reasons.append("DBAE_FUNDING_UNVERIFIED")
+        if reasons or available is None:
+            return await self._refuse_entry(intent, reasons, evidence, policy.band, equity_for_band, now)
+        return _AuthorizedEntry(policy, proposal, account, asset, baseline, equity_for_band, pending, available, now)
+
+    async def _shape_entry(self, entry: _AuthorizedEntry, request: ExecutionRequest, intent: TradeIntent,
+                           risk: RiskDecision, risk_input: RiskCheckInput, snapshot: PortfolioSnapshot,
+                           risk_opts: RiskEvalOptions,
+                           evidence: _EntryEvidence) -> tuple[Decimal, dict[str, DbaeSnapshotValue]] | ExecutionResult:
+        """Spec §8.1 steps 6-8 on the first run's approved quantity: round
+        down (§8.2), re-approve a changed quantity on the same quote,
+        snapshot and options (§7.1), and check the protective exit (§8.3).
+        Returns the submitted quantity and the risk_snapshot.dbae record."""
+        async def refuse(reason: str) -> ExecutionResult:
+            return await self._refuse_entry(intent, [reason], evidence, entry.policy.band, entry.band_equity,
+                                            entry.decided_at)
+
+        asset_class = request.asset.asset_class
+        shaped = shape_quantity(entry.policy, entry.asset, asset_class, risk.approved_quantity)
+        if shaped.refusal is not None:
+            return await refuse(shaped.refusal)
+        reapproved = True
+        if shaped.quantity != risk.approved_quantity:
+            again = evaluate_risk(replace(risk_input, requested_quantity=shaped.quantity), snapshot, self._risk_limits,
+                                  risk_opts)
+            reapproved = again.approved and again.approved_quantity == shaped.quantity
+        if not reapproved:
+            return await refuse("DBAE_SHAPED_QUANTITY_NOT_REAPPROVED")
+        exit_refusal = exit_feasible(entry.policy, entry.asset, entry.proposal, shaped.quantity)
+        if exit_refusal is not None:
+            return await refuse(exit_refusal)
+
+        account = entry.account
+        power_name, power = (("non_marginable_buying_power", account.non_marginable_buying_power)
+                             if asset_class == AssetClass.CRYPTO else ("buying_power", account.buying_power))
+        committed = max_funding(shaped.quantity, entry.proposal.price, request.asset,
+                                self._risk_limits.slippage_limit_for(asset_class))
+        session_date = entry.baseline.session_date.isoformat()
+        record: dict[str, DbaeSnapshotValue] = {
+            "original_requested_quantity": str(request.requested_quantity),
+            "risk_approved_quantity": str(risk.approved_quantity),
+            "shaped_quantity": str(shaped.quantity),
+            "submitted_quantity": str(shaped.quantity),
+            "band": entry.policy.band.value,
+            "band_equity": str(entry.band_equity),
+            "session_date": session_date,
+            "baseline_id": session_date,  # dbae_session_baselines is keyed by session date
+            "funding_available": str(entry.funding_available),
+            "pending_buy_funding": str(entry.pending.total),
+            "max_funding": str(committed),
+            "broker_funding_figures": [f"cash={account.cash}", f"{power_name}={power}",
+                                       f"received_at={account.received_at.isoformat()}"],
+            "shaping_rule": shaped.rule,
+            "reapproved": reapproved,
+            "exit_feasibility": "feasible",
+            "evidence_received_at": [f"account={account.received_at.isoformat()}",
+                                     f"asset={entry.asset.received_at.isoformat()}"],
+        }
+        return shaped.quantity, record
+
+    async def _refuse_entry(self, intent: TradeIntent, reasons: list[str], evidence: _EntryEvidence, band: Band | None,
+                            equity_for_band: Decimal | None, now: datetime) -> ExecutionResult:
+        """Spec §10: the reasons, joined in check order, are the intent's
+        rejection_reason, and ``dbae_entry_refused`` records them."""
+        rejected = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason="; ".join(reasons))
+        await self._repositories.trade_intents.update(intent.trade_intent_id, rejected, status=rejected.status.value)
+
+        def age(received_at: datetime | None) -> str | None:
+            return None if received_at is None else str((now - received_at).total_seconds())
+
+        event_id = f"dbae_entry_refused:{intent.trade_intent_id}"
+        await self._repositories.audit_events.create_once(event_id, AuditEvent(
+            event_id=event_id, event_type="dbae_entry_refused", severity="warning",
+            message=f"DBAE refused a {intent.asset.symbol} entry: {'; '.join(reasons)}", occurred_at=now,
+            correlation_id=intent.correlation_id, entity_type="trade_intent", entity_id=intent.trade_intent_id,
+            details={"reasons": reasons, "band": None if band is None else band.value,
+                     "band_equity": None if equity_for_band is None else str(equity_for_band),
+                     "asset_class": intent.asset.asset_class.value, "symbol": intent.asset.symbol,
+                     "account_evidence_age_seconds": age(evidence.account.received_at if evidence.account else None),
+                     "asset_evidence_age_seconds": age(evidence.asset.received_at if evidence.asset else None)}))
+        return ExecutionResult("rejected", intent.trade_intent_id, reasons, Decimal(0), None)
+
+    async def _record_band(self, intent: TradeIntent, band: Band, equity_for_band: Decimal, current_equity: Decimal,
+                           baseline: SessionBaseline, now: datetime) -> None:
+        """Spec §4.4: ``dbae_band_changed`` when this entry's band differs
+        from the band of the latest such event (none yet: the first entry)."""
+        rows = await list_all_by_json_field(self._repositories.audit_events, "event_type", "dbae_band_changed")
+        previous = rows[-1]["payload"]["details"]["new_band"] if rows else None
+        if previous == band.value:
+            return
+        band_unlocks = unlocks(band)
+        unlocked = [asset_class.value for asset_class, on in (
+            (AssetClass.EQUITY, band_unlocks.equity != "none"), (AssetClass.CRYPTO, band_unlocks.crypto),
+            (AssetClass.OPTION, band_unlocks.options)) if on]
+        event_id = f"dbae_band_changed:{intent.trade_intent_id}"
+        await self._repositories.audit_events.create_once(event_id, AuditEvent(
+            event_id=event_id, event_type="dbae_band_changed", severity="info",
+            message=f"DBAE band {previous or 'none'} -> {band.value} at band equity {equity_for_band}.",
+            occurred_at=now, correlation_id=intent.correlation_id, entity_type="dbae_band",
+            entity_id=baseline.session_date.isoformat(),
+            details={"old_band": previous, "new_band": band.value, "band_equity": str(equity_for_band),
+                     "current_equity": str(current_equity),
+                     "previous_close_equity": str(baseline.previous_close_equity),
+                     "session_date": baseline.session_date.isoformat(), "unlocked_classes": unlocked}))
+
+    async def _alert_quantity_identity_mismatch(self, trade_intent_id: str, now: datetime) -> None:
+        """Spec §7.1: critical, once per intent."""
+        from tradepulse.alerts.once import alert_once
+
+        await alert_once(self._repositories.audit_events, self._alerts, AuditEvent(
+            event_id=f"dbae_quantity_identity_mismatch:{trade_intent_id}",
+            event_type="dbae_quantity_identity_mismatch", severity="critical",
+            message=(f"DBAE_QUANTITY_IDENTITY_MISMATCH: pending buy {trade_intent_id} has a requested_quantity that "
+                     "differs from its risk_snapshot.dbae.submitted_quantity. Funding reserves the larger; new entries "
+                     "are refused until an operator resolves it."),
+            occurred_at=now, entity_type="trade_intent", entity_id=trade_intent_id,
+            details={"trade_intent_id": trade_intent_id}))
 
     async def execute_intent(self, request: ExecutionRequest) -> ExecutionResult:
         now = self._clock()
@@ -378,6 +621,9 @@ class ExecutionGateway:
                 return ExecutionResult("skipped", None, [f"BROKER_UNAVAILABLE: {exc.message}"], Decimal("0"), None)
             if account.equity <= 0:
                 return ExecutionResult("skipped", None, ["BROKER_ACCOUNT_INVALID"], Decimal("0"), None)
+            # DBAE (spec §3.3): every new buy reads fresh account and asset
+            # evidence inside this lock. Protective exits and sells never do.
+            entry_evidence = await self._read_entry_evidence(request.asset) if needs_portfolio_lock else None
 
             trade_intent_id = existing.trade_intent_id if existing else str(uuid4())
             intent = TradeIntent(
@@ -428,6 +674,19 @@ class ExecutionGateway:
                 enforced_stop = hydrate("holdings", holding_row["payload"]).stop_loss if holding_row else None
                 if enforced_stop is not None and enforced_stop < request.stop_loss:
                     sizing_stop = enforced_stop
+            # DBAE (spec §8.1 steps 1-4): account evidence, the session
+            # baseline and band, asset eligibility and funding, before the
+            # unchanged risk engine, which then sizes against the cash not
+            # already committed to a pending buy.
+            available_cash = account.cash
+            authorized_entry: _AuthorizedEntry | None = None
+            if entry_evidence is not None:
+                decided = await self._authorize_entry(request, intent, entry_evidence, account.last_equity, quote,
+                                                      sizing_stop)
+                if isinstance(decided, ExecutionResult):
+                    return decided
+                authorized_entry = decided
+                available_cash = decided.funding_available
             risk_input = RiskCheckInput(
                 symbol=request.asset.symbol, asset_class=request.asset.asset_class, side=request.side,
                 requested_quantity=request.requested_quantity, price=quote.price,
@@ -443,7 +702,7 @@ class ExecutionGateway:
                                       if new_exposure else 0),
                 protective_exit=protective_exit, bid=quote.bid, ask=quote.ask,
                 estimated_slippage_pct=quote.estimated_slippage_pct,
-                held_quantity=abs(held_quantity), available_cash=account.cash,
+                held_quantity=abs(held_quantity), available_cash=available_cash,
                 max_drawdown_breached=max_drawdown_breached,
                 held_notional=abs(held_position.market_value) if held_position is not None and request.side == Side.BUY else Decimal("0"),
             )
@@ -462,6 +721,18 @@ class ExecutionGateway:
                 rejected = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason="; ".join(risk.reasons))
                 await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
                 return ExecutionResult("rejected", trade_intent_id, risk.reasons, Decimal("0"), None)
+
+            # DBAE (spec §8.1 steps 6-8): shape, re-approve, exit feasibility.
+            # From RISK_APPROVED on, the intent's requested_quantity is the
+            # submitted quantity (§7.1).
+            submitted_quantity = risk.approved_quantity
+            dbae_record: dict[str, DbaeSnapshotValue] | None = None
+            if authorized_entry is not None and entry_evidence is not None:
+                shaped = await self._shape_entry(authorized_entry, request, intent, risk, risk_input, snapshot, risk_opts,
+                                                 entry_evidence)
+                if isinstance(shaped, ExecutionResult):
+                    return shaped
+                submitted_quantity, dbae_record = shaped
 
             # Captures values already computed above (risk_input, risk,
             # quote, self._risk_limits) -- nothing here is recomputed or
@@ -513,10 +784,12 @@ class ExecutionGateway:
             # validated regime_multiplier field).
             if request.exit_reason is not None:
                 risk_snapshot["exit_reason"] = request.exit_reason
+            if dbae_record is not None:
+                risk_snapshot["dbae"] = dbae_record  # the four quantities and the decision record (§7.1, §11)
             for key, value in (request.regime_snapshot or {}).items():
                 risk_snapshot.setdefault(key, value)
             approved = replace(
-                intent, status=TradeIntentStatus.RISK_APPROVED, requested_quantity=risk.approved_quantity,
+                intent, status=TradeIntentStatus.RISK_APPROVED, requested_quantity=submitted_quantity,
                 risk_snapshot=risk_snapshot,
             )
             try:
@@ -613,7 +886,7 @@ class ExecutionGateway:
                     fresh = await self._broker.get_positions()
                     matched = [p for p in fresh if asset_key_from_broker_symbol(p.asset_class, p.symbol)
                                == asset_identity_key(request.asset)]
-                    if len(matched) != 1 or risk.approved_quantity > abs(matched[0].qty):
+                    if len(matched) != 1 or submitted_quantity > abs(matched[0].qty):
                         return await self._reject_before_submission(approved, "BROKER_EXIT_QUANTITY_CHANGED")
                     held_quantity = matched[0].qty
                 except (AlpacaError, AlpacaDataIntegrityError, httpx.HTTPError) as exc:
@@ -624,7 +897,7 @@ class ExecutionGateway:
                 return await self._reject_before_submission(approved, str(exc))
 
         order_request = AlpacaOrderRequest(
-            symbol=request.asset.symbol, qty=risk.approved_quantity, side=request.side,
+            symbol=request.asset.symbol, qty=submitted_quantity, side=request.side,
             order_type=request.order_type, time_in_force=default_time_in_force(request.asset.asset_class),
             client_order_id=trade_intent_id,
         )
