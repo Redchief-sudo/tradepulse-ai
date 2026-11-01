@@ -280,6 +280,10 @@ class ExecutionGateway:
         return self._alerts
 
     @property
+    def capabilities(self) -> DbaeCapabilities:
+        return self._capabilities
+
+    @property
     def account_ref(self) -> str:
         return self._lease.ref.key
 
@@ -945,6 +949,8 @@ class ExecutionGateway:
                 reason = f"BROKER_SUBMIT_ERROR: {exc.message}" if isinstance(exc, AlpacaError) else f"BROKER_SUBMIT_ERROR: {exc}"
                 rejected = replace(submitted, status=TradeIntentStatus.REJECTED, rejection_reason=reason)
                 await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
+                if protective_exit:
+                    await self._alert_protective_exit_rejected(rejected, reason)
                 return ExecutionResult("rejected", trade_intent_id, [reason], Decimal("0"), None)
             # Ambiguous outcome (429, 5xx, network/timeout/DNS error, etc.) --
             # Alpaca's actual acceptance of the order cannot be established
@@ -1072,6 +1078,20 @@ class ExecutionGateway:
         rejected = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason=reason)
         await self._repositories.trade_intents.update(intent.trade_intent_id, rejected, status=rejected.status.value)
         return ExecutionResult("rejected", intent.trade_intent_id, [reason], Decimal("0"), None)
+
+    async def _alert_protective_exit_rejected(self, intent: TradeIntent, reason: str) -> None:
+        """Spec §9: the holding and its stop obligation stay; the next monitor
+        cycle may submit a new exit. One critical alert per intent."""
+        from tradepulse.reconciliation.coordinator import _alert_once
+
+        now = self._clock()
+        await _alert_once(
+            self._repositories, self._alerts, event_type="PROTECTIVE_EXIT_REJECTED", subject=intent.trade_intent_id,
+            window="intent", severity="critical",
+            message=(f"PROTECTIVE_EXIT_REJECTED: {intent.asset.symbol} exit of {intent.requested_quantity} rejected by the "
+                     f"broker ({reason}); the position stays held under its stop and the next monitor cycle retries."),
+            details={"trade_intent_id": intent.trade_intent_id, "reason": reason, "asset_key": asset_identity_key(intent.asset)},
+            now=now)
 
     async def _recover_unknown_submission(self, intent: TradeIntent, cause: Exception) -> ExecutionResult:
         """Called whenever a broker submission's outcome is ambiguous (see

@@ -25,6 +25,8 @@ from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter, alert_once
 from tradepulse.broker import AlpacaPosition, BrokerPort
+from tradepulse.broker.capabilities import AssetCapabilities, AssetTradingCapabilities, evidence_fresh
+from tradepulse.dbae.policy import scale_out_feasible
 from tradepulse.execution import (
     SYMBOL_LOCK_TTL_SECONDS,
     ExecutionGateway,
@@ -235,6 +237,9 @@ async def _ratchet_stop(
     return await repositories.holdings.mutate(asset_identity_key(holding.asset), _decide)
 
 
+RESIDUAL_MINIMUM_VALUE = Decimal(1)  # spec §8.5: the entry minimum a held position can fall below
+
+
 @dataclass(frozen=True, slots=True)
 class LadderExit:
     """One exit-ladder decision: sell `quantity` for `reason`. `scale_out`
@@ -245,10 +250,13 @@ class LadderExit:
     scale_out: bool = False
 
 
-def _scale_out_quantity(holding: Holding, position_qty: Decimal, price: Decimal, risk_limits: RiskLimits) -> Decimal | None:
+def _scale_out_quantity(holding: Holding, position_qty: Decimal, price: Decimal, risk_limits: RiskLimits,
+                        asset_caps: AssetTradingCapabilities | None) -> Decimal | None:
     """The partial-exit quantity, or None when the position cannot be split:
-    a single option contract, or either part below the order precision or
-    the minimum lot notional."""
+    a single option contract, either part below the order precision or the
+    minimum lot notional, or (spec §8.4) a part that is not feasible for the
+    asset's own minimum and increment. ``asset_caps`` None is unknown
+    evidence: equities fall back to the $1 rule, crypto is not split."""
     from tradepulse.risk.engine import round_quantity
 
     asset_class = holding.asset.asset_class
@@ -258,6 +266,8 @@ def _scale_out_quantity(holding: Holding, position_qty: Decimal, price: Decimal,
     if part <= 0 or rest <= 0:
         return None
     if part * notional_per_unit < risk_limits.min_lot_notional or rest * notional_per_unit < risk_limits.min_lot_notional:
+        return None
+    if not scale_out_feasible(asset_caps, asset_class, contract_multiplier_of(holding.asset), part, rest, price):
         return None
     return part
 
@@ -281,7 +291,8 @@ def _exit_reason(position: AlpacaPosition, holding: Holding, *, breached: bool, 
 
 
 def plan_ladder_exit(holding: Holding, lots: list[PositionLot], position_qty: Decimal, price: Decimal,
-                     today: date, risk_limits: RiskLimits) -> LadderExit | None:
+                     today: date, risk_limits: RiskLimits,
+                     asset_caps: AssetTradingCapabilities | None = None) -> LadderExit | None:
     """Profit-aware exits measured in R, the position's own risk per unit
     (average_price - stop_loss, the governing first-entry stop). Long
     positions only -- TradePulse never opens a short.
@@ -305,7 +316,7 @@ def plan_ladder_exit(holding: Holding, lots: list[PositionLot], position_qty: De
         return LadderExit(position_qty, "target_r")
     if holding.scaled_out:
         return None
-    part = _scale_out_quantity(holding, position_qty, price, risk_limits)
+    part = _scale_out_quantity(holding, position_qty, price, risk_limits, asset_caps)
     if part is None:
         if risk_limits.single_unit_target_r and gain_r >= risk_limits.single_unit_target_r:
             return LadderExit(position_qty, "target_r_single_unit")
@@ -331,6 +342,45 @@ def _time_stopped(lots: list[PositionLot], today: date, max_hold_days: int) -> b
         return False  # 0 disables -- mirrors atr_stop_multiplier's existing "0 = off" convention
     oldest_lot = min(lots, key=lambda lot: lot.opened_at)
     return (today - oldest_lot.opened_at.date()).days >= max_hold_days
+
+
+async def _read_asset_caps(capabilities: AssetCapabilities, asset: AssetIdentity, now: datetime) -> AssetTradingCapabilities | None:
+    """The asset's capability evidence, or None (unknown) when the read fails
+    or the evidence is stale (spec §3.2, §8.4)."""
+    try:
+        caps = await capabilities.get_asset_capabilities(asset)
+    except Exception:  # unknown evidence only limits a scale-out, never an exit
+        logger.warning("monitor_asset_capabilities_unavailable symbol=%s", asset.symbol, exc_info=True)
+        return None
+    return caps if evidence_fresh(caps.received_at, now) else None
+
+
+async def _report_residual_below_minimum(repositories: PersistenceRepositories, alerts: TelegramAlerter,
+                                         position: AlpacaPosition, holding: Holding, now: datetime) -> None:
+    """Spec §8.5: a held position worth under $1 is a warning, once per asset
+    per session date. It never changes the exit decision (the protective
+    exit is still a full-quantity sell) and never raises into the exit loop."""
+    value = abs(position.qty) * position.current_price * contract_multiplier_of(holding.asset)
+    if value >= RESIDUAL_MINIMUM_VALUE:
+        return
+    from tradepulse.calendar import CalendarHorizonExceeded, market_calendar, ny_date
+    from tradepulse.dbae.baseline import session_date_for
+    from tradepulse.reconciliation.coordinator import _alert_once
+
+    try:
+        try:
+            window = session_date_for(market_calendar(ny_date(now)), now)
+        except (CalendarHorizonExceeded, ValueError):
+            window = ny_date(now)  # no session placed: the New York date still bounds the alert to once per day
+        key = asset_identity_key(holding.asset)
+        await _alert_once(
+            repositories, alerts, event_type="DBAE_RESIDUAL_BELOW_ENTRY_MINIMUM", subject=key, window=window.isoformat(),
+            severity="warning",
+            message=(f"DBAE_RESIDUAL_BELOW_ENTRY_MINIMUM: {holding.asset.symbol} position worth {value} is below the $1 "
+                     "entry minimum; its protective exit is still a full-quantity sell."),
+            details={"asset_key": key, "market_value": str(value), "quantity": str(position.qty)}, now=now)
+    except Exception:  # an alert failure must never block a protective exit
+        logger.exception("monitor_residual_alert_failed symbol=%s", position.symbol)
 
 
 async def _report_unmanaged_position(repositories: PersistenceRepositories, alerts: TelegramAlerter,
@@ -429,6 +479,7 @@ async def run_position_monitor(
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     lease_lost: asyncio.Event | None = None,
     adoption: Any = None,
+    capabilities: AssetCapabilities | None = None,
 ) -> MonitorCycleSummary:
     try:
         positions = await broker.get_positions()
@@ -446,6 +497,9 @@ async def run_position_monitor(
         except Exception:  # a failed adoption must never block other positions' exits
             logger.exception("monitor_adoption_pass_failed")
 
+    # The same evidence source the gateway reads (spec §8.4); a failed or
+    # stale read is unknown evidence for the scale-out, never a blocked exit.
+    asset_evidence = capabilities if capabilities is not None else gateway.capabilities
     execution_results: list[ExecutionResult] = []
     exits_triggered = 0
     deferred_exits = 0
@@ -522,6 +576,7 @@ async def run_position_monitor(
             if await _defer_exit_outside_market_hours(repositories, alerts, position, holding, clock()):
                 deferred_exits += 1
             continue
+        await _report_residual_below_minimum(repositories, alerts, position, holding, clock())
         matching_lots = open_lots_by_asset.get(asset_identity_key(holding.asset), [])
         if matching_lots:
             await _fold_lot_extrema(repositories, matching_lots, position.current_price)
@@ -539,9 +594,11 @@ async def run_position_monitor(
         expiring = _near_expiry(holding, clock().date(), risk_limits.options_forced_close_days_before_expiry)
         time_stopped = _time_stopped(matching_lots, clock().date(), risk_limits.max_hold_days)
         breached = (holding.stop_loss is not None or holding.target_price is not None) and _breached(position, holding)
+        asset_caps = (None if breached or expiring or time_stopped or holding.scaled_out
+                      else await _read_asset_caps(asset_evidence, holding.asset, clock()))
         ladder = (None if breached or expiring or time_stopped
                   else plan_ladder_exit(holding, matching_lots, abs(position.qty), position.current_price,
-                                        clock().date(), risk_limits))
+                                        clock().date(), risk_limits, asset_caps))
         if not (breached or expiring or time_stopped or ladder):
             continue
 
