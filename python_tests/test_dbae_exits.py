@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import pytest
 from rev140_support import AAPL, Rt
 from test_dbae_gateway import NOW, _held
 
@@ -155,7 +156,8 @@ async def test_timeout_never_found_no_second_sell_across_restart(rt: Rt) -> None
                                  capabilities=rt.gateway.capabilities)
     for _ in range(3):
         rt.quote("150", "150.10")
-        await _monitor(rt, restarted)
+        cycle = await _monitor(rt, restarted)
+        assert cycle.exits_triggered == 0 and cycle.execution_results == []
 
     assert await rt.exits_at_broker() == []
     assert await rt.position() == Decimal(10)
@@ -170,7 +172,7 @@ async def test_reconciliation_proves_terminal_then_new_exit_allowed(rt: Rt) -> N
     partial = await rt.sell("4", "tok-1", decision="exit-a")
     assert partial.status == "pending"
     blocked = await rt.sell("6", "tok-2", decision="exit-b")
-    assert blocked.status != "filled"  # unresolved: no second sell
+    assert (blocked.status, blocked.reasons) == ("rejected", ["PRIOR_SUBMISSION_UNRESOLVED"])  # the unresolved intent is the block
     assert len(await rt.exits_at_broker()) == 1
 
     rt.clock.advance(timedelta(minutes=5))  # past the stranded-intent grace period
@@ -197,3 +199,41 @@ async def test_stop_exit_below_20_has_no_dbae_reason(tmp_path: Path) -> None:
         assert not any("DBAE" in reason for reason in result.reasons)
         [intent] = await held.rig.intents()
         assert intent.rejection_reason is None and "dbae" not in intent.risk_snapshot
+
+
+# --- review round 1 ------------------------------------------------------------------------------------
+
+
+async def test_no_caps_read_below_scale_out_threshold(rt: Rt) -> None:
+    """Holding at +0.1R: no scale-out is possible, so no capability read happens."""
+    assert (await rt.buy("10")).status == "filled"  # stop 190, entry about 199.6: R about 9.6
+    rt.quote("200", "200.10")
+    reads: list[str] = []
+
+    class Counting:
+        async def get_asset_capabilities(self, asset: AssetIdentity) -> AssetTradingCapabilities:
+            reads.append(asset.symbol)
+            return _caps()
+
+    summary = await run_position_monitor(rt.repositories, rt.broker, AlpacaMarketDataProvider(rt.broker), rt.gateway, rt.alerts,
+                                         LIMITS, clock=lambda: rt.clock() - timedelta(milliseconds=1), capabilities=Counting())
+
+    assert summary.exits_triggered == 0 and reads == []
+
+
+async def test_failed_alert_write_still_returns_the_rejection(rt: Rt, monkeypatch: pytest.MonkeyPatch) -> None:
+    await _breach(rt)
+    rt.broker.inject(Fault.SUBMIT_REJECTED)
+
+    async def broken(*args: Any, **kwargs: Any) -> bool:
+        raise RuntimeError("audit write failed")
+
+    monkeypatch.setattr("tradepulse.reconciliation.coordinator._alert_once", broken)
+
+    summary = await _monitor(rt)
+
+    [result] = summary.execution_results
+    assert result.status == "rejected"
+    sells = [i for i in await rt.intents() if i.side.value == "sell"]
+    assert [i.status for i in sells] == [TradeIntentStatus.REJECTED]
+    assert await rt.position() == Decimal(10)

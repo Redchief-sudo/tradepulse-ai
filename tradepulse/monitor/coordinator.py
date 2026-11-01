@@ -344,13 +344,22 @@ def _time_stopped(lots: list[PositionLot], today: date, max_hold_days: int) -> b
     return (today - oldest_lot.opened_at.date()).days >= max_hold_days
 
 
+def _scale_out_possible(holding: Holding, price: Decimal, risk_limits: RiskLimits) -> bool:
+    """True when plan_ladder_exit could choose a scale-out this cycle, the only
+    decision that reads asset capabilities (spec §8.4)."""
+    if holding.scaled_out or not risk_limits.scale_out_r or holding.stop_loss is None:
+        return False
+    risk_unit = holding.average_price - holding.stop_loss
+    return risk_unit > 0 and (price - holding.average_price) / risk_unit >= risk_limits.scale_out_r
+
+
 async def _read_asset_caps(capabilities: AssetCapabilities, asset: AssetIdentity, now: datetime) -> AssetTradingCapabilities | None:
     """The asset's capability evidence, or None (unknown) when the read fails
     or the evidence is stale (spec §3.2, §8.4)."""
     try:
         caps = await capabilities.get_asset_capabilities(asset)
-    except Exception:  # unknown evidence only limits a scale-out, never an exit
-        logger.warning("monitor_asset_capabilities_unavailable symbol=%s", asset.symbol, exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - unknown evidence only limits a scale-out, never an exit
+        logger.warning("monitor_asset_capabilities_unavailable symbol=%s error=%s", asset.symbol, type(exc).__name__)
         return None
     return caps if evidence_fresh(caps.received_at, now) else None
 
@@ -594,7 +603,8 @@ async def run_position_monitor(
         expiring = _near_expiry(holding, clock().date(), risk_limits.options_forced_close_days_before_expiry)
         time_stopped = _time_stopped(matching_lots, clock().date(), risk_limits.max_hold_days)
         breached = (holding.stop_loss is not None or holding.target_price is not None) and _breached(position, holding)
-        asset_caps = (None if breached or expiring or time_stopped or holding.scaled_out
+        asset_caps = (None if breached or expiring or time_stopped
+                      or not _scale_out_possible(holding, position.current_price, risk_limits)
                       else await _read_asset_caps(asset_evidence, holding.asset, clock()))
         ladder = (None if breached or expiring or time_stopped
                   else plan_ladder_exit(holding, matching_lots, abs(position.qty), position.current_price,

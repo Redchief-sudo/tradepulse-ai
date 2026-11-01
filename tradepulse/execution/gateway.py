@@ -15,6 +15,7 @@ second, browser-triggered authority.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -128,6 +129,8 @@ from .idempotency import (
     execution_lock_key,
 )
 from .quotes import AuthoritativeQuote, fetch_authoritative_quote
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -950,7 +953,10 @@ class ExecutionGateway:
                 rejected = replace(submitted, status=TradeIntentStatus.REJECTED, rejection_reason=reason)
                 await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
                 if protective_exit:
-                    await self._alert_protective_exit_rejected(rejected, reason)
+                    try:
+                        await self._alert_protective_exit_rejected(rejected, reason)
+                    except Exception:  # the rejection is already persisted; a failed alert must not abort the cycle
+                        logger.exception("protective_exit_rejected_alert_failed trade_intent_id=%s", trade_intent_id)
                 return ExecutionResult("rejected", trade_intent_id, [reason], Decimal("0"), None)
             # Ambiguous outcome (429, 5xx, network/timeout/DNS error, etc.) --
             # Alpaca's actual acceptance of the order cannot be established

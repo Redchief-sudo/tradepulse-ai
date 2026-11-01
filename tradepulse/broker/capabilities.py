@@ -191,7 +191,8 @@ class AlpacaCapabilities:
 class NoCapabilityEvidence:
     """The evidence source of a broker that has none: every read fails as a
     broker read would, so every new entry is refused as unknown evidence
-    (spec §3.2, §10). Protective exits never read it."""
+    (spec §3.2, §10). The monitor reads asset capabilities only to decide a
+    scale-out, never to block an exit."""
 
     async def get_account_evidence(self) -> AccountEvidence:
         raise AlpacaError("no DBAE evidence source for this broker", 503, None, None, "getAccount")
