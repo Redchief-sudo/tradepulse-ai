@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import IO
 
 from tradepulse.config import Settings
+from tradepulse.dbae.evidence import dbae_policy_fingerprint
 from tradepulse.persistence import AsyncSQLiteDatabase
 from tradepulse.provenance import get_provenance
 
@@ -120,7 +121,8 @@ def _publish_freeze(settings, generation, costs, root, identity, checkpoint, soa
         manifest = freeze_source(root, generation_path(store, generation), generation,
                                  context=context_for(settings), opening_checkpoint=checkpoint,
                                  policy={"thresholds": VerificationPolicy().as_dict(), "costs": costs,
-                                         "soak_prerequisites": soak_proof},
+                                         "soak_prerequisites": soak_proof,
+                                         "dbae": dbae_policy_fingerprint()},
                                  revision=get_provenance(repo_path=root).git_commit)
         manifest_digest = digest(canonical(manifest))
         write_once(store / "binding.json", {"generation": generation, "manifest_sha256": manifest_digest,
@@ -213,6 +215,13 @@ class Verification:
             result = verify_source(self.root, self.directory)
             if (self.settings.execution_mode != "paper" or self.settings.live_trading_enabled
                     or not context_matches(manifest["context"], self.settings)):
+                raise VerificationError("frozen_configuration_mismatch")
+            # Spec §15: DBAE is a new release, never a change inside a running
+            # generation. No default, no migration, no compatibility fallback.
+            frozen_dbae = manifest["policy"].get("dbae")
+            if frozen_dbae is None:
+                raise VerificationError("generation_predates_dbae")
+            if frozen_dbae != dbae_policy_fingerprint():
                 raise VerificationError("frozen_configuration_mismatch")
             if manifest["policy"]["thresholds"] != VerificationPolicy().as_dict():
                 raise VerificationError("frozen_threshold_mismatch")
