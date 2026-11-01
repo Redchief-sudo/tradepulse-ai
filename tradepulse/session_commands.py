@@ -65,8 +65,7 @@ def build_gateway(
     settings: Settings, repositories: PersistenceRepositories, broker: BrokerPort,
     market_data: AlpacaMarketDataProvider, alerts: TelegramAlerter, lease: AccountLease,
 ) -> ExecutionGateway:
-    """Raises ValueError if ``lease`` is for another venue than ``broker``,
-    or if ``broker`` has no DBAE capability evidence source."""
+    """Raises ValueError if ``lease`` is for another venue than ``broker``."""
     settlement = SettlementProcessor(repositories, alerts)
     risk_limits = risk_limits_for_profile(settings.risk_profile)
     return ExecutionGateway(repositories, broker, market_data, settlement, alerts, risk_limits,

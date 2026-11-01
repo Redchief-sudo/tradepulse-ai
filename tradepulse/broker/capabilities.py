@@ -188,8 +188,6 @@ class AlpacaCapabilities:
         return sorted(bars, key=lambda bar: bar.trading_date)
 
 
-
-
 class NoCapabilityEvidence:
     """The evidence source of a broker that has none: every read fails as a
     broker read would, so every new entry is refused as unknown evidence

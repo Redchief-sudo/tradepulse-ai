@@ -53,9 +53,17 @@ from tradepulse.dbae.baseline import (
     SessionBaseline,
     band_equity,
     load_or_capture_baseline,
+    session_date_for,
 )
 from tradepulse.dbae.funding import PendingFunding, funding_available, max_funding, pending_buy_funding
-from tradepulse.dbae.policy import EntryProposal, ExecutionPolicy, evaluate_entry_policy, exit_feasible, shape_quantity
+from tradepulse.dbae.policy import (
+    EntryProposal,
+    ExecutionPolicy,
+    core_account_reasons,
+    evaluate_entry_policy,
+    exit_feasible,
+    shape_quantity,
+)
 from tradepulse.models import (
     AssetClass,
     AssetIdentity,
@@ -304,6 +312,17 @@ class ExecutionGateway:
             window = await entry_window_open(gate, self._broker.venue, asset, now, market_clock)
         return window
 
+    async def _latch_kill_switch(self, risk: RiskDecision) -> None:
+        """A genuine account-level kill-switch condition -- not an ordinary
+        per-trade sizing/eligibility rejection (insufficient cash, confidence
+        too low, sector/position caps, etc.) -- must latch the durable session
+        state reset-risk exists to clear, not just reject this one order."""
+        kill_switch_reason = next(
+            (r for r in risk.reasons if r.startswith("MAX_DAILY_LOSS_EXCEEDED") or r == "MAX_DRAWDOWN_BREACHED"), None
+        )
+        if kill_switch_reason is not None:
+            await latch_risk_stop(self._repositories, kill_switch_reason, clock=self._clock)
+
     async def _read_entry_evidence(self, asset: AssetIdentity) -> _EntryEvidence:
         """Spec §3.3: fresh account and asset evidence for a new buy. A failed
         read (timeout, HTTP failure, malformed data) is unknown evidence."""
@@ -318,6 +337,19 @@ class ExecutionGateway:
         except (AlpacaError, AlpacaDataIntegrityError, httpx.HTTPError, ValueError):
             capabilities = None
         return _EntryEvidence(account, capabilities)
+
+    async def _baseline_capture_due(self, gate: CalendarGate, now: datetime) -> bool:
+        """Whether the current session's baseline still has to be captured,
+        which needs a verified calendar date (§4.3). False once it is stored,
+        and for a date the calendar cannot place, which
+        load_or_capture_baseline refuses without any calendar check."""
+        from tradepulse.calendar import CalendarHorizonExceeded
+
+        try:
+            session_date = session_date_for(gate.calendar, now)
+        except (CalendarHorizonExceeded, ValueError):
+            return False
+        return await self._repositories.dbae_session_baselines.get(session_date.isoformat()) is None
 
     def _proposal(self, request: ExecutionRequest, quote: AuthoritativeQuote, sizing_stop: Decimal | None,
                   now: datetime) -> EntryProposal:
@@ -344,9 +376,16 @@ class ExecutionGateway:
         if account is None:
             return await self._refuse_entry(intent, ["DBAE_ACCOUNT_STATE_UNVERIFIED"], evidence, None, None, now)
         asset = evidence.asset or AssetTradingCapabilities(None, None, None, None, None, None, now)
+        # Stale or unusable account evidence is refused before the baseline
+        # step reads history or writes anything.
+        core = core_account_reasons(account, now)
+        if core:
+            return await self._refuse_entry(intent, core, evidence, None, None, now)
 
         gate = self._calendar_gate(now)
-        await self._run_daily_checks_if_due(gate, now)
+        if await self._baseline_capture_due(gate, now):
+            # Once the session's baseline is stored, no broker calendar call is made here.
+            await self._run_daily_checks_if_due(gate, now)
         baseline: SessionBaseline | BaselineRefusal
         try:
             baseline = await load_or_capture_baseline(self._repositories, gate, self._capabilities, last_equity, now)
@@ -674,19 +713,6 @@ class ExecutionGateway:
                 enforced_stop = hydrate("holdings", holding_row["payload"]).stop_loss if holding_row else None
                 if enforced_stop is not None and enforced_stop < request.stop_loss:
                     sizing_stop = enforced_stop
-            # DBAE (spec §8.1 steps 1-4): account evidence, the session
-            # baseline and band, asset eligibility and funding, before the
-            # unchanged risk engine, which then sizes against the cash not
-            # already committed to a pending buy.
-            available_cash = account.cash
-            authorized_entry: _AuthorizedEntry | None = None
-            if entry_evidence is not None:
-                decided = await self._authorize_entry(request, intent, entry_evidence, account.last_equity, quote,
-                                                      sizing_stop)
-                if isinstance(decided, ExecutionResult):
-                    return decided
-                authorized_entry = decided
-                available_cash = decided.funding_available
             risk_input = RiskCheckInput(
                 symbol=request.asset.symbol, asset_class=request.asset.asset_class, side=request.side,
                 requested_quantity=request.requested_quantity, price=quote.price,
@@ -702,22 +728,29 @@ class ExecutionGateway:
                                       if new_exposure else 0),
                 protective_exit=protective_exit, bid=quote.bid, ask=quote.ask,
                 estimated_slippage_pct=quote.estimated_slippage_pct,
-                held_quantity=abs(held_quantity), available_cash=available_cash,
+                held_quantity=abs(held_quantity), available_cash=account.cash,
                 max_drawdown_breached=max_drawdown_breached,
                 held_notional=abs(held_position.market_value) if held_position is not None and request.side == Side.BUY else Decimal("0"),
             )
+            # DBAE (spec §8.1 steps 1-4): account evidence, the session
+            # baseline and band, asset eligibility and funding, before the
+            # unchanged risk engine, which then sizes against the cash not
+            # already committed to a pending buy.
+            authorized_entry: _AuthorizedEntry | None = None
+            if entry_evidence is not None:
+                decided = await self._authorize_entry(request, intent, entry_evidence, account.last_equity, quote,
+                                                      sizing_stop)
+                if isinstance(decided, ExecutionResult):
+                    # §8.1 orders entry authorization, not the account-level
+                    # kill switch: a daily-loss or drawdown breach still
+                    # latches, judged by the engine on this same snapshot.
+                    await self._latch_kill_switch(evaluate_risk(risk_input, snapshot, self._risk_limits, risk_opts))
+                    return decided
+                authorized_entry = decided
+                risk_opts = replace(risk_opts, available_cash=decided.funding_available)
             risk = evaluate_risk(risk_input, snapshot, self._risk_limits, risk_opts)
             if not risk.approved:
-                # A genuine account-level kill-switch condition -- not an
-                # ordinary per-trade sizing/eligibility rejection (insufficient
-                # cash, confidence too low, sector/position caps, etc.) -- must
-                # latch the durable session state reset-risk exists to clear,
-                # not just reject this one order.
-                kill_switch_reason = next(
-                    (r for r in risk.reasons if r.startswith("MAX_DAILY_LOSS_EXCEEDED") or r == "MAX_DRAWDOWN_BREACHED"), None
-                )
-                if kill_switch_reason is not None:
-                    await latch_risk_stop(self._repositories, kill_switch_reason, clock=self._clock)
+                await self._latch_kill_switch(risk)
                 rejected = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason="; ".join(risk.reasons))
                 await self._repositories.trade_intents.update(trade_intent_id, rejected, status=rejected.status.value)
                 return ExecutionResult("rejected", trade_intent_id, risk.reasons, Decimal("0"), None)

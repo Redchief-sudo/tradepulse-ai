@@ -95,6 +95,14 @@ def _core_account_reasons(account: AccountEvidence, now: datetime) -> list[str]:
     return reasons
 
 
+def core_account_reasons(account: AccountEvidence, now: datetime) -> list[str]:
+    """§8.1 step 1's core account check, the same one evaluate_entry_policy
+    runs first: stale evidence or a missing, blocked, closing-only,
+    inactive or limited-margin account. Empty when the account may trade.
+    Lets the gateway refuse before any baseline read or write."""
+    return _core_account_reasons(account, now)
+
+
 def _class_permission_reason(account: AccountEvidence, asset_class: AssetClass) -> str | None:
     """§5.2's class-dependent rows. A missing crypto or options field never blocks equity."""
     if asset_class is AssetClass.CRYPTO:

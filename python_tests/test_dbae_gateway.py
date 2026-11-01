@@ -149,10 +149,7 @@ class Rig:
         self.clock.advance(timedelta(seconds=1))
 
     def build_gateway(self) -> ExecutionGateway:
-        settlement = SettlementProcessor(self.repositories, self.alerts, clock=self.now)
-        return ExecutionGateway(self.repositories, self.broker, AlpacaMarketDataProvider(self.broker), settlement,
-                                self.alerts, self.limits, ExecutionMode.PAPER, clock=self.now,
-                                lease=held_test_lease(), capabilities=self.caps)
+        return _gateway(self.repositories, self.broker, self.caps, self.alerts, self.limits, self.now)
 
     async def reopen(self) -> None:
         """A crash: the gateway and repositories are dropped and rebuilt over
@@ -169,6 +166,13 @@ class Rig:
         return (await pending_buy_funding(self.repositories, self.limits)).total
 
 
+def _gateway(repositories: PersistenceRepositories, broker: SimulatedBroker, caps: FreshCapabilities,
+             alerts: TelegramAlerter, limits: RiskLimits, clock: Callable[[], datetime]) -> ExecutionGateway:
+    settlement = SettlementProcessor(repositories, alerts, clock=clock)
+    return ExecutionGateway(repositories, broker, AlpacaMarketDataProvider(broker), settlement, alerts, limits,
+                            ExecutionMode.PAPER, clock=clock, lease=held_test_lease(), capabilities=caps)
+
+
 async def _rig(tmp_path: Path, name: str = "dbae", *, balance: Decimal = Decimal(100000), profile: str = "balanced",
                alerts: TelegramAlerter | None = None) -> Rig:
     path = tmp_path / f"{name}.db"
@@ -182,9 +186,10 @@ async def _rig(tmp_path: Path, name: str = "dbae", *, balance: Decimal = Decimal
     caps.assets = _assets()
     # The previous trading date's close agrees with the broker's last_equity (the starting cash).
     caps.bars = [DailyEquityBar(ny_date(NOW) - timedelta(days=n), balance) for n in range(14, 0, -1)]
-    rig = Rig(path, database, repositories, broker, clock, caps, alerts or TelegramAlerter(None, None),
-              risk_limits_for_profile(profile), None)  # type: ignore[arg-type]
-    rig.gateway = rig.build_gateway()
+    alerter = alerts or TelegramAlerter(None, None)
+    limits = risk_limits_for_profile(profile)
+    gateway = _gateway(repositories, broker, caps, alerter, limits, lambda: clock() - timedelta(milliseconds=1))
+    rig = Rig(path, database, repositories, broker, clock, caps, alerter, limits, gateway)
     original = broker.place_order
 
     async def place(order: AlpacaOrderRequest) -> AlpacaOrderResponse:
@@ -499,11 +504,16 @@ async def test_second_evaluation_uses_same_quote_and_snapshot(tmp_path: Path, mo
     assert _dbae(intent)["reapproved"] is True
 
 
-async def test_two_concurrent_buys_different_symbols_20_cash(tmp_path: Path) -> None:
-    """The first buy is approved and its order stays accepted; the second,
-    gathered with it, is decided against P (or refused), never against the
-    cash the first already committed."""
+@pytest.mark.parametrize("cash", ["20", "5"])
+async def test_two_concurrent_buys_different_symbols_20_cash(tmp_path: Path, cash: str) -> None:
+    """A $20 micro account. The first buy is approved and its order stays
+    accepted; the second, gathered with it, decides after the first's
+    approval and sizes against funding_available = cash - P. With $20 of
+    cash the risk budget binds both; with $5 of cash the second is capped
+    by the funding the first left."""
     rig = await _rig(tmp_path, balance=Decimal(20), profile="micro")
+    funds = Decimal(cash)
+    rig.caps.account = _account(Decimal(20), cash=funds, buying_power=funds, non_marginable_buying_power=funds)
     _hold_orders_open(rig)
     rig.quote(FRAC, Decimal(100))
     rig.quote(FRAY, Decimal(100))
@@ -522,20 +532,25 @@ async def test_two_concurrent_buys_different_symbols_20_cash(tmp_path: Path) -> 
 
     a, b = await asyncio.gather(first(), second())
 
-    assert a.status == "pending"
+    assert (a.status, b.status) == ("pending", "pending"), (a.reasons, b.reasons)
     first_intent = await _intent(rig, a.trade_intent_id)
-    assert first_intent.status == TradeIntentStatus.ACCEPTED
-    first_funding = Decimal(_dbae(first_intent)["max_funding"])
-    if b.status == "pending":
-        second_intent = await _intent(rig, b.trade_intent_id)
-        dbae = _dbae(second_intent)
-        assert Decimal(dbae["pending_buy_funding"]) == first_funding
-        assert Decimal(dbae["funding_available"]) == Decimal(20) - first_funding
-        total = first_funding + Decimal(dbae["max_funding"])
+    second_intent = await _intent(rig, b.trade_intent_id)
+    assert first_intent.status == second_intent.status == TradeIntentStatus.ACCEPTED
+    first_dbae, second_dbae = _dbae(first_intent), _dbae(second_intent)
+    first_funding = Decimal(first_dbae["max_funding"])
+    assert Decimal(first_dbae["pending_buy_funding"]) == 0
+    assert Decimal(second_dbae["pending_buy_funding"]) == first_funding
+    available = Decimal(second_dbae["funding_available"])
+    assert available == funds - first_funding
+    second_quantity = Decimal(second_dbae["submitted_quantity"])
+    assert second_quantity * 100 <= available * Decimal("0.99")  # check_cash_sufficiency's 1% buffer
+    capped = any(r.endswith("_BY_AVAILABLE_CASH") for r in second_intent.risk_snapshot["reasons"])
+    if cash == "5":
+        assert capped and second_quantity < Decimal(first_dbae["submitted_quantity"])
     else:
-        assert b.status in ("rejected", "skipped")
-        total = first_funding
-    assert total <= Decimal(20)
+        assert not capped and second_quantity == Decimal(first_dbae["submitted_quantity"])
+    total = first_funding + Decimal(second_dbae["max_funding"])
+    assert total <= funds
     assert await rig.pending() == total
 
 
@@ -853,3 +868,125 @@ def test_build_gateway_capability_source() -> None:
     assert isinstance(capabilities_for(client), AlpacaCapabilities)
     simulated = SimulatedBroker(clock=ManualClock(NOW), session=SimSession.always_open())
     assert isinstance(capabilities_for(simulated), NoCapabilityEvidence)
+
+
+# --- the kill switch is never pre-empted by a DBAE refusal (fix round 1) ----------------------------------
+
+
+async def _daily_loss_rig(tmp_path: Path, start: Decimal, now_equity: Decimal) -> Rig:
+    """balanced (max daily loss 1%) on an account whose equity has fallen
+    from ``start`` (the previous close, last_equity) to ``now_equity``."""
+    rig = await _rig(tmp_path, balance=start, profile="balanced")
+    real_account = rig.broker.get_account
+
+    async def fallen() -> Any:
+        account = await real_account()
+        return replace(account, equity=now_equity, cash=now_equity, portfolio_value=now_equity)
+
+    rig.broker.get_account = fallen  # type: ignore[method-assign]
+    rig.caps.account = _account(now_equity)
+    rig.quote(FRAC, Decimal(10))
+    return rig
+
+
+async def _latched(rig: Rig) -> list[dict[str, Any]]:
+    from tradepulse.risk import load_session
+
+    session = await load_session(rig.repositories)
+    assert session.state == SessionState.RISK_STOPPED and session.kill_switch_reset_required is True
+    assert (session.kill_switch_reason or "").startswith("MAX_DAILY_LOSS_EXCEEDED")
+    return [e for e in await _events(rig, "session_transition") if e["details"]["action"] == "latch_risk_stop"]
+
+
+async def test_daily_loss_latches_behind_a_below_minimum_refusal(tmp_path: Path) -> None:
+    """A $25 account at $18: the band is BELOW_MINIMUM and the daily loss is 28%."""
+    rig = await _daily_loss_rig(tmp_path, Decimal(25), Decimal(18))
+
+    result = await rig.gateway.execute_intent(_buy(FRAC, Decimal(1), Decimal(9)))
+
+    assert (result.status, result.reasons) == ("rejected", ["DBAE_BELOW_MINIMUM_BALANCE"])
+    [latch] = await _latched(rig)
+    assert latch["severity"] == "critical" and latch["details"]["new_state"] == "risk_stopped"
+    assert rig.orders == []
+
+
+async def test_daily_loss_latches_behind_a_funding_refusal(tmp_path: Path) -> None:
+    rig = await _daily_loss_rig(tmp_path, Decimal(100000), Decimal(98000))
+    rig.caps.account = _account(Decimal(98000), cash=Decimal(-1))  # a negative funding input
+
+    result = await rig.gateway.execute_intent(_buy(FRAC, Decimal(1), Decimal(9)))
+
+    assert (result.status, result.reasons) == ("rejected", ["DBAE_FUNDING_UNVERIFIED"])
+    [latch] = await _latched(rig)
+    assert latch["severity"] == "critical"
+    assert rig.orders == []
+
+
+async def test_dbae_refusal_without_a_loss_does_not_latch(tmp_path: Path) -> None:
+    from tradepulse.risk import load_session
+
+    rig = await _rig(tmp_path, balance=Decimal(40))
+    rig.quote(SOL, Decimal(100))
+
+    result = await rig.gateway.execute_intent(_buy(SOL, Decimal(1), Decimal(92)))
+
+    assert (result.status, result.reasons) == ("rejected", ["DBAE_ASSET_CLASS_LOCKED"])
+    assert (await load_session(rig.repositories)).state == SessionState.ACTIVE
+    assert await _events(rig, "session_transition") == []
+
+
+# --- no baseline step for unusable evidence; no calendar call once the baseline is stored ------------------
+
+
+async def test_stale_account_evidence_refused_before_the_baseline_step(tmp_path: Path) -> None:
+    rig = await _rig(tmp_path)
+    plain = SimulatedCapabilities()  # returns the evidence as stamped: an hour old
+    plain.account = _account(Decimal(100000), at=NOW - timedelta(hours=1))
+    plain.assets = _assets()
+    rig.caps = plain  # type: ignore[assignment]
+    rig.gateway = rig.build_gateway()
+    calendar_calls: list[object] = []
+    real_calendar = rig.broker.get_calendar
+
+    async def counted(*args: Any) -> Any:
+        calendar_calls.append(args)
+        return await real_calendar(*args)
+
+    rig.broker.get_calendar = counted  # type: ignore[method-assign]
+    rig.quote(SOL, Decimal(100))
+
+    result = await rig.gateway.execute_intent(_buy(SOL, Decimal(1), Decimal(92)))
+
+    assert (result.status, result.reasons) == ("rejected", ["DBAE_ACCOUNT_STATE_UNVERIFIED"])
+    assert calendar_calls == []
+    assert await rig.repositories.dbae_session_baselines.list_all() == []
+    assert await _events(rig, "dbae_session_baseline_captured") == []
+    assert await _events(rig, "dbae_session_baseline_unverified") == []
+
+
+async def test_no_calendar_call_once_the_baseline_is_stored(tmp_path: Path) -> None:
+    """The session's baseline is already stored (say, by an earlier process
+    whose calendar check this database lacks): a crypto buy makes no broker
+    calendar call inside the lock."""
+    from tradepulse.dbae.baseline import SessionBaseline
+
+    rig = await _rig(tmp_path)
+    today = ny_date(NOW)
+    stored = SessionBaseline(session_date=today, previous_trading_date=today - timedelta(days=1),
+                             previous_close_equity=Decimal(100000), last_equity=Decimal(100000),
+                             source="portfolio_history", captured_at=NOW)
+    await rig.repositories.dbae_session_baselines.create_once(today.isoformat(), stored)
+    calendar_calls: list[object] = []
+
+    async def unreachable(*args: Any) -> Any:
+        calendar_calls.append(args)
+        raise httpx.ConnectError("calendar unavailable")
+
+    rig.broker.get_calendar = unreachable  # type: ignore[method-assign]
+    rig.quote(SOL, Decimal(100))
+
+    result = await rig.gateway.execute_intent(_buy(SOL, Decimal(1), Decimal(92)))
+
+    assert result.status == "filled", result.reasons
+    assert calendar_calls == []
+    assert "history" not in rig.caps.reads
