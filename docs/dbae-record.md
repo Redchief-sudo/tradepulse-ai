@@ -344,6 +344,25 @@ The same worktree and `.venv`; no dependency changed. The record commit that fol
 | `.venv/bin/ruff check` | `Found 1750 errors.`: equal to the baseline |
 | `.venv/bin/ruff check $(git diff --name-only 1ada81f4..HEAD -- '*.py')` | `Found 537 errors.` across the same 50 files: equal to the last G3, so this round introduced none |
 
+### G3: passed at the final Rev.146 code head (`e934cb77`, 2026-11-01)
+
+This is the run for the review package: the same worktree and `.venv`, with no dependency changed. It is run with the project's default selection. Integration items are deselected; the Alpaca paper conformance kit is never collected.
+
+| Check | Summary line |
+|---|---|
+| `.venv/bin/python -m pytest -p no:cacheprovider` | `2211 passed, 10 deselected in 765.40s (0:12:45)`: 2 more than the last G3, the zero-slippage tests in `e934cb77` |
+| `.venv/bin/mypy` | `Success: no issues found in 133 source files` |
+| `.venv/bin/ruff check` | `Found 1750 errors.`: equal to the baseline |
+| `.venv/bin/ruff check $(git diff --name-only 1ada81f4..HEAD -- '*.py')` | `Found 537 errors.`: equal to the last G3 |
+
+**A run with a non-default selection was discarded.** An earlier full run at this head used `-o addopts="" -m "not slow"`. That expression selects integration items, and its result was `1 failed, 2210 passed, 1 skipped, 9 errors`. All 9 errors were the conformance fixture refusing with `ALPACA_API_KEY/ALPACA_API_SECRET are not configured`, because the worktree has no `.env`. No broker was contacted and no order guard was reached (`TRADEPULSE_CONFORMANCE_ORDERS` was unset, and the market was closed). Never pass `-m` to the full suite.
+
+**The Rev.146 independent re-reviews:**
+- Every audit requirement was addressed. An exact recomputation then replaced the 2× bound (I1, `54a24f48`).
+- The M1 intent-close fix is `31c1d32a`.
+- A zero slippage allowance is accepted as valid (`e934cb77`).
+- The scoped re-review found no new breakage. It fuzzed the recomputation on 20,000 Decimal round-trip cases with 0 mismatches. Verdict: ready to merge.
+
 ## Before live
 
 - **The alpaca-live liquidation scope is unverified,** so sub-$1 entries are refused on live. G2 verifies paper only, and paper may differ from live.
