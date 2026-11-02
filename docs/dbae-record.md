@@ -35,7 +35,7 @@ The quantity is only ever rounded down. A buy is refused when its protective exi
 | 4 | §5, §6, §8.0–§8.4 | `dbae/policy.py`: `evaluate_entry_policy`, `shape_quantity`, `exit_feasible`, `liquidation_threshold`, `scale_out_feasible`. Pure: no I/O, no clock reads. |
 | 5 | §7 | `dbae/funding.py`: `max_funding`, `pending_buy_funding` (P derived from durable intents and SettlementEvents on every call), `funding_available`. The pending-remainder walk is shared with the risk engine (`pending_intent_remainders`). |
 | 6 | §4.2, §4.3 | `dbae/baseline.py`: the write-once session baseline, captured from the daily bar mapped by New York date and cross-checked against `last_equity` within $0.01; `band_equity = min(current equity, baseline)`. |
-| 7 | §3, §7, §8.1, §10, §11 | `execution/gateway.py`: steps 1–9 of §8.1 for every new buy. `risk_snapshot.dbae` records the four quantities and the decision; `dbae_entry_refused`, `dbae_band_changed` and `dbae_quantity_identity_mismatch` audit events. |
+| 7 | §3, §7, §8.1, §10, §11 | `execution/gateway.py`: steps 1–9 of §8.1 for every new buy. `risk_snapshot.dbae` records the four quantities and the decision, and freezes `max_funding` with the inputs it was computed from: `reference_price`, `contract_multiplier`, `slippage_pct` and `fee_pct`, as Decimal strings (ruling 32); `dbae_entry_refused`, `dbae_band_changed` and `dbae_quantity_identity_mismatch` audit events. |
 | 8 | §8.4, §8.5, §9 | `monitor/coordinator.py`: scale-outs only when both parts meet the asset minimum and increment; a once-per-session residual alert; `PROTECTIVE_EXIT_REJECTED` alerts on a definitive broker rejection, and the obligation is kept. |
 | 9 | §15 | `verification/service.py`: generations freeze `dbae_policy_fingerprint()`. A generation frozen without it gives `generation_predates_dbae`; a changed DBAE policy gives `frozen_configuration_mismatch`. |
 | 10 | §14 item 10 | `python_tests/test_dbae_properties.py` (hypothesis), the funding fix it found (below), `hypothesis` in the `dev` extra. |
@@ -148,14 +148,12 @@ An external audit of the branch at `5d8b7e51` raised four findings. The controll
     - **Broker evidence still reduces P** (reviewer amendment). An attributed fill reduces P, and each SettlementEvent is counted once. A confirmed terminal state drops the buy out of P. `SUBMISSION_UNKNOWN` keeps the full frozen commitment. The fee term stays on the unattributed remainder only, and a mismatch still reserves on the larger quantity.
     - **Fail closed.** A buy with an unattributed remainder is `unpriced` (`DBAE_FUNDING_UNVERIFIED`) when any of these holds:
       - it has no `dbae` block (pre-DBAE: there are no frozen parameters);
-      - `max_funding` is missing, unparsable, non-finite or not positive;
-      - `max_funding` is below the order notional plus its buy-side fee, which implies a negative slippage;
-      - `max_funding` is above `MAX_FROZEN_FUNDING_RATE` (2) times the notional. This bound was chosen in this round: no profile allows more than 1.75% slippage plus a 0.25% fee.
+      - `max_funding` does not reconcile exactly with the block's own frozen inputs (ruling 32).
 
-      The bounds are compared without division, so they are exact.
+      The fixed bounds this round first used (`notional + fee ≤ max_funding ≤ 2 × notional`, `MAX_FROZEN_FUNDING_RATE`) were replaced by that reconciliation in the re-review fix round.
     - **Why no production buy lacks a block.** The gateway's RISK_APPROVED write is the only production writer of a pending buy, and every buy there passes DBAE. So only pre-DBAE rows, and test fixtures, lack a block. Two fixtures were given the block they would have had: one in `test_execution_gateway.py` and the two mismatch fixtures in `test_dbae_gateway.py`. `test_pre_dbae_intent_reserved_on_field` became `test_pre_dbae_intent_is_unpriced`.
     - **Tests.**
-      - `test_dbae_funding.py`: `test_profile_change_never_reduces_pending_funding` (RISK_APPROVED, ACCEPTED, PARTIALLY_FILLED, SUBMISSION_UNKNOWN × lowered, raised); `test_definitive_fill_reduces_to_frozen_remainder` (amendment a, b); `test_terminal_after_partial_fill_reserves_nothing` (c); `test_submission_unknown_keeps_full_frozen_commitment` (d); `test_invalid_frozen_max_funding_is_unpriced`; `test_frozen_max_funding_bounds_are_inclusive`; `test_crypto_frozen_below_notional_plus_fee_is_unpriced`; `test_pre_dbae_intent_is_unpriced`; `test_fully_attributed_pre_dbae_intent_is_not_flagged`.
+      - `test_dbae_funding.py`: `test_profile_change_never_reduces_pending_funding` (RISK_APPROVED, ACCEPTED, PARTIALLY_FILLED, SUBMISSION_UNKNOWN × lowered, raised); `test_definitive_fill_reduces_to_frozen_remainder` (amendment a, b); `test_terminal_after_partial_fill_reserves_nothing` (c); `test_submission_unknown_keeps_full_frozen_commitment` (d); `test_invalid_frozen_max_funding_is_unpriced`; the reconciliation tests of ruling 32 (which replaced `test_frozen_max_funding_bounds_are_inclusive` and `test_crypto_frozen_below_notional_plus_fee_is_unpriced`); `test_pre_dbae_intent_is_unpriced`; `test_fully_attributed_pre_dbae_intent_is_not_flagged`.
       - `test_dbae_gateway.py`: `test_profile_change_across_restart_never_reduces_pending` (accepted, partial, ambiguous; restart; lowered and raised); `test_pending_pre_dbae_buy_refuses_new_entries`.
 29. **DBAE-146-02, evidence age at the authorization boundary** (`cbe531c9`; closes M2's commit-time point).
     - **Defect.** Entry authorization read the clock once, at its start. Calendar, baseline, risk and database work followed, so evidence could pass 30 s before RISK_APPROVED committed.
@@ -169,6 +167,30 @@ An external audit of the branch at `5d8b7e51` raised four findings. The controll
       - `test_dbae_gateway.py`: `test_account_evidence_expiring_before_approval_is_refused` and `test_asset_evidence_expiring_before_approval_is_refused`. Each runs at four points: the baseline step, risk evaluation, the funding read, and before the write's transaction. Then `test_evidence_fresh_at_the_boundary_is_approved` (the control, 29 s), `test_lapsed_lease_with_expired_evidence_cannot_commit`, and `test_expired_evidence_and_two_symbols_competing_for_the_same_cash` (a $20 account, with the lease lapsed or held: one approval, reserved ≤ funding available, the loser refused with its reason).
 30. **DBAE-146-03, the crypto weekend baseline** (`5dab5c3b`). This finding only documents and tests current behaviour; see "Crypto weekend baseline" above. No case contradicts the spec, and no code changed.
 31. **DBAE-146-04: a $20 conservative account and G2.** No code change. `SUB_MINIMUM_LIQUIDATION_EVIDENCE` stays empty. A $20 conservative account sizes a $1.00 fractional entry whose stop value is $0.95, so §8.3 refuses it with `DBAE_SUB_MINIMUM_LIQUIDATION_UNVERIFIED` (§8.6; `test_matrix_expectations_match_the_spec_20_dollar_cases`). It cannot complete an entry and protective-exit lifecycle until G2 adds the paper, equity, fractional evidence row. This is intended: DBAE never approves an entry whose protective exit is not a proven-supported order.
+
+### Rev.146 re-review fixes (2026-11-01)
+
+An independent re-review of the correction round (`5d8b7e51..39a73781`) found one Important and one Minor. The reviewer's binding position ruled both fix-now.
+
+32. **I1, the frozen record reconciles exactly** (`54a24f48`; replaces the 2× bound of ruling 28).
+    - **Defect.** `MAX_FROZEN_FUNDING_RATE = 2` was a fixed window, not evidence. A corrupt `max_funding` within `[1 + fee, 2] ×` notional was accepted, and a legitimate record under a custom profile with 100% or more slippage (`RiskLimits` sets no upper limit) was rejected.
+    - **Frozen inputs.** At approval the gateway's `risk_snapshot.dbae` block also records, as Decimal strings, the exact values its `max_funding` is computed from: `reference_price` (the proposal price, which is the intent's `reference_price`), `contract_multiplier` (`contract_multiplier_of(asset)`), `slippage_pct` (`slippage_limit_for(asset_class)`) and `fee_pct` (the buy-side fee rate, `buy_fee_pct`).
+    - **One formula.** `funding_for(quantity, reference_price, contract_multiplier, slippage_pct, fee_pct)` in `dbae/funding.py` is the §7.2 expression. `max_funding()` and the gateway price a new buy with it; `pending_buy_funding` recomputes the frozen record with it.
+    - **Validation** (`_frozen_max_funding`). The frozen `max_funding` is used only when:
+      - `max_funding`, `reference_price`, `contract_multiplier` and `slippage_pct` are each present, finite and positive, and `fee_pct` is present, finite and zero or positive;
+      - the frozen `reference_price` equals the intent's `reference_price`, and the frozen `contract_multiplier` equals `contract_multiplier_of(intent.asset)`;
+      - `funding_for(dbae.submitted_quantity, …frozen inputs)` equals `max_funding` exactly. The tolerance is zero: the same Decimal expression on the same inputs, which `str(Decimal)` round-trips losslessly, gives the same Decimal.
+
+      Anything else is `unpriced` (`DBAE_FUNDING_UNVERIFIED`). No fixed ratio bounds the record. `MAX_FROZEN_FUNDING_RATE` is deleted.
+    - **Unchanged.** The reservation per unattributed unit is still the larger of the frozen funding and the current profile's; verified fills and confirmed terminal states reduce it, attribution is exact-once, `SUBMISSION_UNKNOWN` keeps its full frozen commitment, and a buy with no `dbae` block, or a block without the new fields, is unpriced. The branch is unmerged, so no production record lacks the new fields. The `test_execution_gateway.py` fixture was given the fields it would have had.
+    - **A zero `slippage_pct` is unpriced**, as the operator specified (only `fee_pct` may be zero). Every built-in profile's slippage is positive; a custom profile with zero slippage would refuse entries while one of its buys is pending (fail closed).
+    - **Tests.**
+      - `test_dbae_funding.py`: `test_exactly_reconciled_record_is_priced`, `test_block_without_frozen_rates_is_unpriced`, `test_missing_frozen_field_is_unpriced`, `test_non_finite_frozen_field_is_unpriced`, `test_non_positive_frozen_field_is_unpriced` (each × the five fields), `test_recompute_mismatch_is_unpriced` (`max_funding`, `slippage_pct`, `fee_pct` ± 0.01), `test_recompute_mismatch_by_one_millionth_is_unpriced`, `test_reference_price_mismatch_is_unpriced` and `test_contract_multiplier_mismatch_is_unpriced` (each self-consistent, so only the cross-check refuses it), `test_option_with_options_slippage_reconciles`, `test_crypto_with_fee_reconciles`, `test_legitimately_large_ratio_is_priced` (an option with multiplier 100, and a custom 150% slippage the old bound rejected).
+      - `test_dbae_gateway.py`: `test_approval_freezes_the_funding_inputs` (equity, crypto, option).
+33. **M1, an unexpected precondition error closes the intent** (`31c1d32a`).
+    - **Defect.** If the in-transaction precondition raised anything but its refusal (for example the policy re-run on stale asset evidence, or the clock), the transaction rolled back but the exception escaped `execute_intent`, leaving the intent in its pre-approval status.
+    - **Fix.** `_evidence_still_fresh` catches an error while judging, logs it with the intent id (`logger.exception`), and returns `DBAE_ACCOUNT_STATE_UNVERIFIED`: freshness at commit is unverified. The write raises `RepositoryPreconditionError` and rolls back, so nothing is written on the approval path, and the gateway closes the intent `REJECTED` with `dbae_entry_refused`, as for stale evidence. No new reason string.
+    - **Test.** `test_dbae_gateway.py`: `test_unexpected_precondition_error_closes_the_intent_unsubmitted` (no `RISK_APPROVED`, no `dbae` block, P = 0, no orders, `REJECTED` with the reason, the refusal event, and the logged error).
 
 ### Known behaviour to note
 
@@ -310,6 +332,17 @@ The same worktree and `.venv`. Dependency pins: `exchange_calendars` 4.13.2 is i
 | `.venv/bin/mypy` | `Success: no issues found in 133 source files` |
 | `.venv/bin/ruff check` | `Found 1750 errors.`: equal to the last G3 and to the baseline, so no new findings (`1ada81f4` itself has 1763) |
 | `.venv/bin/ruff check $(git diff --name-only 1ada81f4..HEAD -- '*.py')` | `Found 537 errors.` across the 50 files the branch changed. That is 15 fewer than those files had at `1ada81f4`. The branch introduced only 2, both in task 1's `test_dbae_ladder_retired.py:29-30` (`PLR0402`); the Rev.146 round introduced none. |
+
+### G3: passed at the Rev.146 re-review fix head (`31c1d32a`, 2026-11-01)
+
+The same worktree and `.venv`; no dependency changed. The record commit that follows changes only this file.
+
+| Check | Summary line |
+|---|---|
+| `.venv/bin/python -m pytest -o addopts="" -q -p no:cacheprovider` | `2209 passed, 10 deselected in 787.17s (0:13:07)` (62 more than the last G3: the I1 reconciliation tests, the gateway freeze test and the M1 regression, less the two removed bound tests) |
+| `.venv/bin/mypy` | `Success: no issues found in 133 source files` |
+| `.venv/bin/ruff check` | `Found 1750 errors.`: equal to the baseline |
+| `.venv/bin/ruff check $(git diff --name-only 1ada81f4..HEAD -- '*.py')` | `Found 537 errors.` across the same 50 files: equal to the last G3, so this round introduced none |
 
 ## Before live
 
