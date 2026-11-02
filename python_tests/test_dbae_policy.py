@@ -465,7 +465,9 @@ def test_scale_out_feasible() -> None:
     one = Decimal(1)
     price = Decimal(2)
     assert scale_out_feasible(_equity_caps(), AssetClass.EQUITY, one, Decimal("0.5"), Decimal("0.5"), price)
-    assert scale_out_feasible(None, AssetClass.EQUITY, one, Decimal("0.5"), Decimal("0.5"), price)
+    # Unknown evidence (None) is whole only (final review I3).
+    assert not scale_out_feasible(None, AssetClass.EQUITY, one, Decimal("0.5"), Decimal("0.5"), price)
+    assert scale_out_feasible(None, AssetClass.EQUITY, one, one, one, price)
     assert not scale_out_feasible(_equity_caps(), AssetClass.EQUITY, one, Decimal("0.495"), Decimal(5), price)
     assert not scale_out_feasible(_equity_caps(), AssetClass.EQUITY, one, Decimal(5), Decimal("0.495"), price)
 

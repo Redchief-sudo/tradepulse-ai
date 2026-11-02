@@ -13,6 +13,7 @@ from test_dbae_gateway import NOW, _held
 from tradepulse.broker.capabilities import AssetTradingCapabilities
 from tradepulse.broker.simulated import Fault
 from tradepulse.config import risk_limits_for_profile
+from tradepulse.dbae.policy import scale_out_feasible
 from tradepulse.execution import ExecutionGateway
 from tradepulse.models import AssetClass, AssetIdentity, Holding, TradeIntentStatus, asset_identity_key
 from tradepulse.monitor import run_position_monitor
@@ -41,7 +42,8 @@ def test_scale_out_skipped_when_part_too_small() -> None:
     """Both parts clear the $1 min lot but not the asset's own minimum (2 x $3 = $6)."""
     holding = _holding(AAPL, "3.9")
     price = Decimal(3)
-    assert _scale_out_quantity(holding, Decimal("3.9"), price, LIMITS, None) == Decimal("1.95")  # $1 rule only
+    assert _scale_out_quantity(holding, Decimal("3.9"), price, LIMITS, _caps()) == Decimal("1.95")  # $1 rule only
+    assert _scale_out_quantity(holding, Decimal("3.9"), price, LIMITS, None) is None  # unknown: whole only, 2.9 left
     assert _scale_out_quantity(holding, Decimal("3.9"), price, LIMITS, _caps(Decimal(2))) is None
     assert _scale_out_quantity(holding, Decimal(4), price, LIMITS, _caps(Decimal(2))) == Decimal(2)
 
@@ -53,6 +55,22 @@ def test_crypto_scale_out_off_increment_skipped() -> None:
     assert _scale_out_quantity(holding, Decimal("0.0105"), price, LIMITS, caps) is None  # part 0.00525
     assert _scale_out_quantity(_holding(BTC, "0.01"), Decimal("0.01"), price, LIMITS, caps) == Decimal("0.005")
     assert _scale_out_quantity(_holding(BTC, "0.01"), Decimal("0.01"), price, LIMITS, None) is None  # unknown: skipped
+
+
+def test_whole_only_equity_scale_out_is_whole_or_skipped() -> None:
+    """Final review I3: a whole-only stock is never split into a fractional
+    sell. 3 shares split 1 + 2, not 1.5 + 1.5; a split that cannot be whole
+    is skipped. Unknown evidence is whole-only too."""
+    whole_only = AssetTradingCapabilities(True, True, False, None, None, None, NOW)
+    price = Decimal(100)
+    for caps in (whole_only, None):
+        assert _scale_out_quantity(_holding(AAPL, "3"), Decimal(3), price, LIMITS, caps) == Decimal(1)
+        assert _scale_out_quantity(_holding(AAPL, "4"), Decimal(4), price, LIMITS, caps) == Decimal(2)
+        assert _scale_out_quantity(_holding(AAPL, "1"), Decimal(1), price, LIMITS, caps) is None  # part floors to 0
+        assert _scale_out_quantity(_holding(AAPL, "2.5"), Decimal("2.5"), price, LIMITS, caps) is None  # 1 + 1.5
+    assert _scale_out_quantity(_holding(AAPL, "3"), Decimal(3), price, LIMITS, _caps()) == Decimal("1.5")
+    assert not scale_out_feasible(whole_only, AssetClass.EQUITY, Decimal(1), Decimal("1.5"), Decimal("1.5"), price)
+    assert scale_out_feasible(whole_only, AssetClass.EQUITY, Decimal(1), Decimal(1), Decimal(2), price)
 
 
 # --- helpers for the monitor rig -----------------------------------------------------------------------

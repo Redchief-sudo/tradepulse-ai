@@ -19,14 +19,14 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from typing import Any, Literal
 from uuid import uuid4
 
 from tradepulse.alerts import TelegramAlerter, alert_once
 from tradepulse.broker import AlpacaPosition, BrokerPort
 from tradepulse.broker.capabilities import AssetCapabilities, AssetTradingCapabilities, evidence_fresh
-from tradepulse.dbae.policy import scale_out_feasible
+from tradepulse.dbae.policy import scale_out_feasible, whole_units_only
 from tradepulse.execution import (
     SYMBOL_LOCK_TTL_SECONDS,
     ExecutionGateway,
@@ -255,12 +255,16 @@ def _scale_out_quantity(holding: Holding, position_qty: Decimal, price: Decimal,
     """The partial-exit quantity, or None when the position cannot be split:
     a single option contract, either part below the order precision or the
     minimum lot notional, or (spec §8.4) a part that is not feasible for the
-    asset's own minimum and increment. ``asset_caps`` None is unknown
-    evidence: equities fall back to the $1 rule, crypto is not split."""
+    asset's own minimum and increment. An asset not verified fractionable
+    (``asset_caps`` None is unknown evidence) is split in whole units only:
+    the part is floored to whole shares, and both parts must be whole.
+    Unknown crypto evidence is not split."""
     from tradepulse.risk.engine import round_quantity
 
     asset_class = holding.asset.asset_class
     part = round_quantity(position_qty * risk_limits.scale_out_fraction, asset_class)
+    if whole_units_only(asset_caps, asset_class):
+        part = part.to_integral_value(rounding=ROUND_FLOOR)
     rest = position_qty - part
     notional_per_unit = price * contract_multiplier_of(holding.asset)
     if part <= 0 or rest <= 0:

@@ -276,6 +276,15 @@ def exit_feasible(
     return "DBAE_SUB_MINIMUM_LIQUIDATION_UNVERIFIED"
 
 
+def whole_units_only(asset: AssetTradingCapabilities | None, asset_class: AssetClass) -> bool:
+    """Spec §8.3, §8.4: an equity or option trades in whole units unless the
+    asset is verified fractionable. Unknown evidence (``None``) never grants
+    fractions. Crypto follows its own increment instead."""
+    if asset_class is AssetClass.CRYPTO:
+        return False
+    return asset is None or asset.fractionable is not True
+
+
 def scale_out_feasible(
     asset: AssetTradingCapabilities | None,
     asset_class: AssetClass,
@@ -284,8 +293,11 @@ def scale_out_feasible(
     rest: Decimal,
     price: Decimal,
 ) -> bool:
-    """Spec §8.4: both parts at least the asset minimum, and on the increment for crypto."""
+    """Spec §8.4: both parts at least the asset minimum, on the increment for
+    crypto, and whole for an asset that is not verified fractionable."""
     if part <= 0 or rest <= 0:
+        return False
+    if whole_units_only(asset, asset_class) and not (_is_whole(part) and _is_whole(rest)):
         return False
     if asset_class is AssetClass.CRYPTO:
         if asset is None:
