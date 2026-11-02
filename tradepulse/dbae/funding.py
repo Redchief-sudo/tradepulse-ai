@@ -31,7 +31,8 @@ class PendingFunding:
     unpriced: ids that cannot be priced: an unparsable
     dbae.submitted_quantity (flagged even when fully attributed), or an
     unattributed remainder with no reference_price, no dbae block, or a
-    missing or inconsistent dbae.max_funding (DBAE-146-01). They add
+    dbae.max_funding that does not reconcile exactly with the block's
+    frozen inputs (DBAE-146-01). They add
     nothing to total, so the caller must refuse entries while any exist."""
 
     total: Decimal
@@ -39,21 +40,37 @@ class PendingFunding:
     unpriced: tuple[str, ...]
 
 
+def buy_fee_pct(asset_class: AssetClass) -> Decimal:
+    """The buy-side fee rate (%): crypto's taker fee, zero for equities and
+    options (no commission; regulatory fees are sell-side)."""
+    return FEE_PCT_PER_SIDE.get(asset_class, Decimal(0))
+
+
 def projected_buy_fee(asset_class: AssetClass, notional: Decimal) -> Decimal:
-    """The estimated buy-side fee on ``notional``: crypto's taker fee, zero
-    for equities and options (no commission; regulatory fees are sell-side)."""
-    return notional * FEE_PCT_PER_SIDE.get(asset_class, Decimal(0)) / 100
+    """The estimated buy-side fee on ``notional`` at buy_fee_pct."""
+    return notional * buy_fee_pct(asset_class) / 100
+
+
+def funding_for(quantity: Decimal, reference_price: Decimal, contract_multiplier: Decimal, slippage_pct: Decimal,
+                fee_pct: Decimal) -> Decimal:
+    """§7.2, the one formula: order notional × (1 + slippage_pct / 100) +
+    order notional × fee_pct / 100, where the order notional is quantity ×
+    reference_price × contract_multiplier. The fee is projected on the
+    order notional, not on the slippage-buffered figure.
+
+    max_funding prices a new buy with it; pending_buy_funding recomputes a
+    frozen record with it from the record's own inputs (DBAE-146-01). The
+    same Decimal expression on the same inputs gives the same Decimal."""
+    notional = quantity * reference_price * contract_multiplier
+    return notional * (1 + slippage_pct / 100) + notional * fee_pct / 100
 
 
 def max_funding(submitted_qty: Decimal, reference_price: Decimal, asset: AssetIdentity, slippage_pct: Decimal) -> Decimal:
-    """§7.2: order notional × (1 + slippage_pct / 100) + projected fee.
-
-    The order notional is submitted_qty × reference_price ×
-    contract_multiplier_of(asset). The fee is projected on that order
-    notional, not on the slippage-buffered figure. An option without a
-    contract multiplier raises ValueError."""
-    notional = submitted_qty * reference_price * contract_multiplier_of(asset)
-    return notional * (1 + slippage_pct / 100) + projected_buy_fee(asset.asset_class, notional)
+    """§7.2: funding_for at contract_multiplier_of(asset) and the asset
+    class's buy-side fee rate. An option without a contract multiplier
+    raises ValueError."""
+    return funding_for(submitted_qty, reference_price, contract_multiplier_of(asset), slippage_pct,
+                       buy_fee_pct(asset.asset_class))
 
 
 def fundable_notional(available: Decimal, asset_class: AssetClass, slippage_pct: Decimal) -> Decimal:
@@ -67,18 +84,13 @@ def fundable_notional(available: Decimal, asset_class: AssetClass, slippage_pct:
     against funding_available alone could approve a buy whose reservation
     exceeds the funding available (found by the Task 10 property test).
     A result at or below zero stays at or below zero (INSUFFICIENT_CASH)."""
-    rate = 1 + slippage_pct / 100 + FEE_PCT_PER_SIDE.get(asset_class, Decimal(0)) / 100
+    rate = 1 + slippage_pct / 100 + buy_fee_pct(asset_class) / 100
     return available / rate
 
 
-# A frozen max_funding above this multiple of its order notional is not a
-# slippage allowance plus a fee but a corrupt record (DBAE-146-01). Every
-# profile allows at most 1.75% slippage and the largest buy-side fee is 0.25%.
-MAX_FROZEN_FUNDING_RATE = Decimal(2)
-
-
-def _positive_field(block: Mapping[str, object], key: str) -> Decimal | None:
-    """block[key] as a finite positive Decimal, or None when it holds no such value."""
+def _frozen_decimal(block: Mapping[str, object], key: str, *, allow_zero: bool = False) -> Decimal | None:
+    """block[key] as a finite Decimal above zero (or at zero, with
+    ``allow_zero``), or None when it holds no such value."""
     raw = block.get(key)
     if raw is None or isinstance(raw, bool):
         return None
@@ -86,7 +98,7 @@ def _positive_field(block: Mapping[str, object], key: str) -> Decimal | None:
         value = Decimal(str(raw))
     except InvalidOperation:
         return None
-    if not value.is_finite() or value <= 0:
+    if not value.is_finite() or value < 0 or (value == 0 and not allow_zero):
         return None
     return value
 
@@ -98,21 +110,28 @@ def _dbae_block(intent: TradeIntent) -> Mapping[str, object] | None:
 
 def _frozen_max_funding(block: Mapping[str, object], submitted_qty: Decimal, intent: TradeIntent) -> Decimal | None:
     """DBAE-146-01: dbae.max_funding, the funding committed at RISK_APPROVED
-    for dbae.submitted_quantity. None when max_funding is
-    missing, not a finite positive number, or inconsistent with
-    submitted_quantity × reference_price × contract multiplier: below the
-    order notional plus its buy-side fee (a negative slippage), or above
-    MAX_FROZEN_FUNDING_RATE times it. The bounds are compared without
-    division, so they are exact. An option without a contract multiplier
-    raises ValueError, as max_funding does."""
-    frozen = _positive_field(block, "max_funding")
-    price = intent.reference_price
-    if frozen is None or price is None or not price.is_finite() or price <= 0:
+    for dbae.submitted_quantity, when the record proves it.
+
+    The block freezes the inputs max_funding was computed from:
+    reference_price, contract_multiplier, slippage_pct and fee_pct. The
+    record is accepted only when every one of them and max_funding is a
+    finite positive Decimal (fee_pct may be zero), the frozen
+    reference_price is the intent's, the frozen contract_multiplier is
+    contract_multiplier_of(intent.asset), and funding_for recomputes
+    max_funding from them exactly (zero tolerance). Otherwise None: the buy
+    is unpriced (DBAE_FUNDING_UNVERIFIED). No fixed ratio bounds the
+    record. An option without a contract multiplier raises ValueError, as
+    max_funding does."""
+    frozen = _frozen_decimal(block, "max_funding")
+    price = _frozen_decimal(block, "reference_price")
+    multiplier = _frozen_decimal(block, "contract_multiplier")
+    slippage = _frozen_decimal(block, "slippage_pct")
+    fee = _frozen_decimal(block, "fee_pct", allow_zero=True)
+    if frozen is None or price is None or multiplier is None or slippage is None or fee is None:
         return None
-    notional = submitted_qty * price * contract_multiplier_of(intent.asset)
-    if frozen < notional + projected_buy_fee(intent.asset.asset_class, notional):
+    if price != intent.reference_price or multiplier != contract_multiplier_of(intent.asset):
         return None
-    if frozen > notional * MAX_FROZEN_FUNDING_RATE:
+    if funding_for(submitted_qty, price, multiplier, slippage, fee) != frozen:
         return None
     return frozen
 
@@ -137,8 +156,8 @@ async def pending_buy_funding(repositories: PersistenceRepositories, limits: Ris
     reserve funding.
 
     A buy with an unattributed remainder is unpriced when it has no dbae
-    block (pre-DBAE: no frozen parameters), an unusable dbae block, or no
-    reference_price."""
+    block (pre-DBAE: no frozen parameters), a dbae block that does not
+    reconcile (_frozen_max_funding), or no reference_price."""
     total = Decimal(0)
     mismatches: list[str] = []
     unpriced: list[str] = []
@@ -151,7 +170,7 @@ async def pending_buy_funding(repositories: PersistenceRepositories, limits: Ris
         field_qty = intent.requested_quantity
         attributed_qty = field_qty - remainder.remaining_qty
         block = _dbae_block(intent)
-        recorded = None if block is None else _positive_field(block, "submitted_quantity")
+        recorded = None if block is None else _frozen_decimal(block, "submitted_quantity")
         if recorded is None and "dbae" in intent.risk_snapshot:
             # A dbae block without a usable submitted quantity: the amount
             # committed is unknown, so it cannot be priced.

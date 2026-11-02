@@ -58,9 +58,10 @@ from tradepulse.dbae.baseline import (
 )
 from tradepulse.dbae.funding import (
     PendingFunding,
+    buy_fee_pct,
     fundable_notional,
     funding_available,
-    max_funding,
+    funding_for,
     pending_buy_funding,
 )
 from tradepulse.dbae.policy import (
@@ -492,8 +493,13 @@ class ExecutionGateway:
         account = entry.account
         power_name, power = (("non_marginable_buying_power", account.non_marginable_buying_power)
                              if asset_class == AssetClass.CRYPTO else ("buying_power", account.buying_power))
-        committed = max_funding(shaped.quantity, entry.proposal.price, request.asset,
-                                self._risk_limits.slippage_limit_for(asset_class))
+        # DBAE-146-01: max_funding is frozen with every input it is computed
+        # from, so pending_buy_funding can recompute it exactly from the record.
+        reference_price = entry.proposal.price
+        multiplier = contract_multiplier_of(request.asset)
+        slippage_pct = self._risk_limits.slippage_limit_for(asset_class)
+        fee_pct = buy_fee_pct(asset_class)
+        committed = funding_for(shaped.quantity, reference_price, multiplier, slippage_pct, fee_pct)
         session_date = entry.baseline.session_date.isoformat()
         record: dict[str, DbaeSnapshotValue] = {
             "original_requested_quantity": str(request.requested_quantity),
@@ -507,6 +513,10 @@ class ExecutionGateway:
             "funding_available": str(entry.funding_available),
             "pending_buy_funding": str(entry.pending.total),
             "max_funding": str(committed),
+            "reference_price": str(reference_price),
+            "contract_multiplier": str(multiplier),
+            "slippage_pct": str(slippage_pct),
+            "fee_pct": str(fee_pct),
             "broker_funding_figures": [f"cash={account.cash}", f"{power_name}={power}",
                                        f"received_at={account.received_at.isoformat()}"],
             "shaping_rule": shaped.rule,

@@ -29,6 +29,7 @@ from tradepulse.models import (
     TradeIntent,
     TradeIntentStatus,
     asset_identity_key,
+    contract_multiplier_of,
 )
 from tradepulse.persistence import PersistenceRepositories
 from tradepulse.risk.engine import (
@@ -76,9 +77,15 @@ def _dbae_block(submitted: str, max_funding_value: Decimal | str | None = None) 
 def _approved_block(submitted: str, price: str, asset: AssetIdentity = EQUITY,
                     slippage: Decimal | None = None) -> dict[str, Any]:
     """The dbae block the gateway freezes at RISK_APPROVED: max_funding on
-    the submitted quantity at the approving profile's slippage."""
+    the submitted quantity at the approving profile's slippage, with the
+    inputs it was computed from (DBAE-146-01, I1)."""
     slip = LIMITS.slippage_limit_for(asset.asset_class) if slippage is None else slippage
-    return _dbae_block(submitted, max_funding(Decimal(submitted), Decimal(price), asset, slip))
+    snapshot = _dbae_block(submitted, max_funding(Decimal(submitted), Decimal(price), asset, slip))
+    snapshot["dbae"].update({
+        "reference_price": price, "contract_multiplier": str(contract_multiplier_of(asset)),
+        "slippage_pct": str(slip), "fee_pct": str(FEE_PCT_PER_SIDE.get(asset.asset_class, Decimal(0))),
+    })
+    return snapshot
 
 
 async def _seed_buy(
@@ -400,15 +407,16 @@ async def test_submission_unknown_keeps_full_frozen_commitment(tmp_path) -> None
 
 @pytest.mark.parametrize("frozen", [
     None, "abc", "NaN", "Infinity", "-Infinity", "0", "-1", True, "",
-    "9.99",  # below the order notional: an impossible negative slippage
-    "20.01",  # above twice the order notional: an absurd rate
+    "9.99",  # below the recomputed max_funding
+    "20.01",  # far above it
 ])
 async def test_invalid_frozen_max_funding_is_unpriced(tmp_path, frozen: object) -> None:
     """A dbae block whose max_funding is missing, unparsable, non-finite,
-    non-positive or inconsistent with submitted_quantity × reference_price
-    cannot be reconstructed: the buy is unpriced (DBAE_FUNDING_UNVERIFIED)."""
+    non-positive or not the recomputation of its frozen inputs cannot be
+    reconstructed: the buy is unpriced (DBAE_FUNDING_UNVERIFIED)."""
     repositories = await _repositories(tmp_path)
-    block = _dbae_block("10")
+    block = _approved_block("10", "1")
+    del block["dbae"]["max_funding"]
     if frozen is not None:
         block["dbae"]["max_funding"] = frozen
     await _seed_buy(repositories, "ti-bad", quantity="10", price="1", risk_snapshot=block)
@@ -420,27 +428,144 @@ async def test_invalid_frozen_max_funding_is_unpriced(tmp_path, frozen: object) 
     assert pending.total == _reserve(Decimal(1), Decimal(2), EQ_SLIP)
 
 
-@pytest.mark.parametrize(("frozen", "asset"), [
-    ("10", EQUITY),  # zero slippage, no fee: the order notional itself
-    ("20", EQUITY),  # the upper bound, twice the notional
-    ("10.025", CRYPTO),  # zero slippage plus crypto's 0.25% fee
-])
-async def test_frozen_max_funding_bounds_are_inclusive(tmp_path, frozen: str, asset: AssetIdentity) -> None:
+# --- DBAE-146-01 (I1): the frozen record reconciles exactly --------------------
+#
+# The block freezes max_funding with every input it was computed from. It is
+# priced only when the recomputation from those inputs equals max_funding
+# exactly and the price and multiplier are the intent's own.
+
+FROZEN_RATE_FIELDS = ("max_funding", "reference_price", "contract_multiplier", "slippage_pct", "fee_pct")
+
+
+async def _priced_alone(tmp_path, block: dict[str, Any], *, asset: AssetIdentity = EQUITY, quantity: str = "10",
+                        price: str = "1", limits: Any = LIMITS) -> PendingFunding:
     repositories = await _repositories(tmp_path)
-    await _seed_buy(repositories, "ti-b", quantity="10", price="1", asset=asset,
-                    risk_snapshot=_dbae_block("10", frozen))
-
-    pending = await pending_buy_funding(repositories, replace(LIMITS, slippage_limit_pct=Decimal(0)))
-
-    assert pending == PendingFunding(Decimal(frozen), (), ())
+    await _seed_buy(repositories, "ti-r", quantity=quantity, price=price, asset=asset, risk_snapshot=block)
+    return await pending_buy_funding(repositories, limits)
 
 
-async def test_crypto_frozen_below_notional_plus_fee_is_unpriced(tmp_path) -> None:
-    repositories = await _repositories(tmp_path)
-    await _seed_buy(repositories, "ti-c", quantity="10", price="1", asset=CRYPTO,
-                    risk_snapshot=_dbae_block("10", "10.02"))
+async def test_exactly_reconciled_record_is_priced(tmp_path) -> None:
+    block = _approved_block("10", "3.37", slippage=FROZEN_SLIP)
 
-    assert (await pending_buy_funding(repositories, LIMITS)).unpriced == ("ti-c",)
+    pending = await _priced_alone(tmp_path, block, price="3.37", limits=LOWER)
+
+    assert pending == PendingFunding(Decimal(block["dbae"]["max_funding"]), (), ())
+    assert pending.total == _reserve(Decimal(10), Decimal("3.37"), FROZEN_SLIP)
+
+
+async def test_block_without_frozen_rates_is_unpriced(tmp_path) -> None:
+    """A dbae block from before I1 (submitted_quantity and max_funding only)
+    cannot be reconciled: unpriced, like a pre-DBAE buy."""
+    legacy = _dbae_block("10", max_funding(Decimal(10), Decimal(1), EQUITY, EQ_SLIP))
+
+    assert (await _priced_alone(tmp_path, legacy)).unpriced == ("ti-r",)
+
+
+@pytest.mark.parametrize("field", FROZEN_RATE_FIELDS)
+async def test_missing_frozen_field_is_unpriced(tmp_path, field: str) -> None:
+    block = _approved_block("10", "1")
+    del block["dbae"][field]
+
+    assert (await _priced_alone(tmp_path, block)) == PendingFunding(Decimal(0), (), ("ti-r",))
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "sNaN", "abc", "", True])
+@pytest.mark.parametrize("field", FROZEN_RATE_FIELDS)
+async def test_non_finite_frozen_field_is_unpriced(tmp_path, field: str, value: object) -> None:
+    block = _approved_block("10", "1")
+    block["dbae"][field] = value
+
+    assert (await _priced_alone(tmp_path, block)) == PendingFunding(Decimal(0), (), ("ti-r",))
+
+
+@pytest.mark.parametrize("field", FROZEN_RATE_FIELDS)
+async def test_non_positive_frozen_field_is_unpriced(tmp_path, field: str) -> None:
+    """Zero and negative values are unpriced, except a zero fee_pct, which
+    is the equity and option buy-side fee (test_exactly_reconciled_record_is_priced)."""
+    for value in (["-1", "-0.01"] if field == "fee_pct" else ["0", "-1", "-0.01"]):
+        block = _approved_block("10", "1", CRYPTO)
+        block["dbae"][field] = value
+        assert (await _priced_alone(tmp_path / value, block, asset=CRYPTO)) == PendingFunding(
+            Decimal(0), (), ("ti-r",)), value
+
+
+@pytest.mark.parametrize("delta", [Decimal("0.01"), Decimal("-0.01")])
+@pytest.mark.parametrize("field", ["max_funding", "slippage_pct", "fee_pct"])
+async def test_recompute_mismatch_is_unpriced(tmp_path, field: str, delta: Decimal) -> None:
+    """Zero tolerance: max_funding, or a rate it was computed from, moved by
+    0.01 no longer reconciles. Crypto, so the fee term is non-zero."""
+    block = _approved_block("10", "1", CRYPTO)
+    block["dbae"][field] = str(Decimal(block["dbae"][field]) + delta)
+
+    assert (await _priced_alone(tmp_path, block, asset=CRYPTO)) == PendingFunding(Decimal(0), (), ("ti-r",))
+
+
+async def test_recompute_mismatch_by_one_millionth_is_unpriced(tmp_path) -> None:
+    block = _approved_block("10", "1")
+    block["dbae"]["max_funding"] = str(Decimal(block["dbae"]["max_funding"]) + Decimal("0.000001"))
+
+    assert (await _priced_alone(tmp_path, block)).unpriced == ("ti-r",)
+
+
+@pytest.mark.parametrize("delta", [Decimal("0.01"), Decimal("-0.01")])
+async def test_reference_price_mismatch_is_unpriced(tmp_path, delta: Decimal) -> None:
+    """A frozen reference_price that is not the intent's, with a max_funding
+    recomputed consistently from it: the record reconciles with itself but
+    not with the intent, so it is unpriced."""
+    block = _approved_block("10", str(Decimal(1) + delta))
+
+    assert (await _priced_alone(tmp_path, block, price="1")) == PendingFunding(Decimal(0), (), ("ti-r",))
+
+
+@pytest.mark.parametrize("frozen_asset", [OPTION_10, EQUITY], ids=["multiplier_10", "multiplier_1"])
+async def test_contract_multiplier_mismatch_is_unpriced(tmp_path, frozen_asset: AssetIdentity) -> None:
+    """A 100-multiplier option whose block was frozen, self-consistently, at
+    another multiplier: unpriced."""
+    block = _approved_block("2", "1.5", OPTION_100)
+    consistent = _approved_block("2", "1.5", frozen_asset, slippage=Decimal(block["dbae"]["slippage_pct"]))
+    block["dbae"].update({key: consistent["dbae"][key] for key in ("contract_multiplier", "max_funding")})
+
+    assert (await _priced_alone(tmp_path, block, asset=OPTION_100, quantity="2", price="1.5")) == PendingFunding(
+        Decimal(0), (), ("ti-r",))
+
+
+async def test_option_with_options_slippage_reconciles(tmp_path) -> None:
+    """An option, multiplier 100, frozen at the options slippage allowance."""
+    options_slip = LIMITS.slippage_limit_for(AssetClass.OPTION)
+    assert options_slip != EQ_SLIP
+    block = _approved_block("2", "1.5", OPTION_100)
+
+    pending = await _priced_alone(tmp_path, block, asset=OPTION_100, quantity="2", price="1.5")
+
+    assert block["dbae"]["slippage_pct"] == str(options_slip)
+    assert pending == PendingFunding(_reserve(Decimal(2), Decimal("1.5"), options_slip, cm=Decimal(100)), (), ())
+
+
+async def test_crypto_with_fee_reconciles(tmp_path) -> None:
+    block = _approved_block("0.37", "61234.57", CRYPTO)
+
+    pending = await _priced_alone(tmp_path, block, asset=CRYPTO, quantity="0.37", price="61234.57")
+
+    assert block["dbae"]["fee_pct"] == "0.25"
+    assert pending == PendingFunding(
+        _reserve(Decimal("0.37"), Decimal("61234.57"), CRYPTO_SLIP, Decimal("0.25")), (), ())
+
+
+@pytest.mark.parametrize(("asset", "slippage"), [
+    (OPTION_100, None),  # 101.25× quantity × price
+    (EQUITY, Decimal(150)),  # a custom profile's 150% slippage: 2.5× the notional
+], ids=["option_multiplier_100", "custom_slippage_150"])
+async def test_legitimately_large_ratio_is_priced(tmp_path, asset: AssetIdentity, slippage: Decimal | None) -> None:
+    """No fixed ratio bounds the record: a large max_funding that reconciles
+    exactly with its frozen inputs is priced (the old 2× cutoff rejected the
+    custom-slippage record outright)."""
+    block = _approved_block("3", "4", asset, slippage=slippage)
+    limits = LIMITS if slippage is None else replace(LIMITS, slippage_limit_pct=slippage)
+
+    pending = await _priced_alone(tmp_path, block, asset=asset, quantity="3", price="4", limits=limits)
+
+    assert pending == PendingFunding(Decimal(block["dbae"]["max_funding"]), (), ())
+    assert pending.total > 2 * Decimal(3) * Decimal(4)
 
 
 @pytest.mark.parametrize("risk_snapshot", [

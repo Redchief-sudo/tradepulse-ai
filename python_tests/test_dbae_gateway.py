@@ -50,6 +50,7 @@ from tradepulse.models import (
     TradeIntent,
     TradeIntentStatus,
     TradingSession,
+    contract_multiplier_of,
 )
 from tradepulse.persistence import (
     AsyncSQLiteDatabase,
@@ -499,6 +500,32 @@ async def test_request_20_approved_3_50_reserves_order_only(tmp_path: Path) -> N
     assert await rig.pending() < request * 7
 
 
+@pytest.mark.parametrize("kind", ["fractionable", "crypto", "option"])
+async def test_approval_freezes_the_funding_inputs(tmp_path: Path, kind: str) -> None:
+    """DBAE-146-01 (I1): the dbae block freezes reference_price,
+    contract_multiplier, slippage_pct and fee_pct, the exact inputs of its
+    max_funding, so the pending buy reconciles and is priced at it."""
+    rig = await _rig(tmp_path)
+    _hold_orders_open(rig)
+    asset, price = _CASE_ASSET[kind], _CASE_PRICE[kind]
+    rig.quote(asset, price)
+
+    result = await rig.gateway.execute_intent(_buy(asset, Decimal(1), price * (1 - rig.limits.stop_loss_pct / 100)))
+
+    assert result.status == "pending", result.reasons
+    [intent] = await rig.intents()
+    dbae = _dbae(intent)
+    slippage = rig.limits.slippage_limit_for(asset.asset_class)
+    fee = Decimal("0.25") if kind == "crypto" else Decimal(0)
+    assert dbae["reference_price"] == str(intent.reference_price)
+    assert Decimal(dbae["contract_multiplier"]) == contract_multiplier_of(asset)
+    assert (dbae["slippage_pct"], Decimal(dbae["fee_pct"])) == (str(slippage), fee)
+    submitted = Decimal(dbae["submitted_quantity"])
+    assert Decimal(dbae["max_funding"]) == max_funding(submitted, price, asset, slippage)
+    pending = await pending_buy_funding(rig.repositories, rig.limits)
+    assert (pending.total, pending.unpriced) == (Decimal(dbae["max_funding"]), ())
+
+
 async def test_quantity_identity_survives_restart(tmp_path: Path) -> None:
     """Request 10; micro at $7,300 risks 1% = $73 over a $10 unit risk:
     risk-approved 7.3, shaped and submitted 7 whole shares."""
@@ -902,7 +929,9 @@ async def test_identity_mismatch_alerts_once_and_refuses_new_entries(tmp_path: P
     delivered = alerts.delivered
     bad = TradeIntent("bad-intent", "idem-bad", "corr-bad", FRAY, Side.BUY, ExecutionMode.PAPER, "test", NOW,
                       requested_quantity=Decimal(7), reference_price=Decimal(100), status=TradeIntentStatus.ACCEPTED,
-                      broker_order_id="order-bad", risk_snapshot={"dbae": {"submitted_quantity": "5", "max_funding": "505"}})
+                      broker_order_id="order-bad", risk_snapshot={"dbae": {
+                          "submitted_quantity": "5", "max_funding": "505", "reference_price": "100",
+                          "contract_multiplier": "1", "slippage_pct": "1", "fee_pct": "0"}})
     await rig.repositories.trade_intents.create_once("bad-intent", bad, status=bad.status.value, unique_value="idem-bad")
     rig.quote(FRAC, Decimal(100))
 
@@ -1027,7 +1056,9 @@ async def test_identity_mismatch_alert_store_failure_still_refuses(tmp_path: Pat
     rig = await _rig(tmp_path)
     bad = TradeIntent("bad-intent", "idem-bad", "corr-bad", FRAY, Side.BUY, ExecutionMode.PAPER, "test", NOW,
                       requested_quantity=Decimal(7), reference_price=Decimal(100), status=TradeIntentStatus.ACCEPTED,
-                      broker_order_id="order-bad", risk_snapshot={"dbae": {"submitted_quantity": "5", "max_funding": "505"}})
+                      broker_order_id="order-bad", risk_snapshot={"dbae": {
+                          "submitted_quantity": "5", "max_funding": "505", "reference_price": "100",
+                          "contract_multiplier": "1", "slippage_pct": "1", "fee_pct": "0"}})
     await rig.repositories.trade_intents.create_once("bad-intent", bad, status=bad.status.value, unique_value="idem-bad")
     monkeypatch.setattr(once_module, "alert_once", _unreadable)
     rig.quote(FRAC, Decimal(100))
