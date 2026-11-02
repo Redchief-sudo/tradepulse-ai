@@ -4,11 +4,13 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Literal
 
+from tradepulse.broker import capabilities
 from tradepulse.dbae import bands
 from tradepulse.models.enums import AssetClass
 
+# DBAE_EVIDENCE_MAX_AGE_SECONDS is defined where it is enforced
+# (broker/capabilities.py); the fingerprint below reads that one value.
 DBAE_POLICY_VERSION = "dbae-1"
-DBAE_EVIDENCE_MAX_AGE_SECONDS = 30
 REQUIRED_OPTIONS_LEVEL = 2
 ACCEPTED_ACCOUNT_MULTIPLIERS = frozenset({Decimal(2), Decimal(4)})
 
@@ -60,7 +62,7 @@ def dbae_policy_fingerprint() -> dict[str, Any]:
     return {
         "dbae_policy_version": DBAE_POLICY_VERSION,
         "band_thresholds": [[band.value, str(edge)] for band, edge in bands.BAND_THRESHOLDS],
-        "dbae_evidence_max_age_seconds": DBAE_EVIDENCE_MAX_AGE_SECONDS,
+        "dbae_evidence_max_age_seconds": capabilities.DBAE_EVIDENCE_MAX_AGE_SECONDS,  # the enforced value, live
         "required_options_level": REQUIRED_OPTIONS_LEVEL,
         "accepted_account_multipliers": sorted(str(m) for m in ACCEPTED_ACCOUNT_MULTIPLIERS),
         "sub_minimum_liquidation_evidence": table,

@@ -23,7 +23,10 @@ from tradepulse.models.market import AssetIdentity
 from .alpaca_client import AlpacaClient
 from .errors import AlpacaDataIntegrityError, AlpacaError, raise_alpaca_error
 
-_FRESH_PAST = timedelta(seconds=30)
+# Spec §3.2, §15: the one evidence-age limit. evidence_fresh() and
+# dbae_policy_fingerprint() both read it at call time, so the value the
+# generation freezes is the value enforced. Re-exported by tradepulse.dbae.
+DBAE_EVIDENCE_MAX_AGE_SECONDS = 30
 _FRESH_FUTURE = timedelta(seconds=5)
 
 
@@ -84,7 +87,8 @@ class DbaeCapabilities(AccountCapabilities, AssetCapabilities, PortfolioHistory,
 
 
 def evidence_fresh(received_at: datetime, now: datetime) -> bool:
-    return now - _FRESH_PAST <= received_at <= now + _FRESH_FUTURE
+    oldest = now - timedelta(seconds=DBAE_EVIDENCE_MAX_AGE_SECONDS)
+    return oldest <= received_at <= now + _FRESH_FUTURE
 
 
 def _flag(value: object) -> bool | None:

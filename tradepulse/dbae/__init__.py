@@ -1,3 +1,4 @@
+from tradepulse.broker.capabilities import DBAE_EVIDENCE_MAX_AGE_SECONDS
 from tradepulse.dbae.bands import (
     BAND_THRESHOLDS,
     Band,
@@ -8,7 +9,6 @@ from tradepulse.dbae.bands import (
 )
 from tradepulse.dbae.evidence import (
     ACCEPTED_ACCOUNT_MULTIPLIERS,
-    DBAE_EVIDENCE_MAX_AGE_SECONDS,
     DBAE_POLICY_VERSION,
     REQUIRED_OPTIONS_LEVEL,
     SUB_MINIMUM_LIQUIDATION_EVIDENCE,

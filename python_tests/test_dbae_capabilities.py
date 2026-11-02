@@ -212,6 +212,24 @@ def test_evidence_fresh_bounds() -> None:
     assert not evidence_fresh(now + timedelta(seconds=6), now)
 
 
+def test_evidence_age_limit_is_the_frozen_constant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Final review I5: the freshness window is DBAE_EVIDENCE_MAX_AGE_SECONDS,
+    the value dbae_policy_fingerprint() freezes. Moving it moves both."""
+    from tradepulse.broker import capabilities
+    from tradepulse.dbae import DBAE_EVIDENCE_MAX_AGE_SECONDS, dbae_policy_fingerprint
+
+    now = datetime(2026, 10, 30, 15, 0, tzinfo=UTC)
+    assert DBAE_EVIDENCE_MAX_AGE_SECONDS == 30
+    assert dbae_policy_fingerprint()["dbae_evidence_max_age_seconds"] == 30
+    assert not evidence_fresh(now - timedelta(seconds=45), now)
+
+    monkeypatch.setattr(capabilities, "DBAE_EVIDENCE_MAX_AGE_SECONDS", 60)
+
+    assert evidence_fresh(now - timedelta(seconds=45), now)
+    assert not evidence_fresh(now - timedelta(seconds=61), now)
+    assert dbae_policy_fingerprint()["dbae_evidence_max_age_seconds"] == 60
+
+
 def test_broker_port_unchanged() -> None:
     # The BrokerPort member set at the DBAE base commit (DBAE-03: no new port methods).
     assert set(BrokerPort.__protocol_attrs__) == {
