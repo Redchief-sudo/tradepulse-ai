@@ -26,9 +26,10 @@ from dataclasses import replace
 from datetime import timedelta
 from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
-from hypothesis import HealthCheck, example, given, settings
+from hypothesis import HealthCheck, event, example, given, settings
 from hypothesis import strategies as st
 from test_dbae_gateway import (
     FRAC,
@@ -53,14 +54,19 @@ from tradepulse.config import risk_limits_for_profile
 from tradepulse.dbae.bands import Band, band_for, unlocks
 from tradepulse.dbae.funding import fundable_notional, funding_available, max_funding
 from tradepulse.dbae.policy import EntryProposal, evaluate_entry_policy, shape_quantity
+from tradepulse.execution import ExecutionResult
 from tradepulse.models import AssetClass, AssetIdentity, TradeIntentStatus
 
 pytestmark = pytest.mark.usefixtures("open_market_calendar")
 
-# The open_market_calendar fixture and conftest's autouse monitor reset are
-# function scoped. Both are the same for every example (a fixed calendar, a
-# monitor no example reads), so sharing them across examples is correct;
-# every example builds its own database, broker and clock.
+# Three function-scoped fixtures are shared by every example of a test:
+# open_market_calendar (a fixed calendar), conftest's autouse held_lease (one
+# lease directory and the held TEST_ACCOUNT lease that every example's
+# gateway carries) and conftest's autouse clock-calendar disagreement MONITOR
+# reset. The first two are the same for every example. MONITOR is process
+# state that the gateway's session decision observes, so each example resets
+# it itself (_fresh_example) instead of relying on the per-test reset. Every
+# example builds its own database, broker and clock.
 _SHARED_FIXTURES = [HealthCheck.function_scoped_fixture]
 PURE = settings(max_examples=400, derandomize=True, database=None, deadline=None)
 FUNDING = settings(max_examples=50, derandomize=True, database=None, deadline=None,
@@ -236,6 +242,49 @@ def test_a_buy_sized_within_fundable_notional_reserves_within_funding(available:
 _BUYABLE = (FRAC, FRAY, FRAZ, WHLE, SOL, OPT)
 
 
+def _fresh_example() -> None:
+    """Per-example reset of the process state a gateway observes (see _SHARED_FIXTURES)."""
+    from tradepulse.calendar.disagreement import MONITOR
+
+    MONITOR.reset()
+
+
+class FundingCase(NamedTuple):
+    balance: Decimal
+    cash_share: Decimal
+    power_share: Decimal
+    profile: str
+    crypto_minimum: Decimal
+    crypto_increment: Decimal
+    entries: list[tuple[AssetIdentity, Decimal, Decimal, Decimal]]
+
+
+def _one_cent_stock(balance: str) -> FundingCase:
+    """An aggressive account whose funding is 1% of ``balance``, buying a 1-cent stock with a 1% stop."""
+    return FundingCase(Decimal(balance), Decimal("0.01"), Decimal("0.01"), "aggressive", Decimal("1E-8"),
+                       Decimal("1E-8"), [(FRAC, Decimal("0.01"), Decimal(1000), Decimal(1))])
+
+
+# Pinned for the funding property, each with the outcome it must still reach
+# (test_pinned_funding_cases_keep_their_outcome), so none can pass vacuously.
+# All three over-reserved before the fundable_notional fix.
+PINNED_FUNDING_CASES = {
+    # $50 of funding, a $10 stock: approved, reserving within $50.
+    "funding_cap_binds": FundingCase(Decimal(1000), Decimal("0.05"), Decimal("0.05"), "aggressive",
+                                     Decimal("0.001"), Decimal("0.001"), [(FRAC, Decimal(10), Decimal(1000), Decimal(1))]),
+    # The counterexample hypothesis found unaided (100 examples, before the fix): $1.03 of funding. After the
+    # fix the buy is under $1 at its stop, so it is refused, not approved over its funding.
+    "one_cent_stock": _one_cent_stock("102.51"),
+    # The same buy with $1.05 of funding: the tightest pinned approval (pre-fix max_funding $1.0551 > $1.05).
+    "one_cent_stock_approved": _one_cent_stock("105"),
+}
+PINNED_OUTCOMES: dict[str, list[tuple[str, list[str]]]] = {
+    "funding_cap_binds": [("pending", [])],
+    "one_cent_stock": [("rejected", ["DBAE_SUB_MINIMUM_LIQUIDATION_UNVERIFIED"])],
+    "one_cent_stock_approved": [("pending", [])],
+}
+
+
 @st.composite
 def entry_sequences(draw: st.DrawFn) -> list[tuple[AssetIdentity, Decimal, Decimal, Decimal]]:
     """One to four buys on distinct symbols: (asset, price, requested quantity, stop %)."""
@@ -245,7 +294,11 @@ def entry_sequences(draw: st.DrawFn) -> list[tuple[AssetIdentity, Decimal, Decim
 
 async def _check_funding(balance: Decimal, cash_share: Decimal, power_share: Decimal, profile: str,
                          crypto_minimum: Decimal, crypto_increment: Decimal,
-                         entries: list[tuple[AssetIdentity, Decimal, Decimal, Decimal]]) -> None:
+                         entries: list[tuple[AssetIdentity, Decimal, Decimal, Decimal]]) -> list[ExecutionResult]:
+    """Checks every entry; returns each entry's result. A refused entry is
+    only checked not to be pending."""
+    _fresh_example()
+    results: list[ExecutionResult] = []
     with tempfile.TemporaryDirectory() as directory:
         rig = await _rig(Path(directory), balance=balance, profile=profile)
         cash = (balance * cash_share).quantize(Decimal("0.01"))
@@ -263,6 +316,7 @@ async def _check_funding(balance: Decimal, cash_share: Decimal, power_share: Dec
             assert pending_before == committed  # orders stay open: every approval is still reserved
 
             result = await rig.gateway.execute_intent(_buy(asset, requested, price * (1 - stop_pct / 100)))
+            results.append(result)
 
             intent = next((i for i in await rig.intents() if i.trade_intent_id == result.trade_intent_id), None)
             if intent is None or "dbae" not in intent.risk_snapshot:
@@ -283,6 +337,7 @@ async def _check_funding(balance: Decimal, cash_share: Decimal, power_share: Dec
             committed += reserved
             assert committed <= funding
         assert await rig.pending() == committed <= max(funding, Decimal(0))
+    return results
 
 
 @FUNDING
@@ -295,19 +350,26 @@ async def _check_funding(balance: Decimal, cash_share: Decimal, power_share: Dec
     crypto_increment=INCREMENT,
     entries=entry_sequences(),
 )
-@example(balance=Decimal(1000), cash_share=Decimal("0.05"), power_share=Decimal("0.05"), profile="aggressive",
-         crypto_minimum=Decimal("0.001"), crypto_increment=Decimal("0.001"),
-         entries=[(FRAC, Decimal(10), Decimal(1000), Decimal(1))])
-# The counterexample hypothesis found unaided (100 examples, before the fix): $1.03 of funding, a 1-cent stock.
-@example(balance=Decimal("102.51"), cash_share=Decimal("0.01"), power_share=Decimal("0.01"), profile="aggressive",
-         crypto_minimum=Decimal("1E-8"), crypto_increment=Decimal("1E-8"),
-         entries=[(FRAC, Decimal("0.01"), Decimal(1000), Decimal(1))])
+@example(**PINNED_FUNDING_CASES["funding_cap_binds"]._asdict())
+@example(**PINNED_FUNDING_CASES["one_cent_stock"]._asdict())
+@example(**PINNED_FUNDING_CASES["one_cent_stock_approved"]._asdict())
 def test_reserved_funding_never_exceeds_funding_available(balance: Decimal, cash_share: Decimal,
                                                            power_share: Decimal, profile: str,
                                                            crypto_minimum: Decimal, crypto_increment: Decimal,
                                                            entries: list[tuple[AssetIdentity, Decimal, Decimal,
                                                                                Decimal]]) -> None:
-    asyncio.run(_check_funding(balance, cash_share, power_share, profile, crypto_minimum, crypto_increment, entries))
+    results = asyncio.run(_check_funding(balance, cash_share, power_share, profile, crypto_minimum,
+                                         crypto_increment, entries))
+    event(f"approvals: {sum(result.status == 'pending' for result in results)}")
+
+
+@pytest.mark.parametrize("name", PINNED_FUNDING_CASES)
+def test_pinned_funding_cases_keep_their_outcome(name: str) -> None:
+    """Final review M5: _check_funding only checks approved entries, so a
+    pinned example that a later change refuses would pass vacuously. Each
+    keeps its outcome; two of them reach approval."""
+    results = asyncio.run(_check_funding(*PINNED_FUNDING_CASES[name]))
+    assert [(result.status, result.reasons) for result in results] == PINNED_OUTCOMES[name]
 
 
 # --- 4. protective exits never carry a DBAE reason (spec §9) -----------------------------------------------
@@ -316,6 +378,7 @@ _EXIT_EVIDENCE = st.sampled_from(["unknown", "stale", "blocked", "closing_only",
 
 
 async def _check_exit(balance: Decimal, evidence: str, quantity: Decimal) -> None:
+    _fresh_example()
     with tempfile.TemporaryDirectory() as directory:
         async with _held(Path(directory), balance) as held:
             rig = held.rig
