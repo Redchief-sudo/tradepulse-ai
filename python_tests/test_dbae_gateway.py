@@ -8,10 +8,10 @@ Runs on the simulated broker with the always-in-session test calendar.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Any
@@ -21,6 +21,7 @@ import pytest
 from lease_support import held_test_lease
 
 from tradepulse.alerts import TelegramAlerter
+from tradepulse.alerts.telegram import Severity
 from tradepulse.broker import AlpacaError
 from tradepulse.broker.capabilities import (
     AccountEvidence,
@@ -31,8 +32,8 @@ from tradepulse.broker.capabilities import (
 )
 from tradepulse.broker.port import AccountRef
 from tradepulse.broker.simulated import ManualClock, SimSession, SimulatedBroker, SimulatedCapabilities
-from tradepulse.broker.types import AlpacaOrderRequest, AlpacaOrderResponse
-from tradepulse.calendar import ny_date
+from tradepulse.broker.types import AlpacaAccount, AlpacaOrderRequest, AlpacaOrderResponse, RawQuote
+from tradepulse.calendar import BrokerSession, ny_date
 from tradepulse.config import risk_limits_for_profile
 from tradepulse.dbae.funding import max_funding, pending_buy_funding
 from tradepulse.execution import PORTFOLIO_RISK_LOCK_KEY, ExecutionGateway, ExecutionRequest, ExecutionResult
@@ -52,6 +53,7 @@ from tradepulse.models import (
 )
 from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate, list_all_by_json_field
 from tradepulse.persistence.codec import encode_payload
+from tradepulse.persistence.repositories import RecordRepository
 from tradepulse.providers import AlpacaMarketDataProvider
 from tradepulse.reconciliation.bootstrap import bootstrap_fill_cursor
 from tradepulse.reconciliation.coordinator import (
@@ -99,13 +101,15 @@ def _assets(at: datetime = NOW) -> dict[str, AssetTradingCapabilities]:
 
 
 class FreshCapabilities(SimulatedCapabilities):
-    """Each read is stamped with the gateway clock, as a live read is. The
+    """Each read is stamped with the gateway clock, as a live read is, unless
+    ``restamp`` is cleared: then the evidence is returned as stamped. The
     next account read can be made to stall until ``stall`` is set, and the
     reads are counted."""
 
     def __init__(self, clock: Callable[[], datetime]) -> None:
         super().__init__()
         self._clock = clock
+        self.restamp = True
         self.stall: asyncio.Event | None = None
         self.stalled = asyncio.Event()
         self.reads: list[str] = []
@@ -116,15 +120,102 @@ class FreshCapabilities(SimulatedCapabilities):
         if gate is not None:
             self.stalled.set()
             await gate.wait()
-        return replace(await super().get_account_evidence(), received_at=self._clock())
+        evidence = await super().get_account_evidence()
+        return replace(evidence, received_at=self._clock()) if self.restamp else evidence
 
     async def get_asset_capabilities(self, asset: AssetIdentity) -> AssetTradingCapabilities:
         self.reads.append(f"asset:{asset.symbol}")
-        return replace(await super().get_asset_capabilities(asset), received_at=self._clock())
+        found = await super().get_asset_capabilities(asset)
+        return replace(found, received_at=self._clock()) if self.restamp else found
 
     async def get_daily_equity_bars(self) -> list[DailyEquityBar]:
         self.reads.append("history")
         return await super().get_daily_equity_bars()
+
+
+PlaceOrder = Callable[[AlpacaOrderRequest], Awaitable[AlpacaOrderResponse]]
+LatestQuote = Callable[[str, AssetClass, "str | None"], Awaitable[RawQuote]]
+GetAccount = Callable[[], Awaitable[AlpacaAccount]]
+GetCalendar = Callable[[date, date], Awaitable[list[BrokerSession]]]
+
+
+class HookedBroker(SimulatedBroker):
+    """The simulated broker with typed seams a test can script. Each hook,
+    when set, replaces the broker's own answer; ``place_on_book`` is the
+    real submission, and records every order it places in ``orders``."""
+
+    def __init__(self, *, clock: ManualClock, cash: Decimal) -> None:
+        super().__init__(clock=clock, session=SimSession.always_open(), cash=cash, opening_journal=True)
+        self.orders: list[AlpacaOrderRequest] = []
+        self.place_hook: PlaceOrder | None = None
+        self.quote_hook: LatestQuote | None = None
+        self.account_hook: GetAccount | None = None
+        self.calendar_hook: GetCalendar | None = None
+
+    async def place_on_book(self, order: AlpacaOrderRequest) -> AlpacaOrderResponse:
+        self.orders.append(order)
+        return await super().place_order(order)
+
+    async def place_order(self, order: AlpacaOrderRequest) -> AlpacaOrderResponse:
+        if self.place_hook is not None:
+            return await self.place_hook(order)
+        return await self.place_on_book(order)
+
+    async def real_latest_quote(self, symbol: str, asset_class: AssetClass,
+                                feed_override: str | None = None) -> RawQuote:
+        return await super().get_latest_quote(symbol, asset_class, feed_override)
+
+    async def get_latest_quote(self, symbol: str, asset_class: AssetClass,
+                               feed_override: str | None = None) -> RawQuote:
+        if self.quote_hook is not None:
+            return await self.quote_hook(symbol, asset_class, feed_override)
+        return await self.real_latest_quote(symbol, asset_class, feed_override)
+
+    async def real_account(self) -> AlpacaAccount:
+        return await super().get_account()
+
+    async def get_account(self) -> AlpacaAccount:
+        if self.account_hook is not None:
+            return await self.account_hook()
+        return await self.real_account()
+
+    async def real_calendar(self, start: date, end: date) -> list[BrokerSession]:
+        return await super().get_calendar(start, end)
+
+    async def get_calendar(self, start: date, end: date) -> list[BrokerSession]:
+        if self.calendar_hook is not None:
+            return await self.calendar_hook(start, end)
+        return await self.real_calendar(start, end)
+
+
+class RecordingAlerter(TelegramAlerter):
+    """A configured alerter whose deliveries are recorded, never sent."""
+
+    def __init__(self) -> None:
+        super().__init__("token", "chat")
+        self.delivered: list[str] = []
+
+    async def send(self, severity: Severity, message: str, details: Mapping[str, Any] | None = None) -> bool:
+        self.delivered.append(message)
+        return True
+
+
+class RecordingIntents(RecordRepository):
+    """The trade-intent repository, recording the status and byte-exact
+    ``dbae`` block of every update that carries one."""
+
+    def __init__(self, database: AsyncSQLiteDatabase) -> None:
+        super().__init__(database, "trade_intents")
+        self.written: list[tuple[str, str]] = []
+
+    async def update(
+        self, record_id: str, payload: Any, *, status: str | None = None,
+        guard_table: str | None = None, guard_key: str | None = None, lease: tuple[str, str] | None = None,
+    ) -> bool:
+        if isinstance(payload, TradeIntent) and "dbae" in payload.risk_snapshot:
+            self.written.append((payload.status.value, encode_payload(payload.risk_snapshot["dbae"])))
+        return await super().update(record_id, payload, status=status, guard_table=guard_table,
+                                    guard_key=guard_key, lease=lease)
 
 
 @dataclass
@@ -132,14 +223,18 @@ class Rig:
     path: Path
     database: AsyncSQLiteDatabase
     repositories: PersistenceRepositories
-    broker: SimulatedBroker
+    broker: HookedBroker
     clock: ManualClock
     caps: FreshCapabilities
     alerts: TelegramAlerter
     limits: RiskLimits
     gateway: ExecutionGateway
     sent: list[tuple[str, str]] = field(default_factory=list)
-    orders: list[AlpacaOrderRequest] = field(default_factory=list)
+
+    @property
+    def orders(self) -> list[AlpacaOrderRequest]:
+        """Every order the broker placed on its book."""
+        return self.broker.orders
 
     def now(self) -> datetime:
         return self.clock() - timedelta(milliseconds=1)
@@ -180,7 +275,7 @@ async def _rig(tmp_path: Path, name: str = "dbae", *, balance: Decimal = Decimal
     await database.initialize()
     repositories = PersistenceRepositories.create(database)
     clock = ManualClock(NOW)
-    broker = SimulatedBroker(clock=clock, session=SimSession.always_open(), cash=balance, opening_journal=True)
+    broker = HookedBroker(clock=clock, cash=balance)
     caps = FreshCapabilities(lambda: clock() - timedelta(milliseconds=1))
     caps.account = _account(balance)
     caps.assets = _assets()
@@ -190,13 +285,6 @@ async def _rig(tmp_path: Path, name: str = "dbae", *, balance: Decimal = Decimal
     limits = risk_limits_for_profile(profile)
     gateway = _gateway(repositories, broker, caps, alerter, limits, lambda: clock() - timedelta(milliseconds=1))
     rig = Rig(path, database, repositories, broker, clock, caps, alerter, limits, gateway)
-    original = broker.place_order
-
-    async def place(order: AlpacaOrderRequest) -> AlpacaOrderResponse:
-        rig.orders.append(order)
-        return await original(order)
-
-    broker.place_order = place  # type: ignore[method-assign]
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     return rig
 
@@ -209,7 +297,7 @@ def _buy(asset: AssetIdentity, quantity: Decimal, stop: Decimal | None, key: str
 def _hold_orders_open(rig: Rig) -> None:
     """Orders stay accepted: they fill a day later and the gateway does not poll."""
     rig.broker.set_fill_latency(LATER)
-    rig.gateway.FILL_TIMEOUT_SECONDS = 0  # type: ignore[misc]
+    rig.gateway.FILL_TIMEOUT_SECONDS = 0
 
 
 def _dbae(intent: TradeIntent) -> dict[str, Any]:
@@ -408,27 +496,21 @@ async def test_quantity_identity_survives_restart(tmp_path: Path) -> None:
     """Request 10; micro at $7,300 risks 1% = $73 over a $10 unit risk:
     risk-approved 7.3, shaped and submitted 7 whole shares."""
     rig = await _rig(tmp_path, balance=Decimal(7300), profile="micro")
-    rig.gateway.FILL_TIMEOUT_SECONDS = 0.3  # type: ignore[misc]
-    rig.gateway.POLL_INTERVAL_SECONDS = 0.01  # type: ignore[misc]
     rig.quote(WHLE, Decimal(100))
-    written: list[tuple[str, str]] = []
-    update = rig.repositories.trade_intents.update
-
-    async def recording_update(record_id: str, payload: Any, **kwargs: Any) -> Any:
-        if isinstance(payload, TradeIntent) and "dbae" in payload.risk_snapshot:
-            written.append((payload.status.value, encode_payload(payload.risk_snapshot["dbae"])))
-        return await update(record_id, payload, **kwargs)
-
-    rig.repositories.trade_intents.update = recording_update  # type: ignore[method-assign]
-    original = rig.broker.place_order
+    intents = RecordingIntents(rig.database)
+    rig.repositories = replace(rig.repositories, trade_intents=intents)
+    rig.gateway = rig.build_gateway()
+    rig.gateway.FILL_TIMEOUT_SECONDS = 0.3
+    rig.gateway.POLL_INTERVAL_SECONDS = 0.01
+    written = intents.written
 
     async def scripted(order: AlpacaOrderRequest) -> AlpacaOrderResponse:
         # 3 now, the other 4 a day later: the order is partially filled when the poll ends.
         rig.broker.schedule_fills(order.client_order_id or "", [(timedelta(0), Decimal(3), None),
                                                                 (LATER, Decimal(4), None)])
-        return await original(order)
+        return await rig.broker.place_on_book(order)
 
-    rig.broker.place_order = scripted  # type: ignore[method-assign]
+    rig.broker.place_hook = scripted
 
     result = await rig.gateway.execute_intent(_buy(WHLE, Decimal(10), Decimal(90)))
 
@@ -476,14 +558,15 @@ async def test_second_evaluation_uses_same_quote_and_snapshot(tmp_path: Path, mo
     rig = await _rig(tmp_path, balance=Decimal(7300), profile="micro")
     rig.quote(WHLE, Decimal(100))
     quote_calls: list[str] = []
-    real_quote = rig.broker.get_latest_quote
 
-    async def moving_quote(symbol: str, asset_class: AssetClass, feed_override: str | None = None) -> Any:
+    async def moving_quote(symbol: str, asset_class: AssetClass, feed_override: str | None = None) -> RawQuote:
         quote_calls.append(symbol)
-        raw = await real_quote(symbol, asset_class, feed_override)
-        return raw if len(quote_calls) == 1 else replace(raw, bid=raw.bid * 2, ask=raw.ask * 2)
+        raw = await rig.broker.real_latest_quote(symbol, asset_class, feed_override)
+        if len(quote_calls) == 1 or raw.bid is None or raw.ask is None:
+            return raw
+        return replace(raw, bid=raw.bid * 2, ask=raw.ask * 2)
 
-    rig.broker.get_latest_quote = moving_quote  # type: ignore[method-assign]
+    rig.broker.quote_hook = moving_quote
     evaluations: list[tuple[Any, Any, Any]] = []
     real_evaluate = gateway_module.evaluate_risk
 
@@ -557,14 +640,13 @@ async def test_two_concurrent_buys_different_symbols_20_cash(tmp_path: Path, cas
 async def test_restart_after_ambiguous_buy_no_second_buy(tmp_path: Path) -> None:
     rig = await _rig(tmp_path, balance=Decimal(100000))
     rig.quote(FRAC, Decimal(100))
-    original = rig.broker.place_order
     calls: list[str] = []
 
     async def unavailable(order: AlpacaOrderRequest) -> AlpacaOrderResponse:
         calls.append(order.client_order_id or "")
         raise AlpacaError("service unavailable", 503, None, None, "placeOrder")  # never reached the book
 
-    rig.broker.place_order = unavailable  # type: ignore[method-assign]
+    rig.broker.place_hook = unavailable
     request = _buy(FRAC, Decimal(5), Decimal(92), key="ambiguous-buy")
 
     result = await rig.gateway.execute_intent(request)
@@ -576,7 +658,7 @@ async def test_restart_after_ambiguous_buy_no_second_buy(tmp_path: Path) -> None
     assert before == Decimal(_dbae(intent)["max_funding"]) > 0
 
     await rig.reopen()
-    rig.broker.place_order = original  # type: ignore[method-assign]
+    rig.broker.place_hook = None
     rig.quote(FRAC, Decimal(100))
     again = await rig.gateway.execute_intent(request)
 
@@ -645,10 +727,9 @@ async def test_funding_conserved_across_crash_and_restart(tmp_path: Path) -> Non
     broker-confirmed terminal state. aggressive allows five simultaneous
     orders, so C is not refused for the two still pending."""
     rig = await _rig(tmp_path, profile="aggressive")
-    rig.gateway.FILL_TIMEOUT_SECONDS = 0.3  # type: ignore[misc]
-    rig.gateway.POLL_INTERVAL_SECONDS = 0.01  # type: ignore[misc]
+    rig.gateway.FILL_TIMEOUT_SECONDS = 0.3
+    rig.gateway.POLL_INTERVAL_SECONDS = 0.01
     rig.broker.set_fill_latency(LATER)
-    original = rig.broker.place_order
 
     async def scripted(order: AlpacaOrderRequest) -> AlpacaOrderResponse:
         if order.symbol == FRAY.symbol:  # the submission times out before Alpaca records anything
@@ -656,9 +737,9 @@ async def test_funding_conserved_across_crash_and_restart(tmp_path: Path) -> Non
         if order.symbol == FRAC.symbol:  # 6 of 10 now, the rest a day later
             rig.broker.schedule_fills(order.client_order_id or "", [(timedelta(0), Decimal(6), None),
                                                                     (LATER, Decimal(4), None)])
-        return await original(order)
+        return await rig.broker.place_on_book(order)
 
-    rig.broker.place_order = scripted  # type: ignore[method-assign]
+    rig.broker.place_hook = scripted
     for asset in (FRAC, FRAY, FRAZ):
         rig.quote(asset, Decimal(100))
 
@@ -676,7 +757,7 @@ async def test_funding_conserved_across_crash_and_restart(tmp_path: Path) -> Non
     assert b_full == max_funding(Decimal(10), b_intent.reference_price or Decimal(0), FRAY, slippage)
     assert await rig.pending() == a_remaining + b_full
 
-    rig.gateway.FILL_TIMEOUT_SECONDS = 0  # type: ignore[misc]
+    rig.gateway.FILL_TIMEOUT_SECONDS = 0
     rig.quote(FRAZ, Decimal(100))
     c = await rig.gateway.execute_intent(_buy(FRAZ, Decimal(10), Decimal(92)))  # 4
     assert c.status == "pending", c.reasons
@@ -737,15 +818,9 @@ async def test_cash_bound_buy_reserves_within_funding_available(tmp_path: Path, 
 
 
 async def test_identity_mismatch_alerts_once_and_refuses_new_entries(tmp_path: Path) -> None:
-    alerts = TelegramAlerter("token", "chat")
+    alerts = RecordingAlerter()
     rig = await _rig(tmp_path, alerts=alerts)
-    delivered: list[str] = []
-
-    async def deliver(severity: str, message: str, details: object = None) -> bool:
-        delivered.append(message)
-        return True
-
-    alerts.send = deliver  # type: ignore[method-assign]
+    delivered = alerts.delivered
     bad = TradeIntent("bad-intent", "idem-bad", "corr-bad", FRAY, Side.BUY, ExecutionMode.PAPER, "test", NOW,
                       requested_quantity=Decimal(7), reference_price=Decimal(100), status=TradeIntentStatus.ACCEPTED,
                       broker_order_id="order-bad", risk_snapshot={"dbae": {"submitted_quantity": "5"}})
@@ -907,13 +982,13 @@ async def _daily_loss_rig(tmp_path: Path, start: Decimal, now_equity: Decimal) -
     """balanced (max daily loss 1%) on an account whose equity has fallen
     from ``start`` (the previous close, last_equity) to ``now_equity``."""
     rig = await _rig(tmp_path, balance=start, profile="balanced")
-    real_account = rig.broker.get_account
+    broker = rig.broker
 
-    async def fallen() -> Any:
-        account = await real_account()
+    async def fallen() -> AlpacaAccount:
+        account = await broker.real_account()
         return replace(account, equity=now_equity, cash=now_equity, portfolio_value=now_equity)
 
-    rig.broker.get_account = fallen  # type: ignore[method-assign]
+    broker.account_hook = fallen
     rig.caps.account = _account(now_equity)
     rig.quote(FRAC, Decimal(10))
     return rig
@@ -970,19 +1045,17 @@ async def test_dbae_refusal_without_a_loss_does_not_latch(tmp_path: Path) -> Non
 
 async def test_stale_account_evidence_refused_before_the_baseline_step(tmp_path: Path) -> None:
     rig = await _rig(tmp_path)
-    plain = SimulatedCapabilities()  # returns the evidence as stamped: an hour old
-    plain.account = _account(Decimal(100000), at=NOW - timedelta(hours=1))
-    plain.assets = _assets()
-    rig.caps = plain  # type: ignore[assignment]
-    rig.gateway = rig.build_gateway()
+    rig.caps.restamp = False  # the evidence is returned as stamped: an hour old
+    rig.caps.account = _account(Decimal(100000), at=NOW - timedelta(hours=1))
+    rig.caps.assets = _assets()
     calendar_calls: list[object] = []
-    real_calendar = rig.broker.get_calendar
+    broker = rig.broker
 
-    async def counted(*args: Any) -> Any:
-        calendar_calls.append(args)
-        return await real_calendar(*args)
+    async def counted(start: date, end: date) -> list[BrokerSession]:
+        calendar_calls.append((start, end))
+        return await broker.real_calendar(start, end)
 
-    rig.broker.get_calendar = counted  # type: ignore[method-assign]
+    broker.calendar_hook = counted
     rig.quote(SOL, Decimal(100))
 
     result = await rig.gateway.execute_intent(_buy(SOL, Decimal(1), Decimal(92)))
@@ -1008,11 +1081,11 @@ async def test_no_calendar_call_once_the_baseline_is_stored(tmp_path: Path) -> N
     await rig.repositories.dbae_session_baselines.create_once(today.isoformat(), stored)
     calendar_calls: list[object] = []
 
-    async def unreachable(*args: Any) -> Any:
-        calendar_calls.append(args)
+    async def unreachable(start: date, end: date) -> list[BrokerSession]:
+        calendar_calls.append((start, end))
         raise httpx.ConnectError("calendar unavailable")
 
-    rig.broker.get_calendar = unreachable  # type: ignore[method-assign]
+    rig.broker.calendar_hook = unreachable
     rig.quote(SOL, Decimal(100))
 
     result = await rig.gateway.execute_intent(_buy(SOL, Decimal(1), Decimal(92)))

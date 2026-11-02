@@ -248,8 +248,9 @@ class _AuthorizedEntry:
 
 
 class ExecutionGateway:
-    FILL_TIMEOUT_SECONDS = 20
-    POLL_INTERVAL_SECONDS = 1
+    # Seconds, real time; a float so a caller may set a sub-second budget.
+    FILL_TIMEOUT_SECONDS: float = 20
+    POLL_INTERVAL_SECONDS: float = 1
 
     def __init__(
         self,

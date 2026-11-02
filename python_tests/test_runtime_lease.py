@@ -11,7 +11,7 @@ import signal
 import subprocess
 import sys
 import textwrap
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -203,12 +203,15 @@ def _buy() -> ExecutionRequest:
 def test_gateway_cannot_be_built_without_a_lease(tmp_path: Path) -> None:
     alerts = TelegramAlerter(None, None)
     broker = SimulatedBroker(clock=ManualClock(NOW), session=SimSession.always_open())
+    # Called through an untyped signature on purpose: these exercise the
+    # runtime guards behind the static ones checked below.
+    build: Callable[..., ExecutionGateway] = ExecutionGateway
     with pytest.raises(TypeError, match="lease"):
-        ExecutionGateway(None, broker, None, None, alerts, None, ExecutionMode.PAPER)  # type: ignore[arg-type, call-arg]
+        build(None, broker, None, None, alerts, None, ExecutionMode.PAPER)
     with (account_lease(AccountRef("ibkr", "U1"), holder="me", directory=tmp_path) as foreign,
           pytest.raises(ValueError, match="venue")):
-        ExecutionGateway(None, broker, None, None, alerts, None, ExecutionMode.PAPER, lease=foreign,  # type: ignore[arg-type]
-                         capabilities=SimulatedCapabilities())
+        build(None, broker, None, None, alerts, None, ExecutionMode.PAPER, lease=foreign,
+              capabilities=SimulatedCapabilities())
     # The omission is also a static error.
     program = textwrap.dedent("""
         from tradepulse.execution import ExecutionGateway
