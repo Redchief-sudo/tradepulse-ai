@@ -56,7 +56,13 @@ from tradepulse.dbae.baseline import (
     load_or_capture_baseline,
     session_date_for,
 )
-from tradepulse.dbae.funding import PendingFunding, funding_available, max_funding, pending_buy_funding
+from tradepulse.dbae.funding import (
+    PendingFunding,
+    fundable_notional,
+    funding_available,
+    max_funding,
+    pending_buy_funding,
+)
 from tradepulse.dbae.policy import (
     EntryProposal,
     ExecutionPolicy,
@@ -754,7 +760,11 @@ class ExecutionGateway:
                     await self._latch_kill_switch(evaluate_risk(risk_input, snapshot, self._risk_limits, risk_opts))
                     return decided
                 authorized_entry = decided
-                risk_opts = replace(risk_opts, available_cash=decided.funding_available)
+                # Sized so the reservation (notional plus slippage allowance
+                # and fee, §7.2) never exceeds the funding available (§7.5).
+                fundable = fundable_notional(decided.funding_available, request.asset.asset_class,
+                                             self._risk_limits.slippage_limit_for(request.asset.asset_class))
+                risk_opts = replace(risk_opts, available_cash=fundable)
             risk = evaluate_risk(risk_input, snapshot, self._risk_limits, risk_opts)
             if not risk.approved:
                 await self._latch_kill_switch(risk)

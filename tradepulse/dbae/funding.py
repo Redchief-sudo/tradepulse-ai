@@ -54,6 +54,21 @@ def max_funding(submitted_qty: Decimal, reference_price: Decimal, asset: AssetId
     return notional * (1 + slippage_pct / 100) + projected_buy_fee(asset.asset_class, notional)
 
 
+def fundable_notional(available: Decimal, asset_class: AssetClass, slippage_pct: Decimal) -> Decimal:
+    """The order notional whose max_funding (§7.2) equals ``available``:
+    available / (1 + slippage_pct / 100 + the buy-side fee rate).
+
+    The gateway passes this, not funding_available itself, to evaluate_risk
+    as available_cash. The engine's cash cap bounds the order notional with
+    a 1% buffer, but max_funding adds the slippage allowance (up to 1.75%
+    for options) and crypto's fee on top of that notional, so sizing
+    against funding_available alone could approve a buy whose reservation
+    exceeds the funding available (found by the Task 10 property test).
+    A result at or below zero stays at or below zero (INSUFFICIENT_CASH)."""
+    rate = 1 + slippage_pct / 100 + FEE_PCT_PER_SIDE.get(asset_class, Decimal(0)) / 100
+    return available / rate
+
+
 def _dbae_submitted_quantity(intent: TradeIntent) -> Decimal | None:
     """risk_snapshot.dbae.submitted_quantity as a finite positive Decimal,
     or None when there is no dbae block or it holds no such quantity."""

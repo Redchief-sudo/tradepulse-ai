@@ -703,6 +703,36 @@ async def test_funding_conserved_across_crash_and_restart(tmp_path: Path) -> Non
     assert await rig.pending() == c_funding
 
 
+@pytest.mark.parametrize(("profile", "balance", "asset", "price", "stop"), [
+    ("aggressive", Decimal(1000), FRAC, Decimal(10), Decimal("9.90")),  # 1.5% allowance, no fee
+    ("balanced", Decimal(2000), SOL, Decimal(100), Decimal(94)),  # 1% allowance plus 0.25% crypto fee
+])
+async def test_cash_bound_buy_reserves_within_funding_available(tmp_path: Path, profile: str, balance: Decimal,
+                                                                asset: AssetIdentity, price: Decimal,
+                                                                stop: Decimal) -> None:
+    """Task 10 property-test counterexample: with $50 of funding the cash
+    cap binds. Sized against funding_available itself, the engine approved
+    $49.50 of notional (its 1% buffer), and max_funding added the slippage
+    allowance (and crypto's fee) on top: $50.24 reserved against $50.00
+    available on the aggressive equity case. The engine now sizes against
+    fundable_notional, so the reservation stays within the funding."""
+    rig = await _rig(tmp_path, balance=balance, profile=profile)
+    funds = Decimal(50)
+    rig.caps.account = _account(balance, cash=funds, buying_power=funds, non_marginable_buying_power=funds)
+    _hold_orders_open(rig)
+    rig.quote(asset, price)
+
+    result = await rig.gateway.execute_intent(_buy(asset, Decimal(1000), stop))
+
+    assert result.status == "pending", result.reasons
+    intent = await _intent(rig, result.trade_intent_id)
+    dbae = _dbae(intent)
+    assert Decimal(dbae["funding_available"]) == funds
+    assert any(reason.endswith("_BY_AVAILABLE_CASH") for reason in intent.risk_snapshot["reasons"])
+    assert Decimal(dbae["max_funding"]) <= funds
+    assert await rig.pending() <= funds
+
+
 # --- integrity, audit and failure handling (spec §4.4, §7.1, §10, §11) -------------------------------------
 
 
