@@ -8,7 +8,7 @@ Runs on the simulated broker with the always-in-session test calendar.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
@@ -217,11 +217,12 @@ class RecordingIntents(RecordRepository):
     async def update(
         self, record_id: str, payload: Any, *, status: str | None = None,
         guard_table: str | None = None, guard_key: str | None = None, lease: tuple[str, str] | None = None,
+        precondition: Callable[[], Sequence[str]] | None = None,
     ) -> bool:
         if isinstance(payload, TradeIntent) and "dbae" in payload.risk_snapshot:
             self.written.append((payload.status.value, encode_payload(payload.risk_snapshot["dbae"])))
         return await super().update(record_id, payload, status=status, guard_table=guard_table,
-                                    guard_key=guard_key, lease=lease)
+                                    guard_key=guard_key, lease=lease, precondition=precondition)
 
 
 @dataclass
@@ -1252,3 +1253,212 @@ async def test_no_calendar_call_once_the_baseline_is_stored(tmp_path: Path) -> N
     assert result.status == "filled", result.reasons
     assert calendar_calls == []
     assert "history" not in rig.caps.reads
+
+
+# --- DBAE-146-02: evidence age revalidated inside the fenced RISK_APPROVED transaction ---------------------
+
+EXPIRED = timedelta(seconds=31)  # past DBAE_EVIDENCE_MAX_AGE_SECONDS (30)
+
+
+class SlowCommitIntents(RecordRepository):
+    """The trade-intent repository whose lease-fenced update (only the
+    RISK_APPROVED write carries a lease) first lets ``delay`` pass on the
+    clock: the time between the gateway's last await and the write's
+    transaction."""
+
+    def __init__(self, database: AsyncSQLiteDatabase, clock: ManualClock, delay: timedelta) -> None:
+        super().__init__(database, "trade_intents")
+        self._clock = clock
+        self._delay = delay
+
+    async def update(
+        self, record_id: str, payload: Any, *, status: str | None = None,
+        guard_table: str | None = None, guard_key: str | None = None, lease: tuple[str, str] | None = None,
+        precondition: Callable[[], Sequence[str]] | None = None,
+    ) -> bool:
+        if lease is not None:
+            self._clock.advance(self._delay)
+        return await super().update(record_id, payload, status=status, guard_table=guard_table,
+                                    guard_key=guard_key, lease=lease, precondition=precondition)
+
+
+def _advance_during(rig: Rig, stage: str, delay: timedelta, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lets ``delay`` pass on the gateway clock at ``stage`` of the first
+    entry, after its capability evidence was read."""
+    import tradepulse.execution.gateway as gateway_module
+
+    if stage == "baseline":
+        caps = rig.caps
+        real_bars = caps.get_daily_equity_bars
+
+        async def slow_bars() -> list[DailyEquityBar]:
+            rig.clock.advance(delay)
+            return await real_bars()
+
+        monkeypatch.setattr(caps, "get_daily_equity_bars", slow_bars)
+    elif stage == "risk":
+        real_evaluate = gateway_module.evaluate_risk
+
+        def slow_evaluate(*args: Any, **kwargs: Any) -> Any:
+            rig.clock.advance(delay)
+            return real_evaluate(*args, **kwargs)
+
+        monkeypatch.setattr(gateway_module, "evaluate_risk", slow_evaluate)
+    elif stage == "database":
+        real_pending = gateway_module.pending_buy_funding
+
+        async def slow_pending(*args: Any, **kwargs: Any) -> Any:
+            rig.clock.advance(delay)
+            return await real_pending(*args, **kwargs)
+
+        monkeypatch.setattr(gateway_module, "pending_buy_funding", slow_pending)
+    else:
+        rig.repositories = replace(rig.repositories, trade_intents=SlowCommitIntents(rig.database, rig.clock, delay))
+        rig.gateway = rig.build_gateway()
+
+
+async def _assert_refused_unreserved(rig: Rig, result: ExecutionResult, reasons: list[str]) -> None:
+    assert (result.status, result.reasons) == ("rejected", reasons)
+    intent = await _intent(rig, result.trade_intent_id)
+    assert intent.status == TradeIntentStatus.REJECTED and intent.rejection_reason == "; ".join(reasons)
+    assert "dbae" not in intent.risk_snapshot
+    assert await rig.pending() == 0
+    assert rig.orders == []
+    [event] = await _events(rig, "dbae_entry_refused")
+    assert event["details"]["reasons"] == reasons and event["entity_id"] == result.trade_intent_id
+
+
+STAGES = ("baseline", "risk", "database", "transaction")
+
+
+@pytest.mark.parametrize("stage", STAGES)
+async def test_account_evidence_expiring_before_approval_is_refused(tmp_path: Path, stage: str,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    """The account and asset evidence were fresh when read; 31 s pass
+    during the calendar and baseline checks, the risk evaluation, the
+    database reads, or before the write's own transaction. The entry is
+    refused, with nothing approved or reserved."""
+    rig = await _rig(tmp_path)
+    rig.quote(FRAC, Decimal(100))
+    _advance_during(rig, stage, EXPIRED, monkeypatch)
+
+    result = await rig.gateway.execute_intent(_buy(FRAC, Decimal(5), Decimal(92)))
+
+    await _assert_refused_unreserved(rig, result, ["DBAE_ACCOUNT_STATE_UNVERIFIED"])
+
+
+@pytest.mark.parametrize("stage", STAGES)
+async def test_asset_evidence_expiring_before_approval_is_refused(tmp_path: Path, stage: str,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    """Asset evidence 20 s old, account evidence fresh; 15 s pass. Only the
+    asset evidence is stale: refused under the field's own reason (record
+    ruling 3), DBAE_ASSET_NOT_TRADABLE."""
+    rig = await _rig(tmp_path)
+    rig.quote(FRAC, Decimal(100))
+    rig.caps.restamp = False
+    rig.caps.account = _account(Decimal(100000), at=rig.now())
+    rig.caps.assets = _assets(at=rig.now() - timedelta(seconds=20))
+    _advance_during(rig, stage, timedelta(seconds=15), monkeypatch)
+
+    result = await rig.gateway.execute_intent(_buy(FRAC, Decimal(5), Decimal(92)))
+
+    await _assert_refused_unreserved(rig, result, ["DBAE_ASSET_NOT_TRADABLE"])
+
+
+@pytest.mark.parametrize("stage", STAGES)
+async def test_evidence_fresh_at_the_boundary_is_approved(tmp_path: Path, stage: str,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """Control: 29 s pass at the same points; the evidence is still fresh
+    at the write, so the entry is approved and reserves its funding."""
+    rig = await _rig(tmp_path)
+    _hold_orders_open(rig)
+    rig.quote(FRAC, Decimal(100))
+    _advance_during(rig, stage, timedelta(seconds=29), monkeypatch)
+
+    result = await rig.gateway.execute_intent(_buy(FRAC, Decimal(5), Decimal(92)))
+
+    assert result.status == "pending", result.reasons
+    intent = await _intent(rig, result.trade_intent_id)
+    assert await rig.pending() == Decimal(_dbae(intent)["max_funding"]) > 0
+    assert await _events(rig, "dbae_entry_refused") == []
+
+
+async def test_lapsed_lease_with_expired_evidence_cannot_commit(tmp_path: Path,
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """A holder whose evidence was fresh when read, whose lease lapsed, and
+    whose evidence then expired during the risk evaluation: the lease fence
+    runs first in the transaction, so it is the lease-lost path, and
+    nothing is written."""
+    rig = await _rig(tmp_path)
+    rig.quote(FRAC, Decimal(100))
+    rig.caps.stall = stall = asyncio.Event()
+    _advance_during(rig, "risk", EXPIRED, monkeypatch)
+    task = asyncio.create_task(rig.gateway.execute_intent(_buy(FRAC, Decimal(5), Decimal(92))))
+    await asyncio.wait_for(rig.caps.stalled.wait(), timeout=10)
+    await _expire_portfolio_lease(rig)
+    stall.set()
+    result = await asyncio.wait_for(task, timeout=30)
+
+    assert (result.status, result.reasons) == ("skipped", ["PORTFOLIO_RISK_LOCK_LOST"])
+    [intent] = await rig.intents()
+    assert intent.status == TradeIntentStatus.REJECTED and "dbae" not in intent.risk_snapshot
+    assert await rig.pending() == 0 and rig.orders == []
+
+
+@pytest.mark.parametrize("lease_lapses", [True, False], ids=["lease_lapsed", "lease_held"])
+async def test_expired_evidence_and_two_symbols_competing_for_the_same_cash(
+        tmp_path: Path, lease_lapses: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A $20 micro account. A (FRAC) reads its evidence and P, then stalls
+    for 31 s. lease_lapsed: its lease lapses meanwhile and B (FRAY) takes
+    the lock and commits against the same cash; A then cannot commit
+    (PORTFOLIO_RISK_LOCK_LOST). lease_held: B is turned away while A holds
+    the lock; A's evidence has expired, so A is refused
+    (DBAE_ACCOUNT_STATE_UNVERIFIED) and B, retried, is approved. Either
+    way exactly one buy is approved, and what is reserved is within the
+    funding available."""
+    import tradepulse.execution.gateway as gateway_module
+
+    rig = await _rig(tmp_path, balance=Decimal(20), profile="micro")
+    _hold_orders_open(rig)
+    rig.quote(FRAC, Decimal(100))
+    real_pending = gateway_module.pending_buy_funding
+    stall = asyncio.Event()
+    stalled = asyncio.Event()
+    calls: list[int] = []
+
+    async def stalling_pending(*args: Any, **kwargs: Any) -> Any:
+        found = await real_pending(*args, **kwargs)
+        calls.append(1)
+        if len(calls) == 1:  # A only: P is read before B commits
+            stalled.set()
+            await stall.wait()
+        return found
+
+    monkeypatch.setattr(gateway_module, "pending_buy_funding", stalling_pending)
+    worker_a = asyncio.create_task(rig.gateway.execute_intent(_buy(FRAC, Decimal(1), Decimal(94))))
+    await asyncio.wait_for(stalled.wait(), timeout=10)
+    rig.clock.advance(EXPIRED)
+    rig.quote(FRAY, Decimal(100))
+    if lease_lapses:
+        await _expire_portfolio_lease(rig)
+        b = await rig.gateway.execute_intent(_buy(FRAY, Decimal(1), Decimal(94)))
+        stall.set()
+        a = await asyncio.wait_for(worker_a, timeout=30)
+        assert (a.status, a.reasons) == ("skipped", ["PORTFOLIO_RISK_LOCK_LOST"])
+    else:
+        turned_away = await rig.gateway.execute_intent(_buy(FRAY, Decimal(1), Decimal(94)))
+        assert (turned_away.status, turned_away.reasons) == ("skipped", ["PORTFOLIO_RISK_EVALUATION_LOCKED"])
+        stall.set()
+        a = await asyncio.wait_for(worker_a, timeout=30)
+        assert (a.status, a.reasons) == ("rejected", ["DBAE_ACCOUNT_STATE_UNVERIFIED"])
+        rig.quote(FRAY, Decimal(100))
+        b = await rig.gateway.execute_intent(_buy(FRAY, Decimal(1), Decimal(94)))
+
+    assert b.status == "pending", b.reasons
+    approved = [i for i in await rig.intents() if "dbae" in i.risk_snapshot]
+    assert [i.asset.symbol for i in approved] == ["FRAY"]
+    a_intent = await _intent(rig, a.trade_intent_id)
+    assert a_intent.status == TradeIntentStatus.REJECTED and "dbae" not in a_intent.risk_snapshot
+    b_dbae = _dbae(approved[0])
+    assert await rig.pending() == Decimal(b_dbae["max_funding"]) <= Decimal(b_dbae["funding_available"]) <= 20
+    assert [order.symbol for order in rig.orders] == ["FRAY"]

@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -92,6 +92,7 @@ from tradepulse.persistence import (
     DatabaseError,
     PersistenceRepositories,
     RepositoryLeaseLostError,
+    RepositoryPreconditionError,
     acquire_lock,
     hydrate,
     list_all_by_asset,
@@ -377,6 +378,29 @@ class ExecutionGateway:
         environment: Literal["alpaca-paper", "alpaca-live"] = (
             "alpaca-paper" if self._execution_mode == ExecutionMode.PAPER else "alpaca-live")
         return EntryProposal(request.asset, quote.price, stop_price, environment, now)
+
+    def _evidence_still_fresh(self, entry: _AuthorizedEntry) -> Callable[[], Sequence[str]]:
+        """DBAE-146-02: the RISK_APPROVED write's precondition, run inside its
+        fenced transaction. It reads the gateway clock there and re-judges
+        the account and asset evidence this entry was authorized on. Stale
+        account evidence gives DBAE_ACCOUNT_STATE_UNVERIFIED; stale asset
+        evidence is all fields unknown (record ruling 3), so the policy is
+        re-run at that instant and its reasons (DBAE_ASSET_NOT_TRADABLE, and
+        any other field's) are returned. Freshness is never extended: the
+        evidence is not re-read."""
+        def check() -> Sequence[str]:
+            now = aware_utc(self._clock(), field_name="now")
+            if not evidence_fresh(entry.account.received_at, now):
+                return ["DBAE_ACCOUNT_STATE_UNVERIFIED"]
+            if evidence_fresh(entry.asset.received_at, now):
+                return []
+            policy = evaluate_entry_policy(entry.account, entry.band_equity, entry.asset,
+                                           replace(entry.proposal, now=now))
+            # Stale asset evidence reads every field as None, so the policy
+            # always refuses it, at least with DBAE_ASSET_NOT_TRADABLE.
+            return list(policy.reasons) or ["DBAE_ASSET_NOT_TRADABLE"]
+
+        return check
 
     async def _authorize_entry(self, request: ExecutionRequest, intent: TradeIntent, evidence: _EntryEvidence,
                                last_equity: Decimal, quote: AuthoritativeQuote,
@@ -862,9 +886,20 @@ class ExecutionGateway:
                 intent, status=TradeIntentStatus.RISK_APPROVED, requested_quantity=submitted_quantity,
                 risk_snapshot=risk_snapshot,
             )
+            # DBAE-146-02: the evidence must still be fresh when the approval
+            # commits, judged inside the same fenced transaction.
+            fresh_at_commit = None if authorized_entry is None else self._evidence_still_fresh(authorized_entry)
             try:
                 await self._repositories.trade_intents.update(trade_intent_id, approved, status=approved.status.value,
-                                                              lease=portfolio_lease)
+                                                              lease=portfolio_lease, precondition=fresh_at_commit)
+            except RepositoryPreconditionError as stale:
+                # Nothing was written. Closed unsubmitted, like the lease-lost
+                # path, with the refusal recorded (§10).
+                if authorized_entry is None or entry_evidence is None:
+                    raise
+                return await self._refuse_entry(intent, list(stale.reasons), entry_evidence,
+                                                authorized_entry.policy.band, authorized_entry.band_equity,
+                                                aware_utc(self._clock(), field_name="now"))
             except RepositoryLeaseLostError:
                 # Another caller may have approved capital against the same
                 # snapshot after this lease lapsed. Close the intent unsubmitted.

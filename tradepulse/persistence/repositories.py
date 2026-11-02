@@ -77,6 +77,27 @@ class RepositoryLeaseLostError(RuntimeError):
     """A lease-fenced write found its lease expired or owned by another caller."""
 
 
+class RepositoryPreconditionError(RuntimeError):
+    """A write's precondition, run inside the write's own transaction,
+    returned reasons: the transaction rolls back with nothing written."""
+
+    def __init__(self, reasons: Sequence[str]) -> None:
+        super().__init__(f"PRECONDITION_FAILED: {'; '.join(reasons)}")
+        self.reasons = tuple(reasons)
+
+
+def _check_precondition(precondition: Callable[[], Sequence[str]] | None) -> None:
+    """Runs a caller's precondition inside the write's BEGIN IMMEDIATE
+    transaction, after the lease fence and before the write. No reasons:
+    the write goes on. Any reason raises RepositoryPreconditionError, so
+    the transaction rolls back and nothing is written."""
+    if precondition is None:
+        return
+    reasons = precondition()
+    if reasons:
+        raise RepositoryPreconditionError(reasons)
+
+
 def _check_lease(connection: sqlite3.Connection, lease: tuple[str, str] | None) -> None:
     """Fence a write on a still-held lease, inside the write's own BEGIN
     IMMEDIATE transaction. A lease that expired while its holder was
@@ -193,10 +214,17 @@ class RecordRepository:
     async def update(
         self, record_id: str, payload: Any, *, status: str | None = None,
         guard_table: str | None = None, guard_key: str | None = None, lease: tuple[str, str] | None = None,
+        precondition: Callable[[], Sequence[str]] | None = None,
     ) -> bool:
         """``lease`` (lock_key, owner_token) fences the write: it raises
         RepositoryLeaseLostError, writing nothing, unless that lease is still
-        held and unexpired when the write's transaction runs."""
+        held and unexpired when the write's transaction runs.
+
+        ``precondition`` runs in the same transaction, after the lease
+        fence and before the write; any reason it returns raises
+        RepositoryPreconditionError, writing nothing. It must not touch the
+        database: it judges state the caller holds (a deadline on the
+        caller's clock, say) at the moment the write would commit."""
         now = utc_now()
         if self.table in STATUS_TABLES:
             if status is None:
@@ -211,6 +239,7 @@ class RecordRepository:
 
         def execute(connection: sqlite3.Connection) -> bool:
             _check_lease(connection, lease)
+            _check_precondition(precondition)
             _check_integrity_hold(connection, guard_table, guard_key)
             return connection.execute(sql, values).rowcount == 1
 
