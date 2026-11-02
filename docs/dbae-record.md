@@ -13,7 +13,8 @@
 - `b6c39035`, `284b3505`, `5a027aa8`: task 7, the gateway takes DBAE capability evidence; entry authorization with funding, shaping and identity (§3, §7, §8.1, §11); review fix round;
 - `50343d11`, `b5214016`: task 8, scale-out feasibility, the residual alert and protective-exit rejection (§8.4, §8.5, §9), and its review fix round;
 - `ce709ede`: task 9, the DBAE policy frozen into verification generations (§15);
-- task 10: the property test with the fix it found, and this record.
+- `48c7a19b`, `76988ab4`, `6ec23255`: task 10, the property test with the fix it found, and this record;
+- `983eab94`, `f73c2836`, `41072dd8`, `b678d9af`, `0ab14d02`, `83632307`: the final review's fix wave (I1–I5, M5; rulings 22–27), and this record update.
 
 DBAE lets TradePulse trade an account from $20. Every new buy is judged, inside the portfolio-risk lock, against fresh broker evidence:
 - the account's state and permissions;
@@ -102,6 +103,36 @@ The SDD ledger is not kept, so this is the permanent copy.
 20. **Review zip.** The controller builds it after the final whole-branch review, not task 10, so the zip matches the reviewed head.
 21. **Funding sizing** (task 10, above): `evaluate_risk` sizes against `fundable_notional(funding_available)`, not `funding_available` itself. This deviates from §7.5's wording ("It is passed to `evaluate_risk` as `available_cash`") in order to keep its guarantee.
 
+### Final review fix wave (2026-11-01)
+
+22. **I1, no type-ignore comments.** The branch's 18 in `test_dbae_gateway.py`, and the two pre-existing ones on the lines it touched in `test_runtime_lease.py`, are gone. The gateway rig uses typed seams: `HookedBroker` (a `SimulatedBroker` subclass with typed place/quote/account/calendar hooks and a recording `place_on_book`), `RecordingAlerter`, `RecordingIntents` (a `RecordRepository` subclass), and a `restamp` flag on `FreshCapabilities` in place of swapping `rig.caps`. `ExecutionGateway.FILL_TIMEOUT_SECONDS` and `POLL_INTERVAL_SECONDS` are annotated `float`, which they always were in use. `test_runtime_lease.py` calls the constructor through a `Callable[..., ExecutionGateway]` on purpose, because it tests the runtime guard behind the static one. `mypy python_tests/test_dbae_gateway.py python_tests/test_runtime_lease.py` passes.
+23. **I2, store failures refuse.** On the entry path, a `DatabaseError` never raises:
+    - the baseline due-check and the daily checks share the baseline step's catch, so the entry is refused with `DBAE_SESSION_BASELINE_UNVERIFIED` (check `baseline_store_unavailable`);
+    - a failed `pending_buy_funding` read is refused with `DBAE_FUNDING_UNVERIFIED`;
+    - the `dbae_band_changed` audit write is best-effort and logged, because it is not a decision input;
+    - the identity-mismatch alert is best-effort and logged, and the entry is still refused with `DBAE_QUANTITY_IDENTITY_MISMATCH`.
+
+    No new reason strings. Tests: `test_baseline_store_failure_refuses_entry`, `test_pending_funding_store_failure_refuses_entry`, `test_band_audit_store_failure_does_not_block_entry` and `test_identity_mismatch_alert_store_failure_still_refuses`.
+24. **I3, whole-only scale-out.** `whole_units_only(caps, asset_class)` holds for an equity or option unless `caps.fractionable is True`. `None` counts as unknown, so it is whole-only. For such an asset:
+    - `_scale_out_quantity` floors the part to whole units;
+    - `scale_out_feasible` requires both parts to be whole;
+    - a 3-share whole-only position sells 1 share, never 1.5;
+    - a split that cannot be whole is skipped.
+
+    Ruling 14 still holds: both `min_lot_notional` and `scale_out_feasible` must pass. Test: `test_dbae_exits.py::test_whole_only_equity_scale_out_is_whole_or_skipped`.
+
+    Behaviour change: an equity whose capability read fails is now whole-only, where before it fell back to the $1 rule. A fractional holding then is not split (see the task 8 note under "Known behaviour"). Two pre-DBAE expectations were updated to match:
+    - `test_exit_ladder.py::test_fractional_half_floors_to_order_precision` now passes fractionable caps and asserts that unknown caps give no fractional split;
+    - `test_dbae_policy.py::test_scale_out_feasible` treats `None` as whole-only.
+25. **I4, residual alert guard.** The residual value, including `contract_multiplier_of`, is computed inside the existing `try`. It runs ahead of the stop check, so it can no longer abort the exit loop. Test: `test_dbae_exits.py::test_residual_value_failure_does_not_block_stop_check`.
+26. **I5, one evidence-age constant.** `DBAE_EVIDENCE_MAX_AGE_SECONDS = 30` lives in `broker/capabilities.py` (the import direction is dbae → broker). `evidence_fresh()` and `dbae_policy_fingerprint()` both read it at call time, and `tradepulse.dbae` re-exports it. The hard-coded `timedelta(seconds=30)` is gone. Test: `test_dbae_capabilities.py::test_evidence_age_limit_is_the_frozen_constant`.
+27. **M5, no vacuous pinned examples.** `_check_funding` returns every result. `test_pinned_funding_cases_keep_their_outcome` asserts each pinned `@example`'s statuses and reasons:
+    - The $50 case is approved.
+    - The unaided counterexample ($1.03 of funding, 1-cent stock) is, after the funding fix, refused with `DBAE_SUB_MINIMUM_LIQUIDATION_UNVERIFIED` (its stop value is below $1), not approved. Before this wave its `@example` passed without checking anything.
+    - A $1.05 twin is pinned as the tightest approval. Before the fix it would have reserved $1.0551 against $1.05.
+
+    The clock-calendar `MONITOR` is reset per example, and the shared-fixture comment is corrected: `MONITOR` is observed by the session decision, and the autouse `held_lease` is shared too.
+
 ### Known behaviour to note
 
 - **Crypto scale-out under a transient capability failure (task 8).** A transient crypto capability-read failure past `single_unit_target_r` gives a full exit instead of a partial one. The position cannot be proven splittable, so it exits whole, consistent with ruling 14.
@@ -131,8 +162,8 @@ The SDD ledger is not kept, so this is the permanent copy.
   - There is an inline import in `test_fee_correction_counted_once`.
 - **Task 6.** The stored-row path writes an audit `create_once` on every call, and a `DatabaseError` there raises.
 - **Task 7.**
-  - `test_dbae_gateway.py` has a `# type: ignore` on `rig.caps`; the final review must fix it.
-  - `_baseline_capture_due` reads `dbae_session_baselines` outside the `DatabaseError` catch, so a store failure raises instead of refusing; the final review must fix it.
+  - `test_dbae_gateway.py` carried type-ignore comments: 18 lines, not only `rig.caps`. Fixed (ruling 22).
+  - `_baseline_capture_due` reads `dbae_session_baselines` outside the `DatabaseError` catch. Fixed with the wider store exposure (ruling 23).
   - A `latch_risk_stop` write failure on the DBAE-refusal path propagates, the same exposure as the existing rejection branch.
   - `NO_RECENT_SESSION` from `session_date_for` escapes `load_or_capture_baseline` (pre-existing).
 - **Task 8.** `_alert_once` writes `entity_type="reconciliation"` for monitor and gateway events. The restart test reads private gateway attributes.
@@ -143,7 +174,29 @@ The SDD ledger is not kept, so this is the permanent copy.
   - The mismatch tests do not assert invalidation, matching the existing context check.
 - **Task 10.**
   - `.venv/bin/pytest` cannot import `python_tests.*` helper modules (two test files import `python_tests.opening_fixtures`), so the suite is run as `.venv/bin/python -m pytest`, as the ledger did with the main venv.
-  - The property tests suppress hypothesis's `function_scoped_fixture` health check. The calendar fixture and the monitor reset are identical for every example, and each example builds its own database, broker and clock.
+  - The property tests suppress hypothesis's `function_scoped_fixture` health check. The calendar fixture and the autouse `held_lease` are identical for every example. `MONITOR` is reset per example (ruling 27), and each example builds its own database, broker and clock.
+  - Refused examples were skipped silently. Fixed (ruling 27).
+
+### Known follow-ups (final review Minors, not fixed in the fix wave)
+
+- **M1.** P is repriced at the current profile's slippage (`funding.py:129`). With a `dbae` block present, it should use `max_funding × unattributed / submitted`.
+- **M2.** Evidence age and lock budget:
+  - `/account` figures are stamped after the `/account/configurations` call;
+  - freshness is judged at the start of `_authorize_entry`, not at commit;
+  - the 30 s portfolio-risk lock now carries extra broker reads and possibly `run_daily_checks`.
+
+  It fails safe.
+- **M3.** `_record_band` scans every `dbae_band_changed` event on each buy, and a `created_at` tie falls back to UUID order.
+- **M4.** A stop exit that the broker keeps rejecting sends a critical alert every monitor cycle (once per intent). Consider a per-asset, per-hour window.
+- **M6.** Install `hypothesis` in the main checkout's venv after merge (see "After merge").
+- **M7.** No static (AST) guard that the `RISK_APPROVED` update in `gateway.py` passes `lease=`.
+- **M8.** The gateway and monitor import the private `reconciliation.coordinator._alert_once`. Promote it to `tradepulse.alerts`.
+- **M9.**
+  - The `_core_account_reasons` docstring cites §10 order, where the order is §5.2's.
+  - `ExecutionPolicy.as_snapshot` is used only by tests.
+  - `pending_buy_funding` has a dead `requested_quantity is None` branch.
+- **M10.** Add a `RiskLimits` validation `single_unit_target_r >= scale_out_r`.
+- **Test typing.** `mypy python_tests/test_dbae_properties.py` reports two `arg-type` errors in `_knock_out` (`replace(**dict[str, None])`). Test files are outside mypy's configured scope.
 
 ## Gates
 
@@ -168,16 +221,19 @@ Paper sub-$1 liquidation and funding behaviour:
 
 The account snapshot is recorded before each submission, after acceptance and after each fill. **The operator approves each exact order beforehand**, and never during a verification run. The outcome adds the single paper, equity, fractional row to `SUB_MINIMUM_LIQUIDATION_EVIDENCE`. Until then, §8.3 refuses every entry whose stop value is below $1.
 
-### G3: passed at the task-10 commit
+### G3: passed at the final-review fix head (`83632307`, 2026-11-01)
 
-Run in `~/tradepulse-ai-dbae` with its own `.venv` (Python 3.12.3, tool versions pinned to the main venv's):
+Run in `~/tradepulse-ai-dbae` with its own `.venv` (Python 3.12.3, tool versions pinned to the main venv's). The record commit that follows changes only this file.
 
-| Check | Result |
+| Check | Summary line |
 |---|---|
-| `.venv/bin/python -m pytest -q` | 2082 passed, 0 failed, 0 errors (about 12 min) |
+| `.venv/bin/python -m pytest -o addopts="" -q` | `2092 passed, 10 deselected in 644.49s (0:10:44)` (the 10 deselected are `integration`-marked) |
 | `.venv/bin/mypy` | `Success: no issues found in 133 source files` |
-| `.venv/bin/ruff check` | 1750 findings, equal to the HEAD baseline before task 10 (`ce709ede`): no new findings |
-| `.venv/bin/python -m pytest python_tests/test_dbae_properties.py -v` | 5 passed, about 40 s |
+| `.venv/bin/ruff check` | `Found 1750 errors.`: equal to the baseline, so no new findings |
+| `.venv/bin/python -m pytest python_tests/test_dbae_properties.py -o addopts="" -q` | `8 passed in 73.89s (0:01:13)` |
+| `git diff 1ada81f4..HEAD \| grep "type: ignore"` | only two `-` lines, the pre-existing comments removed from `test_runtime_lease.py` (ruling 22); no added lines |
+
+The task-10 G3 run (2082 passed, counted from the dots with no summary line) is superseded. The 10 new tests are 4 for I2, 1 each for I3, I4 and I5, and 3 parametrised cases for M5.
 
 ## Before live
 
@@ -185,6 +241,11 @@ Run in `~/tradepulse-ai-dbae` with its own `.venv` (Python 3.12.3, tool versions
 - **`account_multiplier == 1` is refused** (`DBAE_ACCOUNT_TYPE_UNVERIFIED`). Cash accounts and limited-margin live $20 accounts cannot trade until that account type is verified.
 - **IBKR needs its own `DbaeCapabilities`.** `NoCapabilityEvidence` refuses every IBKR entry until A2 adds them.
 - **A regulatory check (adviser and broker rules) is needed** before TradePulse is offered to other people for their own money.
+
+## After merge
+
+- **Install `hypothesis` in the main checkout's venv** (`pip install -e '.[dev]'`, or `pip install 'hypothesis>=6.100'`). It is now a dev dependency, and without it `python_tests/test_dbae_properties.py` fails at import.
+- Build the review zip, run the token scan and record the sha256 at the post-fix head (ruling 20). Then G1b, G2 (if the operator authorises it), and the fresh generation freeze (§15).
 
 ## Not done (DBAE-P3)
 
