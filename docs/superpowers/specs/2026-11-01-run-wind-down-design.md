@@ -1,6 +1,11 @@
 # Rev.147 — Verification run wind-down and generation handover
 
-**Status:** design, rev. 1, for forensic review. No production code changes and no orders until the spec is approved.
+**Status:** design, rev. 2, for forensic review. No production code changes and no orders until the spec is approved.
+**Rev. 2 (2026-11-01):** the reviewer approved the operator controls. Ctrl+C pauses; `end-run` and the scheduled end both start the same wind-down. This revision adds:
+- distinct, persisted `PAUSED` and `WINDING_DOWN` run states (§3.4);
+- an idempotent `end-run` that permanently disables entries;
+- the resume checks;
+- the rule that the wind-down reuses the existing order-recovery and settlement code (§11).
 **Builds on:** Rev.140 (sellable inventory, the sell gate), Rev.142 (adoption), Rev.144 (calendar), Rev.146 (DBAE, merged before this Rev is built).
 **Operator decisions (2026-11-01):**
 - a verification run ends at a planned time;
@@ -62,16 +67,35 @@ Success means three things:
 
 ### 3.3 Stop signals, crashes and the early end
 
-- **SIGINT or SIGTERM** (Ctrl+C, and the `tradepulse-run` service's own `KillSignal=SIGINT`) **does not start a wind-down.** It stops the process the same way a crash does, and everything is resumable. This matters because the service uses the same signal for restarts. If a signal triggered liquidation, every restart or deploy would liquidate the run.
-  - This changes what was offered in chat on 2026-11-01 ("Ctrl+C runs the same wind-down"), and the operator should confirm it.
+- **SIGINT or SIGTERM** (Ctrl+C, and the `tradepulse-run` service's own `KillSignal=SIGINT`) **pauses the run.** It never starts a wind-down, never cancels an order and never liquidates. This matters because the service uses the same signal for restarts; if a signal triggered liquidation, every restart or deploy would liquidate the run. Approved by the operator and the reviewer on 2026-11-01. On the signal:
+  1. The runtime writes a durable `run_paused` event (§3.4) and stops scheduling new scans and new entries.
+  2. It lets every in-flight gateway call finish its current step. A submission already sent to the broker is never abandoned halfway: the intent ends in its true state (`SUBMITTED`, `ACCEPTED`, `PARTIALLY_FILLED`, or `SUBMISSION_UNKNOWN` if the response never arrived). It is never marked cancelled.
+  3. It then exits, within the service's existing `TimeoutStopSec`.
+- **While paused, positions are exposed.** Stops are held in TradePulse, not at the broker (§6.3), so the run plan states this, and the operator should keep pauses short.
 - **Ending early is explicit:** `tradepulse verification end-run --generation G --reason "<text>"`.
-  - It writes a durable wind-down request with the time and the reason.
-  - The running supervisor sees it within one watch cycle (≤ 30 s) and enters wind-down.
+  - It appends a durable `end_run_requested` event with the time, the reason and the OS user.
+  - **It is idempotent.** If a request or any `WINDING_DOWN` state already exists for the generation, a repeat appends nothing and only reports the current state. It never causes a second census-to-order pass, because every sell is still gated per asset by §4.3.
+  - From that event on, **new entries are permanently disabled for the generation.** No command re-enables them.
+  - A running supervisor sees it within one watch cycle (≤ 30 s) and enters wind-down. A paused run enters wind-down on its next start (§6.2).
   - Before any orders, the same window rule as §3.1 is checked against the current time:
     - inside an XNYS session, the request is accepted and the crypto close runs;
     - the seal is held until the session ends, so the valuation boundary rule still holds;
     - the status shows `seal_deferred_until`.
-- **After a crash or power loss,** the restarted runtime (`run --resume`) reloads the wind-down state before any lane starts (§6).
+- **After a crash or power loss,** the restarted runtime (`run --resume`) reloads the run state before any lane starts (§6).
+
+### 3.4 Run state
+
+The generation's run state is persisted in the append-only `wind_down_events` table (§6.1), and derived as the latest event on every read. It is separate from the existing session state (`SessionState`), which keeps governing risk latches.
+
+| Run state | Entered by | Entries | Scan lanes | Monitor, settlement, reconciliation | Leaves to |
+|---|---|---|---|---|---|
+| `RUNNING` | first start | allowed (subject to every existing gate) | run | run | `PAUSED`, `WINDING_DOWN` |
+| `PAUSED` | SIGINT/SIGTERM (`run_paused`) | refused (`RUN_PAUSED`) | stopped | stopped (process exited) | `RUNNING` (resume, §6.2), `WINDING_DOWN` |
+| `WINDING_DOWN` | `planned_end_at − lead`, or `end_run_requested` | refused permanently (`RUN_WIND_DOWN_ACTIVE`) | never run again | run | sealed (§5, §7) |
+
+- **A crash leaves no event.** The state stays whatever it last was, and `run --resume` handles it exactly like `PAUSED`.
+- **`WINDING_DOWN` is terminal for trading.** No event, restart or command returns the generation to `RUNNING`. Section 5's wind-down states (`REQUESTED` through `UNRESOLVED`) are sub-states of `WINDING_DOWN`.
+- **The gateway's entry refusal** reads the run state inside the fenced `RISK_APPROVED` transaction (§8). `PAUSED` gives `RUN_PAUSED`, and `WINDING_DOWN` gives `RUN_WIND_DOWN_ACTIVE`.
 
 ## 4. What the wind-down does
 
@@ -160,8 +184,14 @@ Whether the cause is a crash, a power loss, a service restart or a signal, `run 
 1. Load the frozen `planned_end_at`, plus the latest `wind_down_events` row and any `end-run` request.
 2. Run the existing startup reconciliation, including reconciliation of every `SUBMISSION_UNKNOWN` intent by its original client order ID.
 3. Decide the phase:
-   - If the current time is at or past `planned_end_at − lead`, or a wind-down state or request exists, enter wind-down at the recorded state. Scan lanes never start. Monitoring, settlement and reconciliation start.
-   - Otherwise, the run continues normally.
+   - If the current time is at or past `planned_end_at − lead`, or a `WINDING_DOWN` state or `end_run_requested` event exists, enter wind-down at the recorded sub-state. Scan lanes never start. Monitoring, settlement and reconciliation start.
+   - Otherwise, the run is `PAUSED` (or crashed), and it returns to `RUNNING` only after all of these pass, in order. Any failure keeps it paused and refuses with the existing reason:
+     - the existing integrity check (`Verification.check`), including the Rev.146 DBAE fingerprint;
+     - broker identity (`startup_broker_account_identity_changed`);
+     - the frozen configuration (`frozen_configuration_mismatch`);
+     - the startup reconciliation from step 2, with every outstanding obligation reconciled.
+
+     On success, a `run_resumed` event is appended, and only then do scan lanes start.
 4. In wind-down, take a fresh census before any new order. A sell is never generated because an earlier submission timed out. Only a reconciled terminal state permits the next sell.
 
 The previous generation's accounting and its evidence boundary are never touched. A late fee is attributed through §4.5.
@@ -236,7 +266,16 @@ All on the simulator, with no broker calls.
   - no scan lane starts;
   - no duplicate sell is sent;
   - the previous accounting is unchanged.
-- **Signal:** SIGINT before the lead time stops the process without starting a wind-down. A restart continues the normal run.
+- **Signal and pause:**
+  - SIGINT before the lead time writes `run_paused`, cancels nothing and sells nothing.
+  - SIGINT during an in-flight submission ends with the intent in its true state, never cancelled.
+  - A restart returns the run to `RUNNING` only after the resume checks pass. Each failing check keeps it paused.
+  - SIGINT during `WINDING_DOWN` makes the restart resume the wind-down, never `RUNNING`.
+- **`end-run` idempotency:**
+  - repeated `end-run` appends one event and sends no extra sells;
+  - `end-run` on a paused run starts the wind-down on the next start;
+  - no path returns a wound-down generation to `RUNNING`.
+- **Entries while paused:** a BUY during `PAUSED` is refused with `RUN_PAUSED` inside the fenced transaction.
 - **Early end:**
   - `end-run` outside a session runs the wind-down;
   - `end-run` inside a session holds the seal until the session ends.
@@ -276,11 +315,15 @@ All on the simulator, with no broker calls.
   - `RUN_WIND_DOWN_ACTIVE`;
   - the five `WIND_DOWN_*` states;
   - the outcome `UNRESOLVED_ACCEPTED`.
+- **No second order-recovery or settlement implementation.**
+  - Wind-down sells, cancels and their recovery go only through the existing `ExecutionGateway`, its client-order-ID idempotency and `SUBMISSION_UNKNOWN` reconciliation, the Rev.140 sell gate, `SettlementProcessor`, and the reconciliation coordinator.
+  - Rev.147 adds only the run state, the census, the classification, the per-asset sequencing rule, the handover and the next-run checks.
+- New refusal strings in rev. 2: `RUN_PAUSED`. New run-state events: `run_paused`, `run_resumed`, `end_run_requested`.
 - The build happens on its own branch and worktree, after Rev.146 is merged. Nothing is merged without review and the operator's approval.
 
 ## 12. Open questions for review
 
-1. **§3.3 (stop signals):** a stop signal never starts a wind-down, and an early end needs `end-run`. This differs from what was offered in chat, and the operator should confirm it.
+1. ~~§3.3 (stop signals).~~ Decided in rev. 2: Ctrl+C pauses; `end-run` and the scheduled end start the wind-down.
 2. **§4.3 (reporting):** should wind-down exits count in the strategy's edge statistics, or be excluded like adopted closes? This spec counts them, because they close the strategy's own positions at market. The `exit_reason` lets a report separate them.
 3. **§4.5 (fee wait):** `FEE_WAIT_MINUTES = 15` is a guess until G1 measures the CFEE delay.
 4. **§5 (escalation):** `WIND_DOWN_ESCALATE_MINUTES = 60` before an unresolved alert. A shorter value means earlier operator attention, with more false alarms during brief outages.
