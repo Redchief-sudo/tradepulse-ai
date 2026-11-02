@@ -380,7 +380,7 @@ class ExecutionGateway:
             "alpaca-paper" if self._execution_mode == ExecutionMode.PAPER else "alpaca-live")
         return EntryProposal(request.asset, quote.price, stop_price, environment, now)
 
-    def _evidence_still_fresh(self, entry: _AuthorizedEntry) -> Callable[[], Sequence[str]]:
+    def _evidence_still_fresh(self, entry: _AuthorizedEntry, trade_intent_id: str) -> Callable[[], Sequence[str]]:
         """DBAE-146-02: the RISK_APPROVED write's precondition, run inside its
         fenced transaction. It reads the gateway clock there and re-judges
         the account and asset evidence this entry was authorized on. Stale
@@ -388,8 +388,21 @@ class ExecutionGateway:
         evidence is all fields unknown (record ruling 3), so the policy is
         re-run at that instant and its reasons (DBAE_ASSET_NOT_TRADABLE, and
         any other field's) are returned. Freshness is never extended: the
-        evidence is not re-read."""
+        evidence is not re-read.
+
+        Re-review M1: an error while judging (the clock, or the policy re-run)
+        means freshness at commit is unverified. It is logged and refused as
+        DBAE_ACCOUNT_STATE_UNVERIFIED, so the transaction rolls back and the
+        intent is closed unsubmitted with the refusal recorded."""
         def check() -> Sequence[str]:
+            try:
+                return judge()
+            except Exception:
+                logger.exception("DBAE: evidence freshness for %s could not be judged at commit; refusing",
+                                 trade_intent_id)
+                return ["DBAE_ACCOUNT_STATE_UNVERIFIED"]
+
+        def judge() -> Sequence[str]:
             now = aware_utc(self._clock(), field_name="now")
             if not evidence_fresh(entry.account.received_at, now):
                 return ["DBAE_ACCOUNT_STATE_UNVERIFIED"]
@@ -898,7 +911,7 @@ class ExecutionGateway:
             )
             # DBAE-146-02: the evidence must still be fresh when the approval
             # commits, judged inside the same fenced transaction.
-            fresh_at_commit = None if authorized_entry is None else self._evidence_still_fresh(authorized_entry)
+            fresh_at_commit = None if authorized_entry is None else self._evidence_still_fresh(authorized_entry, trade_intent_id)
             try:
                 await self._repositories.trade_intents.update(trade_intent_id, approved, status=approved.status.value,
                                                               lease=portfolio_lease, precondition=fresh_at_commit)

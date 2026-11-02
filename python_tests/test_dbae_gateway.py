@@ -1396,6 +1396,41 @@ async def test_asset_evidence_expiring_before_approval_is_refused(tmp_path: Path
     await _assert_refused_unreserved(rig, result, ["DBAE_ASSET_NOT_TRADABLE"])
 
 
+async def test_unexpected_precondition_error_closes_the_intent_unsubmitted(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """M1: the in-transaction precondition raising anything but its refusal
+    (here the policy re-run on stale asset evidence) writes nothing on the
+    approval path. The intent is closed REJECTED with a §10 reason, the
+    refusal is recorded and the error is logged; nothing is reserved or sent."""
+    import tradepulse.execution.gateway as gateway_module
+
+    rig = await _rig(tmp_path)
+    rig.quote(FRAC, Decimal(100))
+    rig.caps.restamp = False
+    rig.caps.account = _account(Decimal(100000), at=rig.now())
+    rig.caps.assets = _assets(at=rig.now() - timedelta(seconds=20))
+    _advance_during(rig, "transaction", timedelta(seconds=15), monkeypatch)
+    real_policy = gateway_module.evaluate_entry_policy
+    calls: list[int] = []
+
+    def policy_failing_at_commit(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        if len(calls) > 1:  # the authorization's run succeeds; the commit-time re-run fails
+            raise RuntimeError("policy evaluation failed")
+        return real_policy(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_module, "evaluate_entry_policy", policy_failing_at_commit)
+
+    with caplog.at_level("ERROR", logger=gateway_module.logger.name):
+        result = await rig.gateway.execute_intent(_buy(FRAC, Decimal(5), Decimal(92)))
+
+    assert len(calls) == 2
+    await _assert_refused_unreserved(rig, result, ["DBAE_ACCOUNT_STATE_UNVERIFIED"])
+    row = await rig.repositories.trade_intents.get(result.trade_intent_id or "")
+    assert row is not None and row["status"] == TradeIntentStatus.REJECTED.value
+    assert any("policy evaluation failed" in (record.exc_text or "") for record in caplog.records)
+
+
 @pytest.mark.parametrize("stage", STAGES)
 async def test_evidence_fresh_at_the_boundary_is_approved(tmp_path: Path, stage: str,
                                                          monkeypatch: pytest.MonkeyPatch) -> None:
