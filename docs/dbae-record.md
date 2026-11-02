@@ -14,7 +14,8 @@
 - `50343d11`, `b5214016`: task 8, scale-out feasibility, the residual alert and protective-exit rejection (§8.4, §8.5, §9), and its review fix round;
 - `ce709ede`: task 9, the DBAE policy frozen into verification generations (§15);
 - `48c7a19b`, `76988ab4`, `6ec23255`: task 10, the property test with the fix it found, and this record;
-- `983eab94`, `f73c2836`, `41072dd8`, `b678d9af`, `0ab14d02`, `83632307`: the final review's fix wave (I1–I5, M5; rulings 22–27), and this record update.
+- `983eab94`, `f73c2836`, `41072dd8`, `b678d9af`, `0ab14d02`, `83632307`: the final review's fix wave (I1–I5, M5; rulings 22–27), and this record update;
+- `9ddba3bc`, `cbe531c9`, `5dab5c3b`: the Rev.146 external audit's corrections (DBAE-146-01 to 146-03), and this record update.
 
 DBAE lets TradePulse trade an account from $20. Every new buy is judged, inside the portfolio-risk lock, against fresh broker evidence:
 - the account's state and permissions;
@@ -133,6 +134,42 @@ The SDD ledger is not kept, so this is the permanent copy.
 
     The clock-calendar `MONITOR` is reset per example, and the shared-fixture comment is corrected: `MONITOR` is observed by the session decision, and the autouse `held_lease` is shared too.
 
+### Rev.146 audit corrections (2026-11-01)
+
+An external audit of the branch at `5d8b7e51` raised four findings. The controller made rulings on them, and the reviewer amended two of those rulings (marked below).
+
+28. **DBAE-146-01, P from the frozen authorization** (`9ddba3bc`; closes M1).
+    - **Defect.** `pending_buy_funding` priced every pending buy at the *current* profile's slippage. Lowering the slippage would have shrunk an existing, unproven commitment.
+    - **Fix** (`dbae/funding.py`). A buy now reserves the larger of two figures (controller ruling):
+      - its frozen `dbae.max_funding × unattributed / dbae.submitted_quantity`;
+      - `max_funding` on the unattributed quantity at the current profile.
+
+      So a profile change can only raise P.
+    - **Broker evidence still reduces P** (reviewer amendment). An attributed fill reduces P, and each SettlementEvent is counted once. A confirmed terminal state drops the buy out of P. `SUBMISSION_UNKNOWN` keeps the full frozen commitment. The fee term stays on the unattributed remainder only, and a mismatch still reserves on the larger quantity.
+    - **Fail closed.** A buy with an unattributed remainder is `unpriced` (`DBAE_FUNDING_UNVERIFIED`) when any of these holds:
+      - it has no `dbae` block (pre-DBAE: there are no frozen parameters);
+      - `max_funding` is missing, unparsable, non-finite or not positive;
+      - `max_funding` is below the order notional plus its buy-side fee, which implies a negative slippage;
+      - `max_funding` is above `MAX_FROZEN_FUNDING_RATE` (2) times the notional. This bound was chosen in this round: no profile allows more than 1.75% slippage plus a 0.25% fee.
+
+      The bounds are compared without division, so they are exact.
+    - **Why no production buy lacks a block.** The gateway's RISK_APPROVED write is the only production writer of a pending buy, and every buy there passes DBAE. So only pre-DBAE rows, and test fixtures, lack a block. Two fixtures were given the block they would have had: one in `test_execution_gateway.py` and the two mismatch fixtures in `test_dbae_gateway.py`. `test_pre_dbae_intent_reserved_on_field` became `test_pre_dbae_intent_is_unpriced`.
+    - **Tests.**
+      - `test_dbae_funding.py`: `test_profile_change_never_reduces_pending_funding` (RISK_APPROVED, ACCEPTED, PARTIALLY_FILLED, SUBMISSION_UNKNOWN × lowered, raised); `test_definitive_fill_reduces_to_frozen_remainder` (amendment a, b); `test_terminal_after_partial_fill_reserves_nothing` (c); `test_submission_unknown_keeps_full_frozen_commitment` (d); `test_invalid_frozen_max_funding_is_unpriced`; `test_frozen_max_funding_bounds_are_inclusive`; `test_crypto_frozen_below_notional_plus_fee_is_unpriced`; `test_pre_dbae_intent_is_unpriced`; `test_fully_attributed_pre_dbae_intent_is_not_flagged`.
+      - `test_dbae_gateway.py`: `test_profile_change_across_restart_never_reduces_pending` (accepted, partial, ambiguous; restart; lowered and raised); `test_pending_pre_dbae_buy_refuses_new_entries`.
+29. **DBAE-146-02, evidence age at the authorization boundary** (`cbe531c9`; closes M2's commit-time point).
+    - **Defect.** Entry authorization read the clock once, at its start. Calendar, baseline, risk and database work followed, so evidence could pass 30 s before RISK_APPROVED committed.
+    - **Fix.** The controller's ruling, a check immediately before the update, was **reversed by the reviewer**: the check is part of the fenced write's own transaction.
+      - `RecordRepository.update` gains a generic `precondition` (`Callable[[], Sequence[str]]`). It runs inside the write's BEGIN IMMEDIATE transaction, after `_check_lease` and before the write. Any reason it returns raises `RepositoryPreconditionError`, which rolls back with nothing written. Persistence has no DBAE imports.
+      - The gateway's precondition, `_evidence_still_fresh`, reads the gateway clock inside the transaction. Stale account evidence gives `DBAE_ACCOUNT_STATE_UNVERIFIED`.
+      - Stale asset evidence is all fields unknown (ruling 3), so the policy is re-run at that instant and its field reasons are returned, at least `DBAE_ASSET_NOT_TRADABLE`.
+      - The intent is closed unsubmitted (`REJECTED`) and `dbae_entry_refused` is recorded. Freshness is never extended, and there are no new reason strings. The lease fence runs first, so a lapsed lease is still `PORTFOLIO_RISK_LOCK_LOST`. Protective exits never take this path.
+    - **Tests.**
+      - `test_persistence_lock.py`: `test_failed_precondition_writes_nothing`, `test_passing_precondition_writes`, `test_lease_fence_runs_before_the_precondition`, and `test_precondition_runs_inside_the_write_transaction` (a second writer cannot BEGIN IMMEDIATE while the precondition runs).
+      - `test_dbae_gateway.py`: `test_account_evidence_expiring_before_approval_is_refused` and `test_asset_evidence_expiring_before_approval_is_refused`. Each runs at four points: the baseline step, risk evaluation, the funding read, and before the write's transaction. Then `test_evidence_fresh_at_the_boundary_is_approved` (the control, 29 s), `test_lapsed_lease_with_expired_evidence_cannot_commit`, and `test_expired_evidence_and_two_symbols_competing_for_the_same_cash` (a $20 account, with the lease lapsed or held: one approval, reserved ≤ funding available, the loser refused with its reason).
+30. **DBAE-146-03, the crypto weekend baseline** (`5dab5c3b`). This finding only documents and tests current behaviour; see "Crypto weekend baseline" above. No case contradicts the spec, and no code changed.
+31. **DBAE-146-04: a $20 conservative account and G2.** No code change. `SUB_MINIMUM_LIQUIDATION_EVIDENCE` stays empty. A $20 conservative account sizes a $1.00 fractional entry whose stop value is $0.95, so §8.3 refuses it with `DBAE_SUB_MINIMUM_LIQUIDATION_UNVERIFIED` (§8.6; `test_matrix_expectations_match_the_spec_20_dollar_cases`). It cannot complete an entry and protective-exit lifecycle until G2 adds the paper, equity, fractional evidence row. This is intended: DBAE never approves an entry whose protective exit is not a proven-supported order.
+
 ### Known behaviour to note
 
 - **Crypto scale-out under a transient capability failure (task 8).** A transient crypto capability-read failure past `single_unit_target_r` gives a full exit instead of a partial one. The position cannot be proven splittable, so it exits whole, consistent with ruling 14.
@@ -179,10 +216,10 @@ The SDD ledger is not kept, so this is the permanent copy.
 
 ### Known follow-ups (final review Minors, not fixed in the fix wave)
 
-- **M1.** P is repriced at the current profile's slippage (`funding.py:129`). With a `dbae` block present, it should use `max_funding × unattributed / submitted`.
+- **M1.** Closed by DBAE-146-01 (ruling 28).
 - **M2.** Evidence age and lock budget:
   - `/account` figures are stamped after the `/account/configurations` call;
-  - freshness is judged at the start of `_authorize_entry`, not at commit;
+  - freshness is judged at the start of `_authorize_entry`, not at commit (closed by DBAE-146-02, ruling 29);
   - the 30 s portfolio-risk lock now carries extra broker reads and possibly `run_daily_checks`.
 
   It fails safe.
@@ -262,6 +299,17 @@ Run in `~/tradepulse-ai-dbae` with its own `.venv` (Python 3.12.3, tool versions
 | `git diff 1ada81f4..HEAD \| grep "type: ignore"` | only two `-` lines, the pre-existing comments removed from `test_runtime_lease.py` (ruling 22); no added lines |
 
 The task-10 G3 run (2082 passed, counted from the dots with no summary line) is superseded. The 10 new tests are 4 for I2, 1 each for I3, I4 and I5, and 3 parametrised cases for M5.
+
+### G3: passed at the Rev.146 correction head (`5dab5c3b`, 2026-11-01)
+
+The same worktree and `.venv`. Dependency pins: `exchange_calendars` 4.13.2 is installed and pinned `==4.13.2`. `respx` 0.23.1 is installed, and the pin is `>=0.21`. There is no lock file, so nothing was reinstalled. The record commit that follows changes only this file.
+
+| Check | Summary line |
+|---|---|
+| `.venv/bin/python -m pytest -o addopts="" -q -p no:cacheprovider` | `2147 passed, 10 deselected in 748.29s (0:12:28)` (55 more than the last G3, all new in this round) |
+| `.venv/bin/mypy` | `Success: no issues found in 133 source files` |
+| `.venv/bin/ruff check` | `Found 1750 errors.`: equal to the last G3 and to the baseline, so no new findings (`1ada81f4` itself has 1763) |
+| `.venv/bin/ruff check $(git diff --name-only 1ada81f4..HEAD -- '*.py')` | `Found 537 errors.` across the 50 files the branch changed. That is 15 fewer than those files had at `1ada81f4`. The branch introduced only 2, both in task 1's `test_dbae_ladder_retired.py:29-30` (`PLR0402`); the Rev.146 round introduced none. |
 
 ## Before live
 
