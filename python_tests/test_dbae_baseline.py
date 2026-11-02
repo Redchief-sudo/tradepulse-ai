@@ -16,6 +16,7 @@ from tradepulse.broker.simulated import SimulatedCapabilities
 from tradepulse.calendar import BrokerSession, MarketCalendar, Venue, ny_date
 from tradepulse.calendar.checks import CalendarGate, run_check
 from tradepulse.dbae import Band, band_for
+from tradepulse.dbae.bands import unlocks
 from tradepulse.dbae.baseline import (
     BaselineRefusal,
     SessionBaseline,
@@ -379,3 +380,87 @@ async def test_corrupt_stored_row_refuses(repositories: PersistenceRepositories,
     assert [row["record_id"] for row in await events(repositories, "dbae_session_baseline_unverified")] == [
         f"dbae_baseline_unverified:{TUE.isoformat()}:baseline_corrupt"]
     assert await events(repositories, "dbae_session_baseline_captured") == []
+
+
+# --- DBAE-146-03: the crypto weekend baseline, pinned (spec §4.3 "Which session", "Crypto") -----------
+#
+# Thursday closes at $90 (MICRO_PLUS: crypto locked), Friday gains and closes
+# at $120 (FRACTIONAL: crypto unlocked). Current equity stays $120 all weekend.
+# The baseline is the same for every asset class; a crypto entry differs only
+# in being able to trade outside the equity session.
+
+CRYPTO_WEEKEND = [
+    # (label, instant, last_equity Alpaca reports, session_date, previous_trading_date, baseline close)
+    ("friday_after_close", ny(FRI, 17), "90", FRI, THU, "90"),
+    ("saturday", ny(SAT, 11), "90", FRI, THU, "90"),
+    ("sunday", ny(date(2026, 11, 8), 23), "120", FRI, THU, "90"),  # Friday's stored row is reused
+    ("monday_before_open", ny(MON, 6), "120", MON, FRI, "120"),
+    ("monday_after_open", ny(MON, 10), "120", MON, FRI, "120"),
+]
+
+
+async def test_crypto_weekend_baseline_table(repositories: PersistenceRepositories) -> None:
+    """A Friday gain unlocks crypto only from Monday's session date: from
+    00:00 New York time on Monday, once last_equity has rolled to Friday's
+    close, never during the weekend."""
+    gate = await verified_gate(repositories, THU)
+    bars = history((THU, "90"), (FRI, "120"))
+    for label, instant, last_equity, session, previous, close in CRYPTO_WEEKEND:
+        result = await load_or_capture_baseline(repositories, gate, bars, Decimal(last_equity), instant)
+        assert isinstance(result, SessionBaseline), label
+        assert (result.session_date, result.previous_trading_date, result.previous_close_equity) == (
+            session, previous, Decimal(close)), label
+        equity = band_equity(Decimal(120), result)
+        crypto_unlocked = equity is not None and unlocks(band_for(equity)).crypto
+        assert crypto_unlocked is (session == MON), label
+    assert [row["record_id"] for row in await baseline_rows(repositories)] == [FRI.isoformat(), MON.isoformat()]
+
+
+async def test_saturday_first_capture_needs_last_equity_at_thursday_close(
+        repositories: PersistenceRepositories) -> None:
+    """Friday's baseline first captured on Saturday: verified only if
+    last_equity still reports Thursday's close. If Alpaca has rolled it to
+    Friday's close, the capture is refused until Monday (record ruling 9)."""
+    gate = await verified_gate(repositories, THU)
+    bars = history((THU, "90"), (FRI, "120"))
+    rolled = await load_or_capture_baseline(repositories, gate, bars, Decimal(120), ny(SAT, 11))
+    assert rolled == BaselineRefusal(reason="DBAE_SESSION_BASELINE_UNVERIFIED", check="last_equity_disagrees")
+    unrolled = await load_or_capture_baseline(repositories, gate, bars, Decimal(90), ny(SAT, 12))
+    assert isinstance(unrolled, SessionBaseline)
+    assert (unrolled.session_date, unrolled.previous_trading_date, unrolled.previous_close_equity) == (
+        FRI, THU, Decimal(90))
+
+
+async def test_monday_premarket_before_last_equity_rolls_is_refused(repositories: PersistenceRepositories) -> None:
+    """Monday 00:30 New York: the session date is already Monday. If
+    last_equity still reports Thursday's close, the check against Friday's
+    bar fails and the entry is refused (no fallback to Friday's baseline);
+    capture is retried and succeeds once last_equity has rolled."""
+    gate = await verified_gate(repositories, THU)
+    bars = history((THU, "90"), (FRI, "120"))
+    early = await load_or_capture_baseline(repositories, gate, bars, Decimal(90), ny(MON, 0, 30))
+    assert early == BaselineRefusal(reason="DBAE_SESSION_BASELINE_UNVERIFIED", check="last_equity_disagrees")
+    later = await load_or_capture_baseline(repositories, gate, bars, Decimal(120), ny(MON, 6))
+    assert isinstance(later, SessionBaseline) and later.previous_close_equity == Decimal(120)
+
+
+async def test_crypto_holiday_monday_baseline(repositories: PersistenceRepositories) -> None:
+    """Memorial Day, Monday 2026-05-25, is not a session: Saturday to Monday
+    use Friday 05-22's session (Thursday 05-21's close), and Friday's gain
+    takes effect from Tuesday 05-26's session date (EDT: New York is UTC-4)."""
+    thursday, friday, monday, tuesday = date(2026, 5, 21), date(2026, 5, 22), date(2026, 5, 25), date(2026, 5, 26)
+
+    def edt(day: date, hour: int) -> datetime:
+        return datetime(day.year, day.month, day.day, hour, tzinfo=UTC) + timedelta(hours=4)
+
+    gate = await verified_gate(repositories, thursday)
+    bars = history((thursday, "90"), (friday, "120"))
+    for instant, last_equity, session, previous, close in (
+        (edt(date(2026, 5, 23), 11), "90", friday, thursday, "90"),
+        (edt(monday, 11), "120", friday, thursday, "90"),
+        (edt(tuesday, 6), "120", tuesday, friday, "120"),
+    ):
+        result = await load_or_capture_baseline(repositories, gate, bars, Decimal(last_equity), instant)
+        assert isinstance(result, SessionBaseline), instant
+        assert (result.session_date, result.previous_trading_date, result.previous_close_equity) == (
+            session, previous, Decimal(close)), instant

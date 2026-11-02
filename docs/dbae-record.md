@@ -198,6 +198,34 @@ The SDD ledger is not kept, so this is the permanent copy.
 - **M10.** Add a `RiskLimits` validation `single_unit_target_r >= scale_out_r`.
 - **Test typing.** `mypy python_tests/test_dbae_properties.py` reports two `arg-type` errors in `_knock_out` (`replace(**dict[str, None])`). Test files are outside mypy's configured scope.
 
+## Crypto weekend baseline (DBAE-146-03)
+
+Crypto trades every day, but its band uses the equity session's baseline (§4.3). The session date is the New York calendar date when that date is a US equity session, and otherwise the most recent session before it. The baseline for a session is the close of the trading date before it.
+
+Example: Thursday closes at $90 (MICRO_PLUS, crypto locked). Friday gains and closes at $120 (FRACTIONAL, crypto unlocked).
+
+| Crypto entry at (New York time) | Session date | Previous trading date | Baseline | Crypto |
+|---|---|---|---|---|
+| Friday 17:00, after the close | Friday | Thursday | $90 | locked |
+| Saturday | Friday | Thursday | $90 | locked |
+| Sunday | Friday | Thursday | $90 | locked |
+| Monday 06:00, before the open | Monday | Friday | $120 | unlocked |
+| Monday 10:00, after the open | Monday | Friday | $120 | unlocked |
+| Holiday Monday (Memorial Day 2026-05-25) | Friday | Thursday | $90 | locked |
+| Tuesday after that holiday, 06:00 | Tuesday | Friday | $120 | unlocked |
+
+In plain terms: **a Friday gain unlocks a band for crypto from 00:00 New York time on the next equity trading day** (Monday, or Tuesday after a Monday holiday), not during the weekend and not only at Monday's open. A loss still lowers the band at once, because band equity is the lower of current equity and the baseline (§4.2).
+
+Two conditions apply to that unlock:
+- **`last_equity` must have rolled.** The new baseline is verified only when `last_equity` equals Friday's close within $0.01. If Alpaca still reports Thursday's close early on Monday, the entry is refused (`DBAE_SESSION_BASELINE_UNVERIFIED`, check `last_equity_disagrees`), and capture is retried at the next buy. There is no fallback to Friday's baseline.
+- **Weekend first capture** (ruling 9). If Friday's baseline was not stored on Friday and Alpaca has already rolled `last_equity` to Friday's close, weekend crypto entries are refused until Monday.
+
+This matches the spec: "Upgrades therefore happen only at an equity trading-day boundary", and "A crypto entry on Saturday uses Friday's session baseline". No case contradicts it, and no code was changed. Tests in `python_tests/test_dbae_baseline.py`:
+- `test_crypto_weekend_baseline_table`;
+- `test_saturday_first_capture_needs_last_equity_at_thursday_close`;
+- `test_monday_premarket_before_last_equity_rolls_is_refused`;
+- `test_crypto_holiday_monday_baseline`.
+
 ## Gates
 
 ### G1: done (read only, 2026-10-30)
