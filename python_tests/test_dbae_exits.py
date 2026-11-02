@@ -112,6 +112,26 @@ async def test_residual_below_1_alerts_once_and_full_exit_submitted(rt: Rt) -> N
     assert [(e.severity, e.entity_id) for e in residual] == [("warning", asset_identity_key(AAPL))]  # once, over two cycles
 
 
+async def test_residual_value_failure_does_not_block_stop_check(rt: Rt, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Final review I4: the residual check runs ahead of the stop check. Its
+    value computation failing (an option holding with no contract multiplier
+    raises ValueError) must not abort the cycle: the breached stop still exits."""
+    from tradepulse.monitor import coordinator
+
+    def no_multiplier(asset: AssetIdentity) -> Decimal:
+        raise ValueError(f"{asset.symbol}: no contract multiplier")
+
+    await _breach(rt)
+    monkeypatch.setattr(coordinator, "contract_multiplier_of", no_multiplier)
+
+    result = await _monitor(rt)
+
+    assert result.exits_triggered == 1
+    [sell] = await rt.exits_at_broker()
+    assert sell.qty == Decimal(10)
+    assert await _events(rt, "DBAE_RESIDUAL_BELOW_ENTRY_MINIMUM") == []
+
+
 # --- definitive rejection (spec §9) --------------------------------------------------------------------
 
 

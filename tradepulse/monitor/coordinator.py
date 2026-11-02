@@ -372,15 +372,17 @@ async def _report_residual_below_minimum(repositories: PersistenceRepositories, 
                                          position: AlpacaPosition, holding: Holding, now: datetime) -> None:
     """Spec §8.5: a held position worth under $1 is a warning, once per asset
     per session date. It never changes the exit decision (the protective
-    exit is still a full-quantity sell) and never raises into the exit loop."""
-    value = abs(position.qty) * position.current_price * contract_multiplier_of(holding.asset)
-    if value >= RESIDUAL_MINIMUM_VALUE:
-        return
+    exit is still a full-quantity sell) and never raises into the exit loop:
+    it runs ahead of the stop check, so everything, the value included (an
+    option holding with no contract multiplier raises), is inside the guard."""
     from tradepulse.calendar import CalendarHorizonExceeded, market_calendar, ny_date
     from tradepulse.dbae.baseline import session_date_for
     from tradepulse.reconciliation.coordinator import _alert_once
 
     try:
+        value = abs(position.qty) * position.current_price * contract_multiplier_of(holding.asset)
+        if value >= RESIDUAL_MINIMUM_VALUE:
+            return
         try:
             window = session_date_for(market_calendar(ny_date(now)), now)
         except (CalendarHorizonExceeded, ValueError):
