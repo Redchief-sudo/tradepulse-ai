@@ -480,13 +480,30 @@ async def test_non_finite_frozen_field_is_unpriced(tmp_path, field: str, value: 
 
 @pytest.mark.parametrize("field", FROZEN_RATE_FIELDS)
 async def test_non_positive_frozen_field_is_unpriced(tmp_path, field: str) -> None:
-    """Zero and negative values are unpriced, except a zero fee_pct, which
-    is the equity and option buy-side fee (test_exactly_reconciled_record_is_priced)."""
-    for value in (["-1", "-0.01"] if field == "fee_pct" else ["0", "-1", "-0.01"]):
+    """Zero and negative values are unpriced, except a zero fee_pct (the
+    equity and option buy-side fee) or slippage_pct (a zero allowance):
+    test_zero_frozen_slippage_reconciles."""
+    for value in (["-1", "-0.01"] if field in ("fee_pct", "slippage_pct") else ["0", "-1", "-0.01"]):
         block = _approved_block("10", "1", CRYPTO)
         block["dbae"][field] = value
         assert (await _priced_alone(tmp_path / value, block, asset=CRYPTO)) == PendingFunding(
             Decimal(0), (), ("ti-r",)), value
+
+
+@pytest.mark.parametrize("asset", [EQUITY, CRYPTO])
+async def test_zero_frozen_slippage_reconciles(tmp_path, asset: AssetIdentity) -> None:
+    """A zero slippage allowance is a valid configuration: a record frozen at
+    slippage_pct 0 that reconciles exactly is priced; at -0.01 it is not."""
+    block = _approved_block("10", "2", asset, slippage=Decimal(0))
+    zero = replace(LIMITS, slippage_limit_pct=Decimal(0))
+
+    pending = await _priced_alone(tmp_path / "zero", block, asset=asset, price="2", limits=zero)
+
+    assert block["dbae"]["slippage_pct"] == "0"
+    assert pending == PendingFunding(Decimal(block["dbae"]["max_funding"]), (), ())
+    block["dbae"]["slippage_pct"] = "-0.01"
+    assert (await _priced_alone(tmp_path / "negative", block, asset=asset, price="2", limits=zero)) == PendingFunding(
+        Decimal(0), (), ("ti-r",))
 
 
 @pytest.mark.parametrize("delta", [Decimal("0.01"), Decimal("-0.01")])

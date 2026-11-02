@@ -115,7 +115,7 @@ def _frozen_max_funding(block: Mapping[str, object], submitted_qty: Decimal, int
     The block freezes the inputs max_funding was computed from:
     reference_price, contract_multiplier, slippage_pct and fee_pct. The
     record is accepted only when every one of them and max_funding is a
-    finite positive Decimal (fee_pct may be zero), the frozen
+    finite positive Decimal (slippage_pct and fee_pct may be zero), the frozen
     reference_price is the intent's, the frozen contract_multiplier is
     contract_multiplier_of(intent.asset), and funding_for recomputes
     max_funding from them exactly (zero tolerance). Otherwise None: the buy
@@ -125,7 +125,7 @@ def _frozen_max_funding(block: Mapping[str, object], submitted_qty: Decimal, int
     frozen = _frozen_decimal(block, "max_funding")
     price = _frozen_decimal(block, "reference_price")
     multiplier = _frozen_decimal(block, "contract_multiplier")
-    slippage = _frozen_decimal(block, "slippage_pct")
+    slippage = _frozen_decimal(block, "slippage_pct", allow_zero=True)
     fee = _frozen_decimal(block, "fee_pct", allow_zero=True)
     if frozen is None or price is None or multiplier is None or slippage is None or fee is None:
         return None
