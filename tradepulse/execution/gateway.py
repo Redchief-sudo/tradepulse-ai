@@ -397,11 +397,13 @@ class ExecutionGateway:
             return await self._refuse_entry(intent, core, evidence, None, None, now)
 
         gate = self._calendar_gate(now)
-        if await self._baseline_capture_due(gate, now):
-            # Once the session's baseline is stored, no broker calendar call is made here.
-            await self._run_daily_checks_if_due(gate, now)
         baseline: SessionBaseline | BaselineRefusal
+        # A store that cannot be read is unknown evidence (§10): the baseline
+        # is unverified and the entry is refused, never raised.
         try:
+            if await self._baseline_capture_due(gate, now):
+                # Once the session's baseline is stored, no broker calendar call is made here.
+                await self._run_daily_checks_if_due(gate, now)
             baseline = await load_or_capture_baseline(self._repositories, gate, self._capabilities, last_equity, now)
         except DatabaseError:
             baseline = BaselineRefusal(reason=BASELINE_REASON, check="baseline_store_unavailable")
@@ -420,7 +422,9 @@ class ExecutionGateway:
         reasons: list[str] = []
         try:
             pending = await pending_buy_funding(self._repositories, self._risk_limits)
-        except ValueError:  # PENDING_INTENT_QUANTITY_MISSING, or a pending buy with no dollar notional
+        # PENDING_INTENT_QUANTITY_MISSING, a pending buy with no dollar notional,
+        # or a store that cannot be read: P is unknown, so funding is unverified (§10).
+        except (ValueError, DatabaseError):
             return await self._refuse_entry(intent, ["DBAE_FUNDING_UNVERIFIED"], evidence, policy.band,
                                             equity_for_band, now)
         for mismatched in pending.mismatches:
@@ -514,7 +518,16 @@ class ExecutionGateway:
     async def _record_band(self, intent: TradeIntent, band: Band, equity_for_band: Decimal, current_equity: Decimal,
                            baseline: SessionBaseline, now: datetime) -> None:
         """Spec §4.4: ``dbae_band_changed`` when this entry's band differs
-        from the band of the latest such event (none yet: the first entry)."""
+        from the band of the latest such event (none yet: the first entry).
+        Audit only, not a decision input: a store failure is logged and the
+        entry goes on."""
+        try:
+            await self._write_band_change(intent, band, equity_for_band, current_equity, baseline, now)
+        except DatabaseError:
+            logger.exception("DBAE: dbae_band_changed not recorded for %s", intent.trade_intent_id)
+
+    async def _write_band_change(self, intent: TradeIntent, band: Band, equity_for_band: Decimal,
+                                 current_equity: Decimal, baseline: SessionBaseline, now: datetime) -> None:
         rows = await list_all_by_json_field(self._repositories.audit_events, "event_type", "dbae_band_changed")
         previous = rows[-1]["payload"]["details"]["new_band"] if rows else None
         if previous == band.value:
@@ -535,17 +548,23 @@ class ExecutionGateway:
                      "session_date": baseline.session_date.isoformat(), "unlocked_classes": unlocked}))
 
     async def _alert_quantity_identity_mismatch(self, trade_intent_id: str, now: datetime) -> None:
-        """Spec §7.1: critical, once per intent."""
+        """Spec §7.1: critical, once per intent. The entry is refused with
+        DBAE_QUANTITY_IDENTITY_MISMATCH whether or not this is recorded, so a
+        store failure is logged and retried on the next entry."""
         from tradepulse.alerts.once import alert_once
 
-        await alert_once(self._repositories.audit_events, self._alerts, AuditEvent(
+        event = AuditEvent(
             event_id=f"dbae_quantity_identity_mismatch:{trade_intent_id}",
             event_type="dbae_quantity_identity_mismatch", severity="critical",
             message=(f"DBAE_QUANTITY_IDENTITY_MISMATCH: pending buy {trade_intent_id} has a requested_quantity that "
                      "differs from its risk_snapshot.dbae.submitted_quantity. Funding reserves the larger; new entries "
                      "are refused until an operator resolves it."),
             occurred_at=now, entity_type="trade_intent", entity_id=trade_intent_id,
-            details={"trade_intent_id": trade_intent_id}))
+            details={"trade_intent_id": trade_intent_id})
+        try:
+            await alert_once(self._repositories.audit_events, self._alerts, event)
+        except DatabaseError:
+            logger.exception("DBAE: identity-mismatch alert for %s not recorded", trade_intent_id)
 
     async def execute_intent(self, request: ExecutionRequest) -> ExecutionResult:
         now = self._clock()

@@ -51,7 +51,13 @@ from tradepulse.models import (
     TradeIntentStatus,
     TradingSession,
 )
-from tradepulse.persistence import AsyncSQLiteDatabase, PersistenceRepositories, hydrate, list_all_by_json_field
+from tradepulse.persistence import (
+    AsyncSQLiteDatabase,
+    DatabaseError,
+    PersistenceRepositories,
+    hydrate,
+    list_all_by_json_field,
+)
 from tradepulse.persistence.codec import encode_payload
 from tradepulse.persistence.repositories import RecordRepository
 from tradepulse.providers import AlpacaMarketDataProvider
@@ -876,6 +882,87 @@ async def test_refusal_writes_reason_and_event(tmp_path: Path) -> None:
     assert details["asset_class"] == "equity"
     assert details["account_evidence_age_seconds"] is not None and details["asset_evidence_age_seconds"] is not None
     assert event["entity_id"] == intent.trade_intent_id
+
+
+# --- a store that cannot be read refuses the entry; it never raises (final review I2, spec §10) ----------------
+
+
+class UnreadableBaselines(RecordRepository):
+    """The session-baseline table, failing every read as a locked or
+    corrupt database would."""
+
+    def __init__(self, database: AsyncSQLiteDatabase) -> None:
+        super().__init__(database, "dbae_session_baselines")
+
+    async def get(self, record_id: str) -> Mapping[str, Any] | None:
+        raise DatabaseError("simulated: dbae_session_baselines unreadable")
+
+
+async def _unreadable(*args: object, **kwargs: object) -> Any:
+    raise DatabaseError("simulated: store unreadable")
+
+
+async def test_baseline_store_failure_refuses_entry(tmp_path: Path) -> None:
+    """_baseline_capture_due's read fails: the entry is refused as an
+    unverified baseline, not raised."""
+    rig = await _rig(tmp_path)
+    rig.repositories = replace(rig.repositories, dbae_session_baselines=UnreadableBaselines(rig.database))
+    rig.gateway = rig.build_gateway()
+    rig.quote(FRAC, Decimal(100))
+
+    result = await rig.gateway.execute_intent(_buy(FRAC, Decimal(1), Decimal(92)))
+
+    assert (result.status, result.reasons) == ("rejected", ["DBAE_SESSION_BASELINE_UNVERIFIED"])
+    assert rig.orders == []
+    [intent] = await rig.intents()
+    assert intent.rejection_reason == "DBAE_SESSION_BASELINE_UNVERIFIED"
+
+
+async def test_pending_funding_store_failure_refuses_entry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """P cannot be read: funding is unverified, and the entry is refused."""
+    import tradepulse.execution.gateway as gateway_module
+
+    rig = await _rig(tmp_path)
+    monkeypatch.setattr(gateway_module, "pending_buy_funding", _unreadable)
+    rig.quote(FRAC, Decimal(100))
+
+    result = await rig.gateway.execute_intent(_buy(FRAC, Decimal(1), Decimal(92)))
+
+    assert (result.status, result.reasons) == ("rejected", ["DBAE_FUNDING_UNVERIFIED"])
+    assert rig.orders == []
+
+
+async def test_band_audit_store_failure_does_not_block_entry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """dbae_band_changed is audit, not a decision input: a failed read is
+    logged and the approved entry goes on."""
+    import tradepulse.execution.gateway as gateway_module
+
+    rig = await _rig(tmp_path)
+    monkeypatch.setattr(gateway_module, "list_all_by_json_field", _unreadable)
+    rig.quote(FRAC, Decimal(100))
+
+    result = await rig.gateway.execute_intent(_buy(FRAC, Decimal(1), Decimal(92)))
+
+    assert result.status == "filled", result.reasons
+    assert await _events(rig, "dbae_band_changed") == []
+
+
+async def test_identity_mismatch_alert_store_failure_still_refuses(tmp_path: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    import tradepulse.alerts.once as once_module
+
+    rig = await _rig(tmp_path)
+    bad = TradeIntent("bad-intent", "idem-bad", "corr-bad", FRAY, Side.BUY, ExecutionMode.PAPER, "test", NOW,
+                      requested_quantity=Decimal(7), reference_price=Decimal(100), status=TradeIntentStatus.ACCEPTED,
+                      broker_order_id="order-bad", risk_snapshot={"dbae": {"submitted_quantity": "5"}})
+    await rig.repositories.trade_intents.create_once("bad-intent", bad, status=bad.status.value, unique_value="idem-bad")
+    monkeypatch.setattr(once_module, "alert_once", _unreadable)
+    rig.quote(FRAC, Decimal(100))
+
+    result = await rig.gateway.execute_intent(_buy(FRAC, Decimal(5), Decimal(92)))
+
+    assert (result.status, result.reasons) == ("rejected", ["DBAE_QUANTITY_IDENTITY_MISMATCH"])
+    assert rig.orders == []
 
 
 # --- protective exits never read DBAE evidence (spec §9) --------------------------------------------------
