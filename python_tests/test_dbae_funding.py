@@ -63,11 +63,22 @@ RELEASED_STATUSES = (
 )
 
 
-def _dbae_block(submitted: str) -> dict[str, Any]:
-    return {"dbae": {
+def _dbae_block(submitted: str, max_funding_value: Decimal | str | None = None) -> dict[str, Any]:
+    block: dict[str, Any] = {
         "original_requested_quantity": "20", "risk_approved_quantity": submitted,
         "shaped_quantity": submitted, "submitted_quantity": submitted,
-    }}
+    }
+    if max_funding_value is not None:
+        block["max_funding"] = str(max_funding_value)
+    return {"dbae": block}
+
+
+def _approved_block(submitted: str, price: str, asset: AssetIdentity = EQUITY,
+                    slippage: Decimal | None = None) -> dict[str, Any]:
+    """The dbae block the gateway freezes at RISK_APPROVED: max_funding on
+    the submitted quantity at the approving profile's slippage."""
+    slip = LIMITS.slippage_limit_for(asset.asset_class) if slippage is None else slippage
+    return _dbae_block(submitted, max_funding(Decimal(submitted), Decimal(price), asset, slip))
 
 
 async def _seed_buy(
@@ -78,7 +89,8 @@ async def _seed_buy(
     intent = TradeIntent(
         intent_id, intent_id, intent_id, asset, side, ExecutionMode.PAPER, "test", NOW,
         requested_quantity=Decimal(quantity), reference_price=None if price is None else Decimal(price),
-        risk_snapshot=_dbae_block(quantity) if risk_snapshot is None else risk_snapshot,
+        risk_snapshot=(_dbae_block(quantity) if price is None else _approved_block(quantity, price, asset))
+        if risk_snapshot is None else risk_snapshot,
         status=status, sector=sector,
     )
     await repositories.trade_intents.create_once(intent_id, intent, status=status.value, unique_value=intent_id)
@@ -273,8 +285,8 @@ async def test_buys_across_symbols_sum(tmp_path) -> None:
 
 async def test_identity_mismatch_reserves_larger(tmp_path) -> None:
     repositories = await _repositories(tmp_path)
-    await _seed_buy(repositories, "ti-m", quantity="7", price="1", risk_snapshot=_dbae_block("9"))
-    await _seed_buy(repositories, "ti-n", quantity="9", price="1", risk_snapshot=_dbae_block("7"))
+    await _seed_buy(repositories, "ti-m", quantity="7", price="1", risk_snapshot=_approved_block("9", "1"))
+    await _seed_buy(repositories, "ti-n", quantity="9", price="1", risk_snapshot=_approved_block("7", "1"))
 
     pending = await pending_buy_funding(repositories, LIMITS)
 
@@ -283,14 +295,152 @@ async def test_identity_mismatch_reserves_larger(tmp_path) -> None:
     assert pending.unpriced == ()
 
 
-async def test_pre_dbae_intent_reserved_on_field(tmp_path) -> None:
+async def test_pre_dbae_intent_is_unpriced(tmp_path) -> None:
+    """DBAE-146-01: a pending buy with no dbae block has no frozen
+    authorization, so its commitment cannot be reconstructed: unpriced."""
     repositories = await _repositories(tmp_path)
     await _seed_buy(repositories, "ti-old", quantity="7", price="2",
                     risk_snapshot={"requested_quantity": "50", "approved_quantity": "50"})
 
     pending = await pending_buy_funding(repositories, LIMITS)
 
-    assert pending == PendingFunding(total=_reserve(Decimal(7), Decimal(2), EQ_SLIP), mismatches=(), unpriced=())
+    assert pending == PendingFunding(total=Decimal(0), mismatches=(), unpriced=("ti-old",))
+
+
+async def test_fully_attributed_pre_dbae_intent_is_not_flagged(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await _seed_buy(repositories, "ti-old", quantity="5", price="2", status=TradeIntentStatus.PARTIALLY_FILLED,
+                    risk_snapshot={"requested_quantity": "5"})
+    await _seed_settlement_event(repositories, settlement_event_id="se-o", trade_intent_id="ti-old",
+                                 quantity=Decimal(5), price=Decimal(2), holding_projected=False)
+
+    assert await pending_buy_funding(repositories, LIMITS) == PendingFunding(Decimal(0), (), ())
+
+
+# --- DBAE-146-01: P from the frozen authorization -----------------------------
+
+FROZEN_SLIP = Decimal("1.5")  # the approving profile's equity slippage (aggressive)
+LOWER = replace(LIMITS, slippage_limit_pct=Decimal("0.1"))
+HIGHER = replace(LIMITS, slippage_limit_pct=Decimal(3))
+
+
+@pytest.mark.parametrize("status", [
+    TradeIntentStatus.RISK_APPROVED, TradeIntentStatus.ACCEPTED, TradeIntentStatus.PARTIALLY_FILLED,
+    TradeIntentStatus.SUBMISSION_UNKNOWN,
+])
+@pytest.mark.parametrize(("limits", "slip"), [(LOWER, FROZEN_SLIP), (HIGHER, Decimal(3))],
+                         ids=["profile_lowered", "profile_raised"])
+async def test_profile_change_never_reduces_pending_funding(tmp_path, status: TradeIntentStatus,
+                                                            limits: Any, slip: Decimal) -> None:
+    """A $10 order frozen at 1.5% slippage. Lowering the profile's slippage
+    afterwards never shrinks the commitment (the frozen rate stays);
+    raising it raises P (max of frozen and current)."""
+    repositories = await _repositories(tmp_path)
+    await _seed_buy(repositories, "ti-f", quantity="10", price="1", status=status,
+                    risk_snapshot=_approved_block("10", "1", slippage=FROZEN_SLIP))
+    attributed = Decimal(6) if status == TradeIntentStatus.PARTIALLY_FILLED else Decimal(0)
+    if attributed:
+        await _seed_settlement_event(repositories, settlement_event_id="se-f", trade_intent_id="ti-f",
+                                     quantity=attributed, price=Decimal(1), holding_projected=False)
+
+    pending = await pending_buy_funding(repositories, limits)
+
+    assert pending == PendingFunding(_reserve(10 - attributed, Decimal(1), slip), (), ())
+    assert pending.total >= _reserve(10 - attributed, Decimal(1), FROZEN_SLIP)
+
+
+async def test_definitive_fill_reduces_to_frozen_remainder(tmp_path) -> None:
+    """Amendment (a), (b): $10 with $6 definitively filled reserves the
+    unfilled $4 at the frozen 1.5% (crypto: plus the fee on the $4), not
+    $10; with the profile lowered afterwards, still never below that."""
+    repositories = await _repositories(tmp_path)
+    await _seed_buy(repositories, "ti-eq", quantity="10", price="1", status=TradeIntentStatus.PARTIALLY_FILLED,
+                    risk_snapshot=_approved_block("10", "1", slippage=FROZEN_SLIP))
+    await _seed_settlement_event(repositories, settlement_event_id="se-eq", trade_intent_id="ti-eq",
+                                 quantity=Decimal(6), price=Decimal(1), holding_projected=False)
+    await _seed_buy(repositories, "ti-c", quantity="10", price="1", status=TradeIntentStatus.PARTIALLY_FILLED,
+                    asset=CRYPTO, risk_snapshot=_approved_block("10", "1", CRYPTO, slippage=FROZEN_SLIP))
+    await _seed_settlement_event(repositories, settlement_event_id="se-c", trade_intent_id="ti-c",
+                                 quantity=Decimal(6), price=Decimal(1), holding_projected=True)
+    remainder = _reserve(Decimal(4), Decimal(1), FROZEN_SLIP) + _reserve(Decimal(4), Decimal(1), FROZEN_SLIP,
+                                                                          Decimal("0.25"))
+    lowered = replace(LIMITS, slippage_limit_pct=Decimal(0))
+
+    assert (await pending_buy_funding(repositories, LIMITS)).total == remainder
+    assert (await pending_buy_funding(repositories, lowered)).total == remainder
+    assert remainder < _reserve(Decimal(10), Decimal(1), FROZEN_SLIP)
+
+
+@pytest.mark.parametrize("status", [TradeIntentStatus.CANCELED, TradeIntentStatus.EXPIRED, TradeIntentStatus.REJECTED])
+async def test_terminal_after_partial_fill_reserves_nothing(tmp_path, status: TradeIntentStatus) -> None:
+    """Amendment (c): a broker-confirmed terminal state after a partial fill
+    leaves nothing reserved, whatever the profile does."""
+    repositories = await _repositories(tmp_path)
+    await _seed_buy(repositories, "ti-t", quantity="10", price="1", status=status,
+                    risk_snapshot=_approved_block("10", "1", slippage=FROZEN_SLIP))
+    await _seed_settlement_event(repositories, settlement_event_id="se-t", trade_intent_id="ti-t",
+                                 quantity=Decimal(6), price=Decimal(1), holding_projected=False)
+
+    for limits in (LOWER, LIMITS, HIGHER):
+        assert await pending_buy_funding(repositories, limits) == PendingFunding(Decimal(0), (), ())
+
+
+async def test_submission_unknown_keeps_full_frozen_commitment(tmp_path) -> None:
+    """Amendment (d): an unresolved submission keeps the full frozen
+    commitment, even with the profile's slippage lowered."""
+    repositories = await _repositories(tmp_path)
+    block = _approved_block("10", "3", slippage=FROZEN_SLIP)
+    await _seed_buy(repositories, "ti-x", quantity="10", price="3", status=TradeIntentStatus.SUBMISSION_UNKNOWN,
+                    risk_snapshot=block)
+
+    pending = await pending_buy_funding(repositories, LOWER)
+
+    assert pending.total == Decimal(block["dbae"]["max_funding"]) == _reserve(Decimal(10), Decimal(3), FROZEN_SLIP)
+
+
+@pytest.mark.parametrize("frozen", [
+    None, "abc", "NaN", "Infinity", "-Infinity", "0", "-1", True, "",
+    "9.99",  # below the order notional: an impossible negative slippage
+    "20.01",  # above twice the order notional: an absurd rate
+])
+async def test_invalid_frozen_max_funding_is_unpriced(tmp_path, frozen: object) -> None:
+    """A dbae block whose max_funding is missing, unparsable, non-finite,
+    non-positive or inconsistent with submitted_quantity × reference_price
+    cannot be reconstructed: the buy is unpriced (DBAE_FUNDING_UNVERIFIED)."""
+    repositories = await _repositories(tmp_path)
+    block = _dbae_block("10")
+    if frozen is not None:
+        block["dbae"]["max_funding"] = frozen
+    await _seed_buy(repositories, "ti-bad", quantity="10", price="1", risk_snapshot=block)
+    await _seed_buy(repositories, "ti-ok", quantity="1", price="2")
+
+    pending = await pending_buy_funding(repositories, LIMITS)
+
+    assert pending.unpriced == ("ti-bad",)
+    assert pending.total == _reserve(Decimal(1), Decimal(2), EQ_SLIP)
+
+
+@pytest.mark.parametrize(("frozen", "asset"), [
+    ("10", EQUITY),  # zero slippage, no fee: the order notional itself
+    ("20", EQUITY),  # the upper bound, twice the notional
+    ("10.025", CRYPTO),  # zero slippage plus crypto's 0.25% fee
+])
+async def test_frozen_max_funding_bounds_are_inclusive(tmp_path, frozen: str, asset: AssetIdentity) -> None:
+    repositories = await _repositories(tmp_path)
+    await _seed_buy(repositories, "ti-b", quantity="10", price="1", asset=asset,
+                    risk_snapshot=_dbae_block("10", frozen))
+
+    pending = await pending_buy_funding(repositories, replace(LIMITS, slippage_limit_pct=Decimal(0)))
+
+    assert pending == PendingFunding(Decimal(frozen), (), ())
+
+
+async def test_crypto_frozen_below_notional_plus_fee_is_unpriced(tmp_path) -> None:
+    repositories = await _repositories(tmp_path)
+    await _seed_buy(repositories, "ti-c", quantity="10", price="1", asset=CRYPTO,
+                    risk_snapshot=_dbae_block("10", "10.02"))
+
+    assert (await pending_buy_funding(repositories, LIMITS)).unpriced == ("ti-c",)
 
 
 @pytest.mark.parametrize("risk_snapshot", [

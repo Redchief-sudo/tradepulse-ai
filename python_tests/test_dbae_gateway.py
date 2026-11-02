@@ -790,6 +790,78 @@ async def test_funding_conserved_across_crash_and_restart(tmp_path: Path) -> Non
     assert await rig.pending() == c_funding
 
 
+@pytest.mark.parametrize("slippage", [Decimal("0.1"), Decimal(3)], ids=["profile_lowered", "profile_raised"])
+async def test_profile_change_across_restart_never_reduces_pending(tmp_path: Path, slippage: Decimal) -> None:
+    """DBAE-146-01: three buys approved under aggressive (1.5%): one
+    accepted, one partially filled (6 of 10), one SUBMISSION_UNKNOWN. After
+    a restart under a changed profile slippage, P is each buy's frozen
+    commitment on its unattributed quantity, or the current profile's when
+    that is larger; the next entry records and sizes against that P."""
+    rig = await _rig(tmp_path, profile="aggressive")
+    rig.gateway.FILL_TIMEOUT_SECONDS = 0.3
+    rig.gateway.POLL_INTERVAL_SECONDS = 0.01
+    rig.broker.set_fill_latency(LATER)
+
+    async def scripted(order: AlpacaOrderRequest) -> AlpacaOrderResponse:
+        if order.symbol == FRAY.symbol:
+            raise httpx.ReadTimeout("simulated: submit timed out")
+        if order.symbol == FRAZ.symbol:
+            rig.broker.schedule_fills(order.client_order_id or "", [(timedelta(0), Decimal(6), None),
+                                                                    (LATER, Decimal(4), None)])
+        return await rig.broker.place_on_book(order)
+
+    rig.broker.place_hook = scripted
+    for asset in (FRAC, FRAY, FRAZ, WHLE):
+        rig.quote(asset, Decimal(100))
+    accepted = await rig.gateway.execute_intent(_buy(FRAC, Decimal(10), Decimal(92)))
+    unknown = await rig.gateway.execute_intent(_buy(FRAY, Decimal(10), Decimal(92)))
+    partial = await rig.gateway.execute_intent(_buy(FRAZ, Decimal(10), Decimal(92)))
+    assert accepted.status == "pending" and accepted.filled_quantity == 0
+    assert unknown.status == "pending" and unknown.reasons[0].startswith("SUBMISSION_UNKNOWN")
+    assert partial.status == "pending" and partial.filled_quantity == Decimal(6)
+    frozen = {r.trade_intent_id: Decimal(_dbae(await _intent(rig, r.trade_intent_id))["max_funding"])
+              for r in (accepted, unknown, partial)}
+    assert all(value == max_funding(Decimal(10), Decimal(100), FRAC, Decimal("1.5")) for value in frozen.values())
+
+    rig.limits = replace(rig.limits, slippage_limit_pct=slippage)
+    await rig.reopen()  # a restart: fresh repositories and gateway over the same database, new profile
+
+    def reserve(quantity: Decimal, rate: Decimal) -> Decimal:
+        return quantity * 100 * (1 + rate / 100)
+
+    rate = max(slippage, Decimal("1.5"))
+    expected = reserve(Decimal(10), rate) * 2 + reserve(Decimal(4), rate)
+    pending = await pending_buy_funding(rig.repositories, rig.limits)
+    assert (pending.total, pending.mismatches, pending.unpriced) == (expected, (), ())
+    if slippage < Decimal("1.5"):
+        assert pending.total == frozen[accepted.trade_intent_id] * 2 + frozen[partial.trade_intent_id] * 4 / 10
+
+    rig.gateway.FILL_TIMEOUT_SECONDS = 0
+    rig.quote(WHLE, Decimal(100))
+    nxt = await rig.gateway.execute_intent(_buy(WHLE, Decimal(1), Decimal(92)))
+    assert nxt.status == "pending", nxt.reasons
+    record = _dbae(await _intent(rig, nxt.trade_intent_id))
+    assert Decimal(record["pending_buy_funding"]) == expected
+    assert Decimal(record["funding_available"]) == Decimal(100000) - expected
+
+
+async def test_pending_pre_dbae_buy_refuses_new_entries(tmp_path: Path) -> None:
+    """DBAE-146-01: an accepted buy with no dbae block (written before DBAE)
+    has no frozen authorization, so funding is unverified."""
+    rig = await _rig(tmp_path)
+    legacy = TradeIntent("ti-legacy", "ti-legacy", "ti-legacy", FRAY, Side.BUY, ExecutionMode.PAPER, "test", NOW,
+                         requested_quantity=Decimal(1), reference_price=Decimal(100),
+                         status=TradeIntentStatus.ACCEPTED, risk_snapshot={"approved_quantity": "1"})
+    await rig.repositories.trade_intents.create_once("ti-legacy", legacy, status=legacy.status.value,
+                                                     unique_value="ti-legacy")
+    rig.quote(FRAC, Decimal(100))
+
+    result = await rig.gateway.execute_intent(_buy(FRAC, Decimal(1), Decimal(92)))
+
+    assert (result.status, result.reasons) == ("rejected", ["DBAE_FUNDING_UNVERIFIED"])
+    assert rig.orders == []
+
+
 @pytest.mark.parametrize(("profile", "balance", "asset", "price", "stop"), [
     ("aggressive", Decimal(1000), FRAC, Decimal(10), Decimal("9.90")),  # 1.5% allowance, no fee
     ("balanced", Decimal(2000), SOL, Decimal(100), Decimal(94)),  # 1% allowance plus 0.25% crypto fee
@@ -829,7 +901,7 @@ async def test_identity_mismatch_alerts_once_and_refuses_new_entries(tmp_path: P
     delivered = alerts.delivered
     bad = TradeIntent("bad-intent", "idem-bad", "corr-bad", FRAY, Side.BUY, ExecutionMode.PAPER, "test", NOW,
                       requested_quantity=Decimal(7), reference_price=Decimal(100), status=TradeIntentStatus.ACCEPTED,
-                      broker_order_id="order-bad", risk_snapshot={"dbae": {"submitted_quantity": "5"}})
+                      broker_order_id="order-bad", risk_snapshot={"dbae": {"submitted_quantity": "5", "max_funding": "505"}})
     await rig.repositories.trade_intents.create_once("bad-intent", bad, status=bad.status.value, unique_value="idem-bad")
     rig.quote(FRAC, Decimal(100))
 
@@ -954,7 +1026,7 @@ async def test_identity_mismatch_alert_store_failure_still_refuses(tmp_path: Pat
     rig = await _rig(tmp_path)
     bad = TradeIntent("bad-intent", "idem-bad", "corr-bad", FRAY, Side.BUY, ExecutionMode.PAPER, "test", NOW,
                       requested_quantity=Decimal(7), reference_price=Decimal(100), status=TradeIntentStatus.ACCEPTED,
-                      broker_order_id="order-bad", risk_snapshot={"dbae": {"submitted_quantity": "5"}})
+                      broker_order_id="order-bad", risk_snapshot={"dbae": {"submitted_quantity": "5", "max_funding": "505"}})
     await rig.repositories.trade_intents.create_once("bad-intent", bad, status=bad.status.value, unique_value="idem-bad")
     monkeypatch.setattr(once_module, "alert_once", _unreadable)
     rig.quote(FRAC, Decimal(100))

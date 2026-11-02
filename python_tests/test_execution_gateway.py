@@ -1950,7 +1950,10 @@ async def test_conservative_refuses_a_second_entry_while_the_first_is_unfilled(t
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     first = TradeIntent("first-entry", "idem-first", "corr-first", _aapl(), Side.BUY, ExecutionMode.PAPER, "test", NOW,
                         requested_quantity=Decimal("5"), reference_price=Decimal("199.55"), stop_loss=Decimal("190"),
-                        status=TradeIntentStatus.SUBMITTED, risk_snapshot={"entry_price": "199.55"})
+                        status=TradeIntentStatus.SUBMITTED,
+                        # Approved under DBAE: 5 × 199.55 at conservative's 0.5% slippage.
+                        risk_snapshot={"entry_price": "199.55",
+                                       "dbae": {"submitted_quantity": "5", "max_funding": "1002.73875"}})
     await repositories.trade_intents.create_once("first-entry", first, status=first.status.value, unique_value="idem-first")
     _mock_account()
     _mock_positions()
