@@ -1,6 +1,10 @@
 # Rev.147 — Verification run wind-down and generation handover
 
-**Status:** design, rev. 3, for forensic review. No production code changes and no orders until the spec is approved.
+**Status:** design, rev. 4, implementation-ready, for forensic approval. No production code changes and no orders until the spec is approved.
+**Rev. 4 (2026-11-04):** answers the rev. 3 assessment (with the Rev.148 archive). The reviewer gave two conditions for approval:
+- **Monitoring continuity (open question 5), accepted with conditions:** strict successor-start verification before the successor takes on protection, an explicit exposure-interval record in every case, and a gap audit that only detects and requires intervention. It never claims to restore protection that was absent (§7.5).
+- **Options expiring between generations (open question 6), decided:** an option that can expire before monitoring resumes is `unproven`, which blocks completion until the operator resolves it. An option whose expiry is unknown is treated the same way (§4.2).
+- **Fee wait (open question 3):** unchanged. `FEE_WAIT_MINUTES` stays provisional until G1 (§4.5, §9).
 **Rev. 3 (2026-11-03):** answers the Rev.147 rev. 2 review (REV147-R2-01..04 and the two decisions). Findings map to sections as follows:
 - **R2-01, stop preservation:** carried positions keep their full protective state, and the successor never rebuilds a lower stop (§7.1, §7.2.1).
 - **R2-02, monitoring continuity:** an exact protection-responsibility rule and an operator-acceptance condition (§7.5). `WIND_DOWN_COMPLETE` no longer implies protection.
@@ -127,10 +131,19 @@ Each broker position falls into exactly one class. A position that fits none of 
 
 | Class | Rule | Wind-down action |
 |---|---|---|
-| `carry_adoptable` | long equity or option, fully managed by this run (holding and lots match the broker quantity), with a valid protective state: `stop_loss` present and, if `current_stop` is set, `current_stop ≥ stop_loss` | none; protective exits stay active until the end; recorded in the handover with the full protective state |
+| `carry_adoptable` | long equity or option, fully managed by this run (holding and lots match the broker quantity), with a valid protective state: `stop_loss` present and, if `current_stop` is set, `current_stop ≥ stop_loss`; for an option, valid expiry metadata and an expiry date after the next regular session's date (see the option rule below) | none; protective exits stay active until the end; recorded in the handover with the full protective state |
 | `close_crypto` | long crypto, fully managed by this run, Rev.140 sellable = broker quantity | sell the sellable quantity through the gateway (§4.3) |
 | `crypto_residual` | long crypto managed by this run, quantity > 0 but below the asset's `min_order_size`, or not a multiple of `min_trade_increment` after a sell, and its local lots' remaining quantity equals the broker quantity | none (unsellable); recorded as a residual |
-| `unproven` | everything else, including: partially managed; quarantined; a short or a Rev.140 liability; unmanaged crypto; an adopted asset with an `ADOPTED_EXIT_REFUSED` outstanding; a managed equity or option with a missing or invalid protective state (`carried_stop_missing`, `carried_stop_invalid`); residual dust whose local lots disagree with the broker | none, ever; a critical alert; recorded; makes the wind-down `UNRESOLVED` and blocks the next run until resolved (§7.3) |
+| `unproven` | everything else, including: partially managed; quarantined; a short or a Rev.140 liability; unmanaged crypto; an adopted asset with an `ADOPTED_EXIT_REFUSED` outstanding; a managed equity or option with a missing or invalid protective state (`carried_stop_missing`, `carried_stop_invalid`); an option that can expire before monitoring resumes or whose expiry is unknown (`carried_option_expires_unmonitored`, `carried_option_expiry_unknown`); residual dust whose local lots disagree with the broker | none, ever; a critical alert; recorded; makes the wind-down `UNRESOLVED` and blocks the next run until resolved (§7.3) |
+
+**Option rule (rev. 4, open question 6 decided).** Under §7.5, monitoring resumes at the earliest at `next_session_open`. In the planned case, that is the start of the successor's first regular session. An option the successor cannot monitor through its own expiry is not safely adoptable:
+- **The test:** a long option is `unproven`, reason `carried_option_expires_unmonitored`, when its expiry date (`asset.metadata["expiry"]`) is on or before the NY date of `next_session_open`. That date comes from the Rev.144 calendar, the same value the handover records (§7.1).
+  - **Why the expiry day itself counts:** even a planned `no_session_gap` start puts the successor's only chance to act on that same session. A late start or a refused startup would let the option expire unmonitored, and the existing near-expiry exit (`monitor/coordinator.py::_near_expiry`) would have no session to act in. The rule therefore does not depend on the successor starting on time.
+- **Unknown expiry:** an option whose expiry metadata is missing or malformed (the monitor's existing `_option_expiry_metadata_invalid`) is `unproven`, reason `carried_option_expiry_unknown`. Unknown is not treated as safe, which matches the monitor's own stance.
+- **No sale is attempted.** The wind-down runs outside a session (§3.1), so it cannot sell the option, and Rev.147 adds no options-selling path. It never exercises or closes the option either.
+- **Effect:** like every `unproven` item, the option makes the wind-down `UNRESOLVED`. That outcome is not `COMPLETE`, and it blocks the next run until the operator resolves the option outside TradePulse and records the resolution with a broker-verified `--resolve` (§7.3). The resolution is a closing trade, an exercise or a broker-reported expiry.
+- **Normally unreachable:** during the run, the near-expiry exit closes options within `min_days_to_expiry` while sessions remain. The rule is the backstop for an option that the run could not close, for example after an outage or a failed exit.
+- **The calendar must be verified.** If the Rev.144 calendar cannot verify `next_session_open`, every carried option is `unproven` with `carried_option_expires_unmonitored`, because a safe date cannot be proven.
 
 ### 4.3 The crypto close
 
@@ -338,14 +351,16 @@ For a carried position, the successor's adoption takes the protective state from
 - `--position <asset>=<qty>`;
 - `--resolve <item-id>`;
 - `--resolve-fee <pending_fee_id> --activity <id>`;
-- `--accept-gap`.
+- `--accept-gap`;
+- `--ack-gap-breach <asset>` (rev. 4; this is written to the **successor's** amendment chain, because the hold belongs to the successor; see §7.5).
 
 How it works:
 - It appends an operator-attributed amendment record (reason, time, OS user) next to the sealed handover: a new file `handover-amendments.jsonl`, append-only with a per-line digest chain. It never edits `handover.json`.
 - **Use 1:** declare a deliberate change between runs. Example: the 1 inherited share bought for the next run's adoption test. The amended expectation is what §7.2 compares against. A newly declared position is not a carried one: it has no inherited protective state and goes through ordinary Rev.142 adoption.
 - **Use 2:** record how an `unresolved` item was resolved outside TradePulse. Each `--resolve` must cite the broker activity or order ID that proves it. The amend command verifies that ID against the broker's activity history (read-only) before appending.
 - **Use 3:** `--resolve-fee` attributes an unlinked fee to a pending fee (§7.6).
-- **Use 4:** `--accept-gap` accepts a protection gap (§7.5).
+- **Use 4:** `--accept-gap` accepts a protection gap (§7.5). It accepts the gap only. It does not waive successor-start verification.
+- **Use 5:** `--ack-gap-breach` ends the gap-breach hold for one position (§7.5).
 - Every amendment is shown in the next generation's freeze output and copied into its manifest.
 
 ### 7.4 The first Rev.147 run
@@ -368,16 +383,48 @@ The account has been flat since 2026-10-29, and no Rev.147 handover exists. The 
 So between the seal and the next regular-session open, the predecessor's monitor would have taken no equity or option action even if it had kept running.
 
 1. **The predecessor** is responsible until `monitoring_released_at`, which it records in the handover (§7.1) together with `next_session_open`.
-2. **The successor** becomes responsible at `monitoring_assumed_at`. That is the moment its monitor has completed one evaluation of every carried position with the restored protective state, after the §7.2 startup comparison. The successor records it in its `runtime_started` evidence.
+2. **The successor** becomes responsible at `monitoring_assumed_at`. It may record that time only after **successor-start verification** passes (rev. 4, below). The successor records it in its `runtime_started` evidence.
+
+**Successor-start verification (rev. 4, the reviewer's first condition).** All of the following must pass, in this order, inside the successor's startup and before `monitoring_assumed_at` is recorded. Any failure refuses the startup with `handover_assumption_unverified`, names the failed check, and raises a critical alert. No `monitoring_assumed_at` is written, the runtime does not start, the continuity class is not computed, and the exposure stays open (below). No amendment can waive these checks.
+1. **Checkpoint comparison:** the §7.2 startup comparison against the bound opening checkpoint passes.
+2. **Fresh census:** a new census at assumption time, using the §4.1 capture pattern (activities, then account, positions and open orders, then activities again), equals the handover plus amendments. The positions and quantities must match, there must be no open orders, and no new position-changing activity on a carried asset since the checkpoint. That means a fill or a quantity-changing corporate action, such as a split, a spinoff or an option exercise or assignment. Cash-only activities, such as a dividend (Rev.143) or a fee (§7.6), do not fail this check, and the existing membership rules classify them. This covers the time between freeze and startup, when the account could have changed.
+3. **Restored state:** for each carried position, the successor's own adopted holding and lot rows are re-read from its database after adoption. A `protective_state_digest` recomputed from those rows must equal the handover's. This proves that what the monitor will use is what the predecessor sealed, not just what the handover file says.
+4. **Fresh marks:** each carried position has a mark that is within the existing freshness bound for its asset class and comes from the same source the monitor uses. A position without one fails the check. The startup does not assume a mark.
+5. **One full evaluation:** the monitor completes one evaluation of every carried position with the restored state: effective stop, ladder, time and stall exits, and the near-expiry rule. Every exit the evaluation decides on is submitted through the gateway before `monitoring_assumed_at` is written, and its intent state is recorded. Outside a session, equity and option exits are not decided, as today, so the evaluation records `out_of_session` for those positions. It does not treat them as protected-and-checked.
+
+A failed check is never retried silently into a pass. The operator restarts the successor after fixing the cause, and the whole sequence runs again from step 1.
+
+**Exposure record (rev. 4, the reviewer's second condition).** The unmonitored interval is recorded explicitly in **every** case, including `no_session_gap` and a refused startup.
+- **The interval:** `[monitoring_released_at, monitoring_assumed_at)`. Until the successor writes `monitoring_assumed_at`, the record has `assumed_at = null` and `status = "open"`. An open exposure is never closed by time.
+- **Its contents** (`protection_exposure`):
+  - `released_at`, `assumed_at`, the duration, and `next_session_open`;
+  - `sessions_unmonitored`: each XNYS regular session, or part of one, that falls inside the interval, from the Rev.144 calendar. It is empty for `no_session_gap`;
+  - for each carried position: the asset, the quantity, the `effective_stop` at release, and for options, the expiry;
+  - the residual crypto, listed as unmanaged in both generations (TP145-02), because crypto trades through the interval;
+  - the continuity class, and the gap-audit results (item 5);
+  - the successor-start verification result for each check.
+- **Where it is written:**
+  - in the successor's `runtime_started` evidence, inside its sealed digest at its own seal;
+  - in the predecessor's `handover-amendments.jsonl`, as a **system-written** `protection_exposure` record in the same digest chain as §7.6. The sealed `handover.json` is never edited.
+  - A refused startup appends a `protection_exposure` record with `status = "open"` and the refusal reason, so a failed takeover is recorded on the predecessor's side too.
+- **Reporting:** the predecessor's reports show the exposure in `post_seal_adjustments`. The successor's run report shows it in a `protection_exposure` section. Neither report describes the interval as protected.
 3. **Continuity class**, recorded in the successor's start record and reported in both generations' evidence:
    - `no_session_gap`: `monitoring_assumed_at` < `next_session_open`. Protection is equivalent to a continuous run. The interval is still recorded.
    - `session_gap`: otherwise. The record lists each regular session, or part of one, during which no monitor ran.
    - `no_carried_positions`: `carried_count = 0`. There is nothing to protect.
 4. **Operator acceptance.** If the successor's startup would produce `session_gap`, startup refuses with `handover_protection_gap_unaccepted`, unless an `--accept-gap` amendment exists. That amendment is appended after the predecessor's `next_session_open` has passed, and it states the operator's reason. A `session_gap` start then records the accepted interval and the amendment ID.
 5. **Gap audit.** On a `session_gap` start, for each carried position, the successor compares the regular-session low of each missed session (from the existing bar provider) against the inherited `effective_stop`.
-   - If any low was at or below the stop, it raises a critical alert, `CARRIED_STOP_BREACHED_UNMONITORED`, and reports it in the run evidence. The exit itself is the normal one (§7.2.1).
-   - If bars are unavailable, the audit records `gap_audit_unverified`. It does not guess.
-6. **Run plans** for successive generations schedule the successor's start before `next_session_open`, so the planned result is `no_session_gap`.
+   - **What it cannot do (rev. 4):** the audit detects only. It cannot recreate protection that was absent, undo a loss that happened while no monitor ran, or show what a continuous run would have filled. Its results are reported as findings about the interval, never as protection.
+   - **Breach:** if any low was at or below the stop, it raises a critical alert, `CARRIED_STOP_BREACHED_UNMONITORED`, and reports it in the run evidence and in the exposure record. The exit itself is the normal one (§7.2.1).
+   - **Unverified:** if bars are unavailable or incomplete, the audit records `gap_audit_unverified` for that position. It does not guess, and an unverified result is handled like a breach (below).
+   - **Required intervention (rev. 4):** a breach or an unverified audit puts the successor in a **gap-breach hold**:
+     - protective exits run normally, so a position at or below its stop still exits on the first regular-session cycle;
+     - `ExecutionGateway` refuses every non-protective BUY with `GAP_BREACH_UNACKNOWLEDGED`, in the same fenced authorization as `RUN_WIND_DOWN_ACTIVE` (§8);
+     - the hold ends only through an operator `--ack-gap-breach <asset>` amendment for each held position (§7.3). The amendment states what the operator reviewed and, if the position was closed outside TradePulse, cites the broker activity, which is verified read-only;
+     - time never ends the hold, and the generation's evidence records the hold's start, its end and the amendment IDs.
+6. **Run plans** for successive generations schedule the successor's start before `next_session_open`, so the planned result is `no_session_gap`. A plan whose successor start falls after `next_session_open` is an accepted-gap plan, and it must say so.
+
+**Equivalence, as accepted (rev. 4).** `no_session_gap` is equivalent to a continuous run for equity and option exits only, because neither monitor would have acted between the seal and the open. It holds only when successor-start verification passed before the open. It is not equivalent for crypto residuals, which are unmanaged, or for any event outside the regular session, such as an after-hours gap that opens through a stop. The exposure record names those limits, and the run report repeats them.
 
 **Crypto residuals** are unmanaged in both generations (TP145-02), so they are outside this rule. They are already listed as residuals.
 
@@ -425,7 +472,7 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
 
 ## 8. Entry stop
 
-In wind-down, `ExecutionGateway` refuses every BUY that is not a protective exit, with `RUN_WIND_DOWN_ACTIVE`. The check runs in the same fenced authorization as `RISK_APPROVED`, alongside Rev.146's freshness check, so a buy authorized just before wind-down began cannot be persisted after it. Scan lanes also idle in wind-down, but the gateway check is the guarantee.
+In wind-down, `ExecutionGateway` refuses every BUY that is not a protective exit, with `RUN_WIND_DOWN_ACTIVE`. The check runs in the same fenced authorization as `RISK_APPROVED`, alongside Rev.146's freshness check, so a buy authorized just before wind-down began cannot be persisted after it. Scan lanes also idle in wind-down, but the gateway check is the guarantee. In a successor, the gap-breach hold (§7.5) uses the same check and refuses with `GAP_BREACH_UNACKNOWLEDGED`.
 
 ## 9. Gates
 
@@ -489,6 +536,32 @@ All on the simulator, with no broker calls.
   - **gap refused:** one started after it refuses with `handover_protection_gap_unaccepted`;
   - **gap accepted:** with `--accept-gap`, it starts, records the interval and runs the gap audit. A missed-session low through the stop raises `CARRIED_STOP_BREACHED_UNMONITORED`, and missing bars record `gap_audit_unverified`;
   - **no carried positions:** zero carried positions record `no_carried_positions`, and no acceptance is needed.
+- **Successor-start verification (rev. 4):**
+  - **each check:** for each of the five checks, a failure refuses with `handover_assumption_unverified` naming that check, writes no `monitoring_assumed_at`, does not start the runtime, and appends an open `protection_exposure` record to the predecessor's chain;
+  - **account drift:** a position change or a new open order between freeze and startup fails check 2, even though the checkpoint comparison (check 1) passed;
+  - **restored rows:** a successor holding row altered after adoption fails check 3, even when `handover.json` is intact;
+  - **stale mark:** a carried position with a stale or missing mark fails check 4;
+  - **evaluation exit:** an exit decided in the first evaluation is submitted, and its intent is recorded, before `monitoring_assumed_at`;
+  - **no waiver:** `--accept-gap` does not let a failed check pass;
+  - **restart:** after a fix, a restart reruns all five checks from the first one.
+- **Exposure record (rev. 4):**
+  - written in every class, `no_session_gap` included, in both the successor's evidence and the predecessor's chain;
+  - `sessions_unmonitored` is empty for `no_session_gap` and lists the exact sessions, including a partial one, for `session_gap`;
+  - an open exposure stays open with no successor, and time does not close it;
+  - the predecessor's sealed files are byte-identical after the exposure record is appended.
+- **Gap-breach hold (rev. 4):**
+  - a breach puts the successor in the hold: a non-protective BUY is refused with `GAP_BREACH_UNACKNOWLEDGED` in the fenced transaction, and the breached position's stop exit still fires on the first in-session cycle;
+  - `gap_audit_unverified` leads to the same hold;
+  - `--ack-gap-breach` for each held position ends the hold. An acknowledgement citing an unverifiable broker activity is refused;
+  - the hold never ends on time alone.
+- **Option expiry (rev. 4):**
+  - an option expiring before the NY date of `next_session_open` becomes `unproven` with `carried_option_expires_unmonitored`, and the wind-down becomes `UNRESOLVED`, never `COMPLETE`;
+  - an option expiring **on** that date is `unproven` too;
+  - an option expiring after it, with a valid stop, is `carry_adoptable`;
+  - an option with missing or malformed expiry metadata becomes `unproven` with `carried_option_expiry_unknown`;
+  - when the calendar cannot verify `next_session_open`, every carried option becomes `unproven`;
+  - no option sell, exercise or close is ever sent by the wind-down;
+  - after the operator's broker-verified `--resolve`, the next run's freeze is permitted.
 - **Late fees (R2-04):**
   - **inside the wait:** the fee is recognized in the run;
   - **posted before the successor's freeze:** it is matched at freeze and appended as `fee_attribution`;
@@ -555,6 +628,12 @@ All on the simulator, with no broker calls.
   - records and sections: `fee_attribution`, `fee_correction`, `post_seal_adjustments`, `wind_down_excluded`;
   - events: `escalated`;
   - provenance: `predecessor_handover`, `rev147-handover-v1`.
+- New strings in rev. 4:
+  - refusals: `handover_assumption_unverified`, `GAP_BREACH_UNACKNOWLEDGED`;
+  - classification reasons: `carried_option_expires_unmonitored`, `carried_option_expiry_unknown`;
+  - records and sections: `protection_exposure` (both the system-written amendment record and the report section);
+  - amendment: `--ack-gap-breach`;
+  - evaluation outcome: `out_of_session`.
 - The build happens on its own branch and worktree, after Rev.146 is merged. Nothing is merged without review and the operator's approval.
 
 ## 12. Open questions for review
@@ -563,5 +642,5 @@ All on the simulator, with no broker calls.
 2. ~~§4.3 (reporting).~~ Decided 2026-11-03: included in financial accounting, excluded from edge statistics, and reported as `wind_down_excluded`.
 3. **§4.5 (fee wait):** `FEE_WAIT_MINUTES = 15` stays provisional until G1 measures the CFEE delay and its linkage.
 4. ~~§5 (escalation).~~ Decided 2026-11-03: 60 minutes, as an alert only.
-5. **§7.5 (continuity design):** this revision replaces the reviewer's preferred monitor overlap with a session-boundary rule plus operator acceptance, because the account lease makes overlap impossible and two monitors would risk a duplicate exit. Does the reviewer accept that equivalence?
-6. **§4.2 (option expiry across the gap):** a carried option that expires before the successor's first regular session would expire unmonitored. Should such an option be `unproven` at wind-down, which blocks the seal until the operator acts, or carried with an alert?
+5. ~~§7.5 (continuity design).~~ Accepted with conditions (2026-11-04, the Rev.148 assessment): strict successor-start verification, an explicit exposure record in every case, and a gap audit that only detects and requires intervention. Applied in rev. 4 (§7.5). The original question was: this revision replaces the reviewer's preferred monitor overlap with a session-boundary rule plus operator acceptance, because the account lease makes overlap impossible and two monitors would risk a duplicate exit. Does the reviewer accept that equivalence?
+6. ~~§4.2 (option expiry across the gap).~~ Decided 2026-11-04 (reviewer recommendation): `unproven`, which blocks completion until the operator resolves it. The expiry day itself counts, and an unknown expiry counts too (§4.2, the option rule). The original question was: a carried option that expires before the successor's first regular session would expire unmonitored. Should such an option be `unproven` at wind-down, which blocks the seal until the operator acts, or carried with an alert?
