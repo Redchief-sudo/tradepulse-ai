@@ -27,7 +27,7 @@ from uuid import uuid4
 
 import httpx
 
-from tradepulse.alerts import TelegramAlerter
+from tradepulse.alerts import TelegramAlerter, alert_once_per_window
 from tradepulse.broker import (
     AlpacaDataIntegrityError,
     AlpacaError,
@@ -139,6 +139,9 @@ from .idempotency import (
 from .quotes import AuthoritativeQuote, fetch_authoritative_quote
 
 logger = logging.getLogger(__name__)
+
+# dbae_band_changed audit ids: this prefix, then a 12-digit sequence (M3).
+BAND_CHANGE_ID_PREFIX = "dbae_band_changed:"
 
 
 @asynccontextmanager
@@ -393,14 +396,17 @@ class ExecutionGateway:
         Re-review M1: an error while judging (the clock, or the policy re-run)
         means freshness at commit is unverified. It is logged and refused as
         DBAE_ACCOUNT_STATE_UNVERIFIED, so the transaction rolls back and the
-        intent is closed unsubmitted with the refusal recorded."""
+        intent is closed unsubmitted with the refusal recorded. The second
+        reason, DBAE_FRESHNESS_CHECK_ERROR, separates a fault in the check
+        from evidence that is genuinely stale, for monitoring (Rev.146
+        remediation review)."""
         def check() -> Sequence[str]:
             try:
                 return judge()
             except Exception:
-                logger.exception("DBAE: evidence freshness for %s could not be judged at commit; refusing",
-                                 trade_intent_id)
-                return ["DBAE_ACCOUNT_STATE_UNVERIFIED"]
+                logger.exception("DBAE_FRESHNESS_CHECK_ERROR: evidence freshness for %s could not be judged at "
+                                 "commit; refusing", trade_intent_id)
+                return ["DBAE_ACCOUNT_STATE_UNVERIFIED", "DBAE_FRESHNESS_CHECK_ERROR"]
 
         def judge() -> Sequence[str]:
             now = aware_utc(self._clock(), field_name="now")
@@ -567,7 +573,9 @@ class ExecutionGateway:
         """Spec §4.4: ``dbae_band_changed`` when this entry's band differs
         from the band of the latest such event (none yet: the first entry).
         Audit only, not a decision input: a store failure is logged and the
-        entry goes on."""
+        entry goes on. Event ids carry a zero-padded sequence, so the latest
+        is one primary-key read (M3) and two writers racing for the same
+        sequence collide on create_once instead of both appending."""
         try:
             await self._write_band_change(intent, band, equity_for_band, current_equity, baseline, now)
         except DatabaseError:
@@ -575,15 +583,16 @@ class ExecutionGateway:
 
     async def _write_band_change(self, intent: TradeIntent, band: Band, equity_for_band: Decimal,
                                  current_equity: Decimal, baseline: SessionBaseline, now: datetime) -> None:
-        rows = await list_all_by_json_field(self._repositories.audit_events, "event_type", "dbae_band_changed")
-        previous = rows[-1]["payload"]["details"]["new_band"] if rows else None
+        latest = await self._repositories.audit_events.last_by_id_prefix(BAND_CHANGE_ID_PREFIX)
+        previous = latest["payload"]["details"]["new_band"] if latest else None
         if previous == band.value:
             return
+        sequence = 1 if latest is None else int(latest["record_id"].removeprefix(BAND_CHANGE_ID_PREFIX)) + 1
         band_unlocks = unlocks(band)
         unlocked = [asset_class.value for asset_class, on in (
             (AssetClass.EQUITY, band_unlocks.equity != "none"), (AssetClass.CRYPTO, band_unlocks.crypto),
             (AssetClass.OPTION, band_unlocks.options)) if on]
-        event_id = f"dbae_band_changed:{intent.trade_intent_id}"
+        event_id = f"{BAND_CHANGE_ID_PREFIX}{sequence:012d}"
         await self._repositories.audit_events.create_once(event_id, AuditEvent(
             event_id=event_id, event_type="dbae_band_changed", severity="info",
             message=f"DBAE band {previous or 'none'} -> {band.value} at band equity {equity_for_band}.",
@@ -592,7 +601,8 @@ class ExecutionGateway:
             details={"old_band": previous, "new_band": band.value, "band_equity": str(equity_for_band),
                      "current_equity": str(current_equity),
                      "previous_close_equity": str(baseline.previous_close_equity),
-                     "session_date": baseline.session_date.isoformat(), "unlocked_classes": unlocked}))
+                     "session_date": baseline.session_date.isoformat(), "unlocked_classes": unlocked,
+                     "trade_intent_id": intent.trade_intent_id, "sequence": sequence}))
 
     async def _alert_quantity_identity_mismatch(self, trade_intent_id: str, now: datetime) -> None:
         """Spec §7.1: critical, once per intent. The entry is refused with
@@ -1175,17 +1185,21 @@ class ExecutionGateway:
 
     async def _alert_protective_exit_rejected(self, intent: TradeIntent, reason: str) -> None:
         """Spec §9: the holding and its stop obligation stay; the next monitor
-        cycle may submit a new exit. One critical alert per intent."""
-        from tradepulse.reconciliation.coordinator import _alert_once
-
-        now = self._clock()
-        await _alert_once(
-            self._repositories, self._alerts, event_type="PROTECTIVE_EXIT_REJECTED", subject=intent.trade_intent_id,
-            window="intent", severity="critical",
+        cycle may submit a new exit. Each retry is a new intent, so a broker
+        that keeps rejecting would alert every cycle: one critical alert per
+        asset per UTC hour instead. The audit event of the first rejection
+        in the hour carries its intent; every rejection stays on its own
+        REJECTED intent row."""
+        now = aware_utc(self._clock(), field_name="now")
+        key = asset_identity_key(intent.asset)
+        await alert_once_per_window(
+            self._repositories.audit_events, self._alerts, event_type="PROTECTIVE_EXIT_REJECTED", subject=key,
+            window=now.astimezone(UTC).strftime("%Y-%m-%dT%H"), severity="critical",
             message=(f"PROTECTIVE_EXIT_REJECTED: {intent.asset.symbol} exit of {intent.requested_quantity} rejected by the "
-                     f"broker ({reason}); the position stays held under its stop and the next monitor cycle retries."),
-            details={"trade_intent_id": intent.trade_intent_id, "reason": reason, "asset_key": asset_identity_key(intent.asset)},
-            now=now)
+                     f"broker ({reason}); the position stays held under its stop and the next monitor cycle retries. "
+                     "Further rejections of this asset this hour are not re-alerted."),
+            details={"trade_intent_id": intent.trade_intent_id, "reason": reason, "asset_key": key},
+            now=now, entity_type="execution")
 
     async def _recover_unknown_submission(self, intent: TradeIntent, cause: Exception) -> ExecutionResult:
         """Called whenever a broker submission's outcome is ambiguous (see

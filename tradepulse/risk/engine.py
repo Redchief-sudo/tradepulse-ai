@@ -465,9 +465,11 @@ class PendingIntentRemainder:
     SettlementEvent quantity, unclamped (an over-attributed intent is <= 0).
     unsettled_events are the attributed events not yet holding_projected,
     in repository order; unsettled_event_ids are their ids. row_status is
-    the trade_intents status column the intent was selected by."""
+    the trade_intents status column the intent was selected by.
+    requested_qty is the intent's requested_quantity, proven present."""
 
     intent: TradeIntent
+    requested_qty: Decimal
     remaining_qty: Decimal
     unsettled_event_ids: frozenset[str]
     unsettled_events: tuple[SettlementEvent, ...]
@@ -505,6 +507,7 @@ async def pending_intent_remainders(repositories: PersistenceRepositories) -> li
         unsettled = tuple(e for e in events if not e.holding_projected)
         remainders.append(PendingIntentRemainder(
             intent=intent,
+            requested_qty=intent.requested_quantity,
             remaining_qty=intent.requested_quantity - total_attributed_qty,
             unsettled_event_ids=frozenset(e.settlement_event_id for e in unsettled),
             unsettled_events=unsettled,

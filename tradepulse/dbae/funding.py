@@ -163,11 +163,9 @@ async def pending_buy_funding(repositories: PersistenceRepositories, limits: Ris
     unpriced: list[str] = []
     for remainder in await pending_intent_remainders(repositories):
         intent = remainder.intent
-        # requested_quantity is never None here: pending_intent_remainders
-        # raises PENDING_INTENT_QUANTITY_MISSING first.
-        if intent.side != Side.BUY or intent.requested_quantity is None:
+        if intent.side != Side.BUY:
             continue
-        field_qty = intent.requested_quantity
+        field_qty = remainder.requested_qty
         attributed_qty = field_qty - remainder.remaining_qty
         block = _dbae_block(intent)
         recorded = None if block is None else _frozen_decimal(block, "submitted_quantity")

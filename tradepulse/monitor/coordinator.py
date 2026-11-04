@@ -23,7 +23,7 @@ from decimal import ROUND_FLOOR, Decimal
 from typing import Any, Literal
 from uuid import uuid4
 
-from tradepulse.alerts import TelegramAlerter, alert_once
+from tradepulse.alerts import TelegramAlerter, alert_once, alert_once_per_window
 from tradepulse.broker import AlpacaPosition, BrokerPort
 from tradepulse.broker.capabilities import AssetCapabilities, AssetTradingCapabilities, evidence_fresh
 from tradepulse.dbae.policy import scale_out_feasible, whole_units_only
@@ -377,7 +377,6 @@ async def _report_residual_below_minimum(repositories: PersistenceRepositories, 
     option holding with no contract multiplier raises), is inside the guard."""
     from tradepulse.calendar import CalendarHorizonExceeded, market_calendar, ny_date
     from tradepulse.dbae.baseline import session_date_for
-    from tradepulse.reconciliation.coordinator import _alert_once
 
     try:
         value = abs(position.qty) * position.current_price * contract_multiplier_of(holding.asset)
@@ -388,12 +387,13 @@ async def _report_residual_below_minimum(repositories: PersistenceRepositories, 
         except (CalendarHorizonExceeded, ValueError):
             window = ny_date(now)  # no session placed: the New York date still bounds the alert to once per day
         key = asset_identity_key(holding.asset)
-        await _alert_once(
-            repositories, alerts, event_type="DBAE_RESIDUAL_BELOW_ENTRY_MINIMUM", subject=key, window=window.isoformat(),
+        await alert_once_per_window(
+            repositories.audit_events, alerts, event_type="DBAE_RESIDUAL_BELOW_ENTRY_MINIMUM", subject=key, window=window.isoformat(),
             severity="warning",
             message=(f"DBAE_RESIDUAL_BELOW_ENTRY_MINIMUM: {holding.asset.symbol} position worth {value} is below the $1 "
                      "entry minimum; its protective exit is still a full-quantity sell."),
-            details={"asset_key": key, "market_value": str(value), "quantity": str(position.qty)}, now=now)
+            details={"asset_key": key, "market_value": str(value), "quantity": str(position.qty)}, now=now,
+            entity_type="monitor")
     except Exception:  # an alert failure must never block a protective exit
         logger.exception("monitor_residual_alert_failed symbol=%s", position.symbol)
 

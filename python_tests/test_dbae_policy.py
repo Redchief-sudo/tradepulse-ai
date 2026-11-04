@@ -294,19 +294,6 @@ def test_micro_fractionable_equity_allowed() -> None:
     assert policy.fractional_allowed is True
 
 
-def test_snapshot_is_json_safe() -> None:
-    policy = evaluate_entry_policy(_account(), Decimal(20), _equity_caps(fractionable=False), _proposal())
-    assert policy.as_snapshot() == {
-        "allowed": False,
-        "reasons": ["DBAE_WHOLE_SHARES_NOT_ALLOWED_IN_BAND"],
-        "band": "micro",
-        "band_equity": "20",
-        "fractional_allowed": False,
-    }
-    missing = evaluate_entry_policy(_account(), None, _equity_caps(), _proposal()).as_snapshot()
-    assert missing["band_equity"] is None
-
-
 # --- §8.2: shaping ----------------------------------------------------------------------------------
 
 

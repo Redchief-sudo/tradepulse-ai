@@ -147,7 +147,8 @@ async def test_definitive_rejection_keeps_obligation_and_alerts(rt: Rt) -> None:
     assert await rt.repositories.holdings.get(asset_identity_key(AAPL)) == before  # holding and stop unchanged
     assert await rt.position() == Decimal(10)
     [event] = await _events(rt, "PROTECTIVE_EXIT_REJECTED")
-    assert (event.severity, event.entity_id) == ("critical", result.trade_intent_id)
+    assert (event.severity, event.entity_id, event.entity_type) == ("critical", asset_identity_key(AAPL), "execution")
+    assert event.details["trade_intent_id"] == result.trade_intent_id
     assert result.reasons[0].removeprefix("BROKER_SUBMIT_ERROR: ") in event.message
 
     rt.quote("150", "150.10")
@@ -259,6 +260,34 @@ async def test_no_caps_read_below_scale_out_threshold(rt: Rt) -> None:
     assert summary.exits_triggered == 0 and reads == []
 
 
+async def test_repeated_rejections_alert_once_per_asset_per_hour(rt: Rt) -> None:
+    """M4: every monitor cycle retries with a new intent; a broker that keeps
+    rejecting gives one critical alert per asset per UTC hour, while every
+    rejection stays on its own REJECTED intent."""
+    await _breach(rt)
+    ids = set()
+    for _ in range(3):
+        rt.clock.advance(timedelta(minutes=1))  # one monitor cycle later, inside the same UTC hour
+        rt.quote("150", "150.10")
+        rt.broker.inject(Fault.SUBMIT_REJECTED)
+        [result] = (await _monitor(rt)).execution_results
+        assert result.status == "rejected"
+        ids.add(result.trade_intent_id)
+    assert len(ids) == 3
+    assert len(await _events(rt, "PROTECTIVE_EXIT_REJECTED")) == 1
+
+    rt.clock.advance(timedelta(hours=1))
+    rt.quote("150", "150.10")
+    rt.broker.inject(Fault.SUBMIT_REJECTED)
+    [result] = (await _monitor(rt)).execution_results
+    assert result.status == "rejected"
+    events = await _events(rt, "PROTECTIVE_EXIT_REJECTED")
+    assert len(events) == 2 and events[0].event_id != events[1].event_id
+    sells = [i for i in await rt.intents() if i.side.value == "sell"]
+    assert [i.status for i in sells] == [TradeIntentStatus.REJECTED] * 4
+    assert await rt.position() == Decimal(10)
+
+
 async def test_failed_alert_write_still_returns_the_rejection(rt: Rt, monkeypatch: pytest.MonkeyPatch) -> None:
     await _breach(rt)
     rt.broker.inject(Fault.SUBMIT_REJECTED)
@@ -266,7 +295,7 @@ async def test_failed_alert_write_still_returns_the_rejection(rt: Rt, monkeypatc
     async def broken(*args: Any, **kwargs: Any) -> bool:
         raise RuntimeError("audit write failed")
 
-    monkeypatch.setattr("tradepulse.reconciliation.coordinator._alert_once", broken)
+    monkeypatch.setattr("tradepulse.execution.gateway.alert_once_per_window", broken)
 
     summary = await _monitor(rt)
 

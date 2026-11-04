@@ -464,6 +464,7 @@ Refusals never block exits, cancel orders or change holdings.
 |---|---|
 | `DBAE_BELOW_MINIMUM_BALANCE` | band `BELOW_MINIMUM` |
 | `DBAE_ACCOUNT_STATE_UNVERIFIED` | a core field missing or unparsable, or evidence stale |
+| `DBAE_FRESHNESS_CHECK_ERROR` | added beside `DBAE_ACCOUNT_STATE_UNVERIFIED` when the commit-time freshness check itself raised (a fault, not stale evidence) |
 | `DBAE_ACCOUNT_TRADING_BLOCKED` | `trading_blocked`, `account_blocked`, `trade_suspended_by_user` or `suspend_trade` |
 | `DBAE_ACCOUNT_CLOSING_ONLY` | `closing_transactions_only` |
 | `DBAE_ACCOUNT_NOT_ACTIVE` | `status != ACTIVE` |

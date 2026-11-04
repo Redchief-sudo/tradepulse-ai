@@ -70,3 +70,26 @@ def test_entry_limits_cannot_be_omitted(omitted: str) -> None:
     kwargs = {f.name: getattr(balanced, f.name) for f in fields(balanced) if f.name != omitted}
     with pytest.raises(ValueError, match=omitted):
         RiskLimits(**kwargs)
+
+
+@pytest.mark.parametrize("field", ["single_unit_target_r", "final_target_r"])
+def test_exit_rungs_below_scale_out_are_rejected(field: str) -> None:
+    """M10: a whole exit or final target inside the scale-out rung is inverted."""
+    with pytest.raises(ValueError, match=field):
+        replace(risk_limits_for_profile("balanced"), scale_out_r=Decimal(2),
+                **{"single_unit_target_r": Decimal(3), "final_target_r": Decimal(3), field: Decimal("1.5")})
+
+
+@pytest.mark.parametrize("overrides", [
+    {"scale_out_r": Decimal(0), "single_unit_target_r": Decimal("0.5")},
+    {"scale_out_r": Decimal(1), "single_unit_target_r": Decimal(0), "final_target_r": Decimal(0)},
+    {"scale_out_r": Decimal("1.5"), "single_unit_target_r": Decimal("1.5"), "final_target_r": Decimal("1.5")},
+])
+def test_disabled_or_equal_exit_rungs_are_allowed(overrides: dict) -> None:
+    replace(risk_limits_for_profile("balanced"), **overrides)
+
+
+def test_every_profile_orders_its_exit_rungs() -> None:
+    for name in RISK_PROFILE_IDS:
+        limits = risk_limits_for_profile(name)
+        assert limits.single_unit_target_r >= limits.scale_out_r and limits.final_target_r >= limits.scale_out_r

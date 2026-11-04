@@ -964,6 +964,8 @@ async def test_band_changed_event_once_per_change(tmp_path: Path) -> None:
     assert Decimal(details["previous_close_equity"]) == Decimal(100000)
     assert details["session_date"] == ny_date(NOW).isoformat()
     assert details["unlocked_classes"] == ["equity", "crypto"]
+    assert [e["event_id"] for e in events] == ["dbae_band_changed:000000000001", "dbae_band_changed:000000000002"]
+    assert [e["details"]["sequence"] for e in events] == [1, 2]
 
 
 async def test_refusal_writes_reason_and_event(tmp_path: Path) -> None:
@@ -1037,10 +1039,8 @@ async def test_pending_funding_store_failure_refuses_entry(tmp_path: Path, monke
 async def test_band_audit_store_failure_does_not_block_entry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """dbae_band_changed is audit, not a decision input: a failed read is
     logged and the approved entry goes on."""
-    import tradepulse.execution.gateway as gateway_module
-
     rig = await _rig(tmp_path)
-    monkeypatch.setattr(gateway_module, "list_all_by_json_field", _unreadable)
+    monkeypatch.setattr(rig.repositories.audit_events, "last_by_id_prefix", _unreadable)
     rig.quote(FRAC, Decimal(100))
 
     result = await rig.gateway.execute_intent(_buy(FRAC, Decimal(1), Decimal(92)))
@@ -1425,7 +1425,7 @@ async def test_unexpected_precondition_error_closes_the_intent_unsubmitted(
         result = await rig.gateway.execute_intent(_buy(FRAC, Decimal(5), Decimal(92)))
 
     assert len(calls) == 2
-    await _assert_refused_unreserved(rig, result, ["DBAE_ACCOUNT_STATE_UNVERIFIED"])
+    await _assert_refused_unreserved(rig, result, ["DBAE_ACCOUNT_STATE_UNVERIFIED", "DBAE_FRESHNESS_CHECK_ERROR"])
     row = await rig.repositories.trade_intents.get(result.trade_intent_id or "")
     assert row is not None and row["status"] == TradeIntentStatus.REJECTED.value
     assert any("policy evaluation failed" in (record.exc_text or "") for record in caplog.records)

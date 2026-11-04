@@ -476,6 +476,28 @@ class RecordRepository:
 
         return await self.database.run(select)
 
+    async def last_by_id_prefix(self, prefix: str) -> Mapping[str, Any] | None:
+        """The row with the greatest record_id starting with ``prefix``, or
+        None. A primary-key range read: callers that need "the latest" of a
+        sequence give their ids a fixed-width, zero-padded counter after the
+        prefix, so id order is sequence order and no timestamp tie decides."""
+        if not prefix:
+            raise ValueError("prefix must be non-empty")
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+        def select(connection: sqlite3.Connection) -> Mapping[str, Any] | None:
+            row = connection.execute(
+                f"SELECT * FROM {self.table} WHERE record_id >= ? AND record_id < ? ORDER BY record_id DESC LIMIT 1",
+                (prefix, upper),
+            ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["payload"] = decode_payload(result["payload"])
+            return result
+
+        return await self.database.run(select)
+
     async def max_by_json_field(self, field: str) -> Mapping[str, Any] | None:
         """Returns the row whose payload has the largest value for the
         given top-level JSON field (compared numerically via a REAL cast

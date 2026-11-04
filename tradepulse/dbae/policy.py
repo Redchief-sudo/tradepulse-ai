@@ -39,15 +39,6 @@ class ExecutionPolicy:
     band_equity: Decimal | None
     fractional_allowed: bool
 
-    def as_snapshot(self) -> dict[str, str | bool | list[str] | None]:
-        return {
-            "allowed": self.allowed,
-            "reasons": list(self.reasons),
-            "band": self.band.value,
-            "band_equity": None if self.band_equity is None else str(self.band_equity),
-            "fractional_allowed": self.fractional_allowed,
-        }
-
 
 @dataclass(frozen=True)
 class ShapedQuantity:
@@ -66,7 +57,7 @@ def _add(reasons: list[str], reason: str) -> None:
 
 
 def _core_account_reasons(account: AccountEvidence, now: datetime) -> list[str]:
-    """§5.2 and §5.3, in §10's order. Any reason here ends the evaluation."""
+    """§5.2 and §5.3, in §5.2's order. Any reason here ends the evaluation."""
     if not evidence_fresh(account.received_at, now):
         return ["DBAE_ACCOUNT_STATE_UNVERIFIED"]
     reasons: list[str] = []

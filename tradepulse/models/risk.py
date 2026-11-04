@@ -143,6 +143,14 @@ class RiskLimits:
         entries = self.max_entries_per_symbol_per_day
         if isinstance(entries, bool) or not isinstance(entries, int) or entries < 1:
             raise ValueError("max_entries_per_symbol_per_day must be an integer of at least 1")
+        # An unsplittable position's whole exit, and the final target, both
+        # lie beyond the partial scale-out; inverted rungs would make a
+        # position that cannot be proven splittable exit whole before a
+        # splittable one would scale out. Checked only between enabled rungs.
+        if self.scale_out_r > 0:
+            for name in ("single_unit_target_r", "final_target_r"):
+                if 0 < getattr(self, name) < self.scale_out_r:
+                    raise ValueError(f"{name} must be at least scale_out_r when both are enabled")
 
     def spread_limit_for(self, asset_class) -> Decimal:
         """Maximum quoted spread (% of mid) for a buy of this asset class."""
