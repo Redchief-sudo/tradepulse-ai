@@ -192,10 +192,36 @@ An independent re-review of the correction round (`5d8b7e51..39a73781`) found on
     - **Fix.** `_evidence_still_fresh` catches an error while judging, logs it with the intent id (`logger.exception`), and returns `DBAE_ACCOUNT_STATE_UNVERIFIED`: freshness at commit is unverified. The write raises `RepositoryPreconditionError` and rolls back, so nothing is written on the approval path, and the gateway closes the intent `REJECTED` with `dbae_entry_refused`, as for stale evidence. No new reason string.
     - **Test.** `test_dbae_gateway.py`: `test_unexpected_precondition_error_closes_the_intent_unsubmitted` (no `RISK_APPROVED`, no `dbae` block, P = 0, no orders, `REJECTED` with the reason, the refusal event, and the logged error).
 
+### Rev.146 remediation review follow-ups (2026-11-03)
+
+The forensic review of the remediation zip (`d35643e9`) gave a conditional merge approval (9.0/10). It found no new critical defect, and it set an order: add the M7 guard, close the minor items where practical, re-run G3 in the worktree, then review the merge separately. Rulings 34 to 40 are that round, all in `63aa22a7`.
+
+34. **M7, a static guard on the lease fence.** New `python_tests/test_gateway_lease_fence.py`. An AST scan of `gateway.py` finds every `trade_intents.update` or `create` that writes an intent built with `status=TradeIntentStatus.RISK_APPROVED`, and fails if any lacks `lease=`, or passes `lease=None`. Two mutation tests prove the guard fires: one drops the argument and one passes `None`. A fourth test fails if any other module builds a `RISK_APPROVED` intent, because the guard would not see that path.
+35. **M10, ordered exit rungs.** `RiskLimits.__post_init__` refuses `single_unit_target_r` or `final_target_r` below `scale_out_r` when both are enabled; 0 still disables a rung. Every shipped profile passes (defaults 1, 1.5 and 3). This closes the "inverted exit config" behaviour of task 8 below. Tests are in `test_risk_profiles.py`.
+36. **M9, dead code and a stale docstring.**
+    - `PendingIntentRemainder` gains `requested_qty: Decimal`, set where `pending_intent_remainders` has already raised on a missing quantity, so `pending_buy_funding` no longer needs its dead `requested_quantity is None` branch. This is fixed at the type, not by narrowing.
+    - `ExecutionPolicy.as_snapshot` was used only by its test, so both are deleted.
+    - The `_core_account_reasons` docstring now says §5.2's order.
+37. **M8, the windowed alert is public.** `tradepulse.alerts.alert_once_per_window(audit_events, alerts, …, entity_type=…)` replaces the gateway's and monitor's imports of the private `reconciliation.coordinator._alert_once`. Reconciliation's `_alert_once` now delegates to it with `entity_type="reconciliation"`. The gateway writes `"execution"` and the monitor writes `"monitor"`, which also closes task 8's `entity_type` note.
+38. **M4, one rejection alert per asset per hour.**
+    - `PROTECTIVE_EXIT_REJECTED` is keyed by the asset and the UTC hour, not by the intent. Each monitor retry is a new intent, so a broker that kept rejecting used to alert on every cycle.
+    - Every rejection stays on its own `REJECTED` intent row, and the alert's details carry the first intent of the hour.
+    - Test: `test_repeated_rejections_alert_once_per_asset_per_hour` covers three rejected cycles in one hour (one alert), then a fourth in the next hour (a second alert), with four `REJECTED` intents and the position still held.
+39. **M3, the latest band change is one key read.**
+    - `dbae_band_changed` ids are now `dbae_band_changed:<12-digit sequence>`, and the intent id moved into `details` along with the `sequence`.
+    - The new `RecordRepository.last_by_id_prefix` reads the greatest id in the prefix as a primary-key range. So the latest event is found without decoding every event, and no `created_at` tie or UUID order decides it.
+    - Two writers racing for one sequence collide on `create_once`.
+    - The branch is unmerged, so no database holds the old ids.
+    - Tests: `test_repositories.py::test_last_by_id_prefix_reads_the_greatest_id_in_the_prefix` (neighbouring prefixes excluded), plus sequence assertions in `test_band_changed_event_once_per_change`.
+40. **The freshness-check fault has its own reason.**
+    - The reviewer noted that the commit-time precondition turns any exception into `DBAE_ACCOUNT_STATE_UNVERIFIED`. That is safe, but monitoring could not tell a fault from stale evidence.
+    - The precondition now returns `DBAE_FRESHNESS_CHECK_ERROR` beside `DBAE_ACCOUNT_STATE_UNVERIFIED`, and the log line starts with the same token.
+    - The refusal is unchanged. The new string is listed in the DBAE spec's reason table, and `test_unexpected_precondition_error_closes_the_intent_unsubmitted` asserts both reasons.
+
 ### Known behaviour to note
 
 - **Crypto scale-out under a transient capability failure (task 8).** A transient crypto capability-read failure past `single_unit_target_r` gives a full exit instead of a partial one. The position cannot be proven splittable, so it exits whole, consistent with ruling 14.
-- **Inverted exit config (task 8).** With `single_unit_target_r < scale_out_r` and the gain between them, unknown capabilities make a splittable position exit whole at `single_unit_target_r`. No profile sets this today (defaults 1 and 1.5). A `RiskLimits` validation `single_unit_target_r ≥ scale_out_r` would close it.
+- **Inverted exit config (task 8).** Closed by ruling 35. With `single_unit_target_r < scale_out_r` and the gain between them, unknown capabilities make a splittable position exit whole at `single_unit_target_r`. No profile sets this today (defaults 1 and 1.5). A `RiskLimits` validation `single_unit_target_r ≥ scale_out_r` would close it.
 
 ### Deferred minor findings (from task reviews)
 
@@ -245,16 +271,16 @@ An independent re-review of the correction round (`5d8b7e51..39a73781`) found on
   - the 30 s portfolio-risk lock now carries extra broker reads and possibly `run_daily_checks`.
 
   It fails safe.
-- **M3.** `_record_band` scans every `dbae_band_changed` event on each buy, and a `created_at` tie falls back to UUID order.
-- **M4.** A stop exit that the broker keeps rejecting sends a critical alert every monitor cycle (once per intent). Consider a per-asset, per-hour window.
+- **M3.** Closed by ruling 39. `_record_band` scans every `dbae_band_changed` event on each buy, and a `created_at` tie falls back to UUID order.
+- **M4.** Closed by ruling 38. A stop exit that the broker keeps rejecting sends a critical alert every monitor cycle (once per intent). Consider a per-asset, per-hour window.
 - **M6.** Install `hypothesis` in the main checkout's venv after merge (see "After merge").
-- **M7.** No static (AST) guard that the `RISK_APPROVED` update in `gateway.py` passes `lease=`.
-- **M8.** The gateway and monitor import the private `reconciliation.coordinator._alert_once`. Promote it to `tradepulse.alerts`.
-- **M9.**
+- **M7.** Closed by ruling 34. No static (AST) guard that the `RISK_APPROVED` update in `gateway.py` passes `lease=`.
+- **M8.** Closed by ruling 37. The gateway and monitor import the private `reconciliation.coordinator._alert_once`. Promote it to `tradepulse.alerts`.
+- **M9.** Closed by ruling 36.
   - The `_core_account_reasons` docstring cites §10 order, where the order is §5.2's.
   - `ExecutionPolicy.as_snapshot` is used only by tests.
   - `pending_buy_funding` has a dead `requested_quantity is None` branch.
-- **M10.** Add a `RiskLimits` validation `single_unit_target_r >= scale_out_r`.
+- **M10.** Closed by ruling 35. Add a `RiskLimits` validation `single_unit_target_r >= scale_out_r`.
 - **Test typing.** `mypy python_tests/test_dbae_properties.py` reports two `arg-type` errors in `_knock_out` (`replace(**dict[str, None])`). Test files are outside mypy's configured scope.
 
 ## Crypto weekend baseline (DBAE-146-03)
@@ -362,6 +388,16 @@ This is the run for the review package: the same worktree and `.venv`, with no d
 - The M1 intent-close fix is `31c1d32a`.
 - A zero slippage allowance is accepted as valid (`e934cb77`).
 - The scoped re-review found no new breakage. It fuzzed the recomputation on 20,000 Decimal round-trip cases with 0 mismatches. Verdict: ready to merge.
+
+### G3: passed at the remediation-review follow-up head (`63aa22a7`, 2026-11-03)
+
+This is the same worktree and `.venv`, with no dependency changed, and the project's default selection. No `-m` was passed.
+
+| Check | Summary line |
+|---|---|
+| `.venv/bin/python -m pytest` | `2222 passed, 10 deselected in 755.30s (0:12:35)`. That is 11 more than the last G3: 4 for the lease fence, 6 for the exit rungs, 1 repository test and 1 rejection-window test, minus the deleted `as_snapshot` test |
+| `.venv/bin/mypy` | `Success: no issues found in 133 source files` |
+| `.venv/bin/ruff check` | `Found 1750 errors.`: equal to the baseline. A finding-by-finding diff against `4ab90ac4` is empty after seven `FURB157` findings in the new tests were fixed |
 
 ## Before live
 
