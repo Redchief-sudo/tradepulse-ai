@@ -7,7 +7,6 @@ from tradepulse.config import (
     RISK_PROFILE_IDS,
     RISK_PROFILES,
     SettingsError,
-    profile_id_for_equity,
     risk_limits_for_profile,
 )
 from tradepulse.models import RiskLimits
@@ -32,33 +31,6 @@ def test_conservative_is_stricter_than_aggressive() -> None:
     assert conservative.max_position_pct < aggressive.max_position_pct
     assert conservative.min_confidence > aggressive.min_confidence
     assert conservative.max_daily_trades < aggressive.max_daily_trades
-
-
-@pytest.mark.parametrize(
-    "equity,expected_profile",
-    [
-        (Decimal("0"), "micro"),
-        (Decimal("9999.99"), "micro"),
-        (Decimal("10000"), "aggressive"),  # lower bound is inclusive on the tier it enters
-        (Decimal("49999.99"), "aggressive"),
-        (Decimal("50000"), "balanced"),
-        (Decimal("249999.99"), "balanced"),
-        (Decimal("250000"), "conservative"),
-        (Decimal("10000000"), "conservative"),
-    ],
-)
-def test_profile_id_for_equity_ladder_boundaries(equity: Decimal, expected_profile: str) -> None:
-    """Every boundary is exercised on both sides -- a fence-post error here
-    would silently pick the wrong risk profile for real account equity."""
-    assert profile_id_for_equity(equity) == expected_profile
-
-
-def test_profile_id_for_equity_result_always_a_real_profile() -> None:
-    """Whatever the ladder returns must resolve through risk_limits_for_profile
-    without raising -- a typo in EQUITY_PROFILE_LADDER/EQUITY_PROFILE_LADDER_TOP_PROFILE_ID
-    would otherwise only surface as a live SettingsError mid-cycle."""
-    for equity in (Decimal("-1"), Decimal("0"), Decimal("10000"), Decimal("50000"), Decimal("250000"), Decimal("1e12")):
-        risk_limits_for_profile(profile_id_for_equity(equity))  # must not raise
 
 
 # ---- Rev.141: every profile sets the Phase 1 entry limits ----------------------
@@ -98,3 +70,26 @@ def test_entry_limits_cannot_be_omitted(omitted: str) -> None:
     kwargs = {f.name: getattr(balanced, f.name) for f in fields(balanced) if f.name != omitted}
     with pytest.raises(ValueError, match=omitted):
         RiskLimits(**kwargs)
+
+
+@pytest.mark.parametrize("field", ["single_unit_target_r", "final_target_r"])
+def test_exit_rungs_below_scale_out_are_rejected(field: str) -> None:
+    """M10: a whole exit or final target inside the scale-out rung is inverted."""
+    with pytest.raises(ValueError, match=field):
+        replace(risk_limits_for_profile("balanced"), scale_out_r=Decimal(2),
+                **{"single_unit_target_r": Decimal(3), "final_target_r": Decimal(3), field: Decimal("1.5")})
+
+
+@pytest.mark.parametrize("overrides", [
+    {"scale_out_r": Decimal(0), "single_unit_target_r": Decimal("0.5")},
+    {"scale_out_r": Decimal(1), "single_unit_target_r": Decimal(0), "final_target_r": Decimal(0)},
+    {"scale_out_r": Decimal("1.5"), "single_unit_target_r": Decimal("1.5"), "final_target_r": Decimal("1.5")},
+])
+def test_disabled_or_equal_exit_rungs_are_allowed(overrides: dict) -> None:
+    replace(risk_limits_for_profile("balanced"), **overrides)
+
+
+def test_every_profile_orders_its_exit_rungs() -> None:
+    for name in RISK_PROFILE_IDS:
+        limits = risk_limits_for_profile(name)
+        assert limits.single_unit_target_r >= limits.scale_out_r and limits.final_target_r >= limits.scale_out_r

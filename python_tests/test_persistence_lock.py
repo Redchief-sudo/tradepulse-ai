@@ -1,7 +1,18 @@
 import asyncio
 import sqlite3
 
-from tradepulse.persistence import AsyncSQLiteDatabase, acquire_lock, release_lock, renew_lock, run_with_lock_renewal
+import pytest
+
+from tradepulse.persistence import (
+    AsyncSQLiteDatabase,
+    RecordRepository,
+    RepositoryLeaseLostError,
+    RepositoryPreconditionError,
+    acquire_lock,
+    release_lock,
+    renew_lock,
+    run_with_lock_renewal,
+)
 
 
 async def _database(tmp_path) -> AsyncSQLiteDatabase:
@@ -156,3 +167,78 @@ async def test_run_with_lock_renewal_calls_callback_once_on_lost_lease_but_work_
 
     assert result == "done"  # never cancelled
     assert len(failures) == 1  # called exactly once, not repeatedly
+
+
+# --- a fenced write's precondition (DBAE-146-02) -------------------------------------------------------
+
+
+async def _scan_run(database: AsyncSQLiteDatabase) -> RecordRepository:
+    repository = RecordRepository(database, "scan_runs")
+    await repository.create_once("run-1", {"v": 1}, status="started")
+    return repository
+
+
+async def _payload(repository: RecordRepository) -> object:
+    row = await repository.get("run-1")
+    return None if row is None else row["payload"]
+
+
+async def test_failed_precondition_writes_nothing(tmp_path) -> None:
+    database = await _database(tmp_path)
+    repository = await _scan_run(database)
+    assert await acquire_lock(database, "risk", "owner-a", "risk", ttl_seconds=60) is True
+
+    with pytest.raises(RepositoryPreconditionError) as raised:
+        await repository.update("run-1", {"v": 2}, status="done", lease=("risk", "owner-a"),
+                                precondition=lambda: ["STALE_A", "STALE_B"])
+
+    assert raised.value.reasons == ("STALE_A", "STALE_B")
+    assert await _payload(repository) == {"v": 1}
+
+
+async def test_passing_precondition_writes(tmp_path) -> None:
+    database = await _database(tmp_path)
+    repository = await _scan_run(database)
+
+    assert await repository.update("run-1", {"v": 2}, status="done", precondition=list) is True
+    assert await _payload(repository) == {"v": 2}
+
+
+async def test_lease_fence_runs_before_the_precondition(tmp_path) -> None:
+    database = await _database(tmp_path)
+    repository = await _scan_run(database)
+    assert await acquire_lock(database, "risk", "owner-a", "risk", ttl_seconds=60) is True
+    await _reassign_owner(database, "risk", "owner-b")
+    called: list[bool] = []
+
+    def precondition() -> list[str]:
+        called.append(True)
+        return ["STALE"]
+
+    with pytest.raises(RepositoryLeaseLostError):
+        await repository.update("run-1", {"v": 2}, status="done", lease=("risk", "owner-a"),
+                                precondition=precondition)
+
+    assert called == [] and await _payload(repository) == {"v": 1}
+
+
+async def test_precondition_runs_inside_the_write_transaction(tmp_path) -> None:
+    """While the precondition runs, the write's BEGIN IMMEDIATE is held: no
+    other writer can start, so nothing can change between the check and
+    the write."""
+    database = await _database(tmp_path)
+    repository = await _scan_run(database)
+    blocked: list[str] = []
+
+    def precondition() -> list[str]:
+        other = sqlite3.connect(f"{tmp_path}/test.db", timeout=0)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            blocked.append(str(exc))
+        finally:
+            other.close()
+        return []
+
+    assert await repository.update("run-1", {"v": 2}, status="done", precondition=precondition) is True
+    assert blocked == ["database is locked"]

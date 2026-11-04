@@ -1,4 +1,15 @@
 from .alpaca_client import AlpacaClient
+from .capabilities import (
+    AccountCapabilities,
+    AccountEvidence,
+    AlpacaCapabilities,
+    AssetCapabilities,
+    AssetTradingCapabilities,
+    DailyEquityBar,
+    DbaeCapabilities,
+    PortfolioHistory,
+    evidence_fresh,
+)
 from .errors import AlpacaDataIntegrityError, AlpacaError, is_definitive_rejection
 from .port import (
     AccountRef,
@@ -28,9 +39,12 @@ from .types import (
 )
 
 __all__ = [
+    "AccountCapabilities",
+    "AccountEvidence",
     "AccountRef",
     "AlpacaAccount",
     "AlpacaActivity",
+    "AlpacaCapabilities",
     "AlpacaClient",
     "AlpacaClock",
     "AlpacaDataIntegrityError",
@@ -40,19 +54,25 @@ __all__ = [
     "AlpacaOrderResponse",
     "AlpacaPosition",
     "AlpacaRateLimitSnapshot",
+    "AssetCapabilities",
+    "AssetTradingCapabilities",
     "BrokerAccount",
     "BrokerActivity",
     "BrokerClock",
     "BrokerPort",
     "BrokerPosition",
+    "DailyEquityBar",
+    "DbaeCapabilities",
     "OptionContract",
     "OrderRequest",
     "OrderState",
+    "PortfolioHistory",
     "RateLimitSnapshot",
     "RawBar",
     "RawQuote",
     "account_ref",
     "default_time_in_force",
+    "evidence_fresh",
     "infer_alpaca_asset_class",
     "is_definitive_rejection",
     "normalize_alpaca_symbol",

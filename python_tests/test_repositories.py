@@ -512,3 +512,21 @@ async def test_paginate_all_rows_fetches_the_whole_table_spanning_several_batche
     rows = await paginate_all_rows(repositories.holdings, batch_size=4)
 
     assert {row["record_id"] for row in rows} == {f"holding-{i}" for i in range(25)}
+
+
+async def test_last_by_id_prefix_reads_the_greatest_id_in_the_prefix(tmp_path) -> None:
+    """M3: id order, not created_at, picks the latest; neighbouring prefixes
+    (one character past the range, and a longer id sharing the start) stay out."""
+    from tradepulse.models import AuditEvent
+
+    repositories = await _repositories(tmp_path)
+    events = repositories.audit_events
+    assert await events.last_by_id_prefix("band:") is None
+    for event_id in ("band:000000000002", "band:000000000010", "band:000000000001", "band;x", "ban", "bandx:9"):
+        await events.create_once(event_id, AuditEvent(event_id=event_id, event_type="t", severity="info", message="m",
+                                                      occurred_at=NOW, entity_type="test", entity_id="e", details={}))
+    latest = await events.last_by_id_prefix("band:")
+    assert latest is not None and latest["record_id"] == "band:000000000010"
+    assert latest["payload"]["event_id"] == "band:000000000010"
+    with pytest.raises(ValueError):
+        await events.last_by_id_prefix("")

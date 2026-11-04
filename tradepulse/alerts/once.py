@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
@@ -58,3 +59,19 @@ async def alert_once(audit_events: RecordRepository, alerts: TelegramAlerter, ev
     finally:
         await release_lock(database, lock_key, owner_token)
     return first_sighting
+
+
+async def alert_once_per_window(audit_events: RecordRepository, alerts: TelegramAlerter, *, event_type: str, subject: str,
+                                window: str, severity: Literal["info", "warning", "error", "critical"], message: str,
+                                details: dict, now: datetime, entity_type: str) -> bool:
+    """Send an alert at most once per (event_type, subject, window).
+
+    A condition that persists until an operator acts would otherwise re-alert
+    on every pass of a periodic loop. The deterministic audit id records each
+    window's evidence once and delivers its alert once (a failed send is
+    retried next pass, see alert_once); ``window`` is any stable string, such
+    as a UTC date, a date-hour, or an id the condition is scoped to.
+    ``entity_type`` names the subsystem that raised it."""
+    event = AuditEvent(event_id=f"{event_type}:{subject}:{window}", event_type=event_type, severity=severity,
+                       message=message, occurred_at=now, entity_type=entity_type, entity_id=subject, details=details)
+    return await alert_once(audit_events, alerts, event)

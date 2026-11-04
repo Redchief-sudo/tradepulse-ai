@@ -109,9 +109,10 @@ import httpx
 
 from tradepulse.calendar import BrokerSession
 from tradepulse.models import AssetClass, Side
-from tradepulse.models.market import canonical_venue
+from tradepulse.models.market import AssetIdentity, canonical_venue
 
 from .alpaca_client import paginate_activities, parse_order_data
+from .capabilities import AccountEvidence, AssetTradingCapabilities, DailyEquityBar
 from .errors import AlpacaError
 from .symbols import infer_alpaca_asset_class, normalize_alpaca_symbol
 from .types import (
@@ -1444,3 +1445,28 @@ class SimulatedBroker:
         return await paginate_activities(
             fetch_page, self._clock, activity_type, since, page_size, after_id=after_id, page_evidence=page_evidence,
         )
+
+
+class SimulatedCapabilities:
+    """DBAE capability evidence for tests: settable ``account``, ``assets`` (by
+    symbol) and ``bars``. An unset account or unknown asset raises AlpacaError,
+    as a failed read from the broker would."""
+
+    def __init__(self) -> None:
+        self.account: AccountEvidence | None = None
+        self.assets: dict[str, AssetTradingCapabilities] = {}
+        self.bars: list[DailyEquityBar] = []
+
+    async def get_account_evidence(self) -> AccountEvidence:
+        if self.account is None:
+            raise AlpacaError("no simulated account evidence", 503, None, None, "getAccount")
+        return self.account
+
+    async def get_asset_capabilities(self, asset: AssetIdentity) -> AssetTradingCapabilities:
+        found = self.assets.get(asset.symbol)
+        if found is None:
+            raise AlpacaError(f"no simulated asset {asset.symbol}", 404, None, None, "getAsset")
+        return found
+
+    async def get_daily_equity_bars(self) -> list[DailyEquityBar]:
+        return list(self.bars)

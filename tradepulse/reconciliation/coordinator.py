@@ -46,7 +46,7 @@ from decimal import Decimal
 from typing import Any, Literal
 from uuid import uuid4
 
-from tradepulse.alerts import TelegramAlerter, alert_once
+from tradepulse.alerts import TelegramAlerter, alert_once, alert_once_per_window
 from tradepulse.broker import AlpacaActivity, BrokerPort
 from tradepulse.models import (
     AssetClass,
@@ -106,18 +106,12 @@ async def _record(repositories: PersistenceRepositories, **kwargs) -> None:
 
 async def _alert_once(repositories: PersistenceRepositories, alerts: TelegramAlerter, *, event_type: str, subject: str,
                       window: str, severity: Literal["info", "warning", "error", "critical"], message: str, details: dict, now: datetime) -> bool:
-    """Send an alert at most once per (event_type, subject, window).
-
-    Reconciliation runs every minute, so a condition that persists until an
-    operator acts would otherwise re-alert on every pass. The deterministic
-    audit id records each window's evidence once and delivers its alert once
-    (a failed send is retried next pass, see alert_once); ``window`` is a UTC
-    date or date-hour string. Reconciliation records are still written on
-    every pass."""
-    event_id = f"{event_type}:{subject}:{window}"
-    event = AuditEvent(event_id=event_id, event_type=event_type, severity=severity, message=message,
-                       occurred_at=now, entity_type="reconciliation", entity_id=subject, details=details)
-    return await alert_once(repositories.audit_events, alerts, event)
+    """Reconciliation's alert_once_per_window: reconciliation runs every
+    minute; ``window`` is a UTC date or date-hour string. Reconciliation
+    records are still written on every pass."""
+    return await alert_once_per_window(repositories.audit_events, alerts, event_type=event_type, subject=subject,
+                                       window=window, severity=severity, message=message, details=details, now=now,
+                                       entity_type="reconciliation")
 
 
 def _utc_day(now: datetime) -> str:

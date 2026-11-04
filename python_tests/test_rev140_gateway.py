@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+from dbae_support import FullBandCapabilities
 from rev140_support import AAPL, KEY, T0, Rt
 
 from tradepulse.alerts import TelegramAlerter
@@ -286,7 +287,8 @@ async def test_crypto_cfee_lag_reduces_not_refuses(tmp_path: Path) -> None:
         settlement = SettlementProcessor(repositories, alerts, clock=lambda: clock() - timedelta(milliseconds=1))
         gateway = ExecutionGateway(repositories, broker, AlpacaMarketDataProvider(broker), settlement, alerts,
                                    risk_limits_for_profile("balanced"), ExecutionMode.PAPER,
-                                   clock=lambda: clock() - timedelta(milliseconds=1), lease=lease)
+                                   clock=lambda: clock() - timedelta(milliseconds=1), lease=lease,
+                                   capabilities=FullBandCapabilities(broker, lambda: clock() - timedelta(milliseconds=1)))
         await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, T0))
         clock.advance(timedelta(seconds=1))
         broker.set_quote("BTC/USD", AssetClass.CRYPTO, Decimal(60000), Decimal(60010), at=clock())

@@ -11,7 +11,7 @@ import pytest
 import respx
 
 from tradepulse.alerts import TelegramAlerter
-from tradepulse.broker import AlpacaAccount, AlpacaClock, AlpacaError
+from tradepulse.broker import AlpacaClock, AlpacaError
 from tradepulse.broker.port import AccountRef
 from tradepulse.cli import (
     CRYPTO_SCAN_INTERVAL_SECONDS,
@@ -30,7 +30,6 @@ from tradepulse.cli import (
     _load_dotenv,
     _periodic_loop,
     _require_credentials,
-    _resolve_risk_profile_id,
     _run_application,
     _run_monitor,
     _run_reconcile,
@@ -476,67 +475,6 @@ class _StubClockBroker:
         if self._error is not None:
             raise self._error
         return AlpacaClock(is_open=bool(self._is_open), next_open=None, next_close=None, timestamp=None)
-
-
-class _StubAccountBroker:
-    """Duck-typed broker.get_account() stub for _resolve_risk_profile_id
-    tests -- returns a fixed equity or raises, no real HTTP."""
-
-    def __init__(self, *, equity: Decimal | None = None, error: Exception | None = None) -> None:
-        self._equity = equity
-        self._error = error
-        self.call_count = 0
-
-    async def get_account(self) -> AlpacaAccount:
-        self.call_count += 1
-        if self._error is not None:
-            raise self._error
-        return AlpacaAccount(equity=self._equity, last_equity=self._equity, cash=self._equity, buying_power=self._equity, portfolio_value=self._equity)
-
-
-async def test_resolve_risk_profile_id_passthrough_when_auto_disabled() -> None:
-    """Off by default -- must be a zero-cost passthrough, no broker call at
-    all, so existing deployments that never opt in see zero behavior change
-    and zero extra API load."""
-    settings = Settings.from_env({"TRADEPULSE_RISK_PROFILE": "conservative"})
-    broker = _StubAccountBroker(equity=Decimal("5000"))  # would resolve to "micro" if ever consulted
-
-    resolved = await _resolve_risk_profile_id(settings, broker)
-
-    assert resolved == "conservative"
-    assert broker.call_count == 0
-
-
-async def test_resolve_risk_profile_id_maps_equity_through_the_ladder_when_enabled() -> None:
-    settings = Settings.from_env({
-        "TRADEPULSE_RISK_PROFILE": "balanced", "TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY": "true",
-    })
-    broker = _StubAccountBroker(equity=Decimal("5000"))
-
-    resolved = await _resolve_risk_profile_id(settings, broker)
-
-    assert resolved == "micro"
-    assert broker.call_count == 1
-
-
-async def test_resolve_risk_profile_id_fails_closed_to_most_conservative_tier_on_broker_error(caplog) -> None:
-    """Rev.98 correction: the fail-closed target under auto mode must be the
-    ladder's own most conservative tier, NEVER the arbitrary static
-    TRADEPULSE_RISK_PROFILE setting -- that setting could be "aggressive"
-    from before auto mode was ever enabled, and falling back to it would let
-    a broker outage silently produce a MORE permissive risk posture than
-    intended (flagged by external Rev.97 audit)."""
-    settings = Settings.from_env({
-        "TRADEPULSE_RISK_PROFILE": "aggressive", "TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY": "true",
-    })
-    broker = _StubAccountBroker(error=httpx.ConnectError("boom"))
-
-    with caplog.at_level("WARNING"):
-        resolved = await _resolve_risk_profile_id(settings, broker)
-
-    assert resolved == "conservative"  # never the configured "aggressive" -- never guesses, never crashes the lane
-    failures = [r for r in caplog.records if getattr(r, "event", None) == "auto_risk_profile_equity_fetch_failed"]
-    assert len(failures) == 1
 
 
 # Hang guard only: a passing wait returns as soon as its condition holds. A

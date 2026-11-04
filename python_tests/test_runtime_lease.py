@@ -11,18 +11,19 @@ import signal
 import subprocess
 import sys
 import textwrap
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from dbae_support import FullBandCapabilities
 from test_cli import _settings, _stub_build_dashboard_server
 
 from tradepulse import cli
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker.port import AccountRef
-from tradepulse.broker.simulated import ManualClock, SimSession, SimulatedBroker
+from tradepulse.broker.simulated import ManualClock, SimSession, SimulatedBroker, SimulatedCapabilities
 from tradepulse.config import risk_limits_for_profile
 from tradepulse.execution import ExecutionGateway, ExecutionRequest
 from tradepulse.models import (
@@ -188,7 +189,8 @@ async def _gateway(tmp_path: Path, lease: AccountLease) -> tuple[PersistenceRepo
     alerts = TelegramAlerter(None, None)
     gateway = ExecutionGateway(repositories, broker, AlpacaMarketDataProvider(broker),
                                SettlementProcessor(repositories, alerts, clock=lambda: NOW), alerts,
-                               risk_limits_for_profile("balanced"), ExecutionMode.PAPER, clock=lambda: NOW, lease=lease)
+                               risk_limits_for_profile("balanced"), ExecutionMode.PAPER, clock=lambda: NOW, lease=lease,
+                               capabilities=FullBandCapabilities(broker, lambda: NOW))
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, NOW))
     return repositories, broker, gateway
 
@@ -201,11 +203,15 @@ def _buy() -> ExecutionRequest:
 def test_gateway_cannot_be_built_without_a_lease(tmp_path: Path) -> None:
     alerts = TelegramAlerter(None, None)
     broker = SimulatedBroker(clock=ManualClock(NOW), session=SimSession.always_open())
+    # Called through an untyped signature on purpose: these exercise the
+    # runtime guards behind the static ones checked below.
+    build: Callable[..., ExecutionGateway] = ExecutionGateway
     with pytest.raises(TypeError, match="lease"):
-        ExecutionGateway(None, broker, None, None, alerts, None, ExecutionMode.PAPER)  # type: ignore[arg-type, call-arg]
+        build(None, broker, None, None, alerts, None, ExecutionMode.PAPER)
     with (account_lease(AccountRef("ibkr", "U1"), holder="me", directory=tmp_path) as foreign,
           pytest.raises(ValueError, match="venue")):
-        ExecutionGateway(None, broker, None, None, alerts, None, ExecutionMode.PAPER, lease=foreign)  # type: ignore[arg-type]
+        build(None, broker, None, None, alerts, None, ExecutionMode.PAPER, lease=foreign,
+              capabilities=SimulatedCapabilities())
     # The omission is also a static error.
     program = textwrap.dedent("""
         from tradepulse.execution import ExecutionGateway

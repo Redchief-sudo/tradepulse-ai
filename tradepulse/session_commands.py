@@ -18,6 +18,7 @@ import httpx
 
 from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaClient, AlpacaError, BrokerPort
+from tradepulse.broker.capabilities import capabilities_for
 from tradepulse.config import Settings, SettingsError, risk_limits_for_profile
 from tradepulse.execution import ExecutionGateway
 from tradepulse.models import AuditEvent, ExecutionMode, ReconciliationOutcome, SessionState, TradingSession
@@ -68,7 +69,7 @@ def build_gateway(
     settlement = SettlementProcessor(repositories, alerts)
     risk_limits = risk_limits_for_profile(settings.risk_profile)
     return ExecutionGateway(repositories, broker, market_data, settlement, alerts, risk_limits,
-                            ExecutionMode(settings.execution_mode), lease=lease)
+                            ExecutionMode(settings.execution_mode), lease=lease, capabilities=capabilities_for(broker))
 
 
 async def run_start(settings: Settings) -> int:

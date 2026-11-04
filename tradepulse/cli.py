@@ -79,11 +79,9 @@ from tradepulse.alerts import TelegramAlerter
 from tradepulse.broker import AlpacaError, BrokerPort
 from tradepulse.broker.port import account_ref
 from tradepulse.config import (
-    EQUITY_PROFILE_LADDER_TOP_PROFILE_ID,
     Settings,
     SettingsError,
     default_strategy_weights,
-    profile_id_for_equity,
     risk_limits_for_profile,
 )
 from tradepulse.config.lanes import LANE_INTERVAL_SECONDS
@@ -274,50 +272,6 @@ def _lease_lost_signal(
     return lease_lost, on_lease_lost
 
 
-async def _resolve_risk_profile_id(settings: Settings, broker: BrokerPort) -> str:
-    """TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY, opt-in and off by default. Off
-    -- a pure, zero-cost passthrough to the configured static profile, no
-    broker call at all (existing behavior is byte-for-byte unchanged). On --
-    looks up TODAY's actual account equity and maps it through
-    config.profile_id_for_equity's fixed, deterministic ladder. Deliberately
-    NOT an AI/LLM judgment call, matching this codebase's standing principle
-    that the AI proposes trade candidates only and never sets risk
-    parameters (see scanner/coordinator.py's own module docstring).
-
-    On broker/network trouble while auto mode is ON, fails closed to
-    EQUITY_PROFILE_LADDER_TOP_PROFILE_ID (the ladder's own most conservative
-    tier) -- deliberately NOT settings.risk_profile. The static setting is
-    only ever the pre-auto-mode default and carries no guarantee of being
-    the conservative choice (an operator could have it set to "aggressive"
-    from before auto mode was ever enabled); falling back to it would let a
-    broker outage -- missing financial truth -- silently produce a MORE
-    permissive risk posture than intended, exactly backwards for a
-    fail-closed guard. Never guesses, never crashes the calling lane."""
-    if not settings.auto_risk_profile_by_equity:
-        return settings.risk_profile
-    try:
-        account = await broker.get_account()
-    except (AlpacaError, httpx.HTTPError) as exc:
-        logger.warning(
-            "auto_risk_profile_equity_fetch_failed",
-            extra={
-                "event": "auto_risk_profile_equity_fetch_failed", "error": str(exc),
-                "fallback_profile": EQUITY_PROFILE_LADDER_TOP_PROFILE_ID,
-            },
-        )
-        return EQUITY_PROFILE_LADDER_TOP_PROFILE_ID
-    resolved = profile_id_for_equity(account.equity)
-    if resolved != settings.risk_profile:
-        logger.info(
-            "auto_risk_profile_resolved",
-            extra={
-                "event": "auto_risk_profile_resolved", "equity": str(account.equity),
-                "resolved_profile": resolved, "configured_profile": settings.risk_profile,
-            },
-        )
-    return resolved
-
-
 async def _run_scan_leg(
     database: AsyncSQLiteDatabase, repositories: PersistenceRepositories, ai_provider: AIProvider,
     market_data: AlpacaMarketDataProvider, broker: BrokerPort, gateway: ExecutionGateway,
@@ -331,7 +285,7 @@ async def _run_scan_leg(
         return None
     try:
         universe = load_executable_universe(settings)
-        risk_limits = risk_limits_for_profile(await _resolve_risk_profile_id(settings, broker))
+        risk_limits = risk_limits_for_profile(settings.risk_profile)
         strategy_weights = default_strategy_weights(datetime.now(UTC))
         lease_lost, on_lease_lost = _lease_lost_signal(alerts, lock_key, owner_token)
         return await run_with_lock_renewal(
@@ -376,7 +330,7 @@ async def _run_monitor_leg(
         return None
     try:
         lease_lost, on_lease_lost = _lease_lost_signal(alerts, MONITOR_LOCK_KEY, owner_token)
-        risk_limits = risk_limits_for_profile(await _resolve_risk_profile_id(settings, broker))
+        risk_limits = risk_limits_for_profile(settings.risk_profile)
         adoption = await _adoption_config(settings, repositories, gateway, market_data, risk_limits)
         return await run_with_lock_renewal(
             database, MONITOR_LOCK_KEY, owner_token, MONITOR_LOCK_TTL_SECONDS,
@@ -1116,7 +1070,7 @@ async def _run_application(settings: Settings, port: int, open_browser: bool, *,
                 from tradepulse.adoption import AdoptionGateError
                 try:
                     await _adoption_config(settings, repositories, gateway, market_data,
-                                           risk_limits_for_profile(await _resolve_risk_profile_id(settings, broker)))
+                                           risk_limits_for_profile(settings.risk_profile))
                 except AdoptionGateError as exc:
                     logger.error("adoption_gate_refused", extra={"event": "adoption_gate_refused", "reason": str(exc)})
                     return 1

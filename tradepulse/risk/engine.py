@@ -24,8 +24,10 @@ from tradepulse.models import (
     AssetClass,
     PortfolioSnapshot,
     RiskLimits,
+    SettlementEvent,
     SettlementStatus,
     Side,
+    TradeIntent,
     TradeIntentStatus,
     asset_identity_key,
     contract_multiplier_of,
@@ -143,7 +145,7 @@ class RiskEvalOptions:
 # Estimated taker fee per side, % of notional, used by the cost rule. Alpaca
 # charges crypto 0.15-0.25% per side by volume tier (0.25% at the entry tier);
 # US equity and option regulatory fees are a negligible fraction of R.
-_FEE_PCT_PER_SIDE = {AssetClass.CRYPTO: Decimal("0.25")}
+FEE_PCT_PER_SIDE = {AssetClass.CRYPTO: Decimal("0.25")}
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,7 +234,7 @@ def evaluate_risk(
             and opts.bid is not None and opts.ask is not None and not opts.skip_market_data_checks):
         mid = (opts.bid + opts.ask) / 2
         if mid > 0:
-            cost_pct = (opts.ask - opts.bid) / mid * 100 + 2 * _FEE_PCT_PER_SIDE.get(intent.asset_class, Decimal("0"))
+            cost_pct = (opts.ask - opts.bid) / mid * 100 + 2 * FEE_PCT_PER_SIDE.get(intent.asset_class, Decimal("0"))
             risk_pct = (price - intent.stop_loss) / price * 100
             if cost_pct > limits.max_cost_to_risk_pct / 100 * risk_pct:
                 reasons.append(f"COST_EXCEEDS_RISK_FRACTION ({cost_pct:.2f}% > {limits.max_cost_to_risk_pct}% of R {risk_pct:.2f}%)")
@@ -444,6 +446,76 @@ async def symbol_entries_today(repositories: PersistenceRepositories, asset, now
     return len(entries)
 
 
+# Status-filtered, unbounded pagination -- NOT list_all(limit=1000), which is
+# oldest-first and can silently undercount pending exposure once 1000 older
+# (any-status) trade_intents exist. See
+# persistence/repositories.py::list_all_by_statuses.
+_PENDING_NOTIONAL_STATUSES = (
+    TradeIntentStatus.RISK_APPROVED.value, TradeIntentStatus.SUBMITTED.value,
+    TradeIntentStatus.ACCEPTED.value, TradeIntentStatus.PARTIALLY_FILLED.value,
+    TradeIntentStatus.SUBMISSION_UNKNOWN.value,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PendingIntentRemainder:
+    """One pending intent's RISK-091-01 buckets.
+
+    remaining_qty is requested_quantity minus every attributed
+    SettlementEvent quantity, unclamped (an over-attributed intent is <= 0).
+    unsettled_events are the attributed events not yet holding_projected,
+    in repository order; unsettled_event_ids are their ids. row_status is
+    the trade_intents status column the intent was selected by.
+    requested_qty is the intent's requested_quantity, proven present."""
+
+    intent: TradeIntent
+    requested_qty: Decimal
+    remaining_qty: Decimal
+    unsettled_event_ids: frozenset[str]
+    unsettled_events: tuple[SettlementEvent, ...]
+    row_status: str
+
+
+async def pending_intent_remainders(repositories: PersistenceRepositories) -> list[PendingIntentRemainder]:
+    """Every intent in RISK_APPROVED, SUBMITTED, ACCEPTED, PARTIALLY_FILLED
+    or SUBMISSION_UNKNOWN, either side, with its never-attributed remainder.
+
+    RISK-091-01: corrected to never derive "how much of this order has the
+    broker actually filled" from intent.filled_quantity --
+    execution/gateway.py::_poll_and_settle only persists filled_quantity to
+    the trade_intents row on a status transition, not on every poll
+    iteration, so a later partial fill in the same poll loop can be durably
+    attributed (a real Fill + SettlementEvent already created) while
+    filled_quantity is still stale-low in the DB. Using filled_quantity here
+    would make remaining_qty overcount the still-open portion of the order
+    AND, combined with the unsettled-notional term, double-count that same
+    fill. SettlementEvent records are the only ground truth for "attributed
+    so far" -- they are created once per validated fill activity and never
+    rewritten to lose history."""
+    intent_rows = await list_all_by_statuses(repositories.trade_intents, list(_PENDING_NOTIONAL_STATUSES))
+    remainders: list[PendingIntentRemainder] = []
+    for row in intent_rows:
+        intent: TradeIntent = hydrate("trade_intents", row["payload"])
+        if intent.requested_quantity is None:
+            # Every pending intent was sized at RISK_APPROVED; one without a
+            # quantity has no remainder to reserve or count.
+            raise ValueError(f"PENDING_INTENT_QUANTITY_MISSING: {intent.trade_intent_id}")
+        event_rows = await list_all_by_json_field(repositories.settlements, "trade_intent_id", intent.trade_intent_id)
+        events: list[SettlementEvent] = [hydrate("settlements", r["payload"]) for r in event_rows]
+
+        total_attributed_qty = sum((e.quantity for e in events), Decimal("0"))
+        unsettled = tuple(e for e in events if not e.holding_projected)
+        remainders.append(PendingIntentRemainder(
+            intent=intent,
+            requested_qty=intent.requested_quantity,
+            remaining_qty=intent.requested_quantity - total_attributed_qty,
+            unsettled_event_ids=frozenset(e.settlement_event_id for e in unsettled),
+            unsettled_events=unsettled,
+            row_status=row["status"],
+        ))
+    return remainders
+
+
 async def build_portfolio_snapshot(
     repositories: PersistenceRepositories,
     *,
@@ -519,56 +591,27 @@ async def build_portfolio_snapshot(
         sector = sectors_by_key.get(key, "Other")
         sector_exposure[sector] = sector_exposure.get(sector, Decimal(0)) + notional
 
-    # Status-filtered, unbounded pagination -- NOT list_all(limit=1000),
-    # which is oldest-first and can silently undercount pending exposure
-    # once 1000 older (any-status) trade_intents exist. See
-    # persistence/repositories.py::list_all_by_statuses.
-    _pending_notional_statuses = [
-        TradeIntentStatus.RISK_APPROVED.value, TradeIntentStatus.SUBMITTED.value,
-        TradeIntentStatus.ACCEPTED.value, TradeIntentStatus.PARTIALLY_FILLED.value,
-        TradeIntentStatus.SUBMISSION_UNKNOWN.value,
-    ]
-    intent_rows = await list_all_by_statuses(repositories.trade_intents, _pending_notional_statuses)
-
-    # RISK-091-01: pending-intent notional reservation, corrected to never
-    # derive "how much of this order has the broker actually filled" from
-    # intent.filled_quantity -- execution/gateway.py::_poll_and_settle only
-    # persists filled_quantity to the trade_intents row on a status
-    # transition, not on every poll iteration, so a later partial fill in
-    # the same poll loop can be durably attributed (a real Fill +
-    # SettlementEvent already created) while filled_quantity is still
-    # stale-low in the DB. Using filled_quantity here would make
-    # remaining_qty overcount the still-open portion of the order AND,
-    # combined with the unsettled-notional term below, double-count that
-    # same fill. SettlementEvent records are the only ground truth for
-    # "attributed so far" -- they are created once per validated fill
-    # activity and never rewritten to lose history.
-    #
-    # Every unit of a pending intent's requested_quantity falls into
-    # exactly one of three buckets: never-attributed (remaining_qty below,
-    # against ground-truth total_attributed_qty), attributed-but-not-yet-
+    # RISK-091-01 buckets: see pending_intent_remainders. Every unit of a
+    # pending intent's requested_quantity falls into exactly one of three
+    # buckets: never-attributed (remaining_qty), attributed-but-not-yet-
     # settled (added once here, keyed by settlement_event_id), or
     # attributed-and-settled (already reflected in Holdings above,
     # untouched by either term). A terminal-status intent (e.g. already
-    # FILLED, so absent from intent_rows/_pending_notional_statuses
-    # entirely) only has the latter two buckets -- covered by the global
-    # catch-all term further below plus Holdings.
+    # FILLED, so absent from the pending set entirely) only has the latter
+    # two buckets -- covered by the global catch-all term further below plus
+    # Holdings.
+    remainders = await pending_intent_remainders(repositories)
     already_counted_settlement_ids: set[str] = set()
-    for row in intent_rows:
-        intent = hydrate("trade_intents", row["payload"])
-        event_rows = await list_all_by_json_field(repositories.settlements, "trade_intent_id", intent.trade_intent_id)
-        events = [hydrate("settlements", r["payload"]) for r in event_rows]
-
-        total_attributed_qty = sum((e.quantity for e in events), Decimal("0"))
-        remaining_qty = intent.requested_quantity - total_attributed_qty
-        if remaining_qty > 0 and intent.reference_price is not None:
-            pending_notional = remaining_qty * intent.reference_price * contract_multiplier_of(intent.asset)
+    for remainder in remainders:
+        intent = remainder.intent
+        if remainder.remaining_qty > 0 and intent.reference_price is not None:
+            pending_notional = remainder.remaining_qty * intent.reference_price * contract_multiplier_of(intent.asset)
             holdings_value += pending_notional
             sector = intent.sector or "Other"
             sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + pending_notional
 
-        for event in events:
-            if event.holding_projected or asset_identity_key(event.asset) in pending_keys:
+        for event in remainder.unsettled_events:
+            if asset_identity_key(event.asset) in pending_keys:
                 continue
             unsettled_notional = event.quantity * event.price * contract_multiplier_of(event.asset)
             holdings_value += unsettled_notional
@@ -622,7 +665,7 @@ async def build_portfolio_snapshot(
         TradeIntentStatus.SUBMITTED.value, TradeIntentStatus.ACCEPTED.value,
         TradeIntentStatus.PARTIALLY_FILLED.value, TradeIntentStatus.SUBMISSION_UNKNOWN.value,
     }
-    outstanding_orders = sum(1 for row in intent_rows if row["status"] in outstanding_values)
+    outstanding_orders = sum(1 for remainder in remainders if remainder.row_status in outstanding_values)
 
     risk_day_start, risk_day_end = _risk_day_bounds(now)
     # Time-window query, unbounded pagination -- NOT list_all(limit=1000)

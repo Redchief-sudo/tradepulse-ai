@@ -221,8 +221,18 @@ CREATE TABLE IF NOT EXISTS unmanaged_observations (
   payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_unmanaged_observing ON unmanaged_observations(account_ref, asset_key) WHERE status='observing';
+-- DBAE §4.3: one verified session baseline per session date, write-once.
+CREATE TABLE IF NOT EXISTS dbae_session_baselines (
+  record_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
 """
 
+QUARANTINE_TABLES = (
+    "short_exposure_liabilities", "unmanaged_long_inventory", "quarantine_executions", "quarantine_resolutions",
+    "quarantine_fee_allocations", "quarantine_fee_recognitions", "legacy_lot_conversions",
+    "unresolved_broker_executions", "unresolved_execution_outcomes", "fill_cursor_bootstrap",
+)
+DBAE_TABLES = ("dbae_session_baselines",)
 # These triggers record provenance even if an operator later deletes all rows.
 # Old files cannot prove that their previously deleted history was empty.
 EVIDENCE_TABLES = (
@@ -230,16 +240,13 @@ EVIDENCE_TABLES = (
     "opportunities", "trade_intents", "orders", "fills", "settlements", "holdings",
     "position_lots", "cash_ledger", "pnl_records", "reconciliation_records",
     "scan_runs", "equity_snapshots", "trade_attributions", "integrity_holds",
-    "short_exposure_liabilities", "unmanaged_long_inventory", "quarantine_executions", "quarantine_resolutions",
-    "quarantine_fee_allocations", "quarantine_fee_recognitions", "legacy_lot_conversions",
-    "unresolved_broker_executions", "unresolved_execution_outcomes", "fill_cursor_bootstrap",
+    *QUARANTINE_TABLES, *DBAE_TABLES,
 )
 
-QUARANTINE_TABLES = EVIDENCE_TABLES[-10:]
 CALENDAR_TABLES = ("calendar_check_events", "calendar_check_dates", "instrument_hours")
 DIVIDEND_TABLES = ("corporate_action_announcements", "dividend_attributions")
 ADOPTION_TABLES = ("position_adoptions",)
-APPEND_ONLY_TABLES = QUARANTINE_TABLES + CALENDAR_TABLES + DIVIDEND_TABLES + ADOPTION_TABLES
+APPEND_ONLY_TABLES = QUARANTINE_TABLES + CALENDAR_TABLES + DIVIDEND_TABLES + ADOPTION_TABLES + DBAE_TABLES
 
 # Rev.144 §3.7: at most one terminal event per check, and date or hours rows
 # only for a check already completed in the same transaction.

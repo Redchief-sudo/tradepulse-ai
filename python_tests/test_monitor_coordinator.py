@@ -6,6 +6,7 @@ from decimal import Decimal
 import httpx
 import respx
 from conftest import mock_cursor_read, mock_open_orders, seed_fill_cursor
+from dbae_support import FullBandCapabilities
 from lease_support import held_test_lease
 
 from tradepulse.alerts import TelegramAlerter
@@ -49,7 +50,8 @@ async def _setup(tmp_path):
     alerts = TelegramAlerter(None, None)
     settlement = SettlementProcessor(repositories, alerts, clock=lambda: NOW)
     limits = risk_limits_for_profile("balanced")
-    gateway = ExecutionGateway(repositories, broker, market_data, settlement, alerts, limits, ExecutionMode.PAPER, clock=lambda: NOW, lease=held_test_lease())
+    gateway = ExecutionGateway(repositories, broker, market_data, settlement, alerts, limits, ExecutionMode.PAPER, clock=lambda: NOW, lease=held_test_lease(),
+                               capabilities=FullBandCapabilities(broker, lambda: NOW))
     await seed_fill_cursor(repositories)  # Rev.140: sells are authorized against the fill cursor
     mock_open_orders()
     mock_cursor_read()

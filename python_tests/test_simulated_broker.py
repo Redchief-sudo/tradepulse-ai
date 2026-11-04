@@ -9,6 +9,7 @@ from decimal import Decimal
 
 import httpx
 import pytest
+from dbae_support import FullBandCapabilities
 from lease_support import held_test_lease
 
 from tradepulse.alerts import TelegramAlerter
@@ -1052,7 +1053,7 @@ async def _gateway(tmp_path: object) -> tuple[PersistenceRepositories, Simulated
     settlement = SettlementProcessor(repositories, alerts, clock=lambda: GATEWAY_NOW)
     gateway = ExecutionGateway(repositories, broker, AlpacaMarketDataProvider(broker), settlement, alerts,
                                risk_limits_for_profile("balanced"), ExecutionMode.PAPER, clock=lambda: GATEWAY_NOW,
-                               lease=held_test_lease())
+                               lease=held_test_lease(), capabilities=FullBandCapabilities(broker, lambda: GATEWAY_NOW))
     await save_session(repositories, TradingSession("session", SessionState.ACTIVE, True, GATEWAY_NOW))
     return repositories, broker, gateway
 

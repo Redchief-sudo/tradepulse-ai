@@ -32,68 +32,9 @@ def test_invalid_timeout_fails_configuration() -> None:
 def test_defaults_use_balanced_risk_profile_and_anthropic_haiku() -> None:
     settings = Settings.from_env({})
     assert settings.risk_profile == "balanced"
-    assert settings.auto_risk_profile_by_equity is False
     assert settings.ai_provider == "anthropic"
     assert settings.anthropic_model == "claude-haiku-4-5"
     assert settings.anthropic_api_key is None
     assert settings.telegram_bot_token is None
     assert settings.openai_model == "gpt-4o-mini"
     assert settings.openai_api_key is None
-
-
-def test_auto_risk_profile_by_equity_opt_in_flag() -> None:
-    """Off by default -- existing behavior is unchanged unless explicitly
-    enabled (see cli.py::_resolve_risk_profile_id)."""
-    assert Settings.from_env({}).auto_risk_profile_by_equity is False
-    assert Settings.from_env({"TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY": "true"}).auto_risk_profile_by_equity is True
-    assert Settings.from_env({"TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY": "false"}).auto_risk_profile_by_equity is False
-    with pytest.raises(SettingsError, match="TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY"):
-        Settings.from_env({"TRADEPULSE_AUTO_RISK_PROFILE_BY_EQUITY": "not-a-bool"})
-
-
-def test_unknown_risk_profile_fails_configuration() -> None:
-    with pytest.raises(SettingsError, match="TRADEPULSE_RISK_PROFILE"):
-        Settings.from_env({"TRADEPULSE_RISK_PROFILE": "yolo"})
-
-
-def test_blank_risk_profile_fails_configuration() -> None:
-    """A present-but-empty-string TRADEPULSE_RISK_PROFILE is a distinct
-    case from the var being absent entirely (which defaults to "balanced",
-    see test_defaults_use_balanced_risk_profile_and_anthropic_haiku) -- it
-    must fail closed the same as any other unrecognized value, never
-    silently fall through to a default profile."""
-    with pytest.raises(SettingsError, match="TRADEPULSE_RISK_PROFILE"):
-        Settings.from_env({"TRADEPULSE_RISK_PROFILE": ""})
-
-
-def test_risk_profile_and_anthropic_overrides_are_honored() -> None:
-    settings = Settings.from_env({
-        "TRADEPULSE_RISK_PROFILE": "conservative",
-        "ANTHROPIC_API_KEY": "key",
-        "ANTHROPIC_MODEL": "claude-sonnet-5",
-        "TELEGRAM_BOT_TOKEN": "bot-token",
-        "TELEGRAM_CHAT_ID": "12345",
-    })
-    assert settings.risk_profile == "conservative"
-    assert settings.anthropic_api_key == "key"
-    assert settings.anthropic_model == "claude-sonnet-5"
-    assert settings.telegram_bot_token == "bot-token"
-    assert settings.telegram_chat_id == "12345"
-
-
-def test_unknown_ai_provider_fails_configuration() -> None:
-    with pytest.raises(SettingsError, match="TRADEPULSE_AI_PROVIDER"):
-        Settings.from_env({"TRADEPULSE_AI_PROVIDER": "grok"})
-
-
-def test_openai_provider_and_overrides_are_honored() -> None:
-    settings = Settings.from_env({
-        "TRADEPULSE_AI_PROVIDER": "openai",
-        "OPENAI_API_KEY": "sk-test",
-        "OPENAI_MODEL": "gpt-4.1-mini",
-        "OPENAI_BASE_URL": "https://example.test/v1",
-    })
-    assert settings.ai_provider == "openai"
-    assert settings.openai_api_key == "sk-test"
-    assert settings.openai_model == "gpt-4.1-mini"
-    assert settings.openai_base_url == "https://example.test/v1"

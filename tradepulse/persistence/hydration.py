@@ -18,6 +18,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from tradepulse.dbae.baseline import decode_session_baseline
 from tradepulse.models import (
     AIResponse,
     AssetClass,
@@ -513,3 +514,6 @@ register("fill_cursor_bootstrap", lambda d: FillCursorBootstrap(
     position_results=d["position_results"], cash_result=d["cash_result"],
     database_sha256_before=d["database_sha256_before"], reason=d["reason"], created_at=_datetime(d["created_at"])))
 
+# --- DBAE ------------------------------------------------------------------------
+
+register("dbae_session_baselines", decode_session_baseline)

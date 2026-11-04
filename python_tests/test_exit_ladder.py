@@ -3,6 +3,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
+from tradepulse.broker.capabilities import AssetTradingCapabilities
 from tradepulse.config import risk_limits_for_profile
 from tradepulse.models import AssetClass, AssetIdentity, Holding, PositionLot
 from tradepulse.monitor.coordinator import plan_ladder_exit
@@ -25,9 +26,9 @@ def _lot(asset=AAPL, opened=OPENED, mfe=None, quantity="10", price="100") -> Pos
                        mfe_price=Decimal(mfe) if mfe else None)
 
 
-def _plan(holding, price, *, lots=None, qty=None, today=TODAY, limits=LIMITS):
+def _plan(holding, price, *, lots=None, qty=None, today=TODAY, limits=LIMITS, caps=None):
     return plan_ladder_exit(holding, lots if lots is not None else [_lot()], Decimal(qty or holding.quantity),
-                            Decimal(price), today, limits)
+                            Decimal(price), today, limits, caps)
 
 
 def test_below_one_r_holds():
@@ -40,8 +41,12 @@ def test_one_r_sells_half_and_marks_scale_out():
 
 
 def test_fractional_half_floors_to_order_precision():
-    decision = _plan(_holding(quantity="9.877"), "103.5")
+    fractionable = AssetTradingCapabilities(True, True, True, None, None, None, OPENED)
+    decision = _plan(_holding(quantity="9.877"), "103.5", caps=fractionable)
     assert decision.quantity == Decimal("4.938")
+    # DBAE final review I3: without verified fractionability the split is
+    # whole shares only, and 4 + 5.877 cannot be whole, so nothing is sold.
+    assert _plan(_holding(quantity="9.877"), "103.5") is None
 
 
 def test_after_scale_out_only_the_final_target_sells():

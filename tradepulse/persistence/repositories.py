@@ -36,6 +36,7 @@ TABLES = {
     "quarantine_fee_allocations", "quarantine_fee_recognitions", "legacy_lot_conversions",
     "unresolved_broker_executions", "unresolved_execution_outcomes", "fill_cursor_bootstrap",
     "position_adoptions",  # Rev.142, append-only
+    "dbae_session_baselines",  # DBAE §4.3, append-only
 }
 STATUS_TABLES = {"trade_intents", "orders", "settlements", "trading_sessions", "scan_runs", "integrity_holds"}
 STATUS_TABLES |= {"accounting_epochs", "broker_activity_cursors"}
@@ -74,6 +75,27 @@ def utc_now() -> str:
 
 class RepositoryLeaseLostError(RuntimeError):
     """A lease-fenced write found its lease expired or owned by another caller."""
+
+
+class RepositoryPreconditionError(RuntimeError):
+    """A write's precondition, run inside the write's own transaction,
+    returned reasons: the transaction rolls back with nothing written."""
+
+    def __init__(self, reasons: Sequence[str]) -> None:
+        super().__init__(f"PRECONDITION_FAILED: {'; '.join(reasons)}")
+        self.reasons = tuple(reasons)
+
+
+def _check_precondition(precondition: Callable[[], Sequence[str]] | None) -> None:
+    """Runs a caller's precondition inside the write's BEGIN IMMEDIATE
+    transaction, after the lease fence and before the write. No reasons:
+    the write goes on. Any reason raises RepositoryPreconditionError, so
+    the transaction rolls back and nothing is written."""
+    if precondition is None:
+        return
+    reasons = precondition()
+    if reasons:
+        raise RepositoryPreconditionError(reasons)
 
 
 def _check_lease(connection: sqlite3.Connection, lease: tuple[str, str] | None) -> None:
@@ -192,10 +214,17 @@ class RecordRepository:
     async def update(
         self, record_id: str, payload: Any, *, status: str | None = None,
         guard_table: str | None = None, guard_key: str | None = None, lease: tuple[str, str] | None = None,
+        precondition: Callable[[], Sequence[str]] | None = None,
     ) -> bool:
         """``lease`` (lock_key, owner_token) fences the write: it raises
         RepositoryLeaseLostError, writing nothing, unless that lease is still
-        held and unexpired when the write's transaction runs."""
+        held and unexpired when the write's transaction runs.
+
+        ``precondition`` runs in the same transaction, after the lease
+        fence and before the write; any reason it returns raises
+        RepositoryPreconditionError, writing nothing. It must not touch the
+        database: it judges state the caller holds (a deadline on the
+        caller's clock, say) at the moment the write would commit."""
         now = utc_now()
         if self.table in STATUS_TABLES:
             if status is None:
@@ -210,6 +239,7 @@ class RecordRepository:
 
         def execute(connection: sqlite3.Connection) -> bool:
             _check_lease(connection, lease)
+            _check_precondition(precondition)
             _check_integrity_hold(connection, guard_table, guard_key)
             return connection.execute(sql, values).rowcount == 1
 
@@ -442,6 +472,28 @@ class RecordRepository:
                 item = dict(row)
                 item["payload"] = decode_payload(item["payload"])
                 result.append(item)
+            return result
+
+        return await self.database.run(select)
+
+    async def last_by_id_prefix(self, prefix: str) -> Mapping[str, Any] | None:
+        """The row with the greatest record_id starting with ``prefix``, or
+        None. A primary-key range read: callers that need "the latest" of a
+        sequence give their ids a fixed-width, zero-padded counter after the
+        prefix, so id order is sequence order and no timestamp tie decides."""
+        if not prefix:
+            raise ValueError("prefix must be non-empty")
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+        def select(connection: sqlite3.Connection) -> Mapping[str, Any] | None:
+            row = connection.execute(
+                f"SELECT * FROM {self.table} WHERE record_id >= ? AND record_id < ? ORDER BY record_id DESC LIMIT 1",
+                (prefix, upper),
+            ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["payload"] = decode_payload(result["payload"])
             return result
 
         return await self.database.run(select)
@@ -709,6 +761,7 @@ class PersistenceRepositories:
     unresolved_execution_outcomes: RecordRepository
     fill_cursor_bootstrap: RecordRepository
     position_adoptions: RecordRepository
+    dbae_session_baselines: RecordRepository
 
     @classmethod
     def create(cls, database: AsyncSQLiteDatabase) -> PersistenceRepositories:
