@@ -136,7 +136,7 @@ from .idempotency import (
     derive_idempotency_key,
     execution_lock_key,
 )
-from .quotes import AuthoritativeQuote, fetch_authoritative_quote
+from .quotes import AuthoritativeQuote, fetch_authoritative_quote, quote_age_problem
 
 logger = logging.getLogger(__name__)
 
@@ -740,7 +740,7 @@ class ExecutionGateway:
                 return ExecutionResult("rejected", existing.trade_intent_id if existing else None, [decision.reason], Decimal("0"), None)
 
             try:
-                quote = await fetch_authoritative_quote(self._market_data, request.asset, request.side, now)
+                quote = await fetch_authoritative_quote(self._market_data, request.asset, request.side, self._clock)
             except ProviderError as exc:
                 return ExecutionResult("skipped", None, [f"NO_EXECUTABLE_QUOTE: {exc}"], Decimal("0"), None)
 
@@ -1038,6 +1038,15 @@ class ExecutionGateway:
                 await reserve_epoch(self._repositories, approved, held_quantity, protective=protective_exit, now=now)
             except AccountingEpochPending as exc:
                 return await self._reject_before_submission(approved, str(exc))
+
+        # Rev.149 F05: the quote approved this order, so it must still be fresh
+        # at the dispatch boundary, measured now rather than when execution
+        # began. Stale: close the intent unsent; the next cycle fetches a new
+        # quote and re-authorizes, never extending the old one.
+        stale_quote = quote_age_problem(request.asset.asset_class, quote.observed_at,
+                                        aware_utc(self._clock(), field_name="now"))
+        if stale_quote is not None:
+            return await self._reject_before_submission(approved, f"STALE_EXECUTABLE_QUOTE_AT_DISPATCH: {stale_quote}")
 
         order_request = AlpacaOrderRequest(
             symbol=request.asset.symbol, qty=submitted_quantity, side=request.side,

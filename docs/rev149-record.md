@@ -13,7 +13,7 @@
 | F04 one bad holding blocks unrelated protection | HIGH | fixed | (this commit) |
 | F02 open orders are one default page | HIGH | fixed (gate G-F02 open) | (this commit) |
 | F03 pending buys leave count limits unreserved | HIGH | not started | |
-| F05 quote age measured from a stale `now` | MEDIUM | not started | |
+| F05 quote age measured from a stale `now` | MEDIUM | fixed | (this commit) |
 | F06 broker-only inventory missing from account risk | HIGH | not started | |
 
 ## Rulings and deviations
@@ -39,6 +39,10 @@
 
    The account is flat, so the measurement shows the request shape and the empty result. The paging itself is covered by the tests.
 
+8. **F05, quote age.** `fetch_authoritative_quote` now takes the gateway's clock instead of a `now` captured at the start of `execute_intent`, and it measures age after the quote is received (`quote_age_problem`). A quote stamped up to `QUOTE_CLOCK_SKEW_SECONDS = 2` ahead of the local clock counts as age 0. Beyond that, it is refused as clock disagreement, never trusted.
+9. **F05, dispatch boundary.** Right before the broker POST, after the last await (the reservation renewal and the crypto position re-read), the gateway rechecks the same quote against the clock. If it is stale, the intent is closed unsent (`STALE_EXECUTABLE_QUOTE_AT_DISPATCH`), and the next cycle fetches a new quote and re-authorizes. The old timestamp is never extended. A protective exit refused this way is retried on the next monitor cycle, like any other stale-quote refusal.
+10. **F05, account evidence.** Account and capability evidence keep their existing freshness checks at the RISK_APPROVED boundary (Rev.146 M7). This finding was about price evidence, and the dispatch recheck covers the quote, which is the only evidence priced into the order.
+
 ## Tests added
 
 `python_tests/test_rev149_monitor_protection.py`:
@@ -56,3 +60,7 @@
   - an oversized page;
   - the population changing mid-scan;
   - a continuation row outside the request.
+- **F05** (`python_tests/test_rev149_quote_time.py`):
+  - the audit's two probes: 20 s old at fetch start and received 120 s later is refused; observed 1 s after start and received at +2 s is accepted;
+  - skew beyond the allowance is refused, and within it is accepted;
+  - a monitor stop exit whose quote goes 40 s stale during the last pre-POST step is not sent, and its intent is rejected with `STALE_EXECUTABLE_QUOTE_AT_DISPATCH`. The same exit with a 5 s delay is sent. On the original code, the stale order was POSTed.
