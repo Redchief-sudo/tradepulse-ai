@@ -1,5 +1,5 @@
 from .database import AsyncSQLiteDatabase, DatabaseError, RepositoryPaginationError
-from .hydration import hydrate, register
+from .hydration import decode_asset_identity, hydrate, register
 from .lock import acquire_lock, release_lock, renew_lock, run_with_lock_renewal
 from .repositories import (
     PersistenceRepositories,
@@ -22,6 +22,7 @@ __all__ = [
     "RepositoryPaginationError",
     "RepositoryPreconditionError",
     "acquire_lock",
+    "decode_asset_identity",
     "hydrate",
     "list_all_by_asset",
     "list_all_by_json_field",

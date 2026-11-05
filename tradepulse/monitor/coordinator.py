@@ -50,7 +50,15 @@ from tradepulse.models import (
     contract_multiplier_of,
     fold_price_extremum,
 )
-from tradepulse.persistence import PersistenceRepositories, hydrate, paginate_all_rows, run_with_lock_renewal
+from tradepulse.persistence import (
+    DatabaseError,
+    PersistenceRepositories,
+    RepositoryLeaseLostError,
+    decode_asset_identity,
+    hydrate,
+    paginate_all_rows,
+    run_with_lock_renewal,
+)
 from tradepulse.providers import AlpacaMarketDataProvider, ProviderError
 from tradepulse.strategy import atr
 
@@ -496,6 +504,57 @@ async def _defer_exit_outside_market_hours(repositories: PersistenceRepositories
     return True
 
 
+
+# Rev.149 F04: failures that are not one instrument's problem. They still end
+# the cycle, so the lane supervisor alerts and restarts it as before.
+ACCOUNT_WIDE_FAILURES: tuple[type[BaseException], ...] = (DatabaseError, RepositoryLeaseLostError)
+
+
+class PositionEvidenceDamaged(Exception):
+    """An instrument's own stored evidence (here, a lot) failed to hydrate.
+    The monitor fails closed for that instrument only (Rev.149 F04)."""
+
+
+async def _report_protection_failure(repositories: PersistenceRepositories, alerts: TelegramAlerter,
+                                     position: AlpacaPosition, detail: str, now: datetime) -> None:
+    """One durable critical incident per asset per hour for a position whose
+    protection did not complete this cycle. It is retried every cycle."""
+    try:
+        entity_id = asset_key_from_broker_symbol(position.asset_class, position.symbol)
+    except (KeyError, TypeError, ValueError):  # the broker symbol itself may be the problem
+        entity_id = position.symbol
+    try:
+        await alert_once(repositories.audit_events, alerts, AuditEvent(
+            event_id=f"monitor_position_protection_failed:{entity_id}:{now.strftime('%Y-%m-%dT%H')}",
+            event_type="monitor_position_protection_failed", severity="critical", occurred_at=now,
+            entity_type="asset", entity_id=entity_id,
+            message=(f"POSITION_PROTECTION_FAILED: {position.symbol} protection did not complete this cycle "
+                     f"({detail}). It is retried every cycle; other positions are still protected."),
+            details={"symbol": position.symbol, "error": detail}))
+    except ACCOUNT_WIDE_FAILURES:
+        raise
+    except Exception:  # an alert failure must never block other exits
+        logger.exception("monitor_protection_failure_alert_failed symbol=%s", position.symbol)
+
+
+async def _report_unidentified_lot(repositories: PersistenceRepositories, alerts: TelegramAlerter,
+                                   record_id: str, now: datetime) -> None:
+    """A lot whose payload, asset included, cannot be read: one durable
+    critical incident per lot per hour (Rev.149 F04)."""
+    try:
+        await alert_once(repositories.audit_events, alerts, AuditEvent(
+            event_id=f"monitor_position_protection_failed:lot:{record_id}:{now.strftime('%Y-%m-%dT%H')}",
+            event_type="monitor_position_protection_failed", severity="critical", occurred_at=now,
+            entity_type="position_lot", entity_id=record_id,
+            message=(f"POSITION_PROTECTION_FAILED: lot {record_id} cannot be read, including its asset. "
+                     "Other positions are still protected; the gateway re-reads lots before any sell."),
+            details={"record_id": record_id}))
+    except ACCOUNT_WIDE_FAILURES:
+        raise
+    except Exception:  # an alert failure must never block other exits
+        logger.exception("monitor_unidentified_lot_alert_failed record_id=%s", record_id)
+
+
 async def run_position_monitor(
     repositories: PersistenceRepositories,
     broker: BrokerPort,
@@ -554,8 +613,25 @@ async def run_position_monitor(
     lot_rows = await paginate_all_rows(repositories.position_lots)
     converted = await converted_lots(repositories)
     open_lots_by_asset: dict[str, list[PositionLot]] = {}
+    # Rev.149 F04: one lot that fails to hydrate must not hide every other
+    # asset's lots. A damaged lot whose asset is still readable fails closed
+    # for that asset only; one whose asset is unreadable is reported, and the
+    # gateway's own sell gate still re-reads lots before any sell.
+    damaged_lot_records: dict[str, str] = {}
+    unidentified_lot_records: list[str] = []
     for row in lot_rows:
-        lot = hydrate("position_lots", row["payload"])
+        try:
+            lot = hydrate("position_lots", row["payload"])
+        except Exception:  # classified below; never blocks other assets
+            logger.exception("monitor_lot_hydration_failed record_id=%s", row["record_id"])
+            try:
+                damaged_key = asset_identity_key(decode_asset_identity(row["payload"]["asset"]))
+            except (KeyError, TypeError, ValueError):  # the asset itself is unreadable
+                unidentified_lot_records.append(str(row["record_id"]))
+                await _report_unidentified_lot(repositories, alerts, str(row["record_id"]), clock())
+                continue
+            damaged_lot_records.setdefault(damaged_key, str(row["record_id"]))
+            continue
         if lot.status in ("open", "partially_closed") and lot.lot_id not in converted:
             open_lots_by_asset.setdefault(asset_identity_key(lot.asset), []).append(lot)
 
@@ -590,27 +666,36 @@ async def run_position_monitor(
         except Exception:  # noqa: BLE001 - detection failure on one position must never block exits
             logger.error("monitor_unmanaged_detection_failed symbol=%s", position.symbol, exc_info=True)
 
-    for position in positions:
-        if lease_lost is not None and lease_lost.is_set():
-            continue  # monitor's own command lease may no longer be exclusive -- stop starting new work
-        if asset_key_from_broker_symbol(position.asset_class, position.symbol) in untradeable:
-            continue  # Rev.140 §3.4: no order of any kind on a short, quarantined or unaccounted asset
-        holding_row = await repositories.holdings.get(asset_key_from_broker_symbol(position.asset_class, position.symbol))
+    # Rev.149 F04: each position is protected inside its own guard. A damaged
+    # holding, lot or provider/gateway failure for one instrument records a
+    # critical incident and fails closed for that instrument; every other
+    # position is still evaluated this cycle. Account-wide failures (the
+    # database, a lost lease) still propagate to the lane supervisor.
+    async def _protect(position: AlpacaPosition) -> None:
+        nonlocal exits_triggered, deferred_exits
+        position_key = asset_key_from_broker_symbol(position.asset_class, position.symbol)
+        if position_key in untradeable:
+            return  # Rev.140 §3.4: no order of any kind on a short, quarantined or unaccounted asset
+        if position_key in damaged_lot_records:
+            # Fail closed for this instrument only: its lot evidence (sell
+            # bound, time stop, ladder) cannot be trusted, so no order is built.
+            raise PositionEvidenceDamaged(f"lot {damaged_lot_records[position_key]} failed to hydrate")
+        holding_row = await repositories.holdings.get(position_key)
         if holding_row is None:
-            continue  # nothing on file (e.g. opened outside this system) -- no threshold to check
+            return  # nothing on file (e.g. opened outside this system) -- no threshold to check
         holding = hydrate("holdings", holding_row["payload"])
         if holding.asset.asset_class != AssetClass.CRYPTO and equity_market_open is False:
             # No ratchet, no extreme folding, no exit on out-of-session prints.
             if await _defer_exit_outside_market_hours(repositories, alerts, position, holding, clock()):
                 deferred_exits += 1
-            continue
+            return
         await _report_residual_below_minimum(repositories, alerts, position, holding, clock())
         matching_lots = open_lots_by_asset.get(asset_identity_key(holding.asset), [])
         if matching_lots:
             await _fold_lot_extrema(repositories, matching_lots, position.current_price)
         ratcheted = await _ratchet_stop(repositories, risk_limits, market_data, holding, matching_lots, position.current_price)
         if ratcheted is None:
-            continue  # holding vanished (closed concurrently by settlement) -- same treatment as holding_row is None above
+            return  # holding vanished (closed concurrently by settlement) -- same treatment as holding_row is None above
         holding = ratcheted
         if _option_expiry_metadata_invalid(holding):
             await alerts.send(
@@ -629,15 +714,15 @@ async def run_position_monitor(
                   else plan_ladder_exit(holding, matching_lots, abs(position.qty), position.current_price,
                                         clock().date(), risk_limits, asset_caps))
         if not (breached or expiring or time_stopped or ladder):
-            continue
+            return
 
         database = repositories.trade_intents.database
         owner_token = str(uuid4())
         if not await reserve_symbol_for_execution(database, holding.asset, owner_token):
-            continue  # another coordinator is already processing this asset -- don't race it
+            return  # another coordinator is already processing this asset -- don't race it
         try:
             if await has_in_flight_intent(repositories, holding.asset):
-                continue  # don't fight an order already in flight on this symbol (e.g. from the scanner)
+                return  # don't fight an order already in flight on this symbol (e.g. from the scanner)
 
             is_long = position.qty > 0
             exit_side = Side.SELL if is_long else Side.BUY
@@ -652,7 +737,7 @@ async def run_position_monitor(
                     return replace(current, scaled_out=True, current_stop=floor)
                 marked = await repositories.holdings.mutate(asset_identity_key(holding.asset), _mark)
                 if marked is None or not marked.scaled_out:
-                    continue  # holding gone, or another writer already scaled it out
+                    return  # holding gone, or another writer already scaled it out
             request = ExecutionRequest(
                 asset=holding.asset, side=exit_side,
                 requested_quantity=ladder.quantity if ladder is not None else abs(position.qty),
@@ -687,5 +772,23 @@ async def run_position_monitor(
         finally:
             await release_symbol_reservation(database, holding.asset, owner_token)
 
+    failed_symbols: list[str] = []
+    for position in positions:
+        if lease_lost is not None and lease_lost.is_set():
+            continue  # monitor's own command lease may no longer be exclusive -- stop starting new work
+        try:
+            await _protect(position)
+        except ACCOUNT_WIDE_FAILURES:
+            raise
+        except Exception as exc:  # one instrument's failure must never block another's exit
+            failed_symbols.append(position.symbol)
+            logger.exception("monitor_position_protection_failed symbol=%s", position.symbol)
+            await _report_protection_failure(repositories, alerts, position, f"{type(exc).__name__}: {exc}", clock())
+
+    if failed_symbols or unidentified_lot_records:
+        problems = [*failed_symbols, *(f"lot:{record_id}" for record_id in unidentified_lot_records)]
+        return MonitorCycleSummary("degraded", len(positions), exits_triggered, execution_results,
+                                   error=f"POSITION_PROTECTION_FAILED: {', '.join(problems)}",
+                                   unmanaged_positions=unmanaged, deferred_exits=deferred_exits)
     return MonitorCycleSummary("ok", len(positions), exits_triggered, execution_results, unmanaged_positions=unmanaged,
                                deferred_exits=deferred_exits)

@@ -188,8 +188,11 @@ def check_cash_sufficiency(
 
 
 def evaluate_risk(
-    intent: RiskCheckInput, snapshot: PortfolioSnapshot, limits: RiskLimits, opts: RiskEvalOptions | None = None
+    intent: RiskCheckInput, snapshot: PortfolioSnapshot | None, limits: RiskLimits, opts: RiskEvalOptions | None = None
 ) -> RiskDecision:
+    """snapshot may be None only for a sell: a protective exit or a plain sell
+    returns before any portfolio figure is read (Rev.149 F04). New exposure
+    without a snapshot is a caller defect and raises."""
     opts = opts or RiskEvalOptions()
     reasons: list[str] = []
     qty = intent.requested_quantity
@@ -251,6 +254,9 @@ def evaluate_risk(
                 [f"INSUFFICIENT_POSITION_TO_SELL (held {opts.held_quantity}, requested {qty})"],
             )
         return RiskDecision(True, qty, ["OK"])
+
+    if snapshot is None:
+        raise ValueError("RISK_SNAPSHOT_REQUIRED: new exposure is evaluated against a portfolio snapshot")
 
     if intent.confidence is not None and intent.confidence < limits.min_confidence:
         reasons.append(f"CONFIDENCE_BELOW_MIN ({intent.confidence} < {limits.min_confidence})")

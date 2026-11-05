@@ -483,7 +483,7 @@ class ExecutionGateway:
         return _AuthorizedEntry(policy, proposal, account, asset, baseline, equity_for_band, pending, available, now)
 
     async def _shape_entry(self, entry: _AuthorizedEntry, request: ExecutionRequest, intent: TradeIntent,
-                           risk: RiskDecision, risk_input: RiskCheckInput, snapshot: PortfolioSnapshot,
+                           risk: RiskDecision, risk_input: RiskCheckInput, snapshot: PortfolioSnapshot | None,
                            risk_opts: RiskEvalOptions,
                            evidence: _EntryEvidence) -> tuple[Decimal, dict[str, DbaeSnapshotValue]] | ExecutionResult:
         """Spec §8.1 steps 6-8 on the first run's approved quantity: round
@@ -781,14 +781,19 @@ class ExecutionGateway:
             else:
                 await self._repositories.trade_intents.update(trade_intent_id, intent, status=intent.status.value)
 
-            snapshot = await build_portfolio_snapshot(
+            # Rev.149 F04: only new exposure is decided on the portfolio
+            # snapshot (evaluate_risk returns before reading it for any sell).
+            # A protective exit therefore never builds one, so a damaged
+            # holding row for another asset cannot block this exit; a buy
+            # still builds it and still fails closed on damaged evidence.
+            snapshot = (await build_portfolio_snapshot(
                 self._repositories, cash_balance=account.cash, account_equity=account.equity,
                 broker_prev_close_equity=account.last_equity, mark_prices=mark_prices, now=now,
                 broker_positions=positions_by_key,
-            )
+            ) if needs_portfolio_lock else None)
 
             max_drawdown_breached = False
-            if request.side == Side.BUY and not protective_exit and self._risk_limits.max_drawdown_pct > 0:
+            if snapshot is not None and self._risk_limits.max_drawdown_pct > 0:
                 drawdown = await check_max_drawdown(self._repositories, snapshot.total_equity, self._risk_limits)
                 max_drawdown_breached = drawdown.breached
 

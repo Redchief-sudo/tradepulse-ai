@@ -108,6 +108,14 @@ def _asset_identity(d: Mapping[str, Any]) -> AssetIdentity:
     )
 
 
+def decode_asset_identity(d: Mapping[str, Any]) -> AssetIdentity:
+    """Decode just an asset identity from a stored payload's ``asset`` field.
+    Rev.149 F04: when a lot payload fails to hydrate, the monitor still needs
+    to know which instrument the damaged evidence belongs to, so it can fail
+    closed for that instrument only."""
+    return _asset_identity(d)
+
+
 def _market_quote(d: Mapping[str, Any]) -> MarketQuote:
     return MarketQuote(
         asset=_asset_identity(d["asset"]),
