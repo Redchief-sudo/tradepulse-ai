@@ -193,9 +193,10 @@ async def _ratchet_stop(
     holding: Holding, lots: list[PositionLot], price: Decimal,
 ) -> Holding | None:
     """Exit Intelligence -- break-even ratchet + ATR trailing stop, both
-    monotonic (favorable-direction-only). Returns the updated Holding (or
-    the original, unchanged, if there was nothing to do), or None if the
-    holding vanished (closed concurrently by settlement) since it was read.
+    monotonic (favorable-direction-only). Returns the updated Holding, or
+    the current Holding unchanged if there was nothing to do, or None only
+    if the holding vanished (closed concurrently by settlement) since it was
+    read. An unchanged stop is never None (Rev.149 F01).
     No candle fetch, no write, for the common case of a position that
     hasn't earned break-even yet -- see _fetch_atr's own cost-bounding note."""
     if holding.stop_loss is None:
@@ -225,16 +226,28 @@ async def _ratchet_stop(
                 trail = running_extreme - distance if is_long else running_extreme + distance
                 candidate = max(candidate, trail) if is_long else min(candidate, trail)
 
+    # Rev.149 F01: mutate() returns None both for a missing row and for a
+    # no-op decision. The monitor must tell those apart: a missing holding is
+    # skipped, but an unchanged stop is the common case once break-even or a
+    # trailing stop is set, and that position still needs every exit check.
+    # `observed` is the row as read inside mutate's own transaction, so an
+    # unchanged result is exactly the state the write would have kept.
+    observed: list[Holding] = []
+
     def _decide(current: Holding) -> Holding | None:
+        observed.append(current)
         if current.current_stop is None:
             merged = candidate
         else:
             merged = max(current.current_stop, candidate) if is_long else min(current.current_stop, candidate)
         if merged == current.current_stop:
-            return None  # already at least this favorable -- no-op, matches _fold_lot_extrema's convention
+            return None  # already at least this favorable -- no write, matches _fold_lot_extrema's convention
         return replace(current, current_stop=merged)
 
-    return await repositories.holdings.mutate(asset_identity_key(holding.asset), _decide)
+    updated = await repositories.holdings.mutate(asset_identity_key(holding.asset), _decide)
+    if updated is not None:
+        return updated
+    return observed[-1] if observed else None  # unchanged stop -> the current row; no row -> None (vanished)
 
 
 RESIDUAL_MINIMUM_VALUE = Decimal(1)  # spec §8.5: the entry minimum a held position can fall below
