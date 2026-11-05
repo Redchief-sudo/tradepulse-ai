@@ -817,7 +817,8 @@ class ExecutionGateway:
             )
             new_exposure = request.side == Side.BUY and not protective_exit
             risk_opts = RiskEvalOptions(
-                open_risk=await open_portfolio_risk(self._repositories) if new_exposure else Decimal("0"),
+                open_risk=(await open_portfolio_risk(self._repositories, broker_positions=positions_by_key)
+                           if new_exposure else Decimal("0")),
                 symbol_entries_today=(await symbol_entries_today(self._repositories, request.asset, now,
                                                                  exclude_intent_id=trade_intent_id)
                                       if new_exposure else 0),

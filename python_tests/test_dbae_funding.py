@@ -156,7 +156,8 @@ async def test_snapshot_unchanged_after_extraction(tmp_path) -> None:
     # holdings 400; ti-p open 3*100=300 + unsettled 3*110=330; ti-r 100; ti-s 100; ti-f 202.
     assert snapshot.holdings_value == Decimal(1432)
     assert snapshot.sector_exposure == {"Tech": Decimal(1332), "Energy": Decimal(100)}
-    assert snapshot.outstanding_orders == 3
+    # ti-p, ti-u, ti-s, and (Rev.149 F03) ti-r: an approval holds dispatch capacity before it is sent.
+    assert snapshot.outstanding_orders == 4
 
     remainders = {r.intent.trade_intent_id: r for r in await pending_intent_remainders(repositories)}
     assert set(remainders) == {"ti-p", "ti-r", "ti-u", "ti-s"}

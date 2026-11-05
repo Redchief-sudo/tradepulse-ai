@@ -12,9 +12,9 @@
 | F01 unchanged ratchet suppresses exit checks | CRITICAL | fixed | `4e2b601e` |
 | F04 one bad holding blocks unrelated protection | HIGH | fixed | (this commit) |
 | F02 open orders are one default page | HIGH | fixed (gate G-F02 open) | (this commit) |
-| F03 pending buys leave count limits unreserved | HIGH | not started | |
+| F03 pending buys leave count limits unreserved | HIGH | fixed | (this commit) |
 | F05 quote age measured from a stale `now` | MEDIUM | fixed | (this commit) |
-| F06 broker-only inventory missing from account risk | HIGH | not started | |
+| F06 broker-only inventory missing from account risk | HIGH | fixed | (this commit) |
 
 ## Rulings and deviations
 
@@ -43,6 +43,19 @@
 9. **F05, dispatch boundary.** Right before the broker POST, after the last await (the reservation renewal and the crypto position re-read), the gateway rechecks the same quote against the clock. If it is stale, the intent is closed unsent (`STALE_EXECUTABLE_QUOTE_AT_DISPATCH`), and the next cycle fetches a new quote and re-authorizes. The old timestamp is never extended. A protective exit refused this way is retried on the next monitor cycle, like any other stale-quote refusal.
 10. **F05, account evidence.** Account and capability evidence keep their existing freshness checks at the RISK_APPROVED boundary (Rev.146 M7). This finding was about price evidence, and the dispatch recheck covers the quote, which is the only evidence priced into the order.
 
+11. **F03, count reservations.** `build_portfolio_snapshot`, read under the same portfolio lock as the dollar reservation, now counts every pending intent (RISK_APPROVED, SUBMITTED, ACCEPTED, PARTIALLY_FILLED, SUBMISSION_UNKNOWN), exactly as the pending-notional term already did:
+    - **Outstanding orders:** every pending intent, either side. RISK_APPROVED is now included, which reverses the earlier rule. Two existing tests pinned the old rule: `test_build_portfolio_snapshot_does_not_count_risk_approved_as_outstanding` is replaced by `..._counts_risk_approved_as_outstanding`, and `test_dbae_funding.py::test_snapshot_unchanged_after_extraction` now expects 4 outstanding orders, not 3. Its holdings value and sector figures are unchanged.
+    - **Daily entries:** the distinct BUY intents with a fill in the NY risk day, together with every pending BUY intent. One filled today and still pending counts once. A pending entry counts as soon as it is approved, whatever day it was approved, because it has not yet used a day's allowance through a fill. An add-on is an entry, as before (Rev.127).
+    - **Position slots:** the distinct assets held or committed to: holdings, quarantined inventory, broker positions, and pending BUY intents. An add-on to a held asset takes no second slot, and a pending exit takes none.
+    - **Release and recovery:** a definitive rejection, cancel or expiry leaves the pending set and releases all three counts. SUBMISSION_UNKNOWN keeps them. The counts are read from the database at each approval, so they survive a restart.
+
+    This is the account-level form of Rev.141's per-symbol `symbol_entries_today`, which already counted pending entries.
+12. **F06, unmanaged exposure.** For each broker position that is not a pending-epoch or quarantined asset (both already valued from broker evidence), the quantity beyond what local records account for is added at the broker's per-unit market value (multiplier included), in a new `UNMANAGED_SECTOR = "Unmanaged"` bucket. "What local records account for" means the holding plus filled-but-unsettled BUY settlement events.
+    - Unfilled pending remainders are not subtracted, because the broker cannot show them; they are still counted at their reference price, as before.
+    - In the moment between a fill appearing at the broker and its settlement event existing, the fill is counted twice: once as broker excess, and once as remaining pending quantity. That errs toward over-counting, which can only refuse a buy.
+13. **F06, sector and open risk.** `evaluate_risk` adds `Unmanaged` exposure to the candidate's own sector exposure, because inventory with no known sector is never a free pass against a sector cap. `open_portfolio_risk(broker_positions=...)` counts the unheld excess at its whole market value, because TradePulse manages no stop for it. That is the existing rule for a holding with no stop. The gateway passes its broker position map to both.
+14. **`risk.engine` imports `broker.types.AlpacaPosition`** for the typed broker map. `broker.types` imports only `tradepulse.models`, so the import adds no cycle.
+
 ## Tests added
 
 `python_tests/test_rev149_monitor_protection.py`:
@@ -64,3 +77,19 @@
   - the audit's two probes: 20 s old at fetch start and received 120 s later is refused; observed 1 s after start and received at +2 s is accepted;
   - skew beyond the allowance is refused, and within it is accepted;
   - a monitor stop exit whose quote goes 40 s stale during the last pre-POST step is not sent, and its intent is rejected with `STALE_EXECUTABLE_QUOTE_AT_DISPATCH`. The same exit with a 5 s delay is sent. On the original code, the stale order was POSTed.
+- **F03 and F06** (`python_tests/test_rev149_risk_counts.py`): 16 tests. Ten fail on the original engine. The other six are controls that also pass there:
+  - the test buy is approved on an empty account;
+  - a rejected buy and a cancelled buy each release their capacity;
+  - a partial fill counts once;
+  - a pending exit is not an entry;
+  - an unsettled fill is not counted twice.
+
+  The tests that fail on the original engine:
+  - the audit's two count probes (RISK_APPROVED and ACCEPTED) and its dispatch probe;
+  - SUBMISSION_UNKNOWN keeps its capacity;
+  - an add-on takes no second slot;
+  - the audit's $90,000 broker-only probe, refused by the 60% total cap;
+  - partial adoption counts the unheld excess;
+  - broker-only option inventory;
+  - unmanaged exposure against a sector cap;
+  - open risk.
