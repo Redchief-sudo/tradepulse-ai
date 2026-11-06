@@ -1101,6 +1101,16 @@ class ExecutionGateway:
         )
         submitted = replace(approved, status=TradeIntentStatus.SUBMITTED)
         await self._repositories.trade_intents.update(trade_intent_id, submitted, status=submitted.status.value)
+        # Rev.149 R149-03: the SUBMITTED write is the last await before the
+        # POST, so the quote is checked again after it. Nothing awaits between
+        # this check and place_order. No request has begun, so a stale quote
+        # closes the intent unsent. If that write fails, the intent stays
+        # SUBMITTED with no order behind it: the in-flight rule holds the asset
+        # and recovery resolves it by client order id, never by resubmitting.
+        stale_quote = quote_age_problem(request.asset.asset_class, quote.observed_at,
+                                        aware_utc(self._clock(), field_name="now"))
+        if stale_quote is not None:
+            return await self._reject_before_submission(submitted, f"STALE_EXECUTABLE_QUOTE_AT_DISPATCH: {stale_quote}")
         try:
             placed = await self._broker.place_order(order_request)
         except Exception as exc:  # noqa: BLE001 - must classify every submission failure, never let one crash the cycle

@@ -165,3 +165,115 @@ async def test_a_quote_still_fresh_at_dispatch_is_sent(tmp_path, monkeypatch) ->
 
     assert order_route.call_count == 1
     assert summary.exits_triggered == 1
+
+
+# --- Rev.149 follow-up R149-03 (review 2026-11-05) ---------------------------
+# The dispatch check ran before the awaited SUBMITTED write, and the broker
+# POST followed that write with no further check. A slow write could carry a
+# quote past its limit into the order.
+
+async def _stop_exit_with_slow_submitted_write(tmp_path, monkeypatch, *, quote_age: int, delay_seconds: int,
+                                               fail_write: str | None = None):
+    """A breached stop. ``delay_seconds`` pass while the SUBMITTED intent is
+    written. ``fail_write`` makes the SUBMITTED write, or the REJECTED write
+    that follows it, raise: a crash at that point."""
+    clock = Clock()
+    repositories, broker, market_data, gateway, alerts = await _gateway_setup(tmp_path, clock)
+    await _seed_holding(repositories)
+    await _seed_lot(repositories)
+    _mock_positions(qty="10", current_price="135")  # below the 140 stop
+    _mock_account()
+    _mock_quote_at(NOW - timedelta(seconds=quote_age))
+    order_route = respx.post("https://paper-api.alpaca.markets/v2/orders").mock(
+        return_value=httpx.Response(200, json=_order_json("accepted", "0", None)))
+    respx.get("https://paper-api.alpaca.markets/v2/orders/order-1").mock(
+        return_value=httpx.Response(200, json=_order_json("filled", "10", "135")))
+    _mock_fill_activities("act-1", "10", "135")
+    intents = repositories.trade_intents
+    original_update = intents.update
+
+    async def slow_update(record_id, record, *args, **kwargs):
+        status = kwargs.get("status")
+        if status == "submitted":
+            if fail_write == "submitted":
+                raise RuntimeError("injected crash before the SUBMITTED commit")
+            result = await original_update(record_id, record, *args, **kwargs)
+            clock.now = clock.now + timedelta(seconds=delay_seconds)
+            return result
+        if status == "rejected" and fail_write == "rejected":
+            raise RuntimeError("injected crash after the SUBMITTED commit")
+        return await original_update(record_id, record, *args, **kwargs)
+
+    monkeypatch.setattr(intents, "update", slow_update)
+    summary = await run_position_monitor(repositories, broker, market_data, gateway, alerts, LIMITS, clock=clock)
+    [intent_row] = await repositories.trade_intents.list_all()
+    return summary, order_route, intent_row, (repositories, broker, market_data, gateway, alerts, clock)
+
+
+@respx.mock
+async def test_a_quote_that_ages_past_its_limit_during_the_submitted_write_is_not_sent(tmp_path, monkeypatch) -> None:
+    """The review's probe: a 29 s stock quote passes the earlier checks, and a
+    2 s write makes it 31 s old at the POST."""
+    summary, order_route, intent_row, (_, broker, *_rest) = await _stop_exit_with_slow_submitted_write(
+        tmp_path, monkeypatch, quote_age=29, delay_seconds=2)
+    await broker.aclose()
+
+    assert order_route.call_count == 0
+    assert summary.exits_triggered == 0
+    assert intent_row["status"] == "rejected"
+    assert intent_row["payload"]["rejection_reason"].startswith("STALE_EXECUTABLE_QUOTE_AT_DISPATCH")
+
+
+@respx.mock
+async def test_a_fresh_quote_with_a_long_submitted_write_is_not_sent(tmp_path, monkeypatch) -> None:
+    """The review's second probe: a zero-age quote and a 40 s write."""
+    summary, order_route, intent_row, (_, broker, *_rest) = await _stop_exit_with_slow_submitted_write(
+        tmp_path, monkeypatch, quote_age=0, delay_seconds=40)
+    await broker.aclose()
+
+    assert order_route.call_count == 0
+    assert summary.exits_triggered == 0
+    assert intent_row["status"] == "rejected"
+
+
+@respx.mock
+async def test_a_quote_still_fresh_after_the_submitted_write_is_sent(tmp_path, monkeypatch) -> None:
+    summary, order_route, _, (_, broker, *_rest) = await _stop_exit_with_slow_submitted_write(
+        tmp_path, monkeypatch, quote_age=20, delay_seconds=2)
+    await broker.aclose()
+
+    assert order_route.call_count == 1
+    assert summary.exits_triggered == 1
+
+
+@respx.mock
+async def test_a_crash_before_the_submitted_commit_sends_nothing(tmp_path, monkeypatch) -> None:
+    summary, order_route, intent_row, (_, broker, *_rest) = await _stop_exit_with_slow_submitted_write(
+        tmp_path, monkeypatch, quote_age=29, delay_seconds=2, fail_write="submitted")
+    await broker.aclose()
+
+    assert order_route.call_count == 0
+    assert intent_row["status"] == "risk_approved"  # never reached the broker
+    assert summary.exits_triggered == 0
+
+
+@respx.mock
+async def test_a_crash_after_the_submitted_commit_is_never_blindly_retried(tmp_path, monkeypatch) -> None:
+    """The stale check refuses, but the REJECTED write fails: the intent stays
+    SUBMITTED with no POST. The next cycle must not submit a second exit
+    beside it; the in-flight rule holds the asset until recovery resolves
+    the SUBMITTED intent by client order id."""
+    summary, order_route, intent_row, (repositories, broker, market_data, gateway, alerts, clock) = \
+        await _stop_exit_with_slow_submitted_write(tmp_path, monkeypatch, quote_age=29, delay_seconds=2,
+                                                   fail_write="rejected")
+
+    assert order_route.call_count == 0
+    assert summary.exits_triggered == 0
+    assert intent_row["status"] == "submitted"
+
+    _mock_quote_at(clock.now)  # a fresh quote: only the in-flight rule can stop a second exit
+    await run_position_monitor(repositories, broker, market_data, gateway, alerts, LIMITS, clock=clock)
+    await broker.aclose()
+
+    assert order_route.call_count == 0
+    assert len(await repositories.trade_intents.list_all()) == 1
