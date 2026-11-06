@@ -95,6 +95,7 @@ from tradepulse.persistence import (
     RepositoryLeaseLostError,
     RepositoryPreconditionError,
     acquire_lock,
+    decode_asset_identity,
     hydrate,
     list_all_by_asset,
     list_all_by_json_field,
@@ -139,6 +140,50 @@ from .idempotency import (
 from .quotes import AuthoritativeQuote, fetch_authoritative_quote, quote_age_problem
 
 logger = logging.getLogger(__name__)
+
+
+class SellEvidenceDamaged(Exception):
+    """A stored intent that may bear on this sell cannot be read, so the sell
+    cannot be proven safe. Raised rather than returned, so the monitor's
+    per-position guard reports a critical incident for this asset and keeps
+    protecting the others (Rev.149 R149-02)."""
+
+
+def sell_evidence(rows: Sequence[Mapping[str, Any]], asset_key: str) -> list[TradeIntent]:
+    """The SELL intents for ``asset_key``, hydrating only rows that can bear on
+    that sell (Rev.149 R149-02).
+
+    Each row's side and asset are decoded first. A BUY is never sell
+    evidence, and a row for another asset is irrelevant, so neither is
+    hydrated: damage in either cannot block this sell. A non-BUY row for this
+    asset (including one whose side is unreadable) is hydrated, and if it is
+    damaged the sell is refused, because the obligation it records is
+    unknown. A non-BUY row whose asset cannot be identified could belong to
+    any asset, so it refuses every sell."""
+    intents: list[TradeIntent] = []
+    for row in rows:
+        payload = row["payload"]
+        side = payload.get("side") if isinstance(payload, Mapping) else None
+        if side == Side.BUY.value:
+            continue
+        try:
+            row_key = asset_identity_key(decode_asset_identity(payload["asset"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise SellEvidenceDamaged(
+                f"SELL_EVIDENCE_UNIDENTIFIABLE: intent {row['record_id']} is not a buy and its asset cannot be "
+                "read, so no sell can be proven unaffected by it") from exc
+        if row_key != asset_key:
+            continue
+        try:
+            intent = hydrate("trade_intents", payload)
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise SellEvidenceDamaged(
+                f"SELL_EVIDENCE_DAMAGED: intent {row['record_id']} for {asset_key} cannot be read ({exc}); "
+                "the sell obligation it records is unknown") from exc
+        if intent.side == Side.SELL:
+            intents.append(intent)
+    return intents
+
 
 # dbae_band_changed audit ids: this prefix, then a 12-digit sequence (M3).
 BAND_CHANGE_ID_PREFIX = "dbae_band_changed:"
@@ -1117,10 +1162,8 @@ class ExecutionGateway:
             return refuse("UNRESOLVED_BROKER_EXECUTION")
         if await history_unproven(self._repositories, key):
             return refuse("ACTIVITY_HISTORY_UNPROVEN")
-        intents = [intent for intent in (hydrate("trade_intents", row["payload"])
-                                         for row in await paginate_all_rows(self._repositories.trade_intents))
-                   if intent.side == Side.SELL and asset_identity_key(intent.asset) == key
-                   and intent.trade_intent_id != current_intent_id]
+        intents = [intent for intent in sell_evidence(await paginate_all_rows(self._repositories.trade_intents), key)
+                   if intent.trade_intent_id != current_intent_id]
         if any(intent.status in (TradeIntentStatus.SUBMITTED, TradeIntentStatus.SUBMISSION_UNKNOWN) for intent in intents):
             return refuse("PRIOR_SUBMISSION_UNRESOLVED")  # S3: the monitor's in-flight rule, at the gateway
         cursor = await fill_cursor(self._repositories)
