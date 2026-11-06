@@ -93,3 +93,40 @@
   - broker-only option inventory;
   - unmanaged exposure against a sector cap;
   - open risk.
+
+## Follow-up: the 2026-11-05 remediation review
+
+**Review:** `TradePulse_Rev149_Remediation_Review.pdf` (2026-11-05), against `vegabond-tradepulse(rev.149-runtime-fixes).zip` (sha256 `20d36a7d…`, `b056a072`). It confirmed F01 fixed and found five residual cases, R149-01 to R149-05. The review's probes assert the defective behaviour, so, as before, the new tests assert the desired behaviour instead, and each one failed on `b056a072` before its fix.
+
+| Finding | Severity | Status |
+|---|---|---|
+| R149-01 filled, unprojected buys lose their position slot (F03) | HIGH | fixed |
+| R149-02 one damaged intent row blocks every protective exit (F04) | HIGH | fixed |
+| R149-03 a database await follows the last quote-age check (F05) | MEDIUM | fixed |
+| R149-04 the pager trusts the ordering contract (F02) | MEDIUM | fixed; G-F02 redefined (ruling 20) |
+| R149-05 an add-on at the position cap is refused | LOW | open: operator policy decision |
+
+15. **R149-01, slot union.** `position_keys` now also includes every asset with positive locally supported inventory (`local_quantity`): holdings plus BUY settlement events that are not holding-projected, in any unfinished status (PENDING, PROCESSING, RETRYABLE_FAILED, TERMINAL_FAILED, INTEGRITY_BLOCKED). This covers a BUY whose intent is already terminal (FILLED, or CANCELED/EXPIRED after a partial fill) while the broker's position read still lags. Identities are unioned, so the asset holds one slot whichever of settlement, broker and holding shows it. The slot is released when the asset has no holding, no unprojected BUY, no broker position and no pending entry. A SELL settlement alone never creates a slot.
+16. **R149-02, sell evidence.** The gateway's sell authorization still pages the whole `trade_intents` table, but now decodes only each row's `side` and `asset` before deciding it is relevant (`execution.gateway.sell_evidence`). A BUY row is never hydrated, and neither is a row for another asset. A non-BUY row for the asset being sold (including one whose side is unreadable) is hydrated, and if that fails, `SellEvidenceDamaged` (`SELL_EVIDENCE_DAMAGED: intent <id> …`) is raised. The monitor's per-position guard turns that into a critical incident for that asset only, and other assets are still protected. A non-BUY row whose asset cannot be decoded could belong to any asset, so it refuses every sell (`SELL_EVIDENCE_UNIDENTIFIABLE`), each reported per asset. The narrow catch includes `ArithmeticError`, because a malformed decimal raises `decimal.InvalidOperation`, which is not a `ValueError`.
+17. **R149-02, a damaged pending sell.** A damaged SUBMITTED or SUBMISSION_UNKNOWN sell on the asset never reaches the gateway. The monitor's in-flight rule is an SQL status-and-asset check (`has_in_flight_intent`), which reads no payload, so it holds the asset exactly as it holds a healthy pending sell. The test pins that the asset is not sold while other assets are.
+18. **R149-03, the quote boundary.** Ruling 9 said the dispatch check came after the last await, but the SUBMITTED intent write followed it. The quote is now checked again after that write, with no await between the check and `place_order`. The earlier check stays, so a quote already stale does not cost a SUBMITTED write. A stale quote after the write closes the intent unsent (`STALE_EXECUTABLE_QUOTE_AT_DISPATCH`); no request has begun, so this is not an ambiguous submission. Crash cases, both tested: a failure before the SUBMITTED commit leaves the intent RISK_APPROVED with nothing sent; a failure of the REJECTED write after it leaves the intent SUBMITTED with nothing sent, and the next cycle's in-flight rule holds the asset, so no second exit is submitted beside it. Recovery resolves that intent by client order id, as for any SUBMITTED intent.
+19. **R149-04, the ordering contract.** `get_open_orders` now checks what a response can show, and raises `AlpacaDataIntegrityError` (`BROKER_OPEN_ORDERS_UNAVAILABLE` at the gateway) when:
+    - a page's `submitted_at` values decrease (a descending or shuffled page);
+    - an id repeats within one page;
+    - an id seen on an earlier page comes back with a different `submitted_at`, symbol or side;
+    - a continuation page is missing any order at the previous page's latest timestamp. The cursor starts 1 µs before that timestamp, so those orders must reappear, whether `after` is inclusive or exclusive. This catches an empty continuation and one that skips ahead.
+
+    The one property no response can show stays assumed: that the first page starts at the oldest open order. A boundary order that closes mid-scan now fails the read closed; the sell gate refuses that cycle and the next cycle retries.
+20. **G-F02, redefined.** The review is right that a read on a flat account proves only that the request is accepted and returns empty; it cannot show oldest-first order or `after` precision. Closing G-F02 therefore needs non-empty evidence: several open orders on the paper account, read with the production pager and with raw `direction=asc` and `after` requests, and the responses recorded. That means placing orders, even far-from-market paper limit orders, so it needs the operator's explicit approval, and it would be a separate scripted step that cancels everything it placed. Until then, record what was observed and what is assumed:
+    - observed (2026-10-26, `status=all`): no continuation token, `limit` at most 500, default 50, `after` inclusive and `until` exclusive at µs precision;
+    - assumed for `status=open`: the same semantics, and that the first ascending page starts at the oldest open order.
+
+    Every assumption except the last is now also checked on each read (ruling 19).
+21. **R149-05, not changed.** `evaluate_risk` refuses every BUY once `open_positions >= max_open_positions`, including an add-on to an asset already held. That predates Rev.149 and errs toward refusing. Whether the cap limits distinct instruments (so an add-on may pass) or every buy once full is a policy decision for the operator. The record's statement that an add-on takes no second slot is about the snapshot count, which is correct; the decision at the cap is unchanged.
+
+### Follow-up tests
+
+- **R149-01** (`python_tests/test_rev149_followup_slots.py`, 18): FILLED, partially filled CANCELED and partially filled EXPIRED intents, each with an unprojected settlement in all five unfinished statuses, no holding and a lagging broker read, keep the slot and refuse a different-symbol entry at the cap. Then one slot through every stage (broker lags, broker catches up, holding written, settlement completed), a closed position that releases its slot, and a SELL settlement alone that takes none.
+- **R149-02** (`python_tests/test_rev149_followup_isolation.py`, 7): damaged unrelated terminal BUY and SELL rows; the review's probe (a damaged REJECTED BUY on a held asset); a damaged pending sell that keeps its own asset blocked; a damaged FILLED sell, and one with an unreadable side, that block their own asset with a critical incident while MSFT exits; an unidentifiable sell that blocks every sell; an unidentifiable buy that blocks none.
+- **R149-03** (`python_tests/test_rev149_quote_time.py`, 5 more): the review's two probes (29 s plus a 2 s write; 0 s plus a 40 s write) are not sent; a fresh control is sent; a crash before the SUBMITTED commit sends nothing; a crash after it sends nothing and is not retried on the next cycle.
+- **R149-04** (`python_tests/test_rev149_open_orders.py`, 8 more): the review's descending-pages probe; out-of-sequence timestamps; an id repeated on one page; a repeated id with a conflicting timestamp, symbol or side; a short continuation that skips the boundary; an empty continuation after a full page.
