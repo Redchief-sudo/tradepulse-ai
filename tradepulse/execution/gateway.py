@@ -108,7 +108,7 @@ from tradepulse.risk import (
     RiskCheckInput,
     RiskDecision,
     RiskEvalOptions,
-    build_portfolio_snapshot,
+    build_portfolio_view,
     check_max_drawdown,
     evaluate_risk,
     execution_session_decision,
@@ -831,11 +831,12 @@ class ExecutionGateway:
             # A protective exit therefore never builds one, so a damaged
             # holding row for another asset cannot block this exit; a buy
             # still builds it and still fails closed on damaged evidence.
-            snapshot = (await build_portfolio_snapshot(
+            view = (await build_portfolio_view(
                 self._repositories, cash_balance=account.cash, account_equity=account.equity,
                 broker_prev_close_equity=account.last_equity, mark_prices=mark_prices, now=now,
                 broker_positions=positions_by_key,
             ) if needs_portfolio_lock else None)
+            snapshot = view.snapshot if view is not None else None
 
             max_drawdown_breached = False
             if snapshot is not None and self._risk_limits.max_drawdown_pct > 0:
@@ -871,6 +872,9 @@ class ExecutionGateway:
                 estimated_slippage_pct=quote.estimated_slippage_pct,
                 held_quantity=abs(held_quantity), available_cash=account.cash,
                 max_drawdown_breached=max_drawdown_breached,
+                # Rev.149 R149-05: an add-on to an asset already holding a
+                # slot is not refused by the position cap.
+                candidate_holds_slot=view is not None and asset_identity_key(request.asset) in view.position_keys,
                 held_notional=abs(held_position.market_value) if held_position is not None and request.side == Side.BUY else Decimal("0"),
             )
             # DBAE (spec §8.1 steps 1-4): account evidence, the session

@@ -141,6 +141,10 @@ class RiskEvalOptions:
     open_risk: Decimal = Decimal("0")
     # Filled BUY intents for this symbol in the current risk day (symbol_entries_today).
     symbol_entries_today: int = 0
+    # Rev.149 R149-05: the candidate asset already holds a position slot
+    # (PortfolioView.position_keys), so this BUY is an add-on that creates
+    # no new position. False when unknown, which keeps the cap's refusal.
+    candidate_holds_slot: bool = False
 
 
 # Estimated taker fee per side, % of notional, used by the cost rule. Alpaca
@@ -274,7 +278,10 @@ def evaluate_risk(
         reasons.append(f"INVALID_REGIME_MULTIPLIER ({intent.regime_multiplier})")
     if snapshot.trades_today >= limits.max_daily_trades:
         reasons.append(f"MAX_DAILY_TRADES_REACHED ({snapshot.trades_today}/{limits.max_daily_trades})")
-    if snapshot.open_positions >= limits.max_open_positions:
+    # Rev.149 R149-05: the cap limits distinct instruments. An add-on to an
+    # asset that already holds a slot adds no position, so only a BUY that
+    # would open a new one is refused here; every other limit still applies.
+    if snapshot.open_positions >= limits.max_open_positions and not opts.candidate_holds_slot:
         reasons.append(f"MAX_OPEN_POSITIONS_REACHED ({snapshot.open_positions}/{limits.max_open_positions})")
     if snapshot.daily_pnl_pct <= -limits.max_daily_loss_pct:
         reasons.append(f"MAX_DAILY_LOSS_EXCEEDED ({snapshot.daily_pnl_pct:.2f}% <= -{limits.max_daily_loss_pct}%)")
@@ -553,6 +560,17 @@ async def pending_intent_remainders(repositories: PersistenceRepositories) -> li
     return remainders
 
 
+@dataclass(frozen=True, slots=True)
+class PortfolioView:
+    """A portfolio snapshot and the canonical asset keys that hold its
+    position slots (``snapshot.open_positions == len(position_keys)``). The
+    keys are kept beside the snapshot rather than in it, because
+    PortfolioSnapshot is a persisted record (Rev.149 R149-05)."""
+
+    snapshot: PortfolioSnapshot
+    position_keys: frozenset[str]
+
+
 async def build_portfolio_snapshot(
     repositories: PersistenceRepositories,
     *,
@@ -563,6 +581,25 @@ async def build_portfolio_snapshot(
     broker_positions: Mapping | None = None,
     now: datetime | None = None,
 ) -> PortfolioSnapshot:
+    """The snapshot of build_portfolio_view, for callers that do not need the
+    slot keys."""
+    view = await build_portfolio_view(
+        repositories, cash_balance=cash_balance, account_equity=account_equity,
+        broker_prev_close_equity=broker_prev_close_equity, mark_prices=mark_prices,
+        broker_positions=broker_positions, now=now)
+    return view.snapshot
+
+
+async def build_portfolio_view(
+    repositories: PersistenceRepositories,
+    *,
+    cash_balance: Decimal,
+    account_equity: Decimal | None = None,
+    broker_prev_close_equity: Decimal | None = None,
+    mark_prices: Mapping[str, Decimal] | None = None,
+    broker_positions: Mapping | None = None,
+    now: datetime | None = None,
+) -> PortfolioView:
     """Caller supplies cash_balance (from the broker account or the local
     cash ledger -- this function has no opinion on which) and, for
     broker-backed accounts, account_equity/broker_prev_close_equity so daily
@@ -778,7 +815,7 @@ async def build_portfolio_snapshot(
         daily_pnl_pct = (daily_realized / total_equity) * 100 if total_equity > 0 else Decimal("0")
         source = "holdings"
 
-    return PortfolioSnapshot(
+    snapshot = PortfolioSnapshot(
         snapshot_id=str(uuid4()),
         as_of=now,
         total_equity=total_equity,
@@ -791,6 +828,7 @@ async def build_portfolio_snapshot(
         daily_pnl_pct=daily_pnl_pct,
         source=source,
     )
+    return PortfolioView(snapshot, frozenset(position_keys))
 
 
 async def check_max_drawdown(
