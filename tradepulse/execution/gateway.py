@@ -95,6 +95,7 @@ from tradepulse.persistence import (
     RepositoryLeaseLostError,
     RepositoryPreconditionError,
     acquire_lock,
+    decode_asset_identity,
     hydrate,
     list_all_by_asset,
     list_all_by_json_field,
@@ -107,7 +108,7 @@ from tradepulse.risk import (
     RiskCheckInput,
     RiskDecision,
     RiskEvalOptions,
-    build_portfolio_snapshot,
+    build_portfolio_view,
     check_max_drawdown,
     evaluate_risk,
     execution_session_decision,
@@ -136,9 +137,53 @@ from .idempotency import (
     derive_idempotency_key,
     execution_lock_key,
 )
-from .quotes import AuthoritativeQuote, fetch_authoritative_quote
+from .quotes import AuthoritativeQuote, fetch_authoritative_quote, quote_age_problem
 
 logger = logging.getLogger(__name__)
+
+
+class SellEvidenceDamaged(Exception):
+    """A stored intent that may bear on this sell cannot be read, so the sell
+    cannot be proven safe. Raised rather than returned, so the monitor's
+    per-position guard reports a critical incident for this asset and keeps
+    protecting the others (Rev.149 R149-02)."""
+
+
+def sell_evidence(rows: Sequence[Mapping[str, Any]], asset_key: str) -> list[TradeIntent]:
+    """The SELL intents for ``asset_key``, hydrating only rows that can bear on
+    that sell (Rev.149 R149-02).
+
+    Each row's side and asset are decoded first. A BUY is never sell
+    evidence, and a row for another asset is irrelevant, so neither is
+    hydrated: damage in either cannot block this sell. A non-BUY row for this
+    asset (including one whose side is unreadable) is hydrated, and if it is
+    damaged the sell is refused, because the obligation it records is
+    unknown. A non-BUY row whose asset cannot be identified could belong to
+    any asset, so it refuses every sell."""
+    intents: list[TradeIntent] = []
+    for row in rows:
+        payload = row["payload"]
+        side = payload.get("side") if isinstance(payload, Mapping) else None
+        if side == Side.BUY.value:
+            continue
+        try:
+            row_key = asset_identity_key(decode_asset_identity(payload["asset"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise SellEvidenceDamaged(
+                f"SELL_EVIDENCE_UNIDENTIFIABLE: intent {row['record_id']} is not a buy and its asset cannot be "
+                "read, so no sell can be proven unaffected by it") from exc
+        if row_key != asset_key:
+            continue
+        try:
+            intent = hydrate("trade_intents", payload)
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise SellEvidenceDamaged(
+                f"SELL_EVIDENCE_DAMAGED: intent {row['record_id']} for {asset_key} cannot be read ({exc}); "
+                "the sell obligation it records is unknown") from exc
+        if intent.side == Side.SELL:
+            intents.append(intent)
+    return intents
+
 
 # dbae_band_changed audit ids: this prefix, then a 12-digit sequence (M3).
 BAND_CHANGE_ID_PREFIX = "dbae_band_changed:"
@@ -483,7 +528,7 @@ class ExecutionGateway:
         return _AuthorizedEntry(policy, proposal, account, asset, baseline, equity_for_band, pending, available, now)
 
     async def _shape_entry(self, entry: _AuthorizedEntry, request: ExecutionRequest, intent: TradeIntent,
-                           risk: RiskDecision, risk_input: RiskCheckInput, snapshot: PortfolioSnapshot,
+                           risk: RiskDecision, risk_input: RiskCheckInput, snapshot: PortfolioSnapshot | None,
                            risk_opts: RiskEvalOptions,
                            evidence: _EntryEvidence) -> tuple[Decimal, dict[str, DbaeSnapshotValue]] | ExecutionResult:
         """Spec §8.1 steps 6-8 on the first run's approved quantity: round
@@ -740,7 +785,7 @@ class ExecutionGateway:
                 return ExecutionResult("rejected", existing.trade_intent_id if existing else None, [decision.reason], Decimal("0"), None)
 
             try:
-                quote = await fetch_authoritative_quote(self._market_data, request.asset, request.side, now)
+                quote = await fetch_authoritative_quote(self._market_data, request.asset, request.side, self._clock)
             except ProviderError as exc:
                 return ExecutionResult("skipped", None, [f"NO_EXECUTABLE_QUOTE: {exc}"], Decimal("0"), None)
 
@@ -781,14 +826,20 @@ class ExecutionGateway:
             else:
                 await self._repositories.trade_intents.update(trade_intent_id, intent, status=intent.status.value)
 
-            snapshot = await build_portfolio_snapshot(
+            # Rev.149 F04: only new exposure is decided on the portfolio
+            # snapshot (evaluate_risk returns before reading it for any sell).
+            # A protective exit therefore never builds one, so a damaged
+            # holding row for another asset cannot block this exit; a buy
+            # still builds it and still fails closed on damaged evidence.
+            view = (await build_portfolio_view(
                 self._repositories, cash_balance=account.cash, account_equity=account.equity,
                 broker_prev_close_equity=account.last_equity, mark_prices=mark_prices, now=now,
                 broker_positions=positions_by_key,
-            )
+            ) if needs_portfolio_lock else None)
+            snapshot = view.snapshot if view is not None else None
 
             max_drawdown_breached = False
-            if request.side == Side.BUY and not protective_exit and self._risk_limits.max_drawdown_pct > 0:
+            if snapshot is not None and self._risk_limits.max_drawdown_pct > 0:
                 drawdown = await check_max_drawdown(self._repositories, snapshot.total_equity, self._risk_limits)
                 max_drawdown_breached = drawdown.breached
 
@@ -812,7 +863,8 @@ class ExecutionGateway:
             )
             new_exposure = request.side == Side.BUY and not protective_exit
             risk_opts = RiskEvalOptions(
-                open_risk=await open_portfolio_risk(self._repositories) if new_exposure else Decimal("0"),
+                open_risk=(await open_portfolio_risk(self._repositories, broker_positions=positions_by_key)
+                           if new_exposure else Decimal("0")),
                 symbol_entries_today=(await symbol_entries_today(self._repositories, request.asset, now,
                                                                  exclude_intent_id=trade_intent_id)
                                       if new_exposure else 0),
@@ -820,6 +872,9 @@ class ExecutionGateway:
                 estimated_slippage_pct=quote.estimated_slippage_pct,
                 held_quantity=abs(held_quantity), available_cash=account.cash,
                 max_drawdown_breached=max_drawdown_breached,
+                # Rev.149 R149-05: an add-on to an asset already holding a
+                # slot is not refused by the position cap.
+                candidate_holds_slot=view is not None and asset_identity_key(request.asset) in view.position_keys,
                 held_notional=abs(held_position.market_value) if held_position is not None and request.side == Side.BUY else Decimal("0"),
             )
             # DBAE (spec §8.1 steps 1-4): account evidence, the session
@@ -1034,6 +1089,15 @@ class ExecutionGateway:
             except AccountingEpochPending as exc:
                 return await self._reject_before_submission(approved, str(exc))
 
+        # Rev.149 F05: the quote approved this order, so it must still be fresh
+        # at the dispatch boundary, measured now rather than when execution
+        # began. Stale: close the intent unsent; the next cycle fetches a new
+        # quote and re-authorizes, never extending the old one.
+        stale_quote = quote_age_problem(request.asset.asset_class, quote.observed_at,
+                                        aware_utc(self._clock(), field_name="now"))
+        if stale_quote is not None:
+            return await self._reject_before_submission(approved, f"STALE_EXECUTABLE_QUOTE_AT_DISPATCH: {stale_quote}")
+
         order_request = AlpacaOrderRequest(
             symbol=request.asset.symbol, qty=submitted_quantity, side=request.side,
             order_type=request.order_type, time_in_force=default_time_in_force(request.asset.asset_class),
@@ -1041,6 +1105,16 @@ class ExecutionGateway:
         )
         submitted = replace(approved, status=TradeIntentStatus.SUBMITTED)
         await self._repositories.trade_intents.update(trade_intent_id, submitted, status=submitted.status.value)
+        # Rev.149 R149-03: the SUBMITTED write is the last await before the
+        # POST, so the quote is checked again after it. Nothing awaits between
+        # this check and place_order. No request has begun, so a stale quote
+        # closes the intent unsent. If that write fails, the intent stays
+        # SUBMITTED with no order behind it: the in-flight rule holds the asset
+        # and recovery resolves it by client order id, never by resubmitting.
+        stale_quote = quote_age_problem(request.asset.asset_class, quote.observed_at,
+                                        aware_utc(self._clock(), field_name="now"))
+        if stale_quote is not None:
+            return await self._reject_before_submission(submitted, f"STALE_EXECUTABLE_QUOTE_AT_DISPATCH: {stale_quote}")
         try:
             placed = await self._broker.place_order(order_request)
         except Exception as exc:  # noqa: BLE001 - must classify every submission failure, never let one crash the cycle
@@ -1102,10 +1176,8 @@ class ExecutionGateway:
             return refuse("UNRESOLVED_BROKER_EXECUTION")
         if await history_unproven(self._repositories, key):
             return refuse("ACTIVITY_HISTORY_UNPROVEN")
-        intents = [intent for intent in (hydrate("trade_intents", row["payload"])
-                                         for row in await paginate_all_rows(self._repositories.trade_intents))
-                   if intent.side == Side.SELL and asset_identity_key(intent.asset) == key
-                   and intent.trade_intent_id != current_intent_id]
+        intents = [intent for intent in sell_evidence(await paginate_all_rows(self._repositories.trade_intents), key)
+                   if intent.trade_intent_id != current_intent_id]
         if any(intent.status in (TradeIntentStatus.SUBMITTED, TradeIntentStatus.SUBMISSION_UNKNOWN) for intent in intents):
             return refuse("PRIOR_SUBMISSION_UNRESOLVED")  # S3: the monitor's in-flight rule, at the gateway
         cursor = await fill_cursor(self._repositories)

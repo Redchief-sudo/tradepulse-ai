@@ -308,7 +308,9 @@ async def test_break_even_and_trailing_never_reverse_on_a_pullback(tmp_path) -> 
     repositories, broker, market_data, gateway, alerts = await _setup(tmp_path)
     await _seed_holding(repositories, target_price="999", current_stop="152")
     await _seed_lot(repositories)
-    _mock_positions(qty="10", current_price="151")  # a pullback -- raw break-even candidate (150) is LESS favorable than 152
+    # A pullback -- the raw break-even candidate (150) is LESS favorable than 152. The mark stays above
+    # 152: at 151 the position is breached and must exit, which this test only missed because of Rev.149 F01.
+    _mock_positions(qty="10", current_price="153")
     respx.post("https://paper-api.alpaca.markets/v2/orders").mock(return_value=httpx.Response(200, json={}))
 
     await run_position_monitor(repositories, broker, market_data, gateway, alerts, LIMITS, clock=lambda: NOW)

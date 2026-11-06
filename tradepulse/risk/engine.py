@@ -20,6 +20,7 @@ from typing import Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from tradepulse.broker.types import AlpacaPosition
 from tradepulse.models import (
     AssetClass,
     PortfolioSnapshot,
@@ -140,6 +141,10 @@ class RiskEvalOptions:
     open_risk: Decimal = Decimal("0")
     # Filled BUY intents for this symbol in the current risk day (symbol_entries_today).
     symbol_entries_today: int = 0
+    # Rev.149 R149-05: the candidate asset already holds a position slot
+    # (PortfolioView.position_keys), so this BUY is an add-on that creates
+    # no new position. False when unknown, which keeps the cap's refusal.
+    candidate_holds_slot: bool = False
 
 
 # Estimated taker fee per side, % of notional, used by the cost rule. Alpaca
@@ -188,8 +193,11 @@ def check_cash_sufficiency(
 
 
 def evaluate_risk(
-    intent: RiskCheckInput, snapshot: PortfolioSnapshot, limits: RiskLimits, opts: RiskEvalOptions | None = None
+    intent: RiskCheckInput, snapshot: PortfolioSnapshot | None, limits: RiskLimits, opts: RiskEvalOptions | None = None
 ) -> RiskDecision:
+    """snapshot may be None only for a sell: a protective exit or a plain sell
+    returns before any portfolio figure is read (Rev.149 F04). New exposure
+    without a snapshot is a caller defect and raises."""
     opts = opts or RiskEvalOptions()
     reasons: list[str] = []
     qty = intent.requested_quantity
@@ -252,6 +260,9 @@ def evaluate_risk(
             )
         return RiskDecision(True, qty, ["OK"])
 
+    if snapshot is None:
+        raise ValueError("RISK_SNAPSHOT_REQUIRED: new exposure is evaluated against a portfolio snapshot")
+
     if intent.confidence is not None and intent.confidence < limits.min_confidence:
         reasons.append(f"CONFIDENCE_BELOW_MIN ({intent.confidence} < {limits.min_confidence})")
     if intent.regime_multiplier is not None and (
@@ -267,7 +278,10 @@ def evaluate_risk(
         reasons.append(f"INVALID_REGIME_MULTIPLIER ({intent.regime_multiplier})")
     if snapshot.trades_today >= limits.max_daily_trades:
         reasons.append(f"MAX_DAILY_TRADES_REACHED ({snapshot.trades_today}/{limits.max_daily_trades})")
-    if snapshot.open_positions >= limits.max_open_positions:
+    # Rev.149 R149-05: the cap limits distinct instruments. An add-on to an
+    # asset that already holds a slot adds no position, so only a BUY that
+    # would open a new one is refused here; every other limit still applies.
+    if snapshot.open_positions >= limits.max_open_positions and not opts.candidate_holds_slot:
         reasons.append(f"MAX_OPEN_POSITIONS_REACHED ({snapshot.open_positions}/{limits.max_open_positions})")
     if snapshot.daily_pnl_pct <= -limits.max_daily_loss_pct:
         reasons.append(f"MAX_DAILY_LOSS_EXCEEDED ({snapshot.daily_pnl_pct:.2f}% <= -{limits.max_daily_loss_pct}%)")
@@ -354,7 +368,11 @@ def evaluate_risk(
             approved_qty = _round_qty(max(max_position_notional, Decimal(0)) / notional_per_unit, intent.asset_class)
             reasons.append(f"POSITION_CAPPED_TO_{approved_qty}_BY_MAX_POSITION_PCT")
 
+        # Rev.149 F06: unmanaged broker inventory has no known sector, so it
+        # counts against every sector cap, never as a free pass.
         current_sector = snapshot.sector_exposure.get(intent.sector, Decimal("0"))
+        if intent.sector != UNMANAGED_SECTOR:
+            current_sector += snapshot.sector_exposure.get(UNMANAGED_SECTOR, Decimal(0))
         max_sector_notional = (limits.max_sector_pct / 100) * total_equity
         remaining_sector = max_sector_notional - current_sector
         if approved_qty * notional_per_unit > remaining_sector:
@@ -401,16 +419,40 @@ _PENDING_BUY_STATUSES = (
 )
 
 
-async def open_portfolio_risk(repositories: PersistenceRepositories) -> Decimal:
+# Rev.149 F06: the sector bucket for broker inventory no local holding
+# accounts for. evaluate_risk counts it against every sector's cap.
+UNMANAGED_SECTOR = "Unmanaged"
+
+
+def unmanaged_excess(position: AlpacaPosition, local_quantity: Decimal) -> Decimal:
+    """The broker market value of the part of ``position`` that local
+    records do not account for (Rev.149 F06), valued per unit at the broker's
+    own market value (contract multiplier included). Zero when local records
+    cover the whole position."""
+    broker_quantity = abs(position.qty)
+    excess_quantity = broker_quantity - local_quantity
+    if broker_quantity == 0 or excess_quantity <= 0:
+        return Decimal(0)
+    return abs(position.market_value) / broker_quantity * excess_quantity
+
+
+async def open_portfolio_risk(repositories: PersistenceRepositories, *,
+                              broker_positions: Mapping[str, AlpacaPosition] | None = None) -> Decimal:
     """What the account stands to lose if every open long and every pending
     buy hit its stop: sum of max(0, average_price - effective stop) x
     quantity x contract multiplier over holdings, plus the unfilled part of
     each pending BUY at (entry_price - stop_loss). A holding whose effective
     stop (current_stop if set, else stop_loss) is at or above its average
-    price risks nothing; a holding with no stop counts its whole notional."""
+    price risks nothing; a holding with no stop counts its whole notional.
+
+    Rev.149 F06: with ``broker_positions``, broker inventory beyond the local
+    holding has no stop TradePulse manages, so it also counts its whole
+    market value."""
     total = Decimal(0)
+    held: dict[str, Decimal] = {}
     for row in await paginate_all_rows(repositories.holdings):
         holding = hydrate("holdings", row["payload"])
+        held[asset_identity_key(holding.asset)] = abs(holding.quantity)
         if holding.quantity <= 0:
             continue
         stop = holding.current_stop if holding.current_stop is not None else holding.stop_loss
@@ -424,6 +466,8 @@ async def open_portfolio_risk(repositories: PersistenceRepositories) -> Decimal:
         unfilled = intent.requested_quantity - (intent.filled_quantity or Decimal(0))
         per_unit = Decimal(str(entry)) - intent.stop_loss
         total += max(per_unit, Decimal(0)) * max(unfilled, Decimal(0)) * contract_multiplier_of(intent.asset)
+    for key, position in (broker_positions or {}).items():
+        total += unmanaged_excess(position, held.get(key, Decimal(0)))
     return total
 
 
@@ -516,6 +560,17 @@ async def pending_intent_remainders(repositories: PersistenceRepositories) -> li
     return remainders
 
 
+@dataclass(frozen=True, slots=True)
+class PortfolioView:
+    """A portfolio snapshot and the canonical asset keys that hold its
+    position slots (``snapshot.open_positions == len(position_keys)``). The
+    keys are kept beside the snapshot rather than in it, because
+    PortfolioSnapshot is a persisted record (Rev.149 R149-05)."""
+
+    snapshot: PortfolioSnapshot
+    position_keys: frozenset[str]
+
+
 async def build_portfolio_snapshot(
     repositories: PersistenceRepositories,
     *,
@@ -526,6 +581,25 @@ async def build_portfolio_snapshot(
     broker_positions: Mapping | None = None,
     now: datetime | None = None,
 ) -> PortfolioSnapshot:
+    """The snapshot of build_portfolio_view, for callers that do not need the
+    slot keys."""
+    view = await build_portfolio_view(
+        repositories, cash_balance=cash_balance, account_equity=account_equity,
+        broker_prev_close_equity=broker_prev_close_equity, mark_prices=mark_prices,
+        broker_positions=broker_positions, now=now)
+    return view.snapshot
+
+
+async def build_portfolio_view(
+    repositories: PersistenceRepositories,
+    *,
+    cash_balance: Decimal,
+    account_equity: Decimal | None = None,
+    broker_prev_close_equity: Decimal | None = None,
+    mark_prices: Mapping[str, Decimal] | None = None,
+    broker_positions: Mapping | None = None,
+    now: datetime | None = None,
+) -> PortfolioView:
     """Caller supplies cash_balance (from the broker account or the local
     cash ledger -- this function has no opinion on which) and, for
     broker-backed accounts, account_equity/broker_prev_close_equity so daily
@@ -564,8 +638,14 @@ async def build_portfolio_snapshot(
 
     holdings_value = Decimal("0")
     sector_exposure: dict[str, Decimal] = {}
+    # Rev.149 F06: the quantity of each asset that local records already
+    # value -- holdings plus filled-but-unsettled buys. Broker inventory beyond
+    # it is added below as unmanaged exposure, so nothing is counted twice.
+    local_quantity: dict[str, Decimal] = {}
     for holding in holdings:
-        if asset_identity_key(holding.asset) in pending_keys:
+        key = asset_identity_key(holding.asset)
+        local_quantity[key] = local_quantity.get(key, Decimal(0)) + abs(holding.quantity)
+        if key in pending_keys:
             continue
         mark = mark_prices.get(asset_identity_key(holding.asset), holding.average_price)
         notional = abs(holding.quantity) * mark * contract_multiplier_of(holding.asset)
@@ -576,7 +656,9 @@ async def build_portfolio_snapshot(
     # Rev.140 §3.3: quarantined inventory is real exposure, always at the
     # adverse (higher) of its last confirmed and current mark.
     from tradepulse.quarantine import quarantined_positions
+    quarantined_keys: set[str] = set()
     for record in await quarantined_positions(repositories):
+        quarantined_keys.add(record.asset_key)
         exposure = record.exposure(mark_prices.get(record.asset_key, record.last_confirmed_mark or record.reference_price))
         holdings_value += exposure
         sector_exposure["Quarantined"] = sector_exposure.get("Quarantined", Decimal("0")) + exposure
@@ -611,6 +693,9 @@ async def build_portfolio_snapshot(
             sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + pending_notional
 
         for event in remainder.unsettled_events:
+            if event.side == Side.BUY:
+                event_key = asset_identity_key(event.asset)
+                local_quantity[event_key] = local_quantity.get(event_key, Decimal(0)) + event.quantity
             if asset_identity_key(event.asset) in pending_keys:
                 continue
             unsettled_notional = event.quantity * event.price * contract_multiplier_of(event.asset)
@@ -645,27 +730,57 @@ async def build_portfolio_snapshot(
     )
     for row in unsettled_rows:
         event = hydrate("settlements", row["payload"])
-        if (event.holding_projected or event.settlement_event_id in already_counted_settlement_ids
-                or asset_identity_key(event.asset) in pending_keys):
+        if event.holding_projected or event.settlement_event_id in already_counted_settlement_ids:
+            continue
+        if event.side == Side.BUY:
+            event_key = asset_identity_key(event.asset)
+            local_quantity[event_key] = local_quantity.get(event_key, Decimal(0)) + event.quantity
+        if asset_identity_key(event.asset) in pending_keys:
             continue
         unsettled_notional = event.quantity * event.price * contract_multiplier_of(event.asset)
         holdings_value += unsettled_notional
         sector = event.sector or "Other"
         sector_exposure[sector] = sector_exposure.get(sector, Decimal("0")) + unsettled_notional
 
+    # Rev.149 F06: broker inventory with no local holding (inherited with
+    # adoption off, or unmanaged before reconciliation catches it) is real
+    # account exposure. Pending-epoch and quarantined assets are already
+    # valued from broker evidence above.
+    broker_keys: set[str] = set()
+    for key, position in (broker_positions or {}).items():
+        if position.qty == 0:
+            continue
+        broker_keys.add(key)
+        if key in pending_keys or key in quarantined_keys:
+            continue
+        excess = unmanaged_excess(position, local_quantity.get(key, Decimal(0)))
+        if excess > 0:
+            holdings_value += excess
+            sector_exposure[UNMANAGED_SECTOR] = sector_exposure.get(UNMANAGED_SECTOR, Decimal(0)) + excess
+
     total_equity = account_equity if account_equity and account_equity > 0 else holdings_value
 
-    # SUBMISSION_UNKNOWN counts too -- its broker outcome is genuinely
-    # unresolved (see execute_intent's _recover_unknown_submission: it may
-    # still be live at the broker, and must never be blind-resubmitted), so
-    # it represents the same kind of unresolved broker exposure as an
-    # ordinary in-flight order. RISK_APPROVED is deliberately excluded --
-    # it hasn't reached the broker yet.
-    outstanding_values = {
-        TradeIntentStatus.SUBMITTED.value, TradeIntentStatus.ACCEPTED.value,
-        TradeIntentStatus.PARTIALLY_FILLED.value, TradeIntentStatus.SUBMISSION_UNKNOWN.value,
-    }
-    outstanding_orders = sum(1 for remainder in remainders if remainder.row_status in outstanding_values)
+    # Rev.149 F03: count limits reserve commitments exactly as dollars do.
+    # Every pending intent is an order: RISK_APPROVED included, because the
+    # portfolio lock is released before it reaches the broker, and
+    # SUBMISSION_UNKNOWN because it may still be live there. A definitive
+    # rejection, cancel or expiry leaves the pending set and releases it.
+    outstanding_orders = len(remainders)
+    pending_entries = [r.intent for r in remainders if r.intent.side == Side.BUY]
+    # A position slot is a distinct asset held or committed to: a holding,
+    # quarantined or broker inventory, a pending entry, or a filled BUY whose
+    # holding is not projected yet. An add-on to a held asset takes no second
+    # slot.
+    #
+    # Rev.149 R149-01: the last term covers a BUY whose intent is already
+    # terminal (FILLED, or CANCELED/EXPIRED after a partial fill) while its
+    # settlement is unprojected, failed or blocked, before the broker's
+    # position read shows the fill. Its dollars were counted above; its slot
+    # is held until the holding exists, and identities are unioned, so the
+    # asset is never counted twice.
+    unprojected_entry_keys = {key for key, quantity in local_quantity.items() if quantity > 0}
+    position_keys = ({asset_identity_key(h.asset) for h in holdings} | quarantined_keys | broker_keys
+                     | {asset_identity_key(i.asset) for i in pending_entries} | unprojected_entry_keys)
 
     risk_day_start, risk_day_end = _risk_day_bounds(now)
     # Time-window query, unbounded pagination -- NOT list_all(limit=1000)
@@ -680,7 +795,11 @@ async def build_portfolio_snapshot(
     # not once per fill. Entries only (Rev.127): TradePulse opens long
     # positions only, so its BUYs are entries and its SELLs are exits; an
     # exit must not use up the day's allowance for new positions.
-    trades_today = len({f.trade_intent_id for f in fills if f.side == Side.BUY})
+    # Rev.149 F03: a pending entry uses the day's allowance as soon as it is
+    # approved, not when it first fills; one filled today and still pending
+    # counts once.
+    trades_today = len({f.trade_intent_id for f in fills if f.side == Side.BUY}
+                       | {i.trade_intent_id for i in pending_entries})
 
     source: Literal["broker", "holdings"]
     if broker_prev_close_equity and broker_prev_close_equity > 0 and account_equity and account_equity > 0:
@@ -696,19 +815,20 @@ async def build_portfolio_snapshot(
         daily_pnl_pct = (daily_realized / total_equity) * 100 if total_equity > 0 else Decimal("0")
         source = "holdings"
 
-    return PortfolioSnapshot(
+    snapshot = PortfolioSnapshot(
         snapshot_id=str(uuid4()),
         as_of=now,
         total_equity=total_equity,
         cash_balance=cash_balance,
         holdings_value=holdings_value,
         sector_exposure=sector_exposure,
-        open_positions=len(holdings),
+        open_positions=len(position_keys),
         outstanding_orders=outstanding_orders,
         trades_today=trades_today,
         daily_pnl_pct=daily_pnl_pct,
         source=source,
     )
+    return PortfolioView(snapshot, frozenset(position_keys))
 
 
 async def check_max_drawdown(

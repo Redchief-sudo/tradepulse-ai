@@ -547,15 +547,17 @@ async def test_build_portfolio_snapshot_counts_submission_unknown_as_outstanding
     assert snapshot.outstanding_orders == 1
 
 
-async def test_build_portfolio_snapshot_does_not_count_risk_approved_as_outstanding(tmp_path) -> None:
-    """RISK_APPROVED hasn't reached the broker yet -- must not count as
-    outstanding broker exposure."""
+async def test_build_portfolio_snapshot_counts_risk_approved_as_outstanding(tmp_path) -> None:
+    """Rev.149 F03 reverses the earlier rule. RISK_APPROVED has not reached the
+    broker yet, but the portfolio lock is released before it does, so an
+    approval must already hold its dispatch capacity. Otherwise a second
+    approval passes max_simultaneous_orders before the first is sent."""
     repositories = await _repositories(tmp_path)
     await _seed_intent(repositories, trade_intent_id="ti-approved", status=TradeIntentStatus.RISK_APPROVED)
 
     snapshot = await build_portfolio_snapshot(repositories, cash_balance=Decimal("0"), now=NOW)
 
-    assert snapshot.outstanding_orders == 0
+    assert snapshot.outstanding_orders == 1
 
 
 async def _seed_settlement_event(

@@ -12,7 +12,7 @@ import logging
 import random
 import re
 from collections.abc import Awaitable, Callable
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Literal
 from uuid import uuid4
@@ -92,6 +92,9 @@ def process_rate_limit_evidence() -> tuple[AlpacaRateLimitSnapshot | None, int]:
     process, and the cumulative 429 count across all of them."""
     return _process_rate_limit, _process_rate_limited_responses
 
+
+# Alpaca's documented maximum for GET /v2/orders (the default is 50). Rev.149 F02.
+OPEN_ORDERS_PAGE_LIMIT = 500
 
 class AlpacaClient:
     venue = "alpaca"
@@ -549,14 +552,97 @@ class AlpacaClient:
             raise_alpaca_error(response, "cancelOrder")
 
     async def get_open_orders(self) -> list[AlpacaOrderResponse]:
-        """Return the broker's complete currently-open order population."""
-        response = await self._request("GET", f"{self._trading_base}/orders", params={"status": "open", "nested": "false"})
-        if not response.is_success:
-            raise_alpaca_error(response, "getOpenOrders")
-        rows = response.json()
-        if not isinstance(rows, list):
-            raise AlpacaDataIntegrityError("open orders response is not a list")
-        return [self._parse_order_data(row, request_id=None) for row in rows]
+        """Return the broker's complete currently-open order population,
+        newest first, or raise AlpacaDataIntegrityError when completeness
+        cannot be proven (Rev.149 F02).
+
+        GET /v2/orders has no continuation token. It returns 50 orders by
+        default and at most 500, so one request is never proof of the whole
+        population. Pages are requested oldest first at the maximum limit. A
+        page shorter than the limit ends the scan. After a full page, the next
+        request starts one microsecond before that page's latest
+        submitted_at. Every order sharing that timestamp is fetched again and
+        de-duplicated by id, whichever way ``after`` treats its bound
+        (measured inclusive on 2026-10-26 for status=all). A full page that
+        brings nothing new, or that holds an order with no id or no
+        submitted_at, cannot be continued, and the scan fails closed.
+
+        Rev.149 R149-04: the ascending contract is checked, not trusted.
+        Within a page, submitted_at must never decrease and no id may repeat.
+        A continuation page must contain every order at the previous page's
+        latest timestamp (the overlap the cursor guarantees), and an id seen
+        again must carry the same timestamp, symbol and side. A page that
+        breaks any of these fails closed. That includes an empty or skipping
+        continuation, and a boundary order closing mid-scan; the caller
+        retries on its next cycle. One property remains assumed, because no
+        response can show it: that the first page starts at the oldest open
+        order."""
+        orders: dict[str, AlpacaOrderResponse] = {}
+        after: datetime | None = None
+        boundary_ids: set[str] = set()
+        while True:
+            params = {"status": "open", "nested": "false", "direction": "asc", "limit": str(OPEN_ORDERS_PAGE_LIMIT)}
+            if after is not None:
+                params["after"] = after.isoformat()
+            response = await self._request("GET", f"{self._trading_base}/orders", params=params)
+            if not response.is_success:
+                raise_alpaca_error(response, "getOpenOrders")
+            rows = response.json()
+            if not isinstance(rows, list):
+                raise AlpacaDataIntegrityError("open orders response is not a list")
+            if len(rows) > OPEN_ORDERS_PAGE_LIMIT:
+                raise AlpacaDataIntegrityError(
+                    f"open orders page of {len(rows)} exceeds the limit of {OPEN_ORDERS_PAGE_LIMIT}")
+            full_page = len(rows) == OPEN_ORDERS_PAGE_LIMIT
+            page: list[AlpacaOrderResponse] = []
+            page_ids: set[str] = set()
+            latest: datetime | None = None
+            new = 0
+            for row in rows:
+                order = self._parse_order_data(row, request_id=None)
+                order_id = order.broker_order_id
+                if not order_id:
+                    raise AlpacaDataIntegrityError("an open order has no id; the population cannot be proven complete")
+                if order_id in page_ids:
+                    raise AlpacaDataIntegrityError(f"open order {order_id} appears twice on one page")
+                page_ids.add(order_id)
+                if order.submitted_at is None:
+                    if full_page:
+                        raise AlpacaDataIntegrityError(
+                            f"open order {order_id} has no submitted_at on a full page; "
+                            "the population cannot be proven complete")
+                else:
+                    if after is not None and order.submitted_at < after:
+                        raise AlpacaDataIntegrityError(
+                            f"open order {order_id} at {order.submitted_at.isoformat()} is outside the request")
+                    if latest is not None and order.submitted_at < latest:
+                        raise AlpacaDataIntegrityError(
+                            f"open orders page is not in ascending order at {order_id} "
+                            f"({order.submitted_at.isoformat()} after {latest.isoformat()})")
+                    latest = order.submitted_at
+                seen = orders.get(order_id)
+                if seen is not None and (seen.submitted_at, seen.symbol, seen.side) != (
+                        order.submitted_at, order.symbol, order.side):
+                    raise AlpacaDataIntegrityError(f"open order {order_id} was returned twice with conflicting details")
+                new += seen is None
+                orders[order_id] = order
+                page.append(order)
+            if boundary_ids - page_ids:
+                raise AlpacaDataIntegrityError(
+                    f"open orders continuation does not overlap the previous page (missing "
+                    f"{', '.join(sorted(boundary_ids - page_ids))}); the population cannot be proven complete")
+            if not full_page:
+                break
+            if latest is None:
+                raise AlpacaDataIntegrityError("a full open orders page has no submitted_at to continue from")
+            if not new:
+                raise AlpacaDataIntegrityError(
+                    f"{OPEN_ORDERS_PAGE_LIMIT} or more open orders share submitted_at {latest.isoformat()}; "
+                    "the population cannot be proven complete")
+            boundary_ids = {order.broker_order_id for order in page if order.submitted_at == latest}
+            after = latest - timedelta(microseconds=1)
+        epoch = datetime.min.replace(tzinfo=UTC)
+        return sorted(orders.values(), key=lambda o: (o.submitted_at or epoch, o.broker_order_id), reverse=True)
 
     async def get_activities(
         self, activity_type: str | None = "FILL", since: datetime | None = None, page_size: int = 100,

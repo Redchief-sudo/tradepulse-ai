@@ -10,7 +10,7 @@ from .idempotency import (
     release_symbol_reservation,
     reserve_symbol_for_execution,
 )
-from .quotes import AuthoritativeQuote, fetch_authoritative_quote, max_quote_age_seconds
+from .quotes import AuthoritativeQuote, fetch_authoritative_quote, max_quote_age_seconds, quote_age_problem
 
 __all__ = [
     "IN_FLIGHT_STATUSES",
@@ -26,6 +26,7 @@ __all__ = [
     "fetch_authoritative_quote",
     "has_in_flight_intent",
     "max_quote_age_seconds",
+    "quote_age_problem",
     "release_symbol_reservation",
     "reserve_symbol_for_execution",
 ]
