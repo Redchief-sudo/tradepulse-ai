@@ -731,10 +731,19 @@ async def build_portfolio_snapshot(
     outstanding_orders = len(remainders)
     pending_entries = [r.intent for r in remainders if r.intent.side == Side.BUY]
     # A position slot is a distinct asset held or committed to: a holding,
-    # quarantined or broker inventory, or a pending entry. An add-on to a
-    # held asset takes no second slot.
+    # quarantined or broker inventory, a pending entry, or a filled BUY whose
+    # holding is not projected yet. An add-on to a held asset takes no second
+    # slot.
+    #
+    # Rev.149 R149-01: the last term covers a BUY whose intent is already
+    # terminal (FILLED, or CANCELED/EXPIRED after a partial fill) while its
+    # settlement is unprojected, failed or blocked, before the broker's
+    # position read shows the fill. Its dollars were counted above; its slot
+    # is held until the holding exists, and identities are unioned, so the
+    # asset is never counted twice.
+    unprojected_entry_keys = {key for key, quantity in local_quantity.items() if quantity > 0}
     position_keys = ({asset_identity_key(h.asset) for h in holdings} | quarantined_keys | broker_keys
-                     | {asset_identity_key(i.asset) for i in pending_entries})
+                     | {asset_identity_key(i.asset) for i in pending_entries} | unprojected_entry_keys)
 
     risk_day_start, risk_day_end = _risk_day_bounds(now)
     # Time-window query, unbounded pagination -- NOT list_all(limit=1000)
