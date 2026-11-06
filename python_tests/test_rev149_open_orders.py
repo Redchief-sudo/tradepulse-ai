@@ -184,3 +184,103 @@ async def test_an_order_outside_the_requested_window_is_refused() -> None:
                 await broker.get_open_orders()
         finally:
             await broker.aclose()
+
+
+# --- Rev.149 follow-up R149-04 (review 2026-11-05) ---------------------------
+# The pager trusted direction=asc. A broker that returned some other order
+# could make it stop early and silently omit orders. Each page is now checked
+# against the ascending contract, and each continuation must overlap the page
+# before it, so a violation that can be observed fails closed.
+
+async def _read_served(serve) -> list[str]:
+    with respx.mock:
+        respx.get(ORDERS_URL).mock(side_effect=serve)
+        broker = AlpacaClient("key", "secret", "paper", 10)
+        try:
+            return [order.broker_order_id for order in await broker.get_open_orders()]
+        finally:
+            await broker.aclose()
+
+
+async def test_descending_pages_despite_direction_asc_fail_closed() -> None:
+    """The review's probe: 600 orders served newest first. Before the fix,
+    500 came back after two requests and the oldest 100 were silently lost."""
+    population = [_order(i, BASE + timedelta(seconds=i)) for i in range(600)]
+    model = AlpacaOrdersModel(population)
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        params["direction"] = "desc"  # the nonconforming broker
+        return model(httpx.Request("GET", request.url.copy_merge_params(params)))
+
+    with pytest.raises(AlpacaDataIntegrityError, match="not in ascending order"):
+        await _read_served(serve)
+
+
+async def test_a_page_with_timestamps_out_of_sequence_fails_closed() -> None:
+    rows = [_order(i, BASE + timedelta(seconds=i)) for i in range(20)]
+    rows[5], rows[6] = rows[6], rows[5]
+    with pytest.raises(AlpacaDataIntegrityError, match="not in ascending order"):
+        await _read_served(lambda request: httpx.Response(200, json=rows))
+
+
+async def test_a_repeated_id_within_one_page_fails_closed() -> None:
+    rows = [_order(i, BASE + timedelta(seconds=i)) for i in range(20)]
+    rows.append(rows[-1])
+    with pytest.raises(AlpacaDataIntegrityError, match="twice"):
+        await _read_served(lambda request: httpx.Response(200, json=rows))
+
+
+@pytest.mark.parametrize("conflict", ["submitted_at", "symbol", "side"])
+async def test_a_repeated_id_with_conflicting_details_across_pages_fails_closed(conflict) -> None:
+    """The overlap re-fetches the boundary order. It must be the same order."""
+    population = [_order(i, BASE + timedelta(seconds=i)) for i in range(520)]
+    model = AlpacaOrdersModel(population)
+    calls = 0
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        response = model(request)
+        if calls == 1:
+            return response
+        rows = response.json()
+        changed = {"submitted_at": rows[0]["submitted_at"].replace("Z", ".000001Z"),
+                   "symbol": "MSFT", "side": "sell"}[conflict]
+        rows[0] = {**rows[0], conflict: changed}
+        return httpx.Response(200, json=rows)
+
+    with pytest.raises(AlpacaDataIntegrityError, match="conflicting"):
+        await _read_served(serve)
+
+
+async def test_a_short_continuation_that_skips_the_boundary_fails_closed() -> None:
+    """After a full page, the broker returns only the newest 20 orders: a
+    short, ascending, in-window page that would otherwise end the scan with
+    orders 500-579 missing. The boundary order is absent, so it is refused."""
+    population = [_order(i, BASE + timedelta(seconds=i)) for i in range(600)]
+    model = AlpacaOrdersModel(population)
+    calls = 0
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return model(request)
+        return httpx.Response(200, json=population[580:])
+
+    with pytest.raises(AlpacaDataIntegrityError, match="does not overlap"):
+        await _read_served(serve)
+
+
+async def test_an_empty_continuation_after_a_full_page_fails_closed() -> None:
+    population = [_order(i, BASE + timedelta(seconds=i)) for i in range(500)]
+    calls = 0
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=population if calls == 1 else [])
+
+    with pytest.raises(AlpacaDataIntegrityError, match="does not overlap"):
+        await _read_served(serve)
