@@ -1,6 +1,12 @@
 # Rev.147 — Verification run wind-down and generation handover
 
-**Status:** design, rev. 4, implementation-ready, for forensic approval. No production code changes and no orders until the spec is approved.
+**Status:** design, rev. 5, for forensic approval. No production code changes and no orders until the spec is approved.
+**Rev. 5 (2026-11-06):** answers the five design findings D01–D05 of the 2026-11-04 forensic audit (`TradePulse_Rev147_Forensic_Audit.pdf`). Its runtime findings F01–F06 were fixed separately in Rev.149, merged as main `b010090d`. Each finding was checked against the code at that commit before it was answered (see `docs/rev147-rev5-review-response.md`).
+- **D01, predecessor discovery:** a generation registry per broker account and environment, outside every database, with a digest-chained head, crash-safe appends, a bootstrap rule, and refusal on a missing, forked, stale or unsealed head (§7.7).
+- **D02, late-fee cash:** a signed, exactly-once predecessor-cash bridge entry in the successor. It is included in the cash check and excluded from the successor's equity and P&L, like a capital flow (§7.6.1). Reversals are bridged too.
+- **D03, carried lots:** a versioned carried-lot opening contract. Each carried lot gets one adoption row with a new successor identity, and keeps its original price, date and provenance chain. Its quantity is re-based to what remains. Opening proof and exclusions are aggregated per asset, and the carried target survives re-projection (§7.2.2).
+- **D04, entry race:** a serialized entry-dispatch barrier in the database. It is the RISK_APPROVED → SUBMITTED write, shared by the gateway and the wind-down transition, and every BUY dispatched before the transition is tracked to a terminal state (§8).
+- **D05, mark evidence:** a mark evidence schema with separate observed and received times and a session label. A prior-session mark is accepted for an out-of-session start, and a position without an acceptable mark gets a per-position assumption, so it is never certified (§7.5.1).
 **Rev. 4 (2026-11-04):** answers the rev. 3 assessment (with the Rev.148 archive). The reviewer gave two conditions for approval:
 - **Monitoring continuity (open question 5), accepted with conditions:** strict successor-start verification before the successor takes on protection, an explicit exposure-interval record in every case, and a gap audit that only detects and requires intervention. It never claims to restore protection that was absent (§7.5).
 - **Options expiring between generations (open question 6), decided:** an option that can expire before monitoring resumes is `unproven`, which blocks completion until the operator resolves it. An option whose expiry is unknown is treated the same way (§4.2).
@@ -287,8 +293,8 @@ At seal, the generation writes `handover.json` into its directory. It is include
     - `updated_at`;
   - `effective_stop`: `current_stop` if it is set, otherwise `stop_loss`. This is the same rule as `monitor/coordinator.py`;
   - `stop_state`: `initial`, `break_even_stop` or `trailing_stop`, using the same rule as the monitor's `_exit_reason`;
-  - `lots`: for each open lot, `lot_id`, `originating_fill_id`, `opened_quantity`, `remaining_quantity`, `acquisition_price`, `opened_at`, `mfe_price` and `mae_price`;
-  - `protective_state_digest`: SHA-256 over the canonical encoding of `holding` and `lots`;
+  - `lots`: for each open lot, `lot_id`, `originating_fill_id`, `opened_quantity`, `remaining_quantity`, `acquisition_price`, `opened_at`, `mfe_price` and `mae_price`, and (rev. 5, D03) its full history: `closures` (fill ID to quantity), `asset_fee_quantities`, `realized_pnl`, and `provenance_chain` (§7.2.2). The history is evidence only. The successor never re-applies it;
+  - `protective_state_digest`: SHA-256 over the canonical encoding of `holding` and `lots`, history included;
   - `stop_provenance`:
     - the source generation;
     - the holding and lot record IDs;
@@ -308,7 +314,7 @@ At seal, the generation writes `handover.json` into its directory. It is include
 
 ### 7.2 Freeze and startup of the next generation
 
-- `tradepulse verification freeze` gains `--predecessor <generation>`. It is required when the most recently sealed generation in the store was frozen under Rev.147 (its manifest has a `wind_down` key). A generation sealed before Rev.147 has no handover and needs no predecessor. The named predecessor must be that most recently sealed generation, or freeze refuses with `predecessor_not_latest`.
+- `tradepulse verification freeze` gains `--predecessor <generation>`. **Rev. 5 (D01):** the predecessor is found through the account's generation registry (§7.7), never through the new database's store, which is always empty. `--predecessor` is required when the registry head is a sealed generation frozen under Rev.147 (its manifest has a `wind_down` key); omitting it refuses with `predecessor_required`. The named predecessor must be the registry head, or freeze refuses with `predecessor_not_latest`. The registry rules of §7.7 run before every check below.
 - **Freeze refuses** in each of these cases:
   - the predecessor's handover is missing or its digest fails: `handover_missing` or `handover_digest_invalid`;
   - the predecessor's `unresolved` list is not empty and not covered by an amendment (§7.3): `handover_unproven_items`;
@@ -319,9 +325,9 @@ At seal, the generation writes `handover.json` into its directory. It is include
   - there must be no open orders (`handover_open_orders_present`).
 
   Any mismatch refuses the freeze. Startup (`runtime_started`) repeats the same comparison against the bound checkpoint, and then applies §7.5.
-- **Carried positions** are then `opening_inventory` under Rev.142, so they are never classified `unexpected_external`. They are adopted through §7.2.1, not through Rev.142's broker-average reconstruction.
-  - Their lots keep `origin = "adopted"`, so their closes stay out of the successor's strategy edge, exactly as Rev.142 does.
-  - Their adoption rows record the predecessor generation, the handover digest and the `protective_state_digest` as provenance.
+- **Carried positions** are then `opening_inventory` under Rev.142, so they are never classified `unexpected_external`. They are adopted through §7.2.1 and the carried-lot contract of §7.2.2, not through Rev.142's broker-average reconstruction.
+  - Their lots have `origin = "adopted"`, so their closes stay out of the successor's strategy edge, exactly as Rev.142 does.
+  - Their adoption rows, one per carried lot (§7.2.2), record the predecessor generation, the handover digest and the `protective_state_digest` as provenance.
 - **Residual crypto** is valued and reported, but neither managed nor adopted (TP145-02).
 - **Pending fees** follow §7.6.
 
@@ -329,7 +335,7 @@ At seal, the generation writes `handover.json` into its directory. It is include
 
 For a carried position, the successor's adoption takes the protective state from the handover. It does not recompute a stop.
 - **Holding:** the adopted holding takes `stop_loss`, `current_stop`, `target_price`, `scaled_out` and `average_price` exactly from the handover `holding`.
-- **Lots:** each adopted lot takes `acquisition_price`, `opened_at`, `mfe_price` and `mae_price` from the handover lot.
+- **Lots:** each adopted lot takes `acquisition_price`, `opened_at`, `mfe_price` and `mae_price` from the handover lot. Its identity, quantities and opening proof follow §7.2.2.
 - **Provenance:** `basis_provenance = "predecessor_handover"` and `stop_source = "predecessor_handover"`.
 - **Why the stop is not recomputed:**
   - Rev.142's `entry_stop_loss(broker_avg_entry_price, …)` is still computed, but only as an audit value. It is recorded as `reconstructed_stop` and never applied.
@@ -341,9 +347,40 @@ For a carried position, the successor's adoption takes the protective state from
   3. `protective_state_digest` recomputes from the entry: `handover_stop_unverified`.
   4. The entry equals the predecessor's final holding and lot rows. These are read from the predecessor database, which is opened read-only and verified against its sealed evidence digest. A failure gives `handover_stop_unverified`.
   5. The lots' remaining quantities sum to `quantity`: `handover_stop_unverified`.
+  6. (rev. 5, D03) Each lot's history conserves quantity, so `opened_quantity = remaining_quantity + Σ closures + Σ asset_fee_quantities`. Also, Σ(`remaining_quantity` × `acquisition_price`) / Σ `remaining_quantity` over the lots equals `holding.average_price` exactly, in Decimal. This is the value the successor's projection will recompute (§7.2.2). A failure gives `handover_stop_unverified`.
 - **Cost basis.** `broker_avg_entry_price` may differ from `average_price` (for example, Alpaca's averaging after a partial exit). This difference is recorded in the adoption row and does not refuse adoption, because the protective state comes from TradePulse's own fills, which the predecessor's sealed evidence proves.
 - **No amendment can set or change a stop.** An operator who doubts a carried stop closes the position outside TradePulse, then amends the expected quantity with broker proof (§7.3).
 - **Successor startup:** a carried position whose mark is at or below its inherited `effective_stop` exits on the first regular-session monitor cycle. This is the existing behaviour, and it gets no special case.
+
+### 7.2.2 The carried-lot opening contract (rev. 5, D03)
+
+**Problem.** A literal copy of a predecessor lot conflicts with the current model in four places:
+- **Conservation:** `PositionLot` requires `opened_quantity = remaining_quantity + Σ closures + Σ asset_fee_quantities`. If `opened_quantity = 10` and `remaining_quantity = 6` are copied without the closure map, conservation fails. Copying the closure map instead would point at fills that the successor database does not have.
+- **Origin:** `PositionLot.origin` is derived from the `adopted:` / `adoption:` prefixes. A lot that kept its original fill IDs would be `origin = "fill"`, and its opening proof (`settlement/accounting.py::_opening_evidence`) would look for an original fill that the successor does not have (`ACCOUNTING_OPENING_FILL_MISSING`).
+- **Opening proof:** Rev.142's `_AdoptedOpening` requires `adoption.broker_avg_entry_price = lot.acquisition_price`, `adoption.adopted_quantity = lot.opened_quantity` and `adoption.adopted_at = lot.opened_at`. A carried lot keeps its original date and price, so it fails all three.
+- **Aggregation:** `adoption/accounting.py::adopted_opening_exclusions` assumes one adopted lot per asset and overwrites `exclusions[key]`, so a second carried lot for the same asset replaces the first.
+
+A fifth conflict was found while checking the code. On any successor settlement for the asset, `settlement/engine.py::_project_holding` rebuilds the holding. It recomputes `average_price` from the open lots and takes the targets from `_entry_protective_levels`, which returns `target_price = None` for an adopted lot. The carried target would be lost on the first successor fill in that asset.
+
+**The contract.** Each carried lot becomes one versioned opening record in the successor.
+- **One adoption row per lot,** not per asset, with `classification = "opening_inventory"`, `source_id` = the successor's opening checkpoint ID, and `adoption_policy_version = "rev147-handover-v1"`. Rev.142 rows are unchanged and keep their own rules.
+- **Successor identity:** a new `adoption_id` per lot. The lot is `lot_id = "adopted:<adoption_id>"` and `originating_fill_id = "adoption:<adoption_id>"`, the existing prefixes, so `origin = "adopted"` without any model change, and its closes stay out of the successor's edge.
+- **Successor quantities:** `opened_quantity` = the predecessor lot's `remaining_quantity`, and `remaining_quantity` is the same value. `closures` and `asset_fee_quantities` start empty and `realized_pnl` starts at 0, so conservation holds in the successor from its first row.
+- **Kept from the predecessor:** `acquisition_price` (the original), `opened_at` (the original, so time and stall exits keep counting from the real entry), `mfe_price` and `mae_price`.
+- **Immutable original provenance:** the adoption row's `carried` block holds:
+  - `provenance_chain`: the root generation, root `lot_id` and root `originating_fill_id`, then one hop per handover (the generation, the lot ID in that generation, the handover digest);
+  - `history`: the predecessor lot's `opened_quantity`, `closures`, `asset_fee_quantities` and `realized_pnl`. This is evidence only. Those closures, fees and results were settled in the generation that recorded them and are never counted again;
+  - `original_acquisition_price`, `original_opened_at` and `carried_quantity`;
+  - `adopted_at`: the successor's adoption time, which is separate from `original_opened_at`.
+- **Versioned opening proof:** `_AdoptedOpening` branches on `adoption_policy_version`. For `rev147-handover-v1` it checks `lot.acquisition_price = carried.original_acquisition_price`, `lot.opened_quantity = carried.carried_quantity` and `lot.opened_at = carried.original_opened_at`. It never compares the broker average or the adoption time with the lot. A mismatch is the existing `ACCOUNTING_ADOPTION_LOT_MISMATCH`. The independent projection in `verification/evidence.py` applies the same branch.
+- **Successor basis:** the successor's P&L on carried inventory stays excluded through the existing exclusion X = R × mark + N − V0, where V0 is the opening checkpoint's market value. So the successor never needs a predecessor fill. Attribution rows keep `broker_basis_pnl` (broker average) and `managed_pnl` (adoption mark), and add `original_basis_pnl` from the original acquisition price, for reporting only.
+- **Per-asset aggregation:** `adopted_opening_exclusions` sums over every adopted lot of an asset and subtracts V0(k) once: X(k) = Σ_lots (R × mark + N) − V0(k). The corruption guard becomes Σ `carried_quantity` (or the Rev.142 `adopted_quantity`) per asset = the checkpoint quantity (`ADOPTION_CHECKPOINT_MISMATCH`). The independent assessment aggregates the same way.
+- **Re-projection keeps the protective state:**
+  - `average_price`: `_project_holding` recomputes it from the lots' original prices and remaining quantities. §7.2.1 check 6 proves at freeze that this equals the handover's `average_price`.
+  - `stop_loss` and `target_price`: for a `rev147-handover-v1` adoption, `_entry_protective_levels` returns the adoption row's `stop_loss` and `target_price`. The rule is still `first_entry`, so the oldest carried lot governs.
+  - `current_stop` and `scaled_out`: carried forward by the existing `mutate`, as today.
+- **A second inheritance** (a lot carried again) appends one hop to the chain and keeps the root unchanged. Its stop provenance stays `inherited:<generation>` (§7.1).
+- **Native asset fees:** carried lots are equities and options, which normally have none. If a predecessor lot has `asset_fee_quantities`, they are kept in `history`. Its `remaining_quantity` is already net of them, and the successor lot starts with none.
 
 ### 7.3 Operator amendment between runs
 
@@ -356,7 +393,7 @@ For a carried position, the successor's adoption takes the protective state from
 
 How it works:
 - It appends an operator-attributed amendment record (reason, time, OS user) next to the sealed handover: a new file `handover-amendments.jsonl`, append-only with a per-line digest chain. It never edits `handover.json`.
-- **Use 1:** declare a deliberate change between runs. Example: the 1 inherited share bought for the next run's adoption test. The amended expectation is what §7.2 compares against. A newly declared position is not a carried one: it has no inherited protective state and goes through ordinary Rev.142 adoption.
+- **Use 1:** declare a deliberate change between runs. Example: the 1 inherited share bought for the next run's adoption test. The amended expectation is what §7.2 compares against. A newly declared position is not a carried one: it has no inherited protective state and goes through ordinary Rev.142 adoption. **Rev. 5:** the declaration cites the broker order or activity IDs of the fills that made the change, verified read-only, because §7.7's stale-head check requires every fill after the seal to be cited.
 - **Use 2:** record how an `unresolved` item was resolved outside TradePulse. Each `--resolve` must cite the broker activity or order ID that proves it. The amend command verifies that ID against the broker's activity history (read-only) before appending.
 - **Use 3:** `--resolve-fee` attributes an unlinked fee to a pending fee (§7.6).
 - **Use 4:** `--accept-gap` accepts a protection gap (§7.5). It accepts the gap only. It does not waive successor-start verification.
@@ -365,7 +402,7 @@ How it works:
 
 ### 7.4 The first Rev.147 run
 
-The account has been flat since 2026-10-29, and no Rev.147 handover exists. The first generation frozen under Rev.147 therefore has no predecessor. Freeze still requires an empty open-order list. Its opening positions are whatever the operator has deliberately arranged, such as the 1 inherited share, and Rev.142 adopts them as today, with a stop rebuilt from the broker's average entry.
+The account has been flat since 2026-10-29, and no Rev.147 handover exists. The first generation frozen under Rev.147 therefore has no predecessor, and the account has no registry yet. Its freeze bootstraps the registry with `--registry-bootstrap --reason "<text>"` (§7.7). Freeze still requires an empty open-order list. Its opening positions are whatever the operator has deliberately arranged, such as the 1 inherited share, and Rev.142 adopts them as today, with a stop rebuilt from the broker's average entry.
 
 ### 7.5 Protection continuity between generations (REV147-R2-02)
 
@@ -389,7 +426,7 @@ So between the seal and the next regular-session open, the predecessor's monitor
 1. **Checkpoint comparison:** the §7.2 startup comparison against the bound opening checkpoint passes.
 2. **Fresh census:** a new census at assumption time, using the §4.1 capture pattern (activities, then account, positions and open orders, then activities again), equals the handover plus amendments. The positions and quantities must match, there must be no open orders, and no new position-changing activity on a carried asset since the checkpoint. That means a fill or a quantity-changing corporate action, such as a split, a spinoff or an option exercise or assignment. Cash-only activities, such as a dividend (Rev.143) or a fee (§7.6), do not fail this check, and the existing membership rules classify them. This covers the time between freeze and startup, when the account could have changed.
 3. **Restored state:** for each carried position, the successor's own adopted holding and lot rows are re-read from its database after adoption. A `protective_state_digest` recomputed from those rows must equal the handover's. This proves that what the monitor will use is what the predecessor sealed, not just what the handover file says.
-4. **Fresh marks:** each carried position has a mark that is within the existing freshness bound for its asset class and comes from the same source the monitor uses. A position without one fails the check. The startup does not assume a mark.
+4. **Mark evidence (rewritten in rev. 5, D05):** each carried position gets a mark evidence record under §7.5.1. The check fails only on what §7.5.1 calls a failure: no mark source at all, or a timestamp ahead of the clock beyond the skew allowance. A position whose mark is not acceptable is not certified. It gets a per-position assumption (§7.5.1). The startup never assumes a mark, and it never treats a receipt time as a market time.
 5. **One full evaluation:** the monitor completes one evaluation of every carried position with the restored state: effective stop, ladder, time and stall exits, and the near-expiry rule. Every exit the evaluation decides on is submitted through the gateway before `monitoring_assumed_at` is written, and its intent state is recorded. Outside a session, equity and option exits are not decided, as today, so the evaluation records `out_of_session` for those positions. It does not treat them as protected-and-checked.
 
 A failed check is never retried silently into a pass. The operator restarts the successor after fixing the cause, and the whole sequence runs again from step 1.
@@ -428,6 +465,32 @@ A failed check is never retried silently into a pass. The operator restarts the 
 
 **Crypto residuals** are unmanaged in both generations (TP145-02), so they are outside this rule. They are already listed as residuals.
 
+### 7.5.1 Mark evidence (rev. 5, D05)
+
+**Problem.** Rev. 4 required "a fresh mark from the same source the monitor uses." The monitor uses `positions.current_price`. `AlpacaPosition` has `received_at`, the time the HTTP response arrived, but no time at which the price itself was observed. A positions response received a second ago can carry the previous session's price. The 30 s / 60 s freshness bounds (`execution/quotes.py::quote_age_problem`) belong to executable quotes, which are a separate source with their own `observed_at`. Before the open, those bounds cannot be met at all for an illiquid option. Read literally, rev. 4 either certifies a stale price or makes the planned pre-open takeover impossible.
+
+**The mark evidence record.** One per carried position, written into the successor-start evidence and the `protection_exposure` record:
+- `price` and `source`: the quote midpoint (`market_data_quote`) or the latest trade (`market_data_trade`), both from the existing market data provider;
+- `observed_at`: the market data's own timestamp (`AuthoritativeQuote.observed_at`, or the trade's timestamp);
+- `received_at`: when the response arrived;
+- `session_label`: the Rev.144 calendar session that contains `observed_at` (`regular:<date>`, `extended:<date>` or `closed`);
+- `evaluated_at` and the `acceptance` result below;
+- `broker_position_price`: `positions.current_price`, recorded separately with its `received_at` only. It is never labelled as observed, and it never satisfies the check.
+
+**Acceptance.** It depends on when the successor starts.
+- **Before the open (the planned case):** `prior_session_mark` when `observed_at` falls at or after the open of the latest completed regular session and no later than `evaluated_at` plus the existing clock-skew allowance (`QUOTE_CLOCK_SKEW_SECONDS`). This proves only that the price is from the session that just ended. The evaluation outcome for that position stays `out_of_session` (§7.5, check 5), and no exit is decided from it.
+- **During a session:** `fresh_executable`, under the existing `quote_age_problem` bound for the asset class. This is the same evidence the gateway requires before an in-session exit.
+- **Failure:** a timestamp ahead of the clock beyond the skew allowance, or no mark source for the position at all (the provider cannot price the asset), fails check 4 and refuses the startup, as in rev. 4.
+- **Not acceptable, but not a failure:** for example, an illiquid option with no quote or trade observed in the latest completed session. The position is `mark_unverified`, and gets a per-position assumption:
+  - its `assumed_at` stays null in the exposure record, so the record does not claim it was checked;
+  - non-protective BUYs in that asset are refused with `CARRIED_MARK_UNVERIFIED`, in the fenced authorization (§8);
+  - the monitor evaluates it as usual. Its `assumed_at` is written at the first in-session cycle where an executable quote passes the existing bound, and its exposure closes then;
+  - if the first regular session passes without such a quote, a critical `CARRIED_MARK_UNVERIFIED` alert is raised, and the exposure stays open. Time never closes it.
+
+Rev. 4 refused the whole startup instead. That would leave every carried position unmonitored because of one illiquid option, which is worse protection, not better.
+
+**Per-position assumption.** `monitoring_assumed_at` stays the generation-level time at which checks 1–5 passed. Each carried position also gets its own `assumed_at`. That is the same time for a position whose mark is accepted, and later for a `mark_unverified` one. A position assumed after `next_session_open` lists the part of the first session before its `assumed_at` in its own `sessions_unmonitored`. The generation's continuity class is unchanged, and the report shows the per-position exception.
+
 ### 7.6 Predecessor fees after the seal (REV147-R2-04)
 
 **Immutability.** A sealed generation's database, `handover.json` and evidence digest never change. A fee that belongs to the predecessor but arrives after the seal is appended to the predecessor's `handover-amendments.jsonl` as a **system-written** `fee_attribution` record, in the same digest chain as the operator amendments. Each record cites:
@@ -450,7 +513,7 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
 
 **Where it plugs in:** one rule in the existing membership classifier (`reconciliation/membership.py::_classify`), and no new fee pipeline.
 - **The new class.** A FEE or CFEE activity that is absent from the successor's opening population and matches an open `pending_fee` (linked, or named by a `--resolve-fee` amendment) is classified **`predecessor_obligation`**. The rule is checked before the `unresolved_generation_membership` fallbacks.
-- **Exclusion from the successor.** `predecessor_obligation` is not in `ELIGIBLE_MEMBERSHIPS`. The successor's cash check, cash ledger and accounting therefore exclude it, and the fee is never posted to two generations.
+- **Not the successor's P&L.** `predecessor_obligation` is not in `ELIGIBLE_MEMBERSHIPS`, so the activity is never a successor fee and is never posted as P&L in two generations. **Rev. 5 (D02):** that exclusion alone does not balance the successor's physical cash. §7.6.1 adds the signed bridge entry that does. The rev. 4 wording, "excluded from the successor's cash check", is withdrawn.
 - **A fee posted before the successor's freeze.** It is in the successor's opening population and is already `pre_generation` (excluded). Freeze matches it to the pending fee by the same rule and appends the `fee_attribution` record.
 
 **Duplicates and conflicts:**
@@ -462,17 +525,107 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
 **Corrections and reversals:**
 - Some linked activities reference a predecessor fill but are not a USD debit, such as a credit or a reversal. The existing code refuses these with `GENERATION_FEE_NOT_A_DEBIT`.
 - Such an activity is recorded as a `fee_correction` attribution against the predecessor, citing the original `pending_fee_id` and, if any, the fee activity it reverses.
-- It is never netted against or written over the original record, and it is excluded from the successor's cash check.
-- It raises an alert for operator review. No cash entry is posted automatically, which matches today's refusal to post non-debits.
+- It is never netted against or written over the original record.
+- **Rev. 5 (D02):** it gets a signed **credit** bridge entry in the successor (§7.6.1), because the broker's cash already includes it. Rev. 4 posted no cash entry, which left observed cash unexplained in the same way as an unbridged fee. It is still not successor P&L.
+- It raises an alert for operator review.
 
 **Chains:**
 - A `pending_fee` still open when the successor seals is copied into the successor's handover `pending_fees`, keeping its `origin_generation`.
 - An attribution always targets the origin generation's amendments file.
 - A pending fee is closed only by attribution or by a verified `--resolve-fee`. Time never closes it.
 
-## 8. Entry stop
+### 7.6.1 The predecessor-cash bridge (rev. 5, D02)
 
-In wind-down, `ExecutionGateway` refuses every BUY that is not a protective exit, with `RUN_WIND_DOWN_ACTIVE`. The check runs in the same fenced authorization as `RISK_APPROVED`, alongside Rev.146's freshness check, so a buy authorized just before wind-down began cannot be persisted after it. Scan lanes also idle in wind-down, but the gateway check is the guarantee. In a successor, the gap-breach hold (§7.5) uses the same check and refuses with `GAP_BREACH_UNACKNOWLEDGED`.
+**Problem.** The successor's cash invariant is opening cash + Σ cash-ledger movements = observed broker cash (`valuation.py::_generation_invariants`). A predecessor fee that posts after the successor's opening still changes that account's cash. For example, the successor opens with $1,000, makes no trades, and a $1 predecessor fee posts. Observed cash is $999. If the fee is only excluded, expected cash stays $1,000 and the cash check latches a mismatch.
+
+**The bridge.** Each activity classified `predecessor_obligation` gets exactly one successor record and one cash-ledger entry.
+- **The record:** `generation_predecessor_cash:<activity_id>`, holding:
+  - the activity ID and the SHA-256 of the raw activity;
+  - the broker's signed USD amount: negative for a fee debit, positive for a reversal credit;
+  - the `pending_fee_id` and `origin_generation`;
+  - the entry digest of the matching `fee_attribution` or `fee_correction` record in the origin generation's amendment chain (§7.6);
+  - the kind: `fee_debit` or `fee_correction_credit`.
+- **The cash entry:** `broker:predecessor_cash:<activity_id>`, with the same signed amount, in USD, posted at the activity's time.
+- **Exactly once:** the activity ID is the key for both. The same ID with an identical raw digest is a no-op. The same ID with a different digest is `fee_attribution_conflict`, as in §7.6.
+- **Write order:** the predecessor's amendment record is appended first. The bridge is then written, citing that record's entry digest. After a crash between the two, the next reconciliation pass finds the amendment, which is idempotent, and writes the bridge. A bridge is never written without its amendment.
+
+**Where it counts.**
+- **Cash: included.** `expected_cash` already sums every cash-ledger entry, so the bridge entry is in it: $1,000 + (−$1) = $999, `matched`.
+- **Equity and P&L: excluded,** in the same way as capital flows. The successor's `total_equity` subtracts the bridge total, and the report shows it as `excluded_predecessor_cash`. It never enters the successor's strategy P&L, its fee totals or its edge.
+- **Validation:** `_generation_invariants` validates each bridge record against its ledger entry and its raw activity, as `validate_generation_fee` does for fees. A `predecessor_obligation` activity with no bridge fails with `predecessor_cash_bridge_missing`. A bridge whose amendment record is absent from the origin generation's chain fails with `predecessor_cash_bridge_unlinked`. Either one leaves the cash status not `matched`.
+- **The independent assessment** (`verification/evidence.py`) applies the same bridge term, so valuation and the evidence check agree.
+
+**Cases.**
+- **Debit after the successor's opening:** one bridge for the negative amount.
+- **Split fee:** two activities, two bridges, each exactly once.
+- **Reversal or credit:** one positive bridge, a `fee_correction` record in the predecessor, and an alert.
+- **Before the successor's opening** (the activity is in the opening population): no bridge. It is already in the opening cash, so only the predecessor's `fee_attribution` is written (§7.6).
+- **Unlinked fee before `--resolve-fee`:** it stays `unresolved_generation_membership`, as today, which holds the successor's invariants unresolved. Once it is resolved, it is classified `predecessor_obligation` and bridged.
+
+**The predecessor side.** The sealed figures never change. `post_seal_adjustments` lists each attributed amount, and the predecessor's adjusted result is the sealed result + Σ adjustments. The fee is in the predecessor's adjusted result once, and in the successor's P&L never. Both generations' cash bridges reconcile.
+
+### 7.7 The generation registry (rev. 5, D01)
+
+**Problem.** Each generation must use a new database (`verification/service.py::_require_fresh`), and its store sits next to that database (`store_for`: `<database>.paper-verification`). A new database's store is always empty, so it cannot show that an earlier generation exists. For example, `g1.db` and `g2.db` have different stores. A literal "most recently sealed generation in the store" lookup would treat every new database as a first generation, and skip the unresolved-item, inherited-stop and protection-gap checks.
+
+**The registry.** There is one registry per broker account and environment, outside every database and store.
+- **Location:** `TRADEPULSE_REGISTRY_DIR`, else `$XDG_STATE_HOME/tradepulse/generations`, else `~/.local/state/tradepulse/generations`. It is created with mode 0700 and refused on a network filesystem. This is the account lease's resolver rule (`runtime_lease.py::lease_directory`), used for the same reason.
+- **Key:** one directory per `<venue>-<environment>-<account_number>`. `environment` is `paper` or `live`, from the configured broker base URL. The directory's first entry records the `account_identity_digest`. A configured account whose digest differs refuses with `registry_account_mismatch`, so two accounts never share a chain.
+- **Entries:** one file per entry, `NNNNNNNN.json`, created atomically: written to a temporary file, fsynced, then linked into place with no-replace semantics, then the directory is fsynced. A crash leaves either no entry or a complete one, never a torn one. Each entry holds `seq`, `kind`, `generation`, `parent_entry_digest`, `entry_digest` (the SHA-256 of the canonical entry without that field), the time and the OS user. By kind:
+  - `genesis`: the bootstrap (below);
+  - `frozen`: the database identity (`verification_identity.database_id`), the database and store paths at freeze (as hints only), the manifest digest and the predecessor generation;
+  - `sealed`: the outcome, `sealed_at`, the handover digest and the sealed evidence digest;
+  - `abandoned`: an operator record for a frozen generation that never sent an order (below).
+- **Head and validity:** the head is the highest `seq`. The chain is valid only if every `seq` from 0 is present, each `parent_entry_digest` equals the previous `entry_digest`, and each digest recomputes. Otherwise freeze refuses with `registry_chain_invalid`. Two entries naming the same parent, or two `frozen` generations open at once, refuse with `registry_forked`. Appends hold an exclusive `flock` on the registry directory's lock file, and the no-replace link refuses a second entry with the same `seq`, so a fork can only come from copying or tampering.
+
+**Ordering with the database and the seal.**
+- **Freeze:** freeze appends `frozen` after every other freeze check and before the database bind (`_publish_freeze`'s `UPDATE verification_identity`). If it crashes in between, the `frozen` entry has no bound database. The next freeze for the account sees an unsealed head and refuses with `registry_head_unsealed`. Re-running the same freeze (same generation and database ID, still unbound) completes the bind, idempotently. Otherwise the operator abandons the generation.
+- **Seal:** the seal appends `sealed` after `handover.json` and the evidence digest are written, and before the seal is reported complete. After a crash in between, the generation's next start re-runs the seal step, which appends the entry. Identical content is a no-op.
+- **Abandon:** `tradepulse verification registry abandon --generation G --reason "<text>"` appends `abandoned`, but only if G's database, opened read-only, has no trade intent at all. A generation that never created an intent never sent an order. Any other unsealed generation must be wound down and sealed. Otherwise abandon refuses with `registry_abandon_has_intents`.
+
+**Freeze rules.** These run first, before §7.2.
+- **No registry for the account:** refuse with `registry_missing`, unless `--registry-bootstrap` is given (below).
+- **Head unsealed** (`frozen` with no `sealed` or `abandoned`): refuse with `registry_head_unsealed`, naming that generation.
+- **Head sealed under Rev.147:** `--predecessor` is required (`predecessor_required`) and must name the head (`predecessor_not_latest`). §7.2 then applies.
+- **Head is `genesis`:** there is no predecessor, and opening positions follow §7.4.
+- **Locating the predecessor's artifacts:** by digest, not by path. The store and database are found at the paths in the `frozen` entry, or at `--predecessor-store <dir>` and `--predecessor-database <file>` if they were moved. Either way, the manifest digest, `database_id`, handover digest and sealed evidence digest must equal the registry's (`predecessor_artifacts_mismatch`). Missing artifacts refuse with `predecessor_artifacts_missing`. A renamed database is accepted, because its identity is the `database_id` inside it, not its name.
+
+**A stale or rolled-back head (broker corroboration).** A registry restored from an old backup, or with its newest entries deleted, would show an older head. The broker's own history corroborates the head. At freeze, every FILL activity on the account after the head's `sealed_at` (or the `genesis` time) must be cited by an amendment of the head generation (§7.3: a `--position` declaration or a `--resolve`, each verified against the broker). An uncited fill refuses with `registry_head_stale`. It means someone traded the account after the last seal the registry knows about: a lost generation, or an out-of-band trade.
+- A rolled-back generation that never filled leaves no position or fee. Freeze already requires an empty open-order list, so there is nothing such a generation could have left that this check misses.
+
+**Bootstrap.** `--registry-bootstrap --reason "<text>"` is accepted only when no registry directory exists for the key; otherwise it refuses with `registry_exists`. It writes `genesis` with the operator, the reason and the census digest at bootstrap. Opening positions are adopted under ordinary Rev.142 rules, with stops rebuilt from the broker average. No inherited protective state is claimed.
+
+**Limits (stated, not solved).**
+- **One machine:** like the account lease, the registry is local to one machine. Two machines trading one account are not detected by either. A shared registry belongs with cloud hosting, which is out of scope (§2).
+- **A deleted registry:** if it is deleted and bootstrapped again, the chain restarts. The only consequence is a downgrade. Carried positions lose inherited-stop restoration and are adopted with rebuilt stops. A predecessor's late fee falls to `unresolved_generation_membership`, which holds the successor's invariants unresolved, as today. Nothing is certified that was not proven.
+
+## 8. Entry stop and the dispatch barrier
+
+**Authorization (unchanged).** In wind-down, `ExecutionGateway` refuses every BUY that is not a protective exit, with `RUN_WIND_DOWN_ACTIVE`. The check runs in the same fenced authorization as `RISK_APPROVED`, alongside Rev.146's freshness check. Scan lanes also idle in wind-down. In a successor, the gap-breach hold (§7.5) uses the same check and refuses with `GAP_BREACH_UNACKNOWLEDGED`. So does a `mark_unverified` asset (§7.5.1), with `CARRIED_MARK_UNVERIFIED`.
+
+**Problem (rev. 5, D04).** Authorization is not dispatch. A BUY can already be `RISK_APPROVED` when the wind-down starts, while it still awaits the market clock, the entry window, the lease check, the quote recheck and the `SUBMITTED` write before its POST (`execution/gateway.py`, from the `RISK_APPROVED` write to `place_order`). A census taken in that interval sees no broker order. When the call resumes, the order reaches the broker after the wind-down started. A boolean read followed by more awaits is not a guarantee.
+
+**The dispatch barrier.** It lives in the database, so a second or restarted process sees it, and it uses SQLite's serialized writes.
+1. **The dispatch write.** For a non-protective BUY, the `RISK_APPROVED` → `SUBMITTED` write becomes one `BEGIN IMMEDIATE` transaction that:
+   - re-reads the run state from `wind_down_events`, and any successor hold (gap-breach or `mark_unverified` for the asset);
+   - compares and sets the intent from its `RISK_APPROVED` payload, comparing the full payload, as the stranded sweep does;
+   - writes `SUBMITTED` only when the run state is `RUNNING` and no hold applies. Otherwise, in the same transaction, it writes the intent `REJECTED` with `RUN_WIND_DOWN_ACTIVE_AT_DISPATCH`, `RUN_PAUSED_AT_DISPATCH`, `GAP_BREACH_UNACKNOWLEDGED` or `CARRIED_MARK_UNVERIFIED`, and `place_order` is never called.
+
+   Since Rev.149 R149-03, the `SUBMITTED` write is the last await before `place_order`. The barrier keeps it that way, so nothing can be awaited between the barrier and the POST.
+2. **The transition write.** The event that stops entries (`end_run_requested`, `WIND_DOWN_REQUESTED`, or `run_paused`) is written in a `BEGIN IMMEDIATE` transaction. In that same transaction, every non-protective BUY intent still in `RISK_APPROVED` is moved to `REJECTED` with `RUN_WIND_DOWN_ACTIVE` or `RUN_PAUSED`, by compare-and-set.
+3. **Serialization.** Both writes take SQLite's write lock, so for each BUY exactly one of these is true:
+   - its `SUBMITTED` commit came before the transition, so it is a dispatched order;
+   - the transition came first, so it is `REJECTED` and never sent.
+4. **The dispatched population.** A BUY committed `SUBMITTED` before the transition may still reach the broker after it. At wind-down start, the census therefore reads every local BUY intent in `SUBMITTED`, `ACCEPTED`, `PARTIALLY_FILLED` or `SUBMISSION_UNKNOWN`. Each one enters the observed-order register (§4.1) by client order ID, even if no broker order is visible yet. The wind-down cannot be `COMPLETE` until each is durably classified:
+   - accepted, then cancelled and terminal under §4.4;
+   - rejected by the broker;
+   - or resolved by client order ID through the existing `SUBMISSION_UNKNOWN` recovery or the stranded-intent sweep.
+
+   If the census sees no broker order for a `SUBMITTED` intent, that proves nothing, because the POST may still be in flight.
+5. **Protective exits are never barred.** That covers every SELL, wind-down crypto sells included.
+6. **Pause and crash.**
+   - On a pause, `run_paused` closes the `RISK_APPROVED` BUYs (step 2), and a `SUBMITTED` BUY still completes to its true state (§3.3).
+   - After a crash between the `SUBMITTED` commit and the POST, the intent is `SUBMITTED` with no broker order. The existing stranded-intent sweep (`reconciliation/coordinator.py::_recover_stranded_intents`) resolves it by client order ID after its grace period, and the wind-down waits for that through the register.
 
 ## 9. Gates
 
@@ -540,7 +693,7 @@ All on the simulator, with no broker calls.
   - **each check:** for each of the five checks, a failure refuses with `handover_assumption_unverified` naming that check, writes no `monitoring_assumed_at`, does not start the runtime, and appends an open `protection_exposure` record to the predecessor's chain;
   - **account drift:** a position change or a new open order between freeze and startup fails check 2, even though the checkpoint comparison (check 1) passed;
   - **restored rows:** a successor holding row altered after adoption fails check 3, even when `handover.json` is intact;
-  - **stale mark:** a carried position with a stale or missing mark fails check 4;
+  - **stale mark (amended in rev. 5):** a carried position with no mark source, or a mark ahead of the clock beyond the skew allowance, fails check 4. A stale mark gives `mark_unverified` under §7.5.1, not a pass;
   - **evaluation exit:** an exit decided in the first evaluation is submitted, and its intent is recorded, before `monitoring_assumed_at`;
   - **no waiver:** `--accept-gap` does not let a failed check pass;
   - **restart:** after a fix, a restart reruns all five checks from the first one.
@@ -592,6 +745,48 @@ All on the simulator, with no broker calls.
   - an amendment with an unverifiable `--resolve` ID is refused;
   - no amendment can change a carried stop.
 - **Entry stop race:** a BUY whose authorization straddles the wind-down start is refused inside the fenced transaction.
+- **Dispatch barrier (rev. 5, D04).** These are deterministic interleavings on the simulator, using test hooks that pause the gateway at a named await.
+  - **Every await:** pause after `RISK_APPROVED` and at each await before `place_order` (clock, entry window, lease, positions recheck, quote recheck, the `SUBMITTED` write). At each one, request the wind-down and resume. The BUY is either `REJECTED` with `RUN_WIND_DOWN_ACTIVE` / `RUN_WIND_DOWN_ACTIVE_AT_DISPATCH` and the simulator received no order, or it committed `SUBMITTED` before the transition and is in the observed-order register.
+  - **Census in the gap:** a census taken while a `SUBMITTED` BUY's POST is held sees no broker order. The wind-down still cannot complete until that intent is classified and, if accepted, cancelled to a terminal state.
+  - **The same, with a pause:** the same pauses with `run_paused` instead give `RUN_PAUSED` / `RUN_PAUSED_AT_DISPATCH`, and a `SUBMITTED` BUY ends in its true state.
+  - **Cancel during acceptance:** the broker accepts the BUY while the wind-down's cancel is in flight. The fill or cancel is settled, and the result is classified under §4.2.
+  - **Crash:** the process dies after the `SUBMITTED` commit and before the POST. On restart the intent is `SUBMITTED` with no broker order. The stranded sweep resolves it by client order ID, and the wind-down waits for that.
+  - **Unknown submission:** the POST times out (`SUBMISSION_UNKNOWN`). No second BUY is sent, and the wind-down waits for reconciliation by client order ID.
+  - **Protective exits:** a SELL at each of the same pauses is never barred.
+- **Generation registry (rev. 5, D01):**
+  - **two fresh databases:** two fresh databases for one account. Freezing the second without `--predecessor` refuses with `predecessor_required`, and with a wrong one, `predecessor_not_latest`;
+  - **renamed database:** the predecessor's database is renamed and found through `--predecessor-database` by its `database_id`. A different database with the same name refuses with `predecessor_artifacts_mismatch`;
+  - **moved artifacts:** a moved store refuses with `predecessor_artifacts_missing` until `--predecessor-store` names it, and is then verified by digest;
+  - **stale head:** the registry's newest entries are deleted, leaving an older head. A broker FILL after that head's seal refuses with `registry_head_stale`;
+  - **fork:** a copied entry with a duplicate parent refuses with `registry_forked`, and a broken digest refuses with `registry_chain_invalid`;
+  - **unresolved and unsealed predecessors:** an unresolved predecessor still refuses with `handover_unproven_items`. An unsealed head refuses with `registry_head_unsealed`. `abandon` is refused for a generation with intents (`registry_abandon_has_intents`);
+  - **two accounts:** two accounts get two independent chains, and an account whose digest differs refuses with `registry_account_mismatch`;
+  - **bootstrap:** it succeeds only when no registry exists (`registry_exists`). A missing registry without the flag refuses with `registry_missing`;
+  - **crash safety:** a crash at every step of an append (after the temporary write, after the link, before the directory fsync) leaves either no entry or a complete one, and the chain stays valid. A crash between `frozen` and the database bind is completed by re-running the same freeze.
+- **Predecessor-cash bridge (rev. 5, D02), each case run end to end through `valuation.py` and `verification/evidence.py`:**
+  - **$1,000 / $999:** the successor opens with $1,000, makes no trades, and a $1 linked predecessor fee posts. Expected cash is $999, `matched`. The successor's equity and P&L are unchanged, with `excluded_predecessor_cash = −1`. The predecessor's `post_seal_adjustments` shows −$1, and its sealed bytes are identical;
+  - **split fee:** two bridges, each exactly once;
+  - **reversal:** a +$1 credit bridge, `fee_correction`, an alert, and cash `matched`;
+  - **before the opening:** no bridge, and the opening cash already includes the fee;
+  - **missing bridge:** a classified `predecessor_obligation` with no bridge gives `predecessor_cash_bridge_missing`, and a bridge without its amendment gives `predecessor_cash_bridge_unlinked`;
+  - **crash between the amendment and the bridge:** the next pass writes the bridge once;
+  - **no double P&L:** across both generations, the fee appears once in P&L (the predecessor's adjusted result) and in both cash bridges.
+- **Carried-lot contract (rev. 5, D03).** Each scenario is closed in the successor and must reconcile quantity, basis, P&L, account equity and generation equity, without any predecessor fill in the successor's database:
+  - **partially closed lot:** opened 10, closed 4. The successor lot opens at 6 with an empty closure map, and the history keeps 10 and the closure;
+  - **native asset fees:** a lot with `asset_fee_quantities` keeps them in its history, and the successor lot starts with none;
+  - **several lots:** lots with different dates and prices for one asset. The exclusion is summed over the lots with V0 subtracted once, the projected `average_price` equals the handover's, and the oldest lot governs the stop and target;
+  - **second inheritance:** the chain gains one hop and the root is unchanged;
+  - **target survives:** a successor add-on or partial sell re-projects the holding, and the carried `target_price`, `current_stop` and `scaled_out` are unchanged;
+  - **versioned proof:** a `rev147-handover-v1` row with a tampered `original_opened_at`, `original_acquisition_price` or `carried_quantity` gives `ACCOUNTING_ADOPTION_LOT_MISMATCH`, and Rev.142 rows still use their own rule;
+  - **average mismatch:** a handover whose `average_price` differs from its lots' weighted average refuses the freeze with `handover_stop_unverified`.
+- **Mark evidence (rev. 5, D05):**
+  - **old mark, new response:** a newly received positions response carrying a prior-session price is never accepted. `broker_position_price` is recorded with its `received_at` only;
+  - **prior-session mark:** a quote observed in the latest completed regular session, at a pre-open start, gives `prior_session_mark`, and the position's outcome is `out_of_session`;
+  - **older than that session:** a quote observed before the latest completed session's open is `mark_unverified`;
+  - **illiquid option before the open:** no quote in the latest session gives `mark_unverified`. The startup still proceeds for the other positions, the option's `assumed_at` is null, and a BUY in it is refused with `CARRIED_MARK_UNVERIFIED`. At the first in-session fresh quote, its `assumed_at` is written. With none during the session, an alert is raised and the exposure stays open;
+  - **at the open:** a start exactly at `next_session_open` uses `fresh_executable`;
+  - **future timestamp:** a quote ahead of the clock beyond the skew allowance fails check 4, and the startup is refused;
+  - **planned window:** a successor started in the planned pre-open window with carried equities and an illiquid option records `no_session_gap` for the generation, with the option's per-position exception, and nothing claims more than was checked.
 - **Frozen policy:** `generation_predates_wind_down`, and `frozen_configuration_mismatch` on a changed `planned_end_at`.
 - **Property tests:**
   - over random sequences of fills, rejections, timeouts, outages and crashes, check that:
@@ -616,7 +811,7 @@ All on the simulator, with no broker calls.
 - **No second order-recovery or settlement implementation.**
   - Wind-down sells, cancels and their recovery go only through the existing `ExecutionGateway`, its client-order-ID idempotency and `SUBMISSION_UNKNOWN` reconciliation, the Rev.140 sell gate, `SettlementProcessor`, and the reconciliation coordinator.
   - Late predecessor fees use the existing membership classifier and generation cash ledger (§7.6).
-  - Rev.147 adds only the run state, the census, the observed-order register, the classification, the per-asset sequencing rule, the handover, the protective-state restore, the continuity record and the next-run checks.
+  - Rev.147 adds only the run state, the census, the observed-order register, the classification, the per-asset sequencing rule, the handover, the protective-state restore, the continuity record and the next-run checks. Rev. 5 adds the generation registry, the predecessor-cash bridge (a new ledger entry kind in the existing ledger), the versioned carried-lot branch of the existing adoption proof, the dispatch-barrier transaction around the existing `SUBMITTED` write, and the mark evidence record.
 - New refusal strings in rev. 2: `RUN_PAUSED`. New run-state events: `run_paused`, `run_resumed`, `end_run_requested`.
 - New strings in rev. 3:
   - refusals: `handover_stop_invalid`, `handover_stop_unverified`, `handover_protection_gap_unaccepted`, `wind_down_resolve_order_pending`, `wind_down_order_unaccounted`, `fee_attribution_conflict`;
@@ -634,6 +829,13 @@ All on the simulator, with no broker calls.
   - records and sections: `protection_exposure` (both the system-written amendment record and the report section);
   - amendment: `--ack-gap-breach`;
   - evaluation outcome: `out_of_session`.
+- New strings in rev. 5:
+  - registry refusals (D01): `registry_missing`, `registry_exists`, `registry_account_mismatch`, `registry_chain_invalid`, `registry_forked`, `registry_head_unsealed`, `registry_head_stale`, `registry_abandon_has_intents`, `predecessor_required`, `predecessor_artifacts_missing`, `predecessor_artifacts_mismatch`;
+  - registry entry kinds: `genesis`, `frozen`, `sealed`, `abandoned`; commands and flags: `registry abandon`, `--registry-bootstrap`, `--predecessor-store`, `--predecessor-database`;
+  - cash bridge (D02): record `generation_predecessor_cash:<activity_id>`, cash entry `broker:predecessor_cash:<activity_id>`, kinds `fee_debit` and `fee_correction_credit`, report field `excluded_predecessor_cash`, refusals `predecessor_cash_bridge_missing` and `predecessor_cash_bridge_unlinked`;
+  - carried lots (D03): the adoption row's `carried` block (`provenance_chain`, `history`, `original_acquisition_price`, `original_opened_at`, `carried_quantity`), and the attribution field `original_basis_pnl`;
+  - dispatch barrier (D04): `RUN_WIND_DOWN_ACTIVE_AT_DISPATCH`, `RUN_PAUSED_AT_DISPATCH`;
+  - mark evidence (D05): acceptance results `prior_session_mark`, `fresh_executable` and `mark_unverified`; the refusal and alert `CARRIED_MARK_UNVERIFIED`; the field `broker_position_price`.
 - The build happens on its own branch and worktree, after Rev.146 is merged. Nothing is merged without review and the operator's approval.
 
 ## 12. Open questions for review
@@ -644,3 +846,6 @@ All on the simulator, with no broker calls.
 4. ~~§5 (escalation).~~ Decided 2026-11-03: 60 minutes, as an alert only.
 5. ~~§7.5 (continuity design).~~ Accepted with conditions (2026-11-04, the Rev.148 assessment): strict successor-start verification, an explicit exposure record in every case, and a gap audit that only detects and requires intervention. Applied in rev. 4 (§7.5). The original question was: this revision replaces the reviewer's preferred monitor overlap with a session-boundary rule plus operator acceptance, because the account lease makes overlap impossible and two monitors would risk a duplicate exit. Does the reviewer accept that equivalence?
 6. ~~§4.2 (option expiry across the gap).~~ Decided 2026-11-04 (reviewer recommendation): `unproven`, which blocks completion until the operator resolves it. The expiry day itself counts, and an unknown expiry counts too (§4.2, the option rule). The original question was: a carried option that expires before the successor's first regular session would expire unmonitored. Should such an option be `unproven` at wind-down, which blocks the seal until the operator acts, or carried with an alert?
+7. **§7.7 (registry scope, rev. 5):** the registry is local to one machine, like the account lease. Two machines trading one account are detected by neither. Is a per-machine registry with broker-fill corroboration acceptable until cloud hosting, or does the reviewer require a shared authority before the first Rev.147 run?
+8. **§7.5.1 (`mark_unverified`, rev. 5):** rev. 4 refused the whole successor start when one carried position had no acceptable mark. Rev. 5 starts the successor and holds back only that position: its `assumed_at` stays null and its exposure stays open, entries in it are refused, and it is assumed at its first fresh in-session quote. Does the reviewer accept this per-position assumption, which keeps every other position monitored?
+9. **§7.6 (reversal credits, rev. 5):** rev. 4 posted no cash entry for a fee reversal. Rev. 5 bridges it automatically as a signed credit (still not P&L, still alerted), because otherwise the successor's cash check fails. Is automatic bridging acceptable, or should a credit wait for operator acknowledgement, keeping the cash status unresolved until then?
