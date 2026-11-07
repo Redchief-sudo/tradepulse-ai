@@ -10,11 +10,11 @@
 | Finding | Severity | Status | Commit |
 |---|---|---|---|
 | F01 unchanged ratchet suppresses exit checks | CRITICAL | fixed | `4e2b601e` |
-| F04 one bad holding blocks unrelated protection | HIGH | fixed | (this commit) |
-| F02 open orders are one default page | HIGH | fixed (gate G-F02 open) | (this commit) |
-| F03 pending buys leave count limits unreserved | HIGH | fixed | (this commit) |
-| F05 quote age measured from a stale `now` | MEDIUM | fixed | (this commit) |
-| F06 broker-only inventory missing from account risk | HIGH | fixed | (this commit) |
+| F04 one bad holding blocks unrelated protection | HIGH | fixed | `61f8c9b9` |
+| F02 open orders are one default page | HIGH | fixed; G-F02 closed (ruling 23) | `4f16ffd3`, `c35a4ba9` |
+| F03 pending buys leave count limits unreserved | HIGH | fixed | `b056a072`, `8ace9336` |
+| F05 quote age measured from a stale `now` | MEDIUM | fixed | `c285de02`, `924c0d14` |
+| F06 broker-only inventory missing from account risk | HIGH | fixed | `b056a072` |
 
 ## Rulings and deviations
 
