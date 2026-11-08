@@ -1,6 +1,19 @@
 # Rev.147 — Verification run wind-down and generation handover
 
-**Status:** design, rev. 5, for forensic approval. No production code changes and no orders until the spec is approved.
+**Status:** design, rev. 6, for forensic approval. No production code changes and no orders until the spec is approved.
+**Rev. 6 (2026-11-07):** answers the Rev.151 review of rev. 5 (REV151-01..03) and records the reviewer's decisions on open questions 7–9 (see `docs/rev147-rev6-review-response.md`).
+- **REV151-01, an abandoned head:** after `abandoned`, the effective head is the latest `sealed` or `genesis` entry before it. Abandon now needs broker proof, not only an empty intent table: no broker order after the generation's freeze, and no uncited FILL since the effective head. It also needs proof that the database is the frozen one and intact, and that the generation never took over protection. A database that is damaged or lost has a broker-only path. An abandoned generation can never run, freeze or seal again (§7.7).
+- **REV151-02, a delayed POST:** a not-found lookup by client order ID never ends an intent that may have been POSTed. Today the stranded sweep does exactly that after 120 s (`reconciliation/coordinator.py::_resolve_stranded`). This revision withdraws that rule, in the build and for every generation, not only during the wind-down:
+  - a `SUBMITTED` or `SUBMISSION_UNKNOWN` intent stays unresolved, with its asset blocked, until the broker shows the order;
+  - otherwise, after a finality horizon, an operator resolution backed by broker evidence ends it;
+  - its client order ID stays watched afterwards.
+  
+  A deterministic delayed-POST test covers this (§8 step 7, §10).
+- **REV151-03, an unverified mark:** a `mark_unverified` position gets no price-dependent decision (stop, target, trailing ratchet, scale-out) from any unaccepted price. Its time and expiry checks continue. Its price-dependent evaluation starts at its first accepted executable quote, and every exit still passes the gateway's quote check (§7.5.1).
+- **Decisions:**
+  - Q7: a per-machine registry is accepted, with a hard operational restriction (one machine per account);
+  - Q8: the per-position assumption is accepted with the REV151-03 boundary;
+  - Q9: automatic reversal credits are accepted, only with proven linkage to the original fee (§7.6, §12).
 **Rev. 5 (2026-11-06):** answers the five design findings D01–D05 of the 2026-11-04 forensic audit (`TradePulse_Rev147_Forensic_Audit.pdf`). Its runtime findings F01–F06 were fixed separately in Rev.149, merged as main `b010090d`. Each finding was checked against the code at that commit before it was answered (see `docs/rev147-rev5-review-response.md`).
 - **D01, predecessor discovery:** a generation registry per broker account and environment, outside every database, with a digest-chained head, crash-safe appends, a bootstrap rule, and refusal on a missing, forked, stale or unsealed head (§7.7).
 - **D02, late-fee cash:** a signed, exactly-once predecessor-cash bridge entry in the successor. It is included in the cash check and excluded from the successor's equity and P&L, like a capital flow (§7.6.1). Reversals are bridged too.
@@ -307,6 +320,7 @@ At seal, the generation writes `handover.json` into its directory. It is include
   - the local fill ID, the broker fill (activity) ID and the broker order ID;
   - the asset, the fill time and the expected kind (USD CFEE for a crypto sell, FEE for a regulatory equity fee);
   - `origin_generation`. This is this generation, or the earlier one for a still-open fee inherited through a chain (§7.6).
+- **`watched_client_order_ids`** (rev. 6, REV151-02): each client order ID resolved by `resolve-dispatch` and still inside its 30-day watch, with its intent, `submitted_at`, its resolution digest and its origin generation (§8 step 7). The successor keeps watching it.
 - **`protection`** (§7.5):
   - `monitoring_released_at`: when the monitor loop stopped, which is before the seal;
   - `next_session_open`: from the Rev.144 calendar;
@@ -484,7 +498,16 @@ A failed check is never retried silently into a pass. The operator restarts the 
 - **Not acceptable, but not a failure:** for example, an illiquid option with no quote or trade observed in the latest completed session. The position is `mark_unverified`, and gets a per-position assumption:
   - its `assumed_at` stays null in the exposure record, so the record does not claim it was checked;
   - non-protective BUYs in that asset are refused with `CARRIED_MARK_UNVERIFIED`, in the fenced authorization (§8);
-  - the monitor evaluates it as usual. Its `assumed_at` is written at the first in-session cycle where an executable quote passes the existing bound, and its exposure closes then;
+  - **what the monitor does with it (rev. 6, REV151-03):**
+    - **No price-dependent decision from an unaccepted price.** The monitor makes no stop, target, trailing-stop ratchet or scale-out decision for the position from `broker_position_price`, a `prior_session_mark` or any other unaccepted price. Its carried stop and target stay exactly as restored. A stale price can neither ratchet them nor trigger them. It does not fold into the lots' `mfe_price` and `mae_price` either (`_fold_lot_extrema`), because the stall exit and the ladder read those values later.
+    - **Time and expiry checks continue,** because they do not read the current price:
+      - the `max_hold_days` time stop and the option near-expiry rule;
+      - the stall exit, judged on the carried MFE only.
+      
+      An exit they decide is still submitted through the gateway.
+    - **Every exit still passes the gateway's quote check.** The gateway's existing executable-quote check (`quote_age_problem`) still governs submission. With no fresh quote, the gateway refuses the exit as today, and the existing protective-exit alerting applies.
+    - **Price-dependent evaluation starts at the first accepted quote:** the first in-session cycle where an executable quote for the asset passes the existing bound. That cycle evaluates the full protective state from that quote, and the position's `assumed_at` is written, which closes its exposure. Every later cycle uses the monitor's normal price path.
+    - **Everything else is unchanged.** The monitor keeps its normal cycle for every other carried position, and one `mark_unverified` position never delays them;
   - if the first regular session passes without such a quote, a critical `CARRIED_MARK_UNVERIFIED` alert is raised, and the exposure stays open. Time never closes it.
 
 Rev. 4 refused the whole startup instead. That would leave every carried position unmonitored because of one illiquid option, which is worse protection, not better.
@@ -527,7 +550,14 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
 - Such an activity is recorded as a `fee_correction` attribution against the predecessor, citing the original `pending_fee_id` and, if any, the fee activity it reverses.
 - It is never netted against or written over the original record.
 - **Rev. 5 (D02):** it gets a signed **credit** bridge entry in the successor (§7.6.1), because the broker's cash already includes it. Rev. 4 posted no cash entry, which left observed cash unexplained in the same way as an unbridged fee. It is still not successor P&L.
-- It raises an alert for operator review.
+- **Rev. 6 (Q9 decided), provenance conditions for the automatic credit.** A credit is bridged automatically only when all of these hold:
+  - its raw activity digest verifies;
+  - it carries the same broker `fill_id` or `order_id` link as an original fee that is already attributed to the predecessor by its own `fee_attribution` record;
+  - its amount does not exceed the attributed fees for that link not yet reversed, so a credit can never reverse more than was charged;
+  - its activity ID has not been bridged or attributed anywhere before.
+
+  A credit that fails any condition is never bridged automatically. That covers an unlinked credit, one whose link matches no attributed fee, one that would over-reverse, and one that matches more than one origin generation. It is classified `unresolved_generation_membership`, with the reason `predecessor_cash_reversal_unlinked`, which keeps the successor's cash status unresolved until the operator attributes it with `--resolve-fee`, under the same read-only broker checks.
+- It raises an alert for operator review. The alert is mandatory even when the bridge succeeds.
 
 **Chains:**
 - A `pending_fee` still open when the successor seals is copied into the successor's handover `pending_fees`, keeping its `origin_generation`.
@@ -558,7 +588,7 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
 **Cases.**
 - **Debit after the successor's opening:** one bridge for the negative amount.
 - **Split fee:** two activities, two bridges, each exactly once.
-- **Reversal or credit:** one positive bridge, a `fee_correction` record in the predecessor, and an alert.
+- **Reversal or credit:** one positive bridge, a `fee_correction` record in the predecessor, and an alert, but only under the rev. 6 provenance conditions (§7.6). Otherwise it is held as `predecessor_cash_reversal_unlinked`, with no bridge.
 - **Before the successor's opening** (the activity is in the opening population): no bridge. It is already in the opening cash, so only the predecessor's `fee_attribution` is written (§7.6).
 - **Unlinked fee before `--resolve-fee`:** it stays `unresolved_generation_membership`, as today, which holds the successor's invariants unresolved. Once it is resolved, it is classified `predecessor_obligation` and bridged.
 
@@ -581,13 +611,36 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
 **Ordering with the database and the seal.**
 - **Freeze:** freeze appends `frozen` after every other freeze check and before the database bind (`_publish_freeze`'s `UPDATE verification_identity`). If it crashes in between, the `frozen` entry has no bound database. The next freeze for the account sees an unsealed head and refuses with `registry_head_unsealed`. Re-running the same freeze (same generation and database ID, still unbound) completes the bind, idempotently. Otherwise the operator abandons the generation.
 - **Seal:** the seal appends `sealed` after `handover.json` and the evidence digest are written, and before the seal is reported complete. After a crash in between, the generation's next start re-runs the seal step, which appends the entry. Identical content is a no-op.
-- **Abandon:** `tradepulse verification registry abandon --generation G --reason "<text>"` appends `abandoned`, but only if G's database, opened read-only, has no trade intent at all. A generation that never created an intent never sent an order. Any other unsealed generation must be wound down and sealed. Otherwise abandon refuses with `registry_abandon_has_intents`.
+- **Abandon (rewritten in rev. 6, REV151-01):** `tradepulse verification registry abandon --generation G --reason "<text>"` appends `abandoned` for the head `frozen` generation G. Any other unsealed generation must be wound down and sealed. An empty intent table is not proof on its own, because the database itself may be damaged, restored from a backup, or a different file. So abandon needs both local and broker evidence, all read-only, in this order:
+  1. **The database is G's, and intact.** G's database, opened read-only, must:
+     - pass `PRAGMA integrity_check`;
+     - carry the `verification_identity.database_id` of G's `frozen` entry;
+     - have the frozen manifest digest.
+
+     Otherwise abandon refuses with `registry_abandon_database_unverified`.
+  2. **No intent.** G's database has no trade intent at all. Otherwise abandon refuses with `registry_abandon_has_intents`.
+  3. **No protection taken over.** G never wrote `monitoring_assumed_at` or a successor-start evidence record (§7.5). A generation that took over carried positions holds protective state that would be lost, such as a ratcheted stop, so it must be wound down and sealed instead. Otherwise abandon refuses with `registry_abandon_protection_assumed`.
+  4. **No broker order since the freeze.** Abandon takes a complete census of the account's orders of every status, created at or after G's `frozen` time less the clock-skew allowance. It uses a paged listing of orders of every status, under the Rev.149 F02 completeness rules (`after` inclusive, `until` exclusive; refused when completeness cannot be proven). The census must be empty. One account is operated from one machine (§11), so any order in that window is G's or out-of-band, and either one refuses with `registry_abandon_broker_activity`. A census whose completeness cannot be proven refuses with `registry_abandon_broker_unproven`.
+  5. **No uncited fill since the effective head.** Every FILL activity after the effective head's `sealed_at` (or its `genesis` time) must already be cited by an amendment of that head, which is the stale-head rule below. Otherwise abandon refuses with `registry_abandon_broker_activity`.
+
+  The `abandoned` entry records:
+  - the census windows, and the SHA-256 digests of the order census and the activity census;
+  - G's `database_id` and the result of each check;
+  - the effective head it falls back to.
+
+  **A damaged or lost database:** `--database-lost` replaces checks 1–3 with broker evidence only. It requires checks 4 and 5, plus an empty open-order list. It is recorded as `database_lost: true`, with a critical alert. It is sound only because one account is operated from one machine (§11): an intent that never reached the broker left nothing to account for, and one that did is in the order census.
 
 **Freeze rules.** These run first, before §7.2.
 - **No registry for the account:** refuse with `registry_missing`, unless `--registry-bootstrap` is given (below).
 - **Head unsealed** (`frozen` with no `sealed` or `abandoned`): refuse with `registry_head_unsealed`, naming that generation.
 - **Head sealed under Rev.147:** `--predecessor` is required (`predecessor_required`) and must name the head (`predecessor_not_latest`). §7.2 then applies.
 - **Head is `genesis`:** there is no predecessor, and opening positions follow §7.4.
+- **Head is `abandoned` (rev. 6, REV151-01):**
+  - **The effective head:** the latest `sealed` or `genesis` entry before the abandoned run of entries. Several abandons in a row are skipped together. The abandoned entries stay in the chain as evidence and are never deleted.
+  - **The predecessor:** the effective head's generation, so the freeze applies the rule for that head, either "head sealed" or "head is `genesis`". `--predecessor` must name the effective head (`predecessor_not_latest`). The new `frozen` entry's predecessor is the effective head's generation, never the abandoned one.
+  - **The broker re-check:** every abandoned entry's census digests are re-verified. The stale-head corroboration below is anchored at the effective head's `sealed_at` (or `genesis` time), not at the abandoned entry's time. So the window from the last seal to this freeze, which includes each abandoned generation's whole life, is checked again from the broker. Any fill in it must be cited, and none can come from an abandoned generation.
+  - **The protection gap:** the successor's protection exposure (§7.5) starts at the effective head's `monitoring_released_at`. An abandoned generation never assumed protection (abandon check 3), so it closes no part of that interval.
+- **An abandoned generation never runs again:** a freeze, a seal, a successor start or a `run` for a generation with an `abandoned` entry refuses with `registry_generation_abandoned`. The runtime reads the registry at startup, and its generation must be the head `frozen` entry.
 - **Locating the predecessor's artifacts:** by digest, not by path. The store and database are found at the paths in the `frozen` entry, or at `--predecessor-store <dir>` and `--predecessor-database <file>` if they were moved. Either way, the manifest digest, `database_id`, handover digest and sealed evidence digest must equal the registry's (`predecessor_artifacts_mismatch`). Missing artifacts refuse with `predecessor_artifacts_missing`. A renamed database is accepted, because its identity is the `database_id` inside it, not its name.
 
 **A stale or rolled-back head (broker corroboration).** A registry restored from an old backup, or with its newest entries deleted, would show an older head. The broker's own history corroborates the head. At freeze, every FILL activity on the account after the head's `sealed_at` (or the `genesis` time) must be cited by an amendment of the head generation (§7.3: a `--position` declaration or a `--resolve`, each verified against the broker). An uncited fill refuses with `registry_head_stale`. It means someone traded the account after the last seal the registry knows about: a lost generation, or an out-of-band trade.
@@ -596,7 +649,7 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
 **Bootstrap.** `--registry-bootstrap --reason "<text>"` is accepted only when no registry directory exists for the key; otherwise it refuses with `registry_exists`. It writes `genesis` with the operator, the reason and the census digest at bootstrap. Opening positions are adopted under ordinary Rev.142 rules, with stops rebuilt from the broker average. No inherited protective state is claimed.
 
 **Limits (stated, not solved).**
-- **One machine:** like the account lease, the registry is local to one machine. Two machines trading one account are not detected by either. A shared registry belongs with cloud hosting, which is out of scope (§2).
+- **One machine (rev. 6: a hard operational restriction, Q7 decided):** like the account lease, the registry is local to one machine. Two machines trading one account are not detected by either. Broker-fill corroboration finds only fills after the fact. It is not a distributed lock, and it cannot see another machine's unfilled orders. So one broker account must never be operated by TradePulse from more than one machine, and the run plan and the runbook state that as a precondition (§11). Manual trading of the account outside TradePulse breaks the same assumption (the A0 run failed that way). The registry detects it only through an uncited fill. A shared registry belongs with cloud hosting, which is out of scope (§2).
 - **A deleted registry:** if it is deleted and bootstrapped again, the chain restarts. The only consequence is a downgrade. Carried positions lose inherited-stop restoration and are adopted with rebuilt stops. A predecessor's late fee falls to `unresolved_generation_membership`, which holds the successor's invariants unresolved, as today. Nothing is certified that was not proven.
 
 ## 8. Entry stop and the dispatch barrier
@@ -619,13 +672,44 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
 4. **The dispatched population.** A BUY committed `SUBMITTED` before the transition may still reach the broker after it. At wind-down start, the census therefore reads every local BUY intent in `SUBMITTED`, `ACCEPTED`, `PARTIALLY_FILLED` or `SUBMISSION_UNKNOWN`. Each one enters the observed-order register (§4.1) by client order ID, even if no broker order is visible yet. The wind-down cannot be `COMPLETE` until each is durably classified:
    - accepted, then cancelled and terminal under §4.4;
    - rejected by the broker;
-   - or resolved by client order ID through the existing `SUBMISSION_UNKNOWN` recovery or the stranded-intent sweep.
+   - or resolved by client order ID through the existing `SUBMISSION_UNKNOWN` recovery or the stranded-intent sweep, when the broker shows the order, or by an operator `resolve-dispatch` (step 7). A not-found lookup is never a classification.
 
    If the census sees no broker order for a `SUBMITTED` intent, that proves nothing, because the POST may still be in flight.
 5. **Protective exits are never barred.** That covers every SELL, wind-down crypto sells included.
 6. **Pause and crash.**
    - On a pause, `run_paused` closes the `RISK_APPROVED` BUYs (step 2), and a `SUBMITTED` BUY still completes to its true state (§3.3).
-   - After a crash between the `SUBMITTED` commit and the POST, the intent is `SUBMITTED` with no broker order. The existing stranded-intent sweep (`reconciliation/coordinator.py::_recover_stranded_intents`) resolves it by client order ID after its grace period, and the wind-down waits for that through the register.
+   - After a crash between the `SUBMITTED` commit and the POST, the intent is `SUBMITTED` with no broker order. The stranded-intent sweep (`reconciliation/coordinator.py::_recover_stranded_intents`) resolves it by client order ID, under step 7, and the wind-down waits for that through the register.
+7. **A not-found lookup is not a rejection (rev. 6, REV151-02).**
+
+   **The defect.** A not-found result from the client-order-ID lookup (HTTP 404) proves only that the broker does not show the order now. A POST delayed in transit, for example across a crash, can still reach the broker afterwards. Today `_resolve_stranded` treats a 404, once 120 s have passed since `created_at`, as definitive: a `SUBMITTED` intent becomes `REJECTED` (`STRANDED_BEFORE_SUBMISSION`), and a `SUBMISSION_UNKNOWN` one becomes `REJECTED` (`BROKER_NEVER_RECEIVED`). A late order would then have no live intent. It would be found only when it filled, as an unattributed fill, after the wind-down had already counted it as never sent. This applies to every generation, not only to the wind-down, so the rule below replaces the sweep's rule everywhere.
+
+   **The rule.** What the sweep may conclude depends on how far the intent got:
+   - **`RISK_APPROVED`** (never POSTed, because the POST happens only after the `SUBMITTED` commit, step 1): the sweep may close it as `REJECTED` (`STRANDED_BEFORE_SUBMISSION`) without a broker lookup. This is unchanged in effect.
+   - **`SUBMITTED` or `SUBMISSION_UNKNOWN`** (may have been POSTed):
+     - **Order found:** it is adopted by client order ID, exactly as today.
+     - **404:** the intent becomes, or stays, `SUBMISSION_UNKNOWN`, with `last_absent_at` recorded. It is never made terminal. Its asset stays blocked, as for every `SUBMISSION_UNKNOWN` intent, and the sweep repeats the lookup every pass.
+     - **No time limit:** no timeout, grace period or horizon ever makes the intent terminal on its own.
+   - **The time base:** the `SUBMITTED` write sets the intent's `submitted_at`, which is the dispatch time. The sweep's grace period is measured from `submitted_at`, not from `created_at`.
+
+   **Operator resolution** is the only way to end an intent that stays absent. `tradepulse verification resolve-dispatch --intent <id> --reason "<text>"` is accepted only when all of these hold:
+   - **The horizon has passed:** at least `DISPATCH_FINALITY_MINUTES` since `submitted_at`. This is a precondition for the operator's action, never an automatic resolution. It is provisional, like `FEE_WAIT_MINUTES`.
+   - **The lookup is still absent:** it runs again at the command and still returns 404.
+   - **No order and no fill in the window:** a complete, completeness-proven census of orders of every status, created from `submitted_at` less the clock-skew allowance up to now, contains no order matching the intent's client order ID or its asset, side and quantity. Also, no FILL activity on the asset in that window is uncited.
+
+   On success, the intent becomes `REJECTED` with `SUBMISSION_ABSENT_OPERATOR_RESOLVED`. It cites the census digests, the operator and the reason.
+
+   **Watched client order IDs.** After an operator resolution, the client order ID stays watched. It enters `watched_client_order_ids`:
+   - the reconciliation coordinator looks each one up every pass;
+   - the list is carried in the handover (§7.1), so a successor keeps watching it;
+   - an ID leaves the list only after 30 days with no appearance.
+
+   If a watched ID ever appears at the broker:
+   - a critical alert and an integrity hold are raised (`RESOLVED_DISPATCH_APPEARED`), and the order is never adopted silently;
+   - the operator then decides, and the existing `ORDER_IDENTITY_MISMATCH` path is the model.
+
+   **In the wind-down,** an intent in this state keeps the wind-down out of `COMPLETE`, through the register (step 4). It is `BLOCKED` while the order may still arrive, with the existing escalation alert. Only the broker showing the order, or an operator resolution, moves it. It is never cleared to let the wind-down complete.
+
+   **In the build:** this is a change to the existing sweep in `reconciliation/coordinator.py`, in its own commit with its own tests, separate from the wind-down. The stranded-intent blocker text (`blockers.py`) is updated to match.
 
 ## 9. Gates
 
@@ -752,6 +836,19 @@ All on the simulator, with no broker calls.
   - **Cancel during acceptance:** the broker accepts the BUY while the wind-down's cancel is in flight. The fill or cancel is settled, and the result is classified under §4.2.
   - **Crash:** the process dies after the `SUBMITTED` commit and before the POST. On restart the intent is `SUBMITTED` with no broker order. The stranded sweep resolves it by client order ID, and the wind-down waits for that.
   - **Unknown submission:** the POST times out (`SUBMISSION_UNKNOWN`). No second BUY is sent, and the wind-down waits for reconciliation by client order ID.
+  - **Delayed POST after the recovery lookup (rev. 6, REV151-02).** The simulator holds the POST in transit and the process crashes:
+    1. On restart, the stranded sweep runs past its grace period, and the client-order-ID lookup returns 404.
+    2. Expected: the intent is `SUBMISSION_UNKNOWN` (never `REJECTED`), its asset is blocked, and the wind-down is `BLOCKED`, not `COMPLETE`.
+    3. The simulator then releases the POST, and the broker accepts it.
+    4. The next pass adopts the order by client order ID, the wind-down cancels it or settles its fill under §4.4, and only then can it complete.
+
+    Variants:
+    - **Long hold:** the same, with the POST held across many passes and a restart. The intent never becomes terminal on its own.
+    - **Never released:** with the POST never released, the intent stays `SUBMISSION_UNKNOWN` indefinitely. `resolve-dispatch` is refused before `DISPATCH_FINALITY_MINUTES` and when the order census is incomplete. It is accepted after the horizon, and the result is `SUBMISSION_ABSENT_OPERATOR_RESOLVED`, with the client order ID watched.
+    - **Appears after resolution:** if the POST is released after an operator resolution, the watched ID appears. That gives `RESOLVED_DISPATCH_APPEARED`, a critical alert and an integrity hold, and the order is not adopted.
+    - **In the successor:** the watch is carried in the handover, and an ID that appears in the successor gives the same result.
+    - **Before the POST:** a `RISK_APPROVED` intent that never reached the `SUBMITTED` commit is closed as `STRANDED_BEFORE_SUBMISSION` without a broker lookup.
+    - **Time base:** the grace period counts from `submitted_at`. An intent created long before its dispatch is not swept early.
   - **Protective exits:** a SELL at each of the same pauses is never barred.
 - **Generation registry (rev. 5, D01):**
   - **two fresh databases:** two fresh databases for one account. Freezing the second without `--predecessor` refuses with `predecessor_required`, and with a wrong one, `predecessor_not_latest`;
@@ -760,6 +857,18 @@ All on the simulator, with no broker calls.
   - **stale head:** the registry's newest entries are deleted, leaving an older head. A broker FILL after that head's seal refuses with `registry_head_stale`;
   - **fork:** a copied entry with a duplicate parent refuses with `registry_forked`, and a broken digest refuses with `registry_chain_invalid`;
   - **unresolved and unsealed predecessors:** an unresolved predecessor still refuses with `handover_unproven_items`. An unsealed head refuses with `registry_head_unsealed`. `abandon` is refused for a generation with intents (`registry_abandon_has_intents`);
+  - **abandoned head (rev. 6, REV151-01):**
+    - G1 is sealed, G2 is frozen and then abandoned, and G3 is frozen. G3's predecessor must be G1 (`--predecessor G2` refuses with `predecessor_not_latest`), and G3 inherits G1's carried state and protection interval;
+    - two abandons in a row fall back to the same sealed head;
+    - after a `genesis`, an abandon falls back to the genesis rules;
+    - the stale-head check from G1's `sealed_at` finds an uncited fill during G2's life, and refuses with `registry_head_stale`;
+  - **abandon refusals (rev. 6):**
+    - a database that is not G2's (another `database_id`), fails `integrity_check`, or was restored from before a dispatched intent (no intent, but a broker order after the freeze): `registry_abandon_database_unverified` or `registry_abandon_broker_activity`;
+    - a broker order created after G2's freeze, with an empty intent table: `registry_abandon_broker_activity`;
+    - an order census whose completeness cannot be proven: `registry_abandon_broker_unproven`;
+    - a G2 that wrote `monitoring_assumed_at`: `registry_abandon_protection_assumed`;
+    - `--database-lost` with a clean broker census is accepted and alerted, and with any order in the window it is refused;
+    - running, freezing or sealing an abandoned G2 refuses with `registry_generation_abandoned`;
   - **two accounts:** two accounts get two independent chains, and an account whose digest differs refuses with `registry_account_mismatch`;
   - **bootstrap:** it succeeds only when no registry exists (`registry_exists`). A missing registry without the flag refuses with `registry_missing`;
   - **crash safety:** a crash at every step of an append (after the temporary write, after the link, before the directory fsync) leaves either no entry or a complete one, and the chain stays valid. A crash between `frozen` and the database bind is completed by re-running the same freeze.
@@ -767,6 +876,12 @@ All on the simulator, with no broker calls.
   - **$1,000 / $999:** the successor opens with $1,000, makes no trades, and a $1 linked predecessor fee posts. Expected cash is $999, `matched`. The successor's equity and P&L are unchanged, with `excluded_predecessor_cash = −1`. The predecessor's `post_seal_adjustments` shows −$1, and its sealed bytes are identical;
   - **split fee:** two bridges, each exactly once;
   - **reversal:** a +$1 credit bridge, `fee_correction`, an alert, and cash `matched`;
+  - **reversal without provenance (rev. 6, Q9).** Each of these gets no bridge, is recorded as `predecessor_cash_reversal_unlinked`, raises an alert, and leaves cash not `matched` until `--resolve-fee`:
+    - a credit with no link;
+    - a credit whose link matches no attributed fee;
+    - a credit larger than the unreversed attributed fees for its link;
+    - a credit whose link matches fees in two origin generations;
+    - a credit whose raw digest does not verify;
   - **before the opening:** no bridge, and the opening cash already includes the fee;
   - **missing bridge:** a classified `predecessor_obligation` with no bridge gives `predecessor_cash_bridge_missing`, and a bridge without its amendment gives `predecessor_cash_bridge_unlinked`;
   - **crash between the amendment and the bridge:** the next pass writes the bridge once;
@@ -784,6 +899,11 @@ All on the simulator, with no broker calls.
   - **prior-session mark:** a quote observed in the latest completed regular session, at a pre-open start, gives `prior_session_mark`, and the position's outcome is `out_of_session`;
   - **older than that session:** a quote observed before the latest completed session's open is `mark_unverified`;
   - **illiquid option before the open:** no quote in the latest session gives `mark_unverified`. The startup still proceeds for the other positions, the option's `assumed_at` is null, and a BUY in it is refused with `CARRIED_MARK_UNVERIFIED`. At the first in-session fresh quote, its `assumed_at` is written. With none during the session, an alert is raised and the exposure stays open;
+  - **no decision from a stale price (rev. 6, REV151-03):**
+    - a `mark_unverified` position whose `broker_position_price` is below its stop is not exited on that price, and its stop is not ratcheted by a stale price above the trailing trigger;
+    - its time or near-expiry exit is still decided and submitted, and the gateway refuses it without a fresh quote;
+    - at the first accepted quote, the full evaluation runs from that quote and `assumed_at` is written;
+    - the other carried positions are evaluated every cycle throughout;
   - **at the open:** a start exactly at `next_session_open` uses `fresh_executable`;
   - **future timestamp:** a quote ahead of the clock beyond the skew allowance fails check 4, and the startup is refused;
   - **planned window:** a successor started in the planned pre-open window with carried equities and an illiquid option records `no_session_gap` for the generation, with the option's per-position exception, and nothing claims more than was checked.
@@ -836,6 +956,17 @@ All on the simulator, with no broker calls.
   - carried lots (D03): the adoption row's `carried` block (`provenance_chain`, `history`, `original_acquisition_price`, `original_opened_at`, `carried_quantity`), and the attribution field `original_basis_pnl`;
   - dispatch barrier (D04): `RUN_WIND_DOWN_ACTIVE_AT_DISPATCH`, `RUN_PAUSED_AT_DISPATCH`;
   - mark evidence (D05): acceptance results `prior_session_mark`, `fresh_executable` and `mark_unverified`; the refusal and alert `CARRIED_MARK_UNVERIFIED`; the field `broker_position_price`.
+- New strings in rev. 6:
+  - abandon (REV151-01): `registry_abandon_database_unverified`, `registry_abandon_protection_assumed`, `registry_abandon_broker_activity`, `registry_abandon_broker_unproven`, `registry_generation_abandoned`; the flag `--database-lost` and the entry field `database_lost`;
+  - dispatch outcome (REV151-02):
+    - the command `resolve-dispatch`;
+    - the outcome `SUBMISSION_ABSENT_OPERATOR_RESOLVED`;
+    - the alert and hold `RESOLVED_DISPATCH_APPEARED`;
+    - the handover field `watched_client_order_ids`, and the intent field `last_absent_at`;
+    - the provisional constant `DISPATCH_FINALITY_MINUTES`;
+    - withdrawn: `BROKER_NEVER_RECEIVED`, so a 404 no longer ends a `SUBMISSION_UNKNOWN` intent;
+  - reversal provenance (Q9): `predecessor_cash_reversal_unlinked`.
+- **Operational restriction (rev. 6, Q7):** one broker account is operated by TradePulse from exactly one machine, and nobody trades it by hand during a run or between generations. The run plan and `docs/operations-runbook.md` state this as a precondition of every run. The registry, the lease and broker corroboration all assume it, and none of them enforces it.
 - The build happens on its own branch and worktree, after Rev.146 is merged. Nothing is merged without review and the operator's approval.
 
 ## 12. Open questions for review
@@ -846,6 +977,7 @@ All on the simulator, with no broker calls.
 4. ~~§5 (escalation).~~ Decided 2026-11-03: 60 minutes, as an alert only.
 5. ~~§7.5 (continuity design).~~ Accepted with conditions (2026-11-04, the Rev.148 assessment): strict successor-start verification, an explicit exposure record in every case, and a gap audit that only detects and requires intervention. Applied in rev. 4 (§7.5). The original question was: this revision replaces the reviewer's preferred monitor overlap with a session-boundary rule plus operator acceptance, because the account lease makes overlap impossible and two monitors would risk a duplicate exit. Does the reviewer accept that equivalence?
 6. ~~§4.2 (option expiry across the gap).~~ Decided 2026-11-04 (reviewer recommendation): `unproven`, which blocks completion until the operator resolves it. The expiry day itself counts, and an unknown expiry counts too (§4.2, the option rule). The original question was: a carried option that expires before the successor's first regular session would expire unmonitored. Should such an option be `unproven` at wind-down, which blocks the seal until the operator acts, or carried with an alert?
-7. **§7.7 (registry scope, rev. 5):** the registry is local to one machine, like the account lease. Two machines trading one account are detected by neither. Is a per-machine registry with broker-fill corroboration acceptable until cloud hosting, or does the reviewer require a shared authority before the first Rev.147 run?
-8. **§7.5.1 (`mark_unverified`, rev. 5):** rev. 4 refused the whole successor start when one carried position had no acceptable mark. Rev. 5 starts the successor and holds back only that position: its `assumed_at` stays null and its exposure stays open, entries in it are refused, and it is assumed at its first fresh in-session quote. Does the reviewer accept this per-position assumption, which keeps every other position monitored?
-9. **§7.6 (reversal credits, rev. 5):** rev. 4 posted no cash entry for a fee reversal. Rev. 5 bridges it automatically as a signed credit (still not P&L, still alerted), because otherwise the successor's cash check fails. Is automatic bridging acceptable, or should a credit wait for operator acknowledgement, keeping the cash status unresolved until then?
+7. ~~§7.7 (registry scope).~~ Accepted conditionally (2026-11-07, the Rev.151 review): a per-machine registry is acceptable for the current single-machine deployment, as a hard operational restriction. Broker-fill corroboration is not distributed locking and cannot see another machine's unfilled orders. Applied in rev. 6 (§7.7 limits, §11).
+8. ~~§7.5.1 (`mark_unverified`).~~ Accepted with a clarification (2026-11-07): stale marks never drive a price-dependent decision. Applied in rev. 6 (§7.5.1, REV151-03).
+9. ~~§7.6 (reversal credits).~~ Accepted with provenance conditions (2026-11-07). A credit is bridged automatically only when it is linked to an attributed original fee, its raw digest verifies, and it is recorded once. An unlinked or ambiguous credit stays unresolved. The alert is mandatory either way. Applied in rev. 6 (§7.6).
+10. **§8 step 7 (`DISPATCH_FINALITY_MINUTES`, rev. 6):** the horizon after which an operator may resolve a dispatch the broker still does not show. It gates the operator's action and never resolves anything on its own. The proposed value is 15 minutes, provisional. Does the reviewer want a longer horizon, or a second lookup through the order census before the command is allowed?
