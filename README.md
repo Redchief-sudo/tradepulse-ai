@@ -10,6 +10,16 @@ python3 -m venv .venv
 cp .env.example .env  # fill in ALPACA_API_KEY / ALPACA_API_SECRET, etc.
 ```
 
+To reproduce the exact environment the test suite is verified in (Python 3.12; this is what a review or a deployment should use):
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements-lock.txt
+.venv/bin/pip install -e . --no-deps
+```
+
+`exchange_calendars` must be exactly the pinned version (Rev.144). The calendar refuses any other version, so tests that need it fail rather than run against a different calendar.
+
 ## Tests
 
 ```bash

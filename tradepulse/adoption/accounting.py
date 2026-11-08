@@ -18,9 +18,23 @@ def _adopted_lots(connection: sqlite3.Connection) -> list[Any]:
     return [lot for lot in lots if lot.origin == "adopted"]
 
 
+class FeeSplitError(ValueError):
+    """An order-level fee cannot be split: its amount or its weights are outside
+    the split's domain. An integrity error with a named reason, never a bare
+    decimal.InvalidOperation, a dropped amount or a wrong-signed part."""
+
+
 def _split(amount: Decimal, weights: Mapping[str, Decimal]) -> dict[str, Decimal]:
     """Largest remainder in the amount's own smallest unit (at least a cent),
-    ties broken by fill ID; the parts sum to the amount exactly."""
+    ties broken by fill ID; the parts sum to the amount exactly.
+
+    Rev.152 F151-01: the weights are fill quantities. There must be at least
+    one, and each must be positive, so the total is never zero, no amount is
+    dropped, and no part takes the wrong sign."""
+    if not amount.is_finite():
+        raise FeeSplitError(f"FEE_SPLIT_AMOUNT_INVALID: {amount}")
+    if not weights or any(not weight.is_finite() or weight <= 0 for weight in weights.values()):
+        raise FeeSplitError(f"FEE_SPLIT_WEIGHTS_INVALID: {dict(weights)}")
     exponent = amount.as_tuple().exponent
     unit = min(Decimal("0.01"), Decimal(1).scaleb(exponent if isinstance(exponent, int) else -2))
     total = sum(weights.values(), Decimal(0))
@@ -47,7 +61,9 @@ def closing_fee_allocation(connection: sqlite3.Connection, fills: list[Any]) -> 
             order_fills.setdefault(fill.order_id, []).append(fill)
     by_broker_id = {fill.broker_fill_id: fill for group in order_fills.values() for fill in group if fill.broker_fill_id}
     allocation = {fill.fill_id: fill.fees for group in order_fills.values() for fill in group}
-    for (payload,) in connection.execute("SELECT payload FROM reconciliation_records WHERE record_id LIKE 'generation_fee:%' ORDER BY record_id"):
+    applied = Decimal(0)  # Rev.152 F151-03: every receipt applied, counted once
+    for (record_id, payload) in connection.execute(
+            "SELECT record_id, payload FROM reconciliation_records WHERE record_id LIKE 'generation_fee:%' ORDER BY record_id"):
         actual = decode_payload(payload)["actual"]
         relation, fee = actual["authoritative_relationship"], -Decimal(actual["cash_debit"])
         named = by_broker_id.get(relation["fill_id"]) if relation.get("fill_id") else None
@@ -55,8 +71,20 @@ def closing_fee_allocation(connection: sqlite3.Connection, fills: list[Any]) -> 
             allocation[named.fill_id] += fee
         elif relation.get("order_id") in order_fills:
             group = order_fills[relation["order_id"]]
-            for fill_id, part in _split(fee, {fill.fill_id: fill.quantity for fill in group}).items():
+            parts = _split(fee, {fill.fill_id: fill.quantity for fill in group})
+            if sum(parts.values(), Decimal(0)) != fee:
+                raise FeeSplitError(f"FEE_SPLIT_NOT_CONSERVED: {record_id}")
+            for fill_id, part in parts.items():
                 allocation[fill_id] += part
+        else:
+            continue
+        applied += fee
+    # The allocation is recomputed from the immutable rows on every call, never
+    # accumulated, so replay cannot add a receipt twice. This proves the same
+    # for one call: the fills' own fees plus each applied receipt, once.
+    own = sum((fill.fees for group in order_fills.values() for fill in group), Decimal(0))
+    if sum(allocation.values(), Decimal(0)) != own + applied:
+        raise FeeSplitError("FEE_ALLOCATION_NOT_CONSERVED")
     return allocation
 
 
