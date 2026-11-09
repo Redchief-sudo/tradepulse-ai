@@ -100,7 +100,24 @@ Run on the branch head in a fresh virtualenv from `requirements-lock.txt` (Pytho
 - **mypy:** clean, 134 files.
 - **ruff:** no file changed in this Rev gains a finding (each is compared with the candidate commit `eaf70789`).
 
+## Real-broker conformance (Alpaca paper, 2026-11-09)
+
+`python_tests/broker_conformance/test_dispatch_conformance.py`. It runs on both simulators by default, and on the paper account with `-m integration`:
+- **`test_history_of_all_statuses_is_complete_with_page_proof`, read-only.**
+  - **On paper it passed** over 120 days: 73 orders, all filled, on one page, with the completeness proof holding. The last 7 days had no orders.
+  - **Paging across pages** was not exercised on real data, because the history is under the 500-order page limit. The simulator and HTTP-mock tests cover it.
+- **`test_order_a_real_order_blocks_dispatch_resolution`, behind the order guard.**
+  - **On paper it passed.** It placed one 1-share SPY limit buy at $1.00, cancelled it at once, and the order did not fill:
+    - the client-order-ID lookup and the history both list the order as cancelled;
+    - `resolve-dispatch` refuses with `BROKER_ORDER_PRESENT` for the order's own intent, and with `UNEXPLAINED_ASSET_ORDER` for an absent SPY dispatch;
+    - neither refusal changes local state.
+  - **Run by the operator.** Claude Code's permission policy did not allow it to place the order itself. The operator approved the order and ran the test in their own terminal.
+
+The run's evidence is in `review-evidence/paper/` in the rev.154 zip.
+
+**What a real broker cannot show:** an actual delayed request, a crash at an exact point, or a late appearance. These stay on the simulator and the fakes, because Alpaca cannot be made to hold a request on cue.
+
 ## Not in this Rev
 
 - **Carrying watches across generations** is Rev.147 work (`watched_client_order_ids`, spec §7.1, §8 step 7). Until it is built, keep the current database while a watch is active.
-- **A live broker** was not exercised. Every broker in the tests is a fake, an HTTP mock or the simulator.
+- **Live (real-money) trading** was not exercised. The paper account was exercised only by the two conformance tests above.
