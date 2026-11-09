@@ -24,7 +24,7 @@ from tradepulse.reconciliation.dispatch import (
 async def _sent(repositories, age=timedelta(minutes=20), status=TradeIntentStatus.SUBMITTED):
     await _stranded(repositories, status=status, age=timedelta(hours=1))
     row = await repositories.trade_intents.get('ti-1')
-    intent = replace(hydrate('trade_intents', row['payload']), submitted_at=NOW - age)
+    intent = replace(hydrate('trade_intents', row['payload']), dispatched_at=NOW - age)
     await repositories.trade_intents.update('ti-1', intent, status=status.value)
 
 
@@ -140,7 +140,7 @@ async def test_manual_resolution_refuses_unproven_absence(tmp_path, fault):
     broker = _absent_broker()
     reason = 'Investigated'
     if fault == 'legacy':
-        intent = replace(hydrate('trade_intents', await _payload(repositories)), submitted_at=None)
+        intent = replace(hydrate('trade_intents', await _payload(repositories)), dispatched_at=None)
         await repositories.trade_intents.update('ti-1', intent, status=intent.status.value)
     elif fault == 'account':
         broker.get_account.return_value = SimpleNamespace(account_number='OTHER')
@@ -228,7 +228,9 @@ async def test_late_appearance_blocks_reconciliation_without_adoption(tmp_path):
     await resolve_dispatch(repositories, broker, 'ti-1', 'Investigated', account_lease=_lease(), clock=lambda: NOW)
     broker.get_order_by_client_order_id.return_value = _order()
     summary = await run_reconciliation(repositories, broker, None, _no_op_alerter(), clock=lambda: NOW)
-    assert summary.status == 'degraded' and summary.error == 'RESOLVED_DISPATCH_APPEARED'
+    # Rev.154 R154-01: the pass continues after the appearance (this fake then
+    # fails a later step), and the appearance is always reported first.
+    assert summary.status == 'degraded' and summary.error.startswith('RESOLVED_DISPATCH_APPEARED')
     assert (await _payload(repositories))['status'] == 'rejected'
     # The hold exists even if no session was active before this pass.
     assert (await repositories.integrity_holds.get('order-9'))['status'] == 'resolved_dispatch_appeared'

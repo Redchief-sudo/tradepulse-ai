@@ -689,7 +689,7 @@ async def test_restart_after_ambiguous_buy_no_second_buy(tmp_path: Path) -> None
     before = await rig.pending()
     [intent] = await rig.intents()
     assert intent.status == TradeIntentStatus.SUBMISSION_UNKNOWN
-    assert intent.submitted_at == rig.now()  # dispatch time survives an ambiguous POST and restart
+    assert intent.dispatched_at == rig.now() and intent.submitted_at is None  # Rev.154: local dispatch time, no broker acceptance
     assert before == Decimal(_dbae(intent)["max_funding"]) > 0
 
     await rig.reopen()

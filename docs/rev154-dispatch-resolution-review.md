@@ -86,6 +86,8 @@ no broker order submission or cancellation.
 
 ## Late appearance
 
+> **Superseded in part by `docs/rev154-record.md` (R154-01).** The pass no longer returns early after an appearance, and `resolve-dispatch --acknowledge-appearance` closes the incident once the late order is terminal and every fill is accounted. The local dispatch time is now `dispatched_at` (R154-03), not `submitted_at`. Evidence windows start 5 minutes earlier (R154-02).
+
 At the beginning of each reconciliation pass, active watches are checked against
 their recorded venue/account. A late order creates a durable critical audit event
 and `RESOLVED_DISPATCH_APPEARED` order-level integrity hold, latches financial
