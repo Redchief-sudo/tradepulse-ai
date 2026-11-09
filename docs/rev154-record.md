@@ -2,7 +2,7 @@
 
 **Origin:** REV151-02, a delayed order request, from the Rev.151 review of the Rev.147 spec rev. 5. The stranded-intent sweep turned a broker 404 into `REJECTED` 120 s after `created_at`. A request that was only delayed could then become a live broker order that TradePulse believed was never sent.
 **Candidate:** `TradePulse_AI_Rev154_review_candidate.zip`, the reviewer's source copy against `3042abe7`. It is applied unchanged as `eaf70789`, without its generated listings (`rev154.patch`, `rev154-changed-files.txt`, `rev154-test-environment.txt`, `rev154-validation.txt`). Its own write-up is `docs/rev154-dispatch-resolution-review.md`.
-**Integration review:** the candidate was read in full against `3042abe7`, and its suite was re-run in a fresh environment built from `requirements-lock.txt`: 2,346 passed, mypy clean on 134 files, no new ruff findings. Five findings, R154-01..05, are fixed on this branch.
+**Integration review:** the candidate was read in full against `3042abe7`, and its suite was re-run in a fresh environment built from `requirements-lock.txt`: 2,346 passed, mypy clean on 134 files, no new ruff findings. Five findings, R154-01..05, are fixed on this branch. The re-review of the rev.154 zip found a sixth, R154-06, also fixed.
 **Branch:** `rev154-dispatch-resolution`, from main `3042abe7`. It is not merged without review and the operator's approval.
 
 ## What the candidate does (kept)
@@ -32,6 +32,7 @@
 | R154-03 | medium | **The broker's acceptance time was overwritten.** On acceptance, the gateway stored the local dispatch time in `submitted_at`, which fills copy (`fill_attribution.py`), in place of Alpaca's own `submitted_at`. That silently changed the meaning of an existing evidence field. | A new `TradeIntent.dispatched_at` holds the local dispatch time, set by the `SUBMITTED` write. `submitted_at` is the broker's again (`placed.submitted_at`, falling back to the clock, as before Rev.154). The sweep and `resolve-dispatch` read `dispatched_at`. Older rows hydrate with `None` and stay unclearable, as the candidate intended. |
 | R154-04 | low | **The alerts were misleading.** Moving `SUBMITTED` to `SUBMISSION_UNKNOWN` sent a *warning* saying the intent was "resolved". An absent `SUBMISSION_UNKNOWN` intent wrote a drift record on every pass, about 1,440 a day. | The transition sends a critical `SUBMISSION_UNKNOWN` alert naming the blocked asset and `resolve-dispatch`. `SUBMISSION_ABSENCE_UNPROVEN` joins the unprovable reasons: one critical alert and one drift record per intent per UTC day. |
 | R154-05 | medium (Rev.140) | **A releasable short-exposure hold could never be released.** `run_reconciliation` counted every hold row as `ACTIVE_INTEGRITY_HOLD`. That included a `SHORT_EXPOSURE` hold whose exposure was fully resolved, which only `reset-integrity` releases, in its own transaction. Reset needs that same reconciliation to be clean, so it always refused. Valuation and the unlock proof already used `active_hold_count`, which excludes such holds. | Reconciliation uses `active_hold_count` as well. |
+| R154-06 | high (merge blocker, from the re-review of rev.154) | **A stale watch row could recreate an acknowledged hold.** `check_resolved_dispatches` read the active watches, then awaited the broker lookup, then wrote the hold from the row it had read. An acknowledgement that committed during that lookup deleted the hold and closed the watch. The resumed pass then recreated the hold, leaving a closed watch with an active hold that later passes skip, which is a permanent block again. | The hold write re-reads the watch in its own write transaction. A watch acknowledged meanwhile is skipped: no hold, no latch, no alert. A watch whose recorded appeared order differs from the one now seen is refused (`DISPATCH_WATCH_ORDER_CHANGED`). Tested with the reviewer's exact sequence: the acknowledgement runs inside the paused lookup. The test fails on the previous code. |
 
 ### The acknowledgement (R154-01)
 
@@ -62,7 +63,7 @@
 - **Refusals:**
   - `APPEARED_ORDER_NOT_TERMINAL`, `APPEARED_FILLS_INCOMPLETE`, `APPEARED_FILL_UNACCOUNTED`, `APPEARED_FILL_QUANTITY_INVALID`;
   - `APPEARED_ORDER_IDENTITY_MISMATCH`, `APPEARED_ORDER_CHANGED`;
-  - `DISPATCH_NOT_APPEARED`, `DISPATCH_WATCH_NOT_FOUND`, `APPEARANCE_ALREADY_ACKNOWLEDGED`, `DISPATCH_WATCH_CHANGED`.
+  - `DISPATCH_NOT_APPEARED`, `DISPATCH_WATCH_NOT_FOUND`, `APPEARANCE_ALREADY_ACKNOWLEDGED`, `DISPATCH_WATCH_CHANGED`, `DISPATCH_WATCH_ORDER_CHANGED`.
 - **Other:**
   - the summary error `DISPATCH_WATCH_UNAVAILABLE`;
   - the audit event `resolved_dispatch_acknowledged`;
@@ -75,7 +76,7 @@ The candidate's own strings are in `docs/rev154-dispatch-resolution-review.md`.
 
 ## Tests
 
-`python_tests/test_rev154_integration.py` (20 cases):
+`python_tests/test_rev154_integration.py` (22 cases):
 - **R154-01:**
   - the pass continues after an appearance, so positions and activities are still reconciled, and the order is not adopted;
   - a later failure never hides the appearance;
@@ -87,6 +88,7 @@ The candidate's own strings are in `docs/rev154-dispatch-resolution-review.md`.
 - **R154-03:** on the simulator, acceptance keeps the broker's `submitted_at` and the local `dispatched_at` separate, and an old row without `dispatched_at` hydrates.
 - **R154-04:** becoming unknown is a critical alert, not a resolution, and an absence that persists is alerted once per UTC day with one drift record.
 - **R154-05:** a releasable short-exposure hold no longer degrades reconciliation, and an unreleased one still does.
+- **R154-06:** an acknowledgement that commits during the watch's broker lookup is never undone: no hold, and the watch stays closed. A changed appeared order is refused.
 
 Changes to the candidate's tests:
 - `_sent` sets `dispatched_at`;

@@ -166,6 +166,40 @@ async def test_acknowledgement_refuses_an_order_that_changes_during_the_read(tmp
         await acknowledge_appearance(repositories, broker, 'ti-1', 'Checked', account_lease=_lease(), clock=lambda: NOW)
 
 
+async def test_an_acknowledgement_during_the_watch_lookup_is_never_undone(tmp_path):
+    """R154-06 (the reviewer's sequence): a pass reads the active watch, then
+    pauses in its broker lookup; the operator's acknowledgement commits,
+    deleting the hold and closing the watch; the pass resumes. It must not
+    recreate the hold from its stale row."""
+    repositories, broker = await _appeared(tmp_path)
+    broker.get_order.return_value = _late_order('canceled', '0')
+    _with_fills(broker)
+    acknowledged = []
+
+    async def lookup_paused_by_the_acknowledgement(client_order_id):
+        acknowledged.append(await acknowledge_appearance(repositories, broker, 'ti-1', 'Checked',
+                                                         account_lease=_lease(), clock=lambda: NOW))
+        return _order()
+    broker.get_order_by_client_order_id.side_effect = lookup_paused_by_the_acknowledgement
+    assert await check_resolved_dispatches(repositories, broker, _no_op_alerter(), NOW) == 0
+    assert acknowledged and acknowledged[0]['order_status'] == 'canceled'
+    assert await repositories.integrity_holds.get('order-9') is None
+    assert (await _watch(repositories))['acknowledged_at'] == NOW.isoformat()
+    # And the closed watch stays closed: later passes skip it.
+    broker.get_order_by_client_order_id.side_effect = None
+    broker.get_order_by_client_order_id.reset_mock()
+    assert await check_resolved_dispatches(repositories, broker, _no_op_alerter(), NOW) == 0
+    broker.get_order_by_client_order_id.assert_not_awaited()
+
+
+async def test_a_watch_whose_appeared_order_changes_is_refused(tmp_path):
+    repositories, broker = await _appeared(tmp_path)
+    broker.get_order_by_client_order_id.return_value = SimpleNamespace(**{**vars(_order()), 'broker_order_id': 'order-10'})
+    with pytest.raises(DispatchResolutionRefused, match='DISPATCH_WATCH_ORDER_CHANGED'):
+        await check_resolved_dispatches(repositories, broker, _no_op_alerter(), NOW)
+    assert await repositories.integrity_holds.get('order-10') is None
+
+
 def test_cli_exposes_acknowledge_appearance():
     from tradepulse.cli import _build_parser
     args = _build_parser().parse_args(['resolve-dispatch', 'ti-1', '--reason', 'Checked', '--acknowledge-appearance'])

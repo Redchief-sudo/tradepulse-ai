@@ -206,6 +206,17 @@ async def check_resolved_dispatches(repositories, broker, alerts, now):
                            details={'broker_order_id': identifier, 'resolution_watch_id': row['record_id']})
 
         def persist(connection, identifier=identifier, row=row, hold=hold, event=event):
+            # Rev.154 R154-06: the row was read before the broker lookup was
+            # awaited. Re-read it in this write transaction: an acknowledgement
+            # that committed meanwhile closed the incident and deleted its
+            # hold, so recreating the hold from the stale row would leave a
+            # closed watch with an active hold that no later pass revisits.
+            current = connection.execute(
+                'SELECT appeared_order_id, acknowledged_at FROM resolved_dispatch_watches WHERE record_id=?',
+                (row['record_id'],)).fetchone()
+            if current is None or current['acknowledged_at'] is not None:
+                return False
+            _require(current['appeared_order_id'] in (None, identifier), 'DISPATCH_WATCH_ORDER_CHANGED')
             connection.execute('UPDATE resolved_dispatch_watches SET appeared_order_id=? WHERE record_id=?',
                                (identifier, row['record_id']))
             connection.execute('INSERT INTO integrity_holds(record_id,status,payload,created_at,updated_at) '
@@ -214,7 +225,9 @@ async def check_resolved_dispatches(repositories, broker, alerts, now):
                                (identifier, hold.hold_type.value, encode_payload(hold), now.isoformat(), now.isoformat()))
             connection.execute('INSERT OR IGNORE INTO audit_events(record_id,payload,created_at) VALUES(?,?,?)',
                                (event.event_id, encode_payload(event), now.isoformat()))
-        await database.run(persist, write=True)
+            return True
+        if not await database.run(persist, write=True):
+            continue  # closed by an acknowledgement during the lookup: no hold, no latch, no alert
         await latch_financial_integrity_block(repositories, reason, clock=lambda: now)
         # Durable audit above survives a failed notification; alert_once retries delivery.
         from tradepulse.alerts import alert_once
