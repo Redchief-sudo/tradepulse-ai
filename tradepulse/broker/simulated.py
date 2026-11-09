@@ -191,7 +191,7 @@ _OPERATION_NAMES = {  # the network-dependent calls, with AlpacaClient's operati
     "get_latest_quote": "getLatestQuote", "get_latest_option_quotes": "getLatestOptionQuotes",
     "get_options_chain": "getOptionsChain", "get_bars": "getBars", "place_order": "placeOrder",
     "get_order": "getOrder", "get_order_by_client_order_id": "getOrderByClientOrderId",
-    "get_open_orders": "getOpenOrders", "cancel_order": "cancelOrder", "get_activities": "getActivities",
+    "get_open_orders": "getOpenOrders", "get_order_history": "getOrderHistory", "cancel_order": "cancelOrder", "get_activities": "getActivities",
 }
 NETWORK_OPERATIONS = frozenset(_OPERATION_NAMES)
 
@@ -1399,6 +1399,17 @@ class SimulatedBroker:
         open_orders = sorted((o for o in self._orders.values() if o.status in OPEN_STATUSES),
                              key=lambda o: (o.created_at, o.seq), reverse=True)
         return [parse_order_data(o.raw(), request_id=None) for o in open_orders]
+
+    async def get_order_history(self, since: datetime, *, page_evidence: list[Any] | None = None) -> list[AlpacaOrderResponse]:
+        self._enter("get_order_history")
+        self._materialize(self._clock())
+        orders = sorted((o for o in self._orders.values() if o.created_at >= since),
+                        key=lambda o: (o.created_at, o.seq), reverse=True)
+        result = [parse_order_data(o.raw(), request_id=None) for o in orders]
+        if page_evidence is not None:
+            page_evidence.append({"request": {"status": "all", "after": since.isoformat()},
+                                  "order_ids": [o.broker_order_id for o in result], "terminal": True})
+        return result
 
     async def cancel_order(self, broker_order_id: str) -> None:
         """Effective at clock(). A terminal order is a 422, or silently

@@ -513,6 +513,9 @@ def test_reconciliation_has_explicit_generation_interface(generation):
     args = _build_parser().parse_args(["reconcile", "--verification-generation", "soak-paper-1"])
     assert args.verification_generation == "soak-paper-1"
     assert permit_command(generation.settings, "reconcile", "soak-paper-1")
+    assert permit_command(generation.settings, "resolve-dispatch", "soak-paper-1")
+    assert not permit_command(generation.settings, "resolve-dispatch", None)
+    assert not permit_command(generation.settings, "resolve-dispatch", "other-generation")
     assert not permit_command(generation.settings, "reconcile", None)
 
 

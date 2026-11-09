@@ -689,6 +689,7 @@ async def test_restart_after_ambiguous_buy_no_second_buy(tmp_path: Path) -> None
     before = await rig.pending()
     [intent] = await rig.intents()
     assert intent.status == TradeIntentStatus.SUBMISSION_UNKNOWN
+    assert intent.submitted_at == rig.now()  # dispatch time survives an ambiguous POST and restart
     assert before == Decimal(_dbae(intent)["max_funding"]) > 0
 
     await rig.reopen()
@@ -802,11 +803,11 @@ async def test_funding_conserved_across_crash_and_restart(tmp_path: Path) -> Non
     c_funding = Decimal(c_dbae["max_funding"])
     assert await rig.pending() == a_remaining + b_full + c_funding
 
-    # B: reconciliation proves Alpaca never received it.
+    # B: absence cannot prove rejection: keep its frozen funding reserved.
     rig.clock.advance(timedelta(seconds=STRANDED_INTENT_GRACE_SECONDS + 1))
-    assert await _recover_stranded_intents(rig.repositories, rig.broker, rig.alerts, rig.now()) == 1
-    assert (await _intent(rig, b.trade_intent_id)).status == TradeIntentStatus.REJECTED
-    assert await rig.pending() == a_remaining + c_funding
+    assert await _recover_stranded_intents(rig.repositories, rig.broker, rig.alerts, rig.now()) == 0
+    assert (await _intent(rig, b.trade_intent_id)).status == TradeIntentStatus.SUBMISSION_UNKNOWN
+    assert await rig.pending() == a_remaining + b_full + c_funding
 
     # A: canceled at the broker with 6 filled; reconciliation confirms the terminal state.
     a_order = a_intent.broker_order_id
@@ -815,7 +816,7 @@ async def test_funding_conserved_across_crash_and_restart(tmp_path: Path) -> Non
     settlement = SettlementProcessor(rig.repositories, rig.alerts, clock=rig.now)
     await _recover_inflight_orders(rig.repositories, rig.broker, settlement, rig.alerts, rig.now())
     assert (await _intent(rig, a.trade_intent_id)).status == TradeIntentStatus.CANCELED
-    assert await rig.pending() == c_funding
+    assert await rig.pending() == b_full + c_funding
 
 
 @pytest.mark.parametrize("slippage", [Decimal("0.1"), Decimal(3)], ids=["profile_lowered", "profile_raised"])

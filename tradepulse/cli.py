@@ -448,6 +448,31 @@ async def _run_bootstrap_fill_cursor(settings: Settings, reason: str) -> int:
         await broker.aclose()
 
 
+async def _run_resolve_dispatch(settings: Settings, intent_id: str, reason: str) -> int:
+    from tradepulse.reconciliation.dispatch import resolve_dispatch
+
+    _require_credentials(settings, require_ai=False)
+    database = AsyncSQLiteDatabase(settings.database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    broker = _build_broker(settings)
+    stack = contextlib.ExitStack()
+    try:
+        lease = await _enter_account_lease(stack, broker, "tradepulse resolve-dispatch")
+        if lease is None:
+            return 1
+        with stack:
+            try:
+                await resolve_dispatch(repositories, broker, intent_id, reason, account_lease=lease)
+            except Exception as exc:  # noqa: BLE001 - incomplete broker/provider evidence always refuses closure
+                logger.error("resolve_dispatch_refused", extra={"event": "resolve_dispatch_refused", "reason": str(exc)})
+                return 1
+            logger.info("dispatch_resolved", extra={"event": "dispatch_resolved", "trade_intent_id": intent_id})
+            return 0
+    finally:
+        await broker.aclose()
+
+
 async def _run_quarantine_resolve(settings: Settings, activity_id: str, reason: str) -> int:
     """`tradepulse quarantine resolve --activity --reason` (Rev.140 §3.7):
     resolves quarantined inventory from one verified broker execution. It
@@ -1246,6 +1271,10 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("stop", help="deactivate the trading session (never downgrades an active safety block)")
     subparsers.add_parser("status", help="report the current trading session state and exit")
     subparsers.add_parser("reset-risk", help="acknowledge and clear a RISK_STOPPED kill-switch (run start afterward to resume trading)")
+    dispatch_parser = subparsers.add_parser("resolve-dispatch", help="resolve an absent ambiguous dispatch with broker evidence")
+    dispatch_parser.add_argument("intent_id")
+    dispatch_parser.add_argument("--reason", required=True)
+    dispatch_parser.add_argument("--verification-generation", help="require the frozen official paper-verification generation")
     reset_integrity_parser = subparsers.add_parser(
         "reset-integrity", help="clear a FINANCIAL_INTEGRITY_BLOCKED session after a clean reconciliation pass (run start afterward to resume trading)"
     )
@@ -1408,6 +1437,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "reconcile" and generation is not None:
             return asyncio.run(run_official(settings, generation, lambda verification: _run_reconcile(settings),
                                             reconciliation_only=True))
+        if args.command == "resolve-dispatch":
+            if generation is not None:
+                return asyncio.run(run_official(
+                    settings, generation,
+                    lambda verification: _run_resolve_dispatch(settings, args.intent_id, args.reason),
+                    reconciliation_only=True,
+                ))
+            return asyncio.run(_run_resolve_dispatch(settings, args.intent_id, args.reason))
         if args.command == "quarantine":
             target = args.activity if args.action == "resolve" else args.lot_id
             if not args.reason.strip() or not target or (args.action == "resolve") == (args.lot_id is not None):

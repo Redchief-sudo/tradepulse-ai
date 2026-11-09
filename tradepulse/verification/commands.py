@@ -71,9 +71,9 @@ def permit_command(settings, command_name: str, generation: str | None) -> bool:
         return True
     try:
         binding = bound_generation(settings)
-        if generation is not None and (command_name not in {"run", "reconcile"} or generation != binding):
+        if generation is not None and (command_name not in {"run", "reconcile", "resolve-dispatch"} or generation != binding):
             raise VerificationError("official_generation_binding_missing_or_mismatched")
-        if binding is not None and (command_name not in {"run", "reconcile"} or generation != binding):
+        if binding is not None and (command_name not in {"run", "reconcile", "resolve-dispatch"} or generation != binding):
             raise VerificationError("bound_database_requires_explicit_official_run")
         return True
     except (OSError, ValueError, KeyError, TypeError, DatabaseError) as exc:

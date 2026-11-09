@@ -50,6 +50,10 @@ CREATE TABLE IF NOT EXISTS trade_intents (
   record_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
   payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS resolved_dispatch_watches (
+  record_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL, appeared_order_id TEXT
+);
 CREATE TABLE IF NOT EXISTS orders (
   record_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
   payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL

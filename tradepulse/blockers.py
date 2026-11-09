@@ -143,7 +143,9 @@ def _collect(connection: sqlite3.Connection) -> list[Blocker]:
             "stranded_intent", symbol, f"{row['status']} intent {row['record_id']} has no broker order id",
             _ORDER_BLOCK, row["created_at"], checked, True,
             "The stranded sweep looks the order up by client_order_id each reconciliation pass (after a 120 s "
-            "grace): it adopts a proven order, or closes the intent on Alpaca's definitive not-found."))
+            "grace from dispatch): it adopts a proven order. A sent order stays unknown on not-found and blocks "
+            "all orders, including exits. Use resolve-dispatch after 15 minutes with complete broker evidence; "
+            "legacy sent orders without submitted_at require investigation and cannot be cleared by this command."))
     return blockers
 
 

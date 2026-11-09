@@ -689,6 +689,13 @@ _UNPROVABLE_STRANDED_REASONS = frozenset({
 })
 
 
+def _stranded_ready(intent, now):
+    # Legacy sent records have no trustworthy dispatch time. Still look them
+    # up (adoption is safe), but never infer absence from their age.
+    start = intent.created_at if intent.status == TradeIntentStatus.RISK_APPROVED else intent.submitted_at
+    return start is None or (now - start).total_seconds() >= STRANDED_INTENT_GRACE_SECONDS
+
+
 async def _recover_stranded_intents(repositories, broker, alerts, now, lease_lost=None, *, lock_ttl_seconds=None,
                                     reconcile_lease=None) -> int:
     """Intents approved or marked submitted but never given a broker order id.
@@ -723,7 +730,7 @@ async def _recover_stranded_intents(repositories, broker, alerts, now, lease_los
         reserved = None  # (asset, token) once the reservation is ours
         try:
             candidate = hydrate("trade_intents", row["payload"])
-            if candidate.broker_order_id or (now - candidate.created_at).total_seconds() < STRANDED_INTENT_GRACE_SECONDS:
+            if candidate.broker_order_id or not _stranded_ready(candidate, now):
                 continue
             token = str(uuid4())
             if not await reserve_symbol_for_execution(database, candidate.asset, token):
@@ -794,7 +801,7 @@ async def _resolve_stranded(repositories, broker, alerts, trade_intent_id, now, 
     original_payload = row["payload"]
     intent = hydrate("trade_intents", original_payload)
     if (intent.status not in _STRANDED_STATUSES or intent.broker_order_id
-            or (now - intent.created_at).total_seconds() < STRANDED_INTENT_GRACE_SECONDS):
+            or not _stranded_ready(intent, now)):
         return False  # resolved or advanced by someone else since the scan -- nothing to do
     approved_on = intent.risk_snapshot.get("broker_account_number")
     try:
@@ -815,10 +822,15 @@ async def _resolve_stranded(repositories, broker, alerts, trade_intent_id, now, 
                           client_order_id=intent.trade_intent_id)
         action = "adopted the broker order Alpaca holds for this client_order_id"
     else:
-        reason = ("BROKER_NEVER_RECEIVED" if intent.status == TradeIntentStatus.SUBMISSION_UNKNOWN
-                  else "STRANDED_BEFORE_SUBMISSION")
-        updated = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason=reason)
-        action = "closed: Alpaca returned a definitive not-found for this client_order_id"
+        if intent.status == TradeIntentStatus.RISK_APPROVED:
+            updated = replace(intent, status=TradeIntentStatus.REJECTED,
+                              rejection_reason="STRANDED_BEFORE_SUBMISSION")
+            action = "closed an unsent approved intent under its execution reservation"
+        else:
+            updated = replace(intent, status=TradeIntentStatus.SUBMISSION_UNKNOWN)
+            action = "dispatch outcome remains unknown; broker not-found does not prove rejection"
+            if intent.status == TradeIntentStatus.SUBMISSION_UNKNOWN:
+                return await unresolved(intent, "SUBMISSION_ABSENCE_UNPROVEN")
     record = ReconciliationRecord(
         str(uuid4()), "order", intent.trade_intent_id, ReconciliationOutcome.CORRECTED,
         expected={"stranded_intent_resolved": True},
@@ -925,6 +937,13 @@ async def run_reconciliation(
     fill_overlap_days: int = 7,
 ) -> ReconciliationSummary:
     now = aware_utc(clock(), field_name='reconciliation_observed_at')
+    from .dispatch import check_resolved_dispatches
+    try:
+        appeared = await check_resolved_dispatches(repositories, broker, alerts, now)
+        if appeared:
+            return ReconciliationSummary('degraded', error='RESOLVED_DISPATCH_APPEARED')
+    except Exception as exc:  # noqa: BLE001 - watch lookup failure cannot authorize ordinary adoption
+        return ReconciliationSummary('degraded', error=f'DISPATCH_WATCH_UNAVAILABLE: {exc}')
     generation_membership = None
     try:
         from tradepulse.verification.opening import load_bound_opening_checkpoint

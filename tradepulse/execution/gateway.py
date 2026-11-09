@@ -1103,7 +1103,7 @@ class ExecutionGateway:
             order_type=request.order_type, time_in_force=default_time_in_force(request.asset.asset_class),
             client_order_id=trade_intent_id,
         )
-        submitted = replace(approved, status=TradeIntentStatus.SUBMITTED)
+        submitted = replace(approved, status=TradeIntentStatus.SUBMITTED, submitted_at=self._clock())
         await self._repositories.trade_intents.update(trade_intent_id, submitted, status=submitted.status.value)
         # Rev.149 R149-03: the SUBMITTED write is the last await before the
         # POST, so the quote is checked again after it. Nothing awaits between
@@ -1143,7 +1143,7 @@ class ExecutionGateway:
 
         accepted = replace(
             submitted, status=TradeIntentStatus.ACCEPTED, broker_order_id=placed.broker_order_id,
-            client_order_id=trade_intent_id, submitted_at=placed.submitted_at or self._clock(),
+            client_order_id=trade_intent_id, submitted_at=submitted.submitted_at,
         )
         await self._repositories.trade_intents.update(trade_intent_id, accepted, status=accepted.status.value)
 

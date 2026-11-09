@@ -68,6 +68,10 @@ class BrokerPort(Protocol):
 
     async def get_open_orders(self) -> list[OrderState]: ...
 
+    async def get_order_history(
+        self, since: datetime, *, page_evidence: list[Any] | None = None,
+    ) -> list[OrderState]: ...
+
     async def cancel_order(self, broker_order_id: str) -> None: ...
 
     async def get_activities(

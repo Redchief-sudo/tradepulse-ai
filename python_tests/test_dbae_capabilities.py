@@ -230,12 +230,12 @@ def test_evidence_age_limit_is_the_frozen_constant(monkeypatch: pytest.MonkeyPat
     assert dbae_policy_fingerprint()["dbae_evidence_max_age_seconds"] == 60
 
 
-def test_broker_port_unchanged() -> None:
-    # The BrokerPort member set at the DBAE base commit (DBAE-03: no new port methods).
+def test_broker_port_includes_dispatch_history() -> None:
+    # DBAE itself adds no methods; Rev.154 adds complete history for dispatch resolution.
     assert set(BrokerPort.__protocol_attrs__) == {
         "venue", "implementation", "get_account", "get_positions", "get_clock", "get_calendar",
         "get_dividend_announcements", "place_order", "get_order", "get_order_by_client_order_id",
-        "get_open_orders", "cancel_order", "get_activities", "get_latest_quote", "get_latest_option_quotes",
+        "get_open_orders", "get_order_history", "cancel_order", "get_activities", "get_latest_quote", "get_latest_option_quotes",
         "get_options_chain", "get_bars", "set_market_data_feeds", "rate_limit_snapshot", "aclose",
     }
 
