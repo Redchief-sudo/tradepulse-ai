@@ -98,7 +98,7 @@ Changes to the candidate's tests:
 ## G3
 
 Run on the branch head in a fresh virtualenv from `requirements-lock.txt` (Python 3.12.3). The results are in `review-evidence/` in the rev.154 zip.
-- **pytest:** 2366 passed, 10 deselected, exit 0. That is the candidate's 2346 plus the 20 new cases.
+- **pytest:** 2372 passed, 12 deselected, exit 0, at `5985a798`. That is the candidate's 2346, plus the 22 integration cases, plus the 4 simulator runs of the two conformance tests. The 2 extra deselected items are those tests' Alpaca paper variants, which ran separately (above).
 - **mypy:** clean, 134 files.
 - **ruff:** no file changed in this Rev gains a finding (each is compared with the candidate commit `eaf70789`).
 
