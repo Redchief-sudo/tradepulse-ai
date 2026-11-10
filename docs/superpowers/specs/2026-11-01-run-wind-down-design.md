@@ -1,6 +1,11 @@
 # Rev.147 — Verification run wind-down and generation handover
 
-**Status:** design, rev. 8, for forensic approval. No production code changes and no orders until the spec is approved.
+**Status:** design, rev. 9, for forensic approval. No production code changes and no orders until the spec is approved.
+**Rev. 9 (2026-11-10):** answers the rev.157 review (REV157-01..04).
+- **REV157-01, cash treatment.** Cash treatment is decided at resolution, from the actual activity named, its generation membership and the existing ledger entries. It is never decided from candidates. Every open obligation is carried forward in one list, whatever its candidates. There are four cash cases, each exactly once, and a two-generation test checks cash and P&L (§4.5.1, §7.6.1).
+- **REV157-02, one decision time.** Inside the dispatch transaction, one timestamp drives both the refusal and the deadline transition. An intent the transition rejected can never be written `SUBMITTED`. The test proves the clock is read while the transaction holds SQLite's write lock (§8 step 1).
+- **REV157-03, calendar coverage.** The broker calendar request starts at the last library session on or before `planned_end_at`, so a weekend or holiday `now` or end date is covered. Freeze is tested with `now` on a weekend and on a holiday (§4.5).
+- **REV157-04, the durable state before reconciliation.** The startup records `PAUSED`, or preserves or enters `WINDING_DOWN`, before startup reconciliation. A failure in reconciliation leaves that state, which is tested from a fresh connection (§6.2).
 **Rev. 8 (2026-11-10):** answers the rev.156 review (REV156-01..04) and its two smaller points. The reviewer confirmed Q10 and Q11.
 - **REV156-01, an amount match is not attribution.**
   - **Fee obligations:** each wind-down crypto sell fill gets one fee obligation, `fee_obligation:<fill_id>`.
@@ -227,7 +232,10 @@ Alpaca posts FEE and CFEE activities dated at midnight, after the fill (`broker/
 - **Fitting the wait into the gap (freeze check):** `planned_end_at` + 30 min + `CRYPTO_SELL_FEE_WAIT_HOURS` + `SUCCESSOR_START_MARGIN_MINUTES` (30) must be no later than `next_session_open`. That is 9 hours before the next open. Otherwise freeze refuses with `wind_down_end_fee_window_insufficient`.
   - **The authoritative next session.** `next_session_open` is the first XNYS session open strictly after `planned_end_at`, from the Rev.144 calendar, with all times in UTC. A holiday is skipped (it has no session), and daylight-saving changes are absorbed by the UTC session times. An early close moves the session's close, and with it the "inside a session" test, but not the next open.
   - **The broker must agree (rev. 8, REV156-03).** A fresh check alone is not enough: the age test (`CalendarGate.fresh`) says nothing about completion, agreement or coverage, and a fresh database holds no calendar evidence, because `_require_fresh` refuses populated tables. Freeze therefore takes its own evidence:
-    - **The read:** read-only, with the broker it already uses for the opening checkpoint, freeze calls `broker.get_calendar(ny_date(now), ny_date(next_session_open))`.
+    - **The read:** read-only, with the broker it already uses for the opening checkpoint, freeze calls `broker.get_calendar(range_start, ny_date(next_session_open))`.
+      - **`range_start` (rev. 9, REV157-03)** is the date of the last library XNYS session on or before `ny_date(planned_end_at)`, searched up to 14 days back. It is not `ny_date(now)`.
+      - **Why:** `compare()` covers only the dates between the first and last sessions the broker returns, so a request starting on a weekend or holiday would leave its own start date uncovered.
+      - **Both ends** of the request are now session dates, so every date between them is in coverage. A broker response that omits the start session leaves dates uncovered, and is refused.
     - **The comparison:** it runs the existing pure comparison (`calendar/checks.py::compare`) in memory.
     - **What must hold:** every date from `ny_date(planned_end_at)` through `ny_date(next_session_open)` is in the comparison's coverage with result `agreed`, including holidays, where both sides have no session. A missing date, a `contested` date, or a failed fetch refuses with `wind_down_end_calendar_unverified`.
     - **Where it is kept:** the request range, the response's SHA-256 and the per-date rows are frozen in the manifest as `policy.wind_down.calendar_evidence`. Nothing is written to the database, so the fresh-database rule is untouched.
@@ -263,9 +271,15 @@ Alpaca posts FEE and CFEE activities dated at midnight, after the fill (`broker/
 
 **At the seal:**
 - `fee_accounting` is `"complete"` only when every obligation is `closed`. Otherwise it is `"incomplete"`.
-- The handover lists each open obligation:
-  - as `unattributed_fee` when one or more candidates were booked inside the generation. The cash is already in this generation, so the later resolution is attribution only, with no cash entry;
-  - as `pending_fee` (reason `fee_wait_expired`) when no candidate posted. Its cash may arrive in the successor, where §7.6 and §7.6.1 apply after `--resolve-fee`.
+- **(rev. 9, REV157-01) The handover lists every open obligation** in one list, `pending_fees`, whatever its candidates. Each entry has `fee_obligation_id`, which is its `pending_fee_id`, the fill, the expected amount, the reason `fee_wait_expired`, and `fee_amount_candidates` as information only. There is no `unattributed_fee` category, because whether candidates exist does not decide the cash. Every open obligation is carried forward through each successor's handover until it is closed.
+- **Cash treatment is decided at resolution**, from the actual activity the operator names: its generation membership and the existing ledger entries. Candidates never decide it. `--resolve-fee` determines exactly one of four cases, records it as `cash_treatment` in the attribution record, and then acts:
+  1. **`origin_booked`:** the activity is in the origin generation's ledger (`broker:fee:<id>`, `in_generation` there). The resolution is attribution only. No cash entry is written anywhere.
+  2. **`successor_opening`:** the activity is in a successor's opening population (`pre_generation`). Its cash is already in that successor's opening cash. The resolution is attribution only.
+  3. **`successor_reclassified`:** the activity was booked in a successor as that successor's own fee (`broker:fee:<id>`, classed `in_generation` there, because it carried no link). No new cash entry is written. The successor writes `generation_predecessor_cash:<id>` with kind `reclassified_fee`, citing the existing cash entry. From then on the successor's equity, P&L and fee totals exclude it as `excluded_predecessor_cash`.
+  4. **`successor_bridged`:** the activity is in a successor but not booked there (`unresolved_generation_membership`). It is classified `predecessor_obligation`, and the §7.6.1 bridge writes exactly one `broker:predecessor_cash:<id>` cash entry.
+- **Exactly once,** checked across the account's generations (`fee_cash_not_exactly_once` otherwise):
+  - each fee activity ID has exactly one cash ledger entry, either `broker:fee:<id>` or `broker:predecessor_cash:<id>`, never both, and never one in two generations;
+  - each fee has exactly one P&L owner: the origin generation's adjusted result after resolution, or the generation that booked it before resolution.
 - The inventory outcome is reported separately from `fee_accounting`.
 
 **Fee not yet posted:** when a wait expires, the fee is recorded in the handover as a `pending_fee` (§7.1). It does not block `WIND_DOWN_COMPLETE`. It stays a durable predecessor obligation until it is attributed (§7.6) or resolved by the operator (§7.3). No timeout closes it.
@@ -328,7 +342,7 @@ Let **B** be the final census's broker positions, as (asset identity key, signed
 4. **Carried positions match:** for each carried asset, the broker quantity = the local holding quantity = the sum of the remaining quantities of the local open lots = the handover's `carried` entry. The protective state in the handover equals the holding and lot rows exactly (§7.1).
 5. **Residuals match:** for each residual asset, the broker quantity = the remaining quantity of its local lots = the handover's `residual` entry.
 6. **No orders open:** O = ∅, every local intent of the run is terminal, and the observed-order register (§4.1) is empty: every order ever observed has a broker terminal state.
-7. **Fills accounted:** every wind-down fill is settled and attributed. Each fill's fee obligation is closed (§4.5.1), or listed as `unattributed_fee` or `pending_fee` with `fee_accounting: "incomplete"`. An open fee obligation never blocks the inventory outcome, and it is never reported as complete.
+7. **Fills accounted:** every wind-down fill is settled and attributed. Each fill's fee obligation is closed (§4.5.1), or listed as a `pending_fee` with `fee_accounting: "incomplete"` (rev. 9: one list). An open fee obligation never blocks the inventory outcome, and it is never reported as complete.
 
 **For `UNRESOLVED_ACCEPTED`:**
 - items 1 and 4–7 must still hold;
@@ -350,17 +364,24 @@ The wind-down state lives in the generation's database, in a new append-only tab
 
 Whether the cause is a crash, a power loss, a service restart or a signal, `run --resume` does these steps in order, before any scan lane starts:
 1. Load the frozen `planned_end_at`, plus the latest `wind_down_events` row and any `end-run` request.
-2. Run the existing startup reconciliation, including reconciliation of every `SUBMISSION_UNKNOWN` intent by its original client order ID.
-3. Decide the phase:
+2. **(rev. 9, REV157-04) Record the durable state first, before anything asynchronous.** This is one transition write (§8 step 2), using one decision time:
+   - **`WINDING_DOWN`:** preserved, and nothing is written.
+   - **At or past `planned_end_at − lead`, or an `end_run_requested` exists:** `WIND_DOWN_REQUESTED` is recorded.
+   - **`RUNNING`** (no event, or a latest `run_resumed`): `run_paused` (cause `startup_recovery`) is recorded.
+   - **`PAUSED`:** nothing is written.
+
+   Only after this does any reconciliation or broker call begin. If anything later raises, or the process dies, the durable state is already `PAUSED` or `WINDING_DOWN`.
+3. Run the existing startup reconciliation, including reconciliation of every `SUBMISSION_UNKNOWN` intent by its original client order ID.
+4. Decide the phase from the durable state recorded in step 2:
    - If the current time is at or past `planned_end_at − lead`, or a `WINDING_DOWN` state or `end_run_requested` event exists, enter wind-down at the recorded sub-state. Scan lanes never start. Monitoring, settlement and reconciliation start.
-   - **Otherwise,** the run is `PAUSED` (or crashed). **Rev. 8 (REV156-04):** before any asynchronous check, the startup durably records the entry block. If the run state is `RUNNING`, meaning no event or a latest `run_resumed` (the crash case), it records `run_paused` with cause `startup_recovery`, through the transition write of §8 step 2, which also rejects any stale `RISK_APPROVED` BUY. A `WINDING_DOWN` state is preserved and never overwritten. The run returns to `RUNNING` only after all of these pass, in order. Any failure leaves the durable `PAUSED` state and refuses with the existing reason:
+   - **Otherwise,** the run is durably `PAUSED`, by step 2. It returns to `RUNNING` only after all of these pass, in order. Any failure leaves the durable `PAUSED` state and refuses with the existing reason:
      - the existing integrity check (`Verification.check`), including the Rev.146 DBAE fingerprint;
      - broker identity (`startup_broker_account_identity_changed`);
      - the frozen configuration (`frozen_configuration_mismatch`);
-     - the startup reconciliation from step 2, with every outstanding obligation reconciled.
+     - the startup reconciliation from step 3, with every outstanding obligation reconciled.
 
      On success, a `run_resumed` event is appended, and only then do scan lanes start.
-4. In wind-down, take a fresh census before any new order. A sell is never generated because an earlier submission timed out. Only a reconciled terminal state permits the next sell.
+5. In wind-down, take a fresh census before any new order. A sell is never generated because an earlier submission timed out. Only a reconciled terminal state permits the next sell.
 
 The previous generation's accounting and its evidence boundary are never touched. A late predecessor fee is attributed through §7.6.
 
@@ -395,7 +416,6 @@ At seal, the generation writes `handover.json` into its directory. It is include
 - **`residuals`:** each `crypto_residual`, with its quantity, its lot IDs and the reason.
 - **`unresolved`:** each `unproven` position and each `foreign_open_order`, with its class, quantity and reason. It is empty unless the outcome is `UNRESOLVED_ACCEPTED`.
 - **`fee_accounting`** (rev. 8): `complete` or `incomplete` (§4.5.1).
-- **`unattributed_fees`** (rev. 8): each open obligation whose cash was booked inside the generation. Each lists `fee_obligation_id`, the fill, the expected amount and `fee_amount_candidates`.
 - **`pending_fees`:** for each fill whose fee had not posted:
   - `pending_fee_id`;
   - the local fill ID, the broker fill (activity) ID and the broker order ID;
@@ -671,7 +691,10 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
 - **Split fee:** two activities, two bridges, each exactly once.
 - **Reversal or credit:** one positive bridge, a `fee_correction` record in the predecessor, and an alert, but only under the rev. 6 provenance conditions (§7.6). Otherwise it is held as `predecessor_cash_reversal_unlinked`, with no bridge.
 - **Before the successor's opening** (the activity is in the opening population): no bridge. It is already in the opening cash, so only the predecessor's `fee_attribution` is written (§7.6).
-- **Unlinked fee before `--resolve-fee`:** it stays `unresolved_generation_membership`, as today, which holds the successor's invariants unresolved. Once it is resolved, it is classified `predecessor_obligation` and bridged.
+- **Unlinked fee before `--resolve-fee` (corrected in rev. 9, REV157-01):** today's classifier gives it one of two memberships, depending on its timestamp and the opening cursor.
+  - **`unresolved_generation_membership`:** it is not booked. Resolution gives `successor_bridged`, with one bridge cash entry.
+  - **`in_generation` of the successor:** it is booked as the successor's own fee until resolved. Resolution gives `successor_reclassified`: no new cash entry, and from then on it is excluded from the successor's P&L (§4.5.1).
+  - Either way, the activity has one cash entry and one P&L owner at every moment.
 
 **The predecessor side.** The sealed figures never change. `post_seal_adjustments` lists each attributed amount, and the predecessor's adjusted result is the sealed result + Σ adjustments. The fee is in the predecessor's adjusted result once, and in the successor's P&L never. Both generations' cash bridges reconcile.
 
@@ -742,7 +765,10 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
 **The dispatch barrier.** It lives in the database, so a second or restarted process sees it, and it uses SQLite's serialized writes.
 1. **The dispatch write.** For a non-protective BUY, the `RISK_APPROVED` → `SUBMITTED` write becomes one `BEGIN IMMEDIATE` transaction that:
    - re-reads the run state from `wind_down_events`, and any successor hold (gap-breach or `mark_unverified` for the asset);
-   - **(rev. 8, REV156-02) checks the deadline itself.** It reads the clock *inside* the transaction, never a time captured before the database was awaited, and compares it with the frozen `planned_end_at − lead`. This does not depend on the watcher having run. At or past the deadline, the BUY is refused with `RUN_WIND_DOWN_ACTIVE_AT_DISPATCH`, and `WIND_DOWN_REQUESTED` (cause `deadline_at_dispatch`) is recorded in the same transaction if it is absent. That is the §8 step 2 transition, so every other `RISK_APPROVED` BUY is rejected with it. The fenced `RISK_APPROVED` write applies the same deadline test;
+   - **checks the deadline itself (rev. 8, REV156-02; corrected in rev. 9, REV157-02).**
+     - **One decision time.** The transaction samples **one** decision time `t`, once, after `BEGIN IMMEDIATE` has taken the write lock. The run-state refusal, the deadline test (`t ≥ planned_end_at − lead`) and the transition all use that same `t`. The clock is never read twice in one decision, and never before the database was awaited.
+     - **The transition forces the refusal.** At or past the deadline, the BUY is refused with `RUN_WIND_DOWN_ACTIVE_AT_DISPATCH`, and `WIND_DOWN_REQUESTED` (cause `deadline_at_dispatch`) is recorded if it is absent. That is the §8 step 2 transition, so every other `RISK_APPROVED` BUY is rejected with it. Whenever this transaction records the transition, the current intent is refused. An intent the transition rejected can never be written `SUBMITTED`.
+     - **The fenced `RISK_APPROVED` write** applies the same single-sample deadline test;
    - compares and sets the intent from its `RISK_APPROVED` payload, comparing the full payload, as the stranded sweep does;
    - writes `SUBMITTED` only when the run state is `RUNNING` and no hold applies. Otherwise, in the same transaction, it writes the intent `REJECTED` with `RUN_WIND_DOWN_ACTIVE_AT_DISPATCH`, `RUN_PAUSED_AT_DISPATCH`, `GAP_BREACH_UNACKNOWLEDGED` or `CARRIED_MARK_UNVERIFIED`, and `place_order` is never called.
 
@@ -998,15 +1024,26 @@ All on the simulator, with no broker calls.
 - **Fee waits (rev. 7, G1).** On the simulator with the measured posting (`cfee_usd_delay` = 4 h 17 min):
   - **USD fee inside the wait (rev. 8):** a wind-down crypto sell's USD CFEE posts at about 4 h 17 min, within the 8-hour wait.
     - Its cash is booked once, `in_generation`, as an `unallocated_account_fee`, and the cash invariant is `matched`.
-    - The fill's obligation stays `open`, with the activity as its candidate, and the handover lists it under `unattributed_fees` with `fee_accounting: "incomplete"`.
-    - After `--resolve-fee` it is `closed`, and `fee_accounting` is `"complete"` in `post_seal_adjustments`, with no new cash entry.
+    - The fill's obligation stays `open`, with the activity as its candidate, and the handover lists it in `pending_fees` with `fee_accounting: "incomplete"`.
+    - After `--resolve-fee` it is `closed` with `cash_treatment: origin_booked`, and `fee_accounting` is `"complete"` in `post_seal_adjustments`, with no new cash entry.
   - **Two equal expected fees, one activity (REV156-01):** two fills whose expected fees both round to $3.54, with one $3.54 CFEE posted. Both obligations stay `open`, and both list the activity. Resolving the first succeeds. Resolving the second with the same activity refuses with `fee_activity_already_attributed`.
   - **Unrelated or predecessor fee of equal amount:** a $3.54 fee from another fill, or attributed to a predecessor, is a candidate at most. It never closes the obligation, and it is shown `already_attributed` where that applies.
   - **Repeated reconciliation:** ten passes over the same rows give identical obligations and candidates. No activity closes more than one obligation, and the cash ledger has one entry per activity.
+  - **Two generations, exactly once (rev. 9, REV157-01).** G1 has two wind-down fills, each expecting $3.54. Activity A1 ($3.54) posts before G1 seals and is booked in G1. Both obligations are carried in G1's `pending_fees`, and both list A1. G2 is frozen and opens. Activity A2 ($3.54) posts after G2's opening, once with each membership:
+    - **(a) `in_generation` of G2:** resolving O1 ← A1 gives `origin_booked`. Resolving O2 ← A2 gives `successor_reclassified`. **Checks:**
+      - each of A1 and A2 has exactly one cash entry, account-wide;
+      - G1's adjusted P&L includes −$7.08 once;
+      - G2's P&L includes neither, after resolution, with `excluded_predecessor_cash` = −$3.54;
+      - both generations' cash invariants are `matched` before and after resolution;
+      - before resolution, A2 is in G2's P&L once and in G1's never.
+    - **(b) `unresolved_generation_membership` in G2:** resolving O2 ← A2 gives `successor_bridged`, with one `broker:predecessor_cash:A2` entry and no `broker:fee:A2`, and the same P&L totals.
+    - **(c) A2 in G2's opening population:** `successor_opening`, with no cash entry written.
+    - **In every variant:** resolving O2 ← A1 refuses with `fee_activity_already_attributed`, and the exactly-once check passes.
   - **USD fee after the wait:** with the USD CFEE delayed past 8 h, the seal proceeds with a `pending_fee`. In the successor the fee is unlinked, and it is held until `--resolve-fee`.
   - **Amount mismatch:** an obligation with no candidate inside the wait is a `pending_fee` (`fee_wait_expired`). `--resolve-fee` naming an activity one cent off refuses with `fee_attribution_amount_mismatch`. Cash and P&L come from the activities only.
   - **Native-coin buy fee:** it is waited for within 15 minutes through the existing asset-fee path.
   - **Freeze:** a `planned_end_at` that leaves less than 30 min + 8 h + 30 min before `next_session_open` refuses with `wind_down_end_fee_window_insufficient`. A weekday 16:30 ET end passes.
+  - **Calendar coverage (rev. 9, REV157-03):** freeze with `now` = Sunday 2026-11-15 and an end on Monday 2026-11-16 at 16:30 ET passes. So does freeze with `now` = Thanksgiving, 2026-11-26, and an end on Friday 2026-11-27 at 13:30 ET. The request starts at the last session on or before the end date, and each covered date is `agreed`.
   - **Authoritative next session (rev. 7 decision):** the examples in §4.5 are each a test: Thanksgiving 2026 (Wednesday 16:30 ET passes, with the next open on Friday 2026-11-27, an early-close day; Friday 13:30 ET, after the 13:00 close, is outside the session), the daylight-saving change (Monday 2027-03-15 00:30 EDT passes and 00:31 EDT is refused), Monday 2026-11-16 00:30 versus 00:31 ET, and refusals with `wind_down_end_calendar_unverified`:
     - a fetch that fails;
     - a broker response that is `contested` for any date in the range;
@@ -1072,9 +1109,14 @@ All on the simulator, with no broker calls.
     - the provisional constant `DISPATCH_FINALITY_MINUTES`;
     - withdrawn: `BROKER_NEVER_RECEIVED`, so a 404 no longer ends a `SUBMISSION_UNKNOWN` intent;
   - reversal provenance (Q9): `predecessor_cash_reversal_unlinked`.
+- New strings in rev. 9:
+  - the attribution field `cash_treatment`, with values `origin_booked`, `successor_opening`, `successor_reclassified` and `successor_bridged`;
+  - the bridge kind `reclassified_fee`;
+  - the refusal `fee_cash_not_exactly_once`.
+- Withdrawn in rev. 9: the `unattributed_fees` section, merged into `pending_fees`.
 - New strings in rev. 8:
   - the obligation ID `fee_obligation:<fill_id>`, with states `open` and `closed`;
-  - the field `fee_amount_candidates`, the handover section `unattributed_fees`, and the candidate flag `already_attributed`;
+  - the field `fee_amount_candidates` and the candidate flag `already_attributed`;
   - the refusal `fee_activity_already_attributed`;
   - the manifest field `policy.wind_down.calendar_evidence`;
   - the event causes `deadline_at_dispatch` and `startup_recovery`.

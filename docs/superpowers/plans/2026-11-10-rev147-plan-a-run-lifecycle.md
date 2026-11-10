@@ -12,7 +12,7 @@
 
 **Tech Stack:** Python 3.12, SQLite through `AsyncSQLiteDatabase`, pytest with asyncio auto mode, the Rev.144 `MarketCalendar`, and `SimulatedBroker`.
 
-**Spec:** `docs/superpowers/specs/2026-11-01-run-wind-down-design.md`, rev. 8: §3.1–§3.4, §4.5 freeze check, §6.1, §6.2, §8, and the strings in §11.
+**Spec:** `docs/superpowers/specs/2026-11-01-run-wind-down-design.md`, rev. 9: §3.1–§3.4, §4.5 freeze check, §6.1, §6.2, §8, and the strings in §11.
 
 ## Rev.147 plan roadmap
 
@@ -94,7 +94,8 @@ The spec is split into four plans. Each ends with software that works and is tes
   - the constants from Global Constraints;
   - `wind_down_policy(planned_end_at: datetime) -> dict[str, str]`, returning `{"planned_end_at", "lead_minutes", "crypto_sell_fee_wait_hours", "successor_start_margin_minutes", "fee_wait_minutes", "crypto_fee_rate"}`, all as strings;
   - `async def calendar_evidence(broker, calendar: MarketCalendar, planned_end_at: datetime, now: datetime) -> dict`:
-    - it fetches `broker.get_calendar(ny_date(now), ny_date(next_session_open(calendar, planned_end_at)))` and runs `calendar.checks.compare(calendar, Venue.US_EQUITY, sessions)`;
+    - it fetches `broker.get_calendar(range_start, ny_date(next_session_open(calendar, planned_end_at)))` and runs `calendar.checks.compare(calendar, Venue.US_EQUITY, sessions)`;
+    - `range_start` (REV157-03) is the date of the last library XNYS session on or before `ny_date(planned_end_at)`, searched up to 14 days back; never `ny_date(now)`. `compare()` covers only the dates between the first and last returned sessions, so both ends of the request must be session dates;
     - it returns `{"range_start", "range_end", "response_sha256", "rows"}`, with rows only for the dates in [ny_date(planned_end_at), ny_date(next open)];
     - a fetch error, an invalid response, a missing date or a `contested` date raises `VerificationError("wind_down_end_calendar_unverified")`. `CalendarGate.fresh` is never used for this (REV156-03).
   - `validate_planned_end(planned_end_at: datetime, now: datetime, calendar: MarketCalendar) -> None`. It is pure, and it raises `VerificationError` with one of:
@@ -130,6 +131,7 @@ The spec is split into four plans. Each ends with software that works and is tes
     - (c) the broker agrees, but its response stops one day before the next open's date (short coverage);
     - (d) the broker reports a session on Thanksgiving Day.
   - `test_calendar_evidence_is_frozen_not_stored`: after the freeze, `manifest["policy"]["wind_down"]["calendar_evidence"]["rows"]` covers every date from the planned end through the next open, all `agreed`. The `calendar_check_*` tables are empty.
+  - `test_freeze_on_a_weekend_or_holiday` (REV157-03): freeze with `now` = Sunday 2026-11-15 12:00 ET and an end on Monday 2026-11-16 at 16:30 ET passes, with the request starting on Friday 2026-11-13. Freeze with `now` = Thursday 2026-11-26 (Thanksgiving) and an end on Friday 2026-11-27 at 13:30 ET passes. In both, the evidence rows cover every date from the end through the next open, all `agreed`.
   - `test_valid_planned_end_skips_holidays`: from `now` = Wednesday 2026-11-25 17:00 ET, the helper returns Friday 2026-11-27's 13:00 early close plus 30 min, never Thursday.
   - `test_freeze_records_wind_down_policy`: the `generation` fixture's manifest has `policy["wind_down"] == wind_down_policy(end_at)`, and `check()["integrity_valid"]` is true.
   - `test_pre_wind_down_generation_is_refused`: following `test_dbae_activation.py::pre_dbae_generation`, monkeypatch `freeze_source` to drop `"wind_down"`. Then `check()["reason"] == "generation_predates_wind_down"`, and `invalid.json` is written.
@@ -144,12 +146,13 @@ The spec is split into four plans. Each ends with software that works and is tes
 
 **Files:**
 - Modify: `tradepulse/persistence/repositories.py`. Add `update(..., connection_precondition: Callable[[sqlite3.Connection], Sequence[str]] | None = None)`. It runs after `_check_lease` and `_check_precondition`, inside the same transaction, and raises `RepositoryPreconditionError(reasons)` on any reason.
-- Modify: `tradepulse/winddown/state.py`. Add `entry_refusals(connection, generation: str | None, deadline: datetime | None, clock: Callable[[], datetime]) -> list[str]`:
-  - it returns `[]` for `None` (no generation bound), or for `RUNNING` with `clock() < deadline`;
-  - `["RUN_PAUSED"]` for `PAUSED`;
-  - `["RUN_WIND_DOWN_ACTIVE"]` for `WINDING_DOWN`, **or** when `clock()`, read here inside the transaction, is at or past `deadline` (`planned_end_at − lead`, REV156-02);
+- Modify: `tradepulse/winddown/state.py`. Add `entry_refusals(connection, generation: str | None, deadline: datetime | None, at: datetime) -> list[str]`. `at` is the **one** decision time the caller sampled inside its transaction (REV157-02). This function never reads a clock.
+  - It returns `[]` for `None` (no generation bound), or for `RUNNING` with `at < deadline`.
+  - `["RUN_PAUSED"]` for `PAUSED`.
+  - `["RUN_WIND_DOWN_ACTIVE"]` for `WINDING_DOWN`, or when `at >= deadline`.
   - Plan D extends it with the per-asset holds.
-- Modify: `tradepulse/execution/gateway.py`. The gateway takes `generation: str | None = None`, and `_build_gateway` in `cli.py` passes the verification's generation. It also takes `deadline: datetime | None`, which is `planned_end_at − lead` from the manifest. For `request.side == Side.BUY`, the `RISK_APPROVED` update passes `connection_precondition=lambda c: entry_refusals(c, generation, deadline, self._clock)`. A refusal is handled like the DBAE precondition: closed unsubmitted, `REJECTED`, with the reason.
+- Modify: `tradepulse/persistence/repositories.py`. `connection_precondition` is called as `precondition(connection, at)`, where `at = clock()` is sampled once by `update` after `BEGIN IMMEDIATE`, from a `clock` argument the gateway passes.
+- Modify: `tradepulse/execution/gateway.py`. The gateway takes `generation: str | None = None`, and `_build_gateway` in `cli.py` passes the verification's generation. It also takes `deadline: datetime | None`, which is `planned_end_at − lead` from the manifest. For `request.side == Side.BUY`, the `RISK_APPROVED` update passes `connection_precondition=lambda c, at: entry_refusals(c, generation, deadline, at)` and `clock=self._clock`. A refusal is handled like the DBAE precondition: closed unsubmitted, `REJECTED`, with the reason.
 - Test: `python_tests/test_rev147_entry_refusal.py`
 
 **Interfaces:**
@@ -180,8 +183,9 @@ The spec is split into four plans. Each ends with software that works and is tes
 - Produces:
   - `dispatch_or_refuse(database, *, generation: str | None, deadline: datetime | None, clock: Callable[[], datetime], approved: TradeIntent, submitted: TradeIntent) -> list[str]`. It runs as one `BEGIN IMMEDIATE`:
     - **The intent:** it re-reads the row and requires `status == "risk_approved"` and a payload equal to `approved`, otherwise `["DISPATCH_INTENT_CHANGED"]` with nothing written.
-    - **For a BUY:** it calls `entry_refusals(c, generation, deadline, clock)`. The clock is read **inside** the transaction, never passed in as a precomputed `now` (REV156-02).
-    - **The deadline:** if `clock() >= deadline` and the state is not yet `WINDING_DOWN`, it also calls `append_transition(kind="WIND_DOWN_REQUESTED", cause="deadline_at_dispatch")` in the same transaction.
+    - **One decision time (REV157-02):** right after `BEGIN IMMEDIATE`, it samples `at = clock()` **once**. Every decision below uses `at`, and the clock is not read again.
+    - **For a BUY:** `reasons = entry_refusals(c, generation, deadline, at)`.
+    - **The deadline:** if `at >= deadline` and the state is not yet `WINDING_DOWN`, it calls `append_transition(kind="WIND_DOWN_REQUESTED", cause="deadline_at_dispatch", now=at)`. Then, **unconditionally**, `reasons` includes `RUN_WIND_DOWN_ACTIVE`, so the intent the transition just rejected can never be written `SUBMITTED`. The transition's own rejection of this intent and the barrier's refusal are the same write, with no second update.
     - **A refusal** is mapped to `RUN_PAUSED_AT_DISPATCH` or `RUN_WIND_DOWN_ACTIVE_AT_DISPATCH` (Plan D's hold reasons pass through unchanged). It writes the intent `REJECTED` with the first reason, in the same transaction.
     - **With no reason** it writes `submitted`, and returns `[]` once `SUBMITTED` has committed.
   - `append_transition(connection, *, generation, kind, cause, reason, now) -> list[str]`, for `end_run_requested`, `WIND_DOWN_REQUESTED` or `run_paused`. It appends the event, then, in the same transaction, moves every BUY intent in `risk_approved` to `REJECTED` (`RUN_WIND_DOWN_ACTIVE`, or `RUN_PAUSED` for `run_paused`), comparing each full payload. It returns the rejected intent IDs.
@@ -198,7 +202,13 @@ The spec is split into four plans. Each ends with software that works and is tes
     2. Pause a BUY at `quote`.
     3. Advance the `ManualClock` 1 s past `planned_end_at − 30 min`, then release.
     4. Expected: the BUY is `REJECTED` with `RUN_WIND_DOWN_ACTIVE_AT_DISPATCH`, no order reaches the simulator, and exactly one `WIND_DOWN_REQUESTED` with cause `deadline_at_dispatch` is recorded. A second paused BUY released afterwards is refused the same way, and no second event is recorded.
-  - `test_deadline_clock_is_read_inside_the_transaction`: the clock returns before the deadline when first read and after it when read again. The barrier refuses, which proves it read the clock inside the transaction.
+  - `test_deadline_clock_is_sampled_once_inside_the_write_lock` (REV157-02). This checks where the read happens, directly. The test clock, each time it is called:
+    - opens a **second** connection to the same database file with `timeout=0` and tries `BEGIN IMMEDIATE`. It records whether that raised `sqlite3.OperationalError("database is locked")`, which proves the barrier's write transaction holds the lock at that instant;
+    - records the call count;
+    - returns a time 1 s past the deadline.
+
+    Expected: exactly one call per dispatch, made while the lock is held. The BUY is `REJECTED` with `RUN_WIND_DOWN_ACTIVE_AT_DISPATCH`, the transition is recorded, and the intent is never `SUBMITTED`. The same clock check is applied to the fenced `RISK_APPROVED` write.
+  - `test_transition_in_this_transaction_always_refuses_the_current_intent`: with `entry_refusals` monkeypatched to return `[]`, a dispatch at `at >= deadline` still writes `REJECTED`, never `SUBMITTED`.
 - [ ] **Step 2: Run them, and confirm they fail.**
 - [ ] **Step 3: Implement** `barrier.py` and the gateway changes. The R149-03 quote recheck after the `SUBMITTED` commit stays synchronous.
 - [ ] **Step 4: Run them, plus the gateway, DBAE and Rev.154 suites.** `pytest python_tests -k "gateway or dbae or dispatch or stranded"`. Expected: PASS.
@@ -241,21 +251,29 @@ The spec is split into four plans. Each ends with software that works and is tes
 - Test: `python_tests/test_rev147_resume.py`
 
 **Interfaces:**
-- Produces: `async def decide_phase(database, generation, planned_end: datetime, now: datetime) -> Literal["wind_down", "resume_checks"]`.
-  - **(REV156-04) Before returning `"resume_checks"`,** if `run_state` is `RUNNING` (no events, or a latest `run_resumed`: the crash case), it durably records the entry block with `transition(kind="run_paused", cause="startup_recovery")`. That also rejects any stale `RISK_APPROVED` BUY.
-  - A `PAUSED` state is left as it is. A `WINDING_DOWN` state is never overwritten.
+- Produces: `async def enter_durable_state(database, generation, deadline: datetime, clock) -> RunState`. It is **the first database write of startup**, before reconciliation or any broker call (REV157-04). It is one transition write, with `at` sampled once inside it:
+  - `WINDING_DOWN` is preserved, and nothing is written;
+  - `at >= deadline`, or an `end_run_requested` exists: `WIND_DOWN_REQUESTED` (cause `planned_end`, or `end_run_requested`);
+  - `RUNNING` (no events, or a latest `run_resumed`): `run_paused` (cause `startup_recovery`), which also rejects any stale `RISK_APPROVED` BUY;
+  - `PAUSED`: nothing is written.
+
+  It returns the resulting state.
+- Produces: `def decide_phase(state: RunState) -> Literal["wind_down", "resume_checks"]`, which is pure.
   - It returns `"wind_down"` when `now >= planned_end − lead` (appending `WIND_DOWN_REQUESTED` if it is absent), or when the state is `WINDING_DOWN`.
   - Otherwise it returns `"resume_checks"`.
   - After the existing checks pass, `run_resumed` is appended (refused if the state is `WINDING_DOWN`), and only then do scan lanes start.
-- Startup order:
+- Startup order (REV157-04):
   1. load the policy and events;
-  2. the existing startup reconciliation (`_run_reconcile`);
-  3. `decide_phase`;
-  4. on `"resume_checks"`: `verification.check`, `runtime_started` (broker identity), and the reconciliation outcome. Any failure keeps the run `PAUSED`, returns 1, and starts no scan lane.
+  2. `enter_durable_state`;
+  3. the existing startup reconciliation (`_run_reconcile`);
+  4. `decide_phase`;
+  5. on `"resume_checks"`: `verification.check`, `runtime_started` (broker identity), and the reconciliation outcome. Any failure leaves the durable `PAUSED`, returns 1, and starts no scan lane. On success, `run_resumed`.
 
 - [ ] **Step 1: Write the failing tests.**
   - `test_crash_without_event_resumes_only_after_checks`: no events, every check passes. The events are exactly `run_paused` (`startup_recovery`), then `run_resumed`, and scan lanes start after the second.
   - `test_crash_without_event_then_failed_checks_stays_paused` (REV156-04): no events, and the broker identity check fails. `run_state` is durably `PAUSED`, read from a fresh connection after the process returns 1. A BUY submitted through a new gateway gives `RUN_PAUSED`. No `run_resumed` is recorded.
+  - `test_reconciliation_failure_leaves_the_durable_pause` (REV157-04): no events, and `_run_reconcile` raises. The process returns 1. A fresh connection reads `run_state == PAUSED` with cause `startup_recovery`. No `run_resumed` is recorded, and no scan lane started.
+  - `test_reconciliation_failure_after_the_deadline_leaves_wind_down`: `now` is past the deadline, with no events, and `_run_reconcile` raises. A fresh connection reads `WINDING_DOWN`, with `WIND_DOWN_REQUESTED` recorded before the reconciliation call. The recorded call order proves it.
   - `test_startup_recovery_rejects_a_stale_approved_buy`: a `risk_approved` BUY left by the crash is `REJECTED` (`RUN_PAUSED`) by the `startup_recovery` transition.
   - `test_paused_resume_refused_by_identity_change`: the broker reports another account. The state stays `PAUSED`, the result is 1, and no scan lane is started.
   - `test_restart_after_lead_enters_wind_down`: `now = planned_end − 10 min`. `"wind_down"`, `WIND_DOWN_REQUESTED` appended, and no scan lane.
