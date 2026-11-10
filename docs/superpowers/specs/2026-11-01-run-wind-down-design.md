@@ -1,10 +1,22 @@
 # Rev.147 — Verification run wind-down and generation handover
 
-**Status:** design, rev. 7, for forensic approval. No production code changes and no orders until the spec is approved.
+**Status:** design, rev. 8, for forensic approval. No production code changes and no orders until the spec is approved.
+**Rev. 8 (2026-11-10):** answers the rev.156 review (REV156-01..04) and its two smaller points. The reviewer confirmed Q10 and Q11.
+- **REV156-01, an amount match is not attribution.**
+  - **Fee obligations:** each wind-down crypto sell fill gets one fee obligation, `fee_obligation:<fill_id>`.
+  - **What closes one:** only a broker-identity link, which G1 shows Alpaca never gives for crypto, or the operator's `--resolve-fee`, validated by amount.
+  - **What an amount match is:** evidence only. It is listed as candidates, and it never consumes an activity, closes an obligation, or makes fee accounting complete.
+  - **The cash** of each fee activity is still booked once, as an unallocated account fee (§4.5, §4.5.1).
+- **REV156-02, the deadline at dispatch.** The dispatch transaction reads the clock itself and compares it with the frozen `planned_end_at − lead`, independently of the watcher. Past the deadline, it refuses the BUY and records `WIND_DOWN_REQUESTED` in that same transaction (§8 step 1).
+- **REV156-03, agreed calendar evidence.** Freeze fetches the broker calendar read-only and compares it with the Rev.144 calendar in memory. Every date from `planned_end_at` through `next_session_open` must be covered and `agreed`. The evidence is kept in the frozen manifest, not in the database, so the fresh-database rule is untouched (§4.5).
+- **REV156-04, the durable pause before resume checks.** On any start that is not a wind-down, `run_paused` (cause `startup_recovery`) is recorded before the asynchronous resume checks. `run_resumed` is recorded only after every check passes, so a failed restart leaves the run paused, durably (§6.2).
+- **Smaller points:**
+  - the test planned-end fixture uses real exchange sessions;
+  - G1's delays are described as observed `created_at` lag, not as a maximum delay before the API shows a fee.
 **Rev. 7 (2026-11-10):** records G1, the read-only CFEE history read of the paper account (§9), and amends the fee wait to match it (§4.5, §7.6, §12 q. 3 and 11).
 - **G1 measured:**
   - **Buys:** a crypto buy's fee is a native-coin CFEE ("Coin Pair Transaction Fee (Non USD)"), one per fill, 2–5 s after it.
-  - **Sells:** a crypto sell's fee is a USD CFEE ("Coin Pair Transaction Fee (USD)"), one per fill, **4 h 16 min 42 s** after it. It is 0.25% of quantity × price, rounded up to the cent.
+  - **Sells:** a crypto sell's fee is a USD CFEE ("Coin Pair Transaction Fee (USD)"), one per fill, with `created_at` **4 h 16 min 42 s** after it. That is the observed timestamp lag, not a maximum delay before the API shows the fee (rev. 8). It is 0.25% of quantity × price, rounded up to the cent.
   - **No link:** neither carries a `fill_id` or an `order_id`, and the USD CFEE has no symbol.
   - **Sample:** 1 sell order with 2 fills, and 2 buy orders with 4 fills. The evidence is in `~/tradepulse-evidence/2026-11-10-rev147-g1/`.
 - **Consequences:**
@@ -205,8 +217,8 @@ Alpaca posts FEE and CFEE activities dated at midnight, after the fill (`broker/
 
 **The wait (rev. 7, measured by G1).** For each wind-down fill, the wind-down waits for its fee activity before sealing. Any activity already visible is used.
 - **A crypto buy's native-coin fee** posts within seconds, through the existing asset-fee path. It is waited for up to `FEE_WAIT_MINUTES = 15`.
-- **A crypto sell's USD fee** posted 4 h 16 min 42 s after its fill in the one measured case. It is waited for up to `CRYPTO_SELL_FEE_WAIT_HOURS = 8` after the wind-down's last crypto sell fill.
-  - The fee then posts inside its own generation. The existing membership rules class it `in_generation`, and the existing exactly-once ledger records it as an `unallocated_account_fee`. No cross-generation attribution is needed.
+- **A crypto sell's USD fee:** in the one measured case, its `created_at` was 4 h 16 min 42 s after the fill. That is an **observed timestamp lag**, not a maximum delay before the API shows the fee (rev. 8). The wind-down waits up to `CRYPTO_SELL_FEE_WAIT_HOURS = 8` after its last crypto sell fill.
+  - A fee that posts inside the wait posts inside its own generation. The existing membership rules class it `in_generation`, and the existing exactly-once ledger books its cash once as an `unallocated_account_fee`. Booking the cash does **not** prove which fill the fee belongs to (§4.5.1).
   - **Provisional,** because the sample is one sell order. Each run's record states the measured delays, and the constant is revised when they say so.
 - **What the waits are:** they only decide how long the run waits before sealing with a fee still pending. They are timeouts, not settlement boundaries, and they never declare fee accounting complete (operator decision, 2026-11-10).
   - **An expired wait leaves an explicit unresolved state.** The handover and the run record carry `fee_accounting: "incomplete"`, listing each `pending_fee` with the reason `fee_wait_expired`. The run report says that fee accounting is incomplete. It never describes fee accounting as complete while a pending fee is open.
@@ -214,19 +226,49 @@ Alpaca posts FEE and CFEE activities dated at midnight, after the fill (`broker/
   - The inventory outcome (`COMPLETE` or `UNRESOLVED_ACCEPTED`) and `fee_accounting` are reported separately, so a proven inventory never implies proven fees.
 - **Fitting the wait into the gap (freeze check):** `planned_end_at` + 30 min + `CRYPTO_SELL_FEE_WAIT_HOURS` + `SUCCESSOR_START_MARGIN_MINUTES` (30) must be no later than `next_session_open`. That is 9 hours before the next open. Otherwise freeze refuses with `wind_down_end_fee_window_insufficient`.
   - **The authoritative next session.** `next_session_open` is the first XNYS session open strictly after `planned_end_at`, from the Rev.144 calendar, with all times in UTC. A holiday is skipped (it has no session), and daylight-saving changes are absorbed by the UTC session times. An early close moves the session's close, and with it the "inside a session" test, but not the next open.
-  - **The broker must agree.** Freeze also requires the Rev.144 broker calendar cross-check (`CalendarGate`) to be fresh for the dates involved. Otherwise it refuses with `wind_down_end_calendar_unverified`.
+  - **The broker must agree (rev. 8, REV156-03).** A fresh check alone is not enough: the age test (`CalendarGate.fresh`) says nothing about completion, agreement or coverage, and a fresh database holds no calendar evidence, because `_require_fresh` refuses populated tables. Freeze therefore takes its own evidence:
+    - **The read:** read-only, with the broker it already uses for the opening checkpoint, freeze calls `broker.get_calendar(ny_date(now), ny_date(next_session_open))`.
+    - **The comparison:** it runs the existing pure comparison (`calendar/checks.py::compare`) in memory.
+    - **What must hold:** every date from `ny_date(planned_end_at)` through `ny_date(next_session_open)` is in the comparison's coverage with result `agreed`, including holidays, where both sides have no session. A missing date, a `contested` date, or a failed fetch refuses with `wind_down_end_calendar_unverified`.
+    - **Where it is kept:** the request range, the response's SHA-256 and the per-date rows are frozen in the manifest as `policy.wind_down.calendar_evidence`. Nothing is written to the database, so the fresh-database rule is untouched.
+    - **Mismatch check:** `Verification.check` compares only the policy constants and `planned_end_at` for `frozen_configuration_mismatch`, never this evidence.
   - **Examples:**
     - a weekday end at 16:30 ET leaves 17 hours, and passes;
     - Monday 2026-11-16 at 00:31 ET is refused;
     - an end on the Wednesday before Thanksgiving (2026-11-25, 16:30 ET) skips the holiday, so the next open is Friday's early-close session at 09:30 ET on 2026-11-27, and it passes;
     - an end on Friday 2026-11-27 at 13:30 ET, after that early close at 13:00 ET, is outside the session, and passes;
     - after the 2027-03-14 daylight-saving change, Monday 2027-03-15 at 00:30 EDT is exactly 9 hours before that day's 09:30 EDT open (13:30 UTC, an hour earlier in UTC than the week before), and passes. 00:31 EDT is refused.
-- **Corroboration, not attribution:** each wind-down crypto sell fill is checked against the USD CFEEs posted inside its wait.
-  - The expected amount is −ceil_cent(quantity × price × the frozen crypto fee rate). The rate was 0.25% when measured, and it is frozen in the run's manifest.
-  - Exactly one match records `fee_corroborated`. No match, or more than one, records `fee_amount_unmatched` with an alert.
-  - Either way, the result is evidence in the run's record. Cash and P&L come from the fee activities themselves, never from this computation.
+- **Amounts are evidence, not attribution (rev. 8, REV156-01):** see §4.5.1. No amount computation closes an obligation or consumes an activity.
 - **Fee recognized in time:** recorded in the run's accounting as usual, through the existing exactly-once generation cash ledger. Its cash entry ID is `broker:fee:<activity_id>` (`reconciliation/generation_fees.py`).
-- **Fee not yet posted:** when a wait expires, the fee is recorded in the handover as a `pending_fee` (§7.1). It does not block `WIND_DOWN_COMPLETE`. It stays a durable predecessor obligation until it is attributed (§7.6) or resolved by the operator (§7.3). No timeout closes it.
+### 4.5.1 Fee obligations and what closes them (rev. 8, REV156-01)
+
+**An obligation per fill.** Each wind-down fill whose fee is not proven by broker identity gets one durable obligation, `fee_obligation:<fill_id>`. In practice that is every crypto sell fill, because G1 shows no crypto CFEE carries a link. It records:
+- the fill, the asset, the fill's quantity and price;
+- the frozen `crypto_fee_rate`, and the expected amount −ceil_cent(quantity × price × rate);
+- the state: `open` or `closed`.
+
+**What closes an obligation.** Only one of these:
+1. **A broker-identity link:** an activity whose `fill_id`, or `order_id` with an exact split under the existing `closing_fee_allocation` rule, names the fill. G1 shows this never happens for crypto today.
+2. **An operator `--resolve-fee <obligation_id> --activity <id>`** (§7.3), validated by amount. The activity's `net_amount` must equal the expected amount (`fee_attribution_amount_mismatch` otherwise). The activity must not already close another obligation (`fee_activity_already_attributed`); its ID is the attribution key, so it is unique across every generation's attributions.
+
+**What does not close an obligation:**
+- **An amount match:** a fee activity whose amount equals the expected amount is recorded as a **candidate** (`fee_amount_candidates`, a list of activity IDs) on every obligation it matches. A candidate is evidence for the operator. It never consumes the activity, never closes the obligation, and never makes `fee_accounting` complete.
+- **The cash booking:** the cash of every fee activity in the generation is booked exactly once, as an `unallocated_account_fee` (`broker:fee:<activity_id>`). That keeps the cash invariant exact, but proves nothing about which fill the fee belongs to.
+- **Time:** an expired wait closes nothing (operator decision, rev. 7).
+
+**What the candidates look like:**
+- **Two equal expected fees, one activity:** both obligations stay `open`, and both list the same single activity as a candidate. Resolving one with it succeeds. Resolving the other with the same activity refuses with `fee_activity_already_attributed`.
+- **An unrelated or predecessor fee of the same amount:** it is listed as a candidate, and it closes nothing. If it is already attributed elsewhere, it is listed with `already_attributed`.
+- **Repeated reconciliation:** the obligations and candidates are recomputed from immutable rows on every pass, never accumulated. One activity never satisfies two obligations, because only an attribution record closes one, and attributions are unique per activity.
+
+**At the seal:**
+- `fee_accounting` is `"complete"` only when every obligation is `closed`. Otherwise it is `"incomplete"`.
+- The handover lists each open obligation:
+  - as `unattributed_fee` when one or more candidates were booked inside the generation. The cash is already in this generation, so the later resolution is attribution only, with no cash entry;
+  - as `pending_fee` (reason `fee_wait_expired`) when no candidate posted. Its cash may arrive in the successor, where §7.6 and §7.6.1 apply after `--resolve-fee`.
+- The inventory outcome is reported separately from `fee_accounting`.
+
+**Fee not yet posted:** when a wait expires, the fee is recorded in the handover as a `pending_fee` (§7.1). It does not block `WIND_DOWN_COMPLETE`. It stays a durable predecessor obligation until it is attributed (§7.6) or resolved by the operator (§7.3). No timeout closes it.
   - **A crypto USD fee can only be attributed by the operator** (Q11, decided 2026-11-10). G1 shows it carries no link, so §7.6's linked-fee rule never matches it, and `--resolve-fee` is the only way to attribute it. The run plan says this. The 8-hour wait exists so that the path is the exception.
   - **The computed amount validates the attribution.** For a crypto sell's pending fee, `--resolve-fee` also requires the activity's `net_amount` to equal −ceil_cent(fill quantity × fill price × the frozen `crypto_fee_rate`). Otherwise it refuses with `fee_attribution_amount_mismatch`. The amount never selects the fill: the operator names the pending fee and the activity, and the command only checks them.
 
@@ -286,7 +328,7 @@ Let **B** be the final census's broker positions, as (asset identity key, signed
 4. **Carried positions match:** for each carried asset, the broker quantity = the local holding quantity = the sum of the remaining quantities of the local open lots = the handover's `carried` entry. The protective state in the handover equals the holding and lot rows exactly (§7.1).
 5. **Residuals match:** for each residual asset, the broker quantity = the remaining quantity of its local lots = the handover's `residual` entry.
 6. **No orders open:** O = ∅, every local intent of the run is terminal, and the observed-order register (§4.1) is empty: every order ever observed has a broker terminal state.
-7. **Fills accounted:** every wind-down fill is settled and attributed. Each fill's fee is either recognized or listed as a `pending_fee`.
+7. **Fills accounted:** every wind-down fill is settled and attributed. Each fill's fee obligation is closed (§4.5.1), or listed as `unattributed_fee` or `pending_fee` with `fee_accounting: "incomplete"`. An open fee obligation never blocks the inventory outcome, and it is never reported as complete.
 
 **For `UNRESOLVED_ACCEPTED`:**
 - items 1 and 4–7 must still hold;
@@ -311,7 +353,7 @@ Whether the cause is a crash, a power loss, a service restart or a signal, `run 
 2. Run the existing startup reconciliation, including reconciliation of every `SUBMISSION_UNKNOWN` intent by its original client order ID.
 3. Decide the phase:
    - If the current time is at or past `planned_end_at − lead`, or a `WINDING_DOWN` state or `end_run_requested` event exists, enter wind-down at the recorded sub-state. Scan lanes never start. Monitoring, settlement and reconciliation start.
-   - Otherwise, the run is `PAUSED` (or crashed), and it returns to `RUNNING` only after all of these pass, in order. Any failure keeps it paused and refuses with the existing reason:
+   - **Otherwise,** the run is `PAUSED` (or crashed). **Rev. 8 (REV156-04):** before any asynchronous check, the startup durably records the entry block. If the run state is `RUNNING`, meaning no event or a latest `run_resumed` (the crash case), it records `run_paused` with cause `startup_recovery`, through the transition write of §8 step 2, which also rejects any stale `RISK_APPROVED` BUY. A `WINDING_DOWN` state is preserved and never overwritten. The run returns to `RUNNING` only after all of these pass, in order. Any failure leaves the durable `PAUSED` state and refuses with the existing reason:
      - the existing integrity check (`Verification.check`), including the Rev.146 DBAE fingerprint;
      - broker identity (`startup_broker_account_identity_changed`);
      - the frozen configuration (`frozen_configuration_mismatch`);
@@ -352,6 +394,8 @@ At seal, the generation writes `handover.json` into its directory. It is include
   - `adoption_policy_version: "rev147-handover-v1"`.
 - **`residuals`:** each `crypto_residual`, with its quantity, its lot IDs and the reason.
 - **`unresolved`:** each `unproven` position and each `foreign_open_order`, with its class, quantity and reason. It is empty unless the outcome is `UNRESOLVED_ACCEPTED`.
+- **`fee_accounting`** (rev. 8): `complete` or `incomplete` (§4.5.1).
+- **`unattributed_fees`** (rev. 8): each open obligation whose cash was booked inside the generation. Each lists `fee_obligation_id`, the fill, the expected amount and `fee_amount_candidates`.
 - **`pending_fees`:** for each fill whose fee had not posted:
   - `pending_fee_id`;
   - the local fill ID, the broker fill (activity) ID and the broker order ID;
@@ -698,6 +742,7 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
 **The dispatch barrier.** It lives in the database, so a second or restarted process sees it, and it uses SQLite's serialized writes.
 1. **The dispatch write.** For a non-protective BUY, the `RISK_APPROVED` → `SUBMITTED` write becomes one `BEGIN IMMEDIATE` transaction that:
    - re-reads the run state from `wind_down_events`, and any successor hold (gap-breach or `mark_unverified` for the asset);
+   - **(rev. 8, REV156-02) checks the deadline itself.** It reads the clock *inside* the transaction, never a time captured before the database was awaited, and compares it with the frozen `planned_end_at − lead`. This does not depend on the watcher having run. At or past the deadline, the BUY is refused with `RUN_WIND_DOWN_ACTIVE_AT_DISPATCH`, and `WIND_DOWN_REQUESTED` (cause `deadline_at_dispatch`) is recorded in the same transaction if it is absent. That is the §8 step 2 transition, so every other `RISK_APPROVED` BUY is rejected with it. The fenced `RISK_APPROVED` write applies the same deadline test;
    - compares and sets the intent from its `RISK_APPROVED` payload, comparing the full payload, as the stranded sweep does;
    - writes `SUBMITTED` only when the run state is `RUNNING` and no hold applies. Otherwise, in the same transaction, it writes the intent `REJECTED` with `RUN_WIND_DOWN_ACTIVE_AT_DISPATCH`, `RUN_PAUSED_AT_DISPATCH`, `GAP_BREACH_UNACKNOWLEDGED` or `CARRIED_MARK_UNVERIFIED`, and `place_order` is never called.
 
@@ -753,7 +798,7 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
 ## 9. Gates
 
 - **G1 (read-only, before the build): done 2026-11-10.** The read covered 227 activities on 3 pages, the last one terminal, with the operator's go-ahead. Results:
-  - **Crypto sells:** one order with 2 fills. Each fill has one USD CFEE, posted 4 h 16 min 42 s later, at 0.25% of quantity × price rounded up to the cent ($3.54 and $5.77).
+  - **Crypto sells:** one order with 2 fills. Each fill has one USD CFEE, with `created_at` 4 h 16 min 42 s later (observed timestamp lag, not a maximum API delay), at 0.25% of quantity × price rounded up to the cent ($3.54 and $5.77).
   - **Crypto buys:** two orders with 4 fills. Each fill has one native SOL CFEE, posted 2.3 s and 4.5 s later, at 0.25% of quantity.
   - **No link:** no CFEE carries a `fill_id` or an `order_id`.
   - **Applied** in rev. 7 (§4.5, §7.6). The evidence is in `~/tradepulse-evidence/2026-11-10-rev147-g1/` (manifest sha256 `3e76666d…`).
@@ -951,12 +996,21 @@ All on the simulator, with no broker calls.
   - **future timestamp:** a quote ahead of the clock beyond the skew allowance fails check 4, and the startup is refused;
   - **planned window:** a successor started in the planned pre-open window with carried equities and an illiquid option records `no_session_gap` for the generation, with the option's per-position exception, and nothing claims more than was checked.
 - **Fee waits (rev. 7, G1).** On the simulator with the measured posting (`cfee_usd_delay` = 4 h 17 min):
-  - **USD fee inside the wait:** a wind-down crypto sell's USD CFEE posts at about 4 h 17 min, within the 8-hour wait. The seal waits for it, records it `in_generation` as an `unallocated_account_fee`, and records `fee_corroborated`. No `pending_fee` is carried.
+  - **USD fee inside the wait (rev. 8):** a wind-down crypto sell's USD CFEE posts at about 4 h 17 min, within the 8-hour wait.
+    - Its cash is booked once, `in_generation`, as an `unallocated_account_fee`, and the cash invariant is `matched`.
+    - The fill's obligation stays `open`, with the activity as its candidate, and the handover lists it under `unattributed_fees` with `fee_accounting: "incomplete"`.
+    - After `--resolve-fee` it is `closed`, and `fee_accounting` is `"complete"` in `post_seal_adjustments`, with no new cash entry.
+  - **Two equal expected fees, one activity (REV156-01):** two fills whose expected fees both round to $3.54, with one $3.54 CFEE posted. Both obligations stay `open`, and both list the activity. Resolving the first succeeds. Resolving the second with the same activity refuses with `fee_activity_already_attributed`.
+  - **Unrelated or predecessor fee of equal amount:** a $3.54 fee from another fill, or attributed to a predecessor, is a candidate at most. It never closes the obligation, and it is shown `already_attributed` where that applies.
+  - **Repeated reconciliation:** ten passes over the same rows give identical obligations and candidates. No activity closes more than one obligation, and the cash ledger has one entry per activity.
   - **USD fee after the wait:** with the USD CFEE delayed past 8 h, the seal proceeds with a `pending_fee`. In the successor the fee is unlinked, and it is held until `--resolve-fee`.
-  - **Amount mismatch:** an amount that differs by one cent, or two candidate matches, gives `fee_amount_unmatched` and an alert. Cash and P&L still come from the activity.
+  - **Amount mismatch:** an obligation with no candidate inside the wait is a `pending_fee` (`fee_wait_expired`). `--resolve-fee` naming an activity one cent off refuses with `fee_attribution_amount_mismatch`. Cash and P&L come from the activities only.
   - **Native-coin buy fee:** it is waited for within 15 minutes through the existing asset-fee path.
   - **Freeze:** a `planned_end_at` that leaves less than 30 min + 8 h + 30 min before `next_session_open` refuses with `wind_down_end_fee_window_insufficient`. A weekday 16:30 ET end passes.
-  - **Authoritative next session (rev. 7 decision):** the examples in §4.5 are each a test: Thanksgiving 2026 (Wednesday 16:30 ET passes, with the next open on Friday 2026-11-27, an early-close day; Friday 13:30 ET, after the 13:00 close, is outside the session), the daylight-saving change (Monday 2027-03-15 00:30 EDT passes and 00:31 EDT is refused), Monday 2026-11-16 00:30 versus 00:31 ET, and a stale broker cross-check refusing with `wind_down_end_calendar_unverified`.
+  - **Authoritative next session (rev. 7 decision):** the examples in §4.5 are each a test: Thanksgiving 2026 (Wednesday 16:30 ET passes, with the next open on Friday 2026-11-27, an early-close day; Friday 13:30 ET, after the 13:00 close, is outside the session), the daylight-saving change (Monday 2027-03-15 00:30 EDT passes and 00:31 EDT is refused), Monday 2026-11-16 00:30 versus 00:31 ET, and refusals with `wind_down_end_calendar_unverified`:
+    - a fetch that fails;
+    - a broker response that is `contested` for any date in the range;
+    - a broker response that agrees, but whose coverage ends before `next_session_open`'s date (a fresh check for other dates).
   - **Timeout, not completeness:** a wait that expires gives `fee_accounting: "incomplete"`, with each `pending_fee` marked `fee_wait_expired`, and the report says so. A later `--resolve-fee` for each one gives `"complete"` in `post_seal_adjustments`.
   - **Amount validates an attribution:** `--resolve-fee` naming a crypto USD fee whose amount is one cent off the computed fee refuses with `fee_attribution_amount_mismatch`. Two fills with identical computed fees are never resolved automatically.
 - **Frozen policy:** `generation_predates_wind_down`, and `frozen_configuration_mismatch` on a changed `planned_end_at`.
@@ -1018,6 +1072,13 @@ All on the simulator, with no broker calls.
     - the provisional constant `DISPATCH_FINALITY_MINUTES`;
     - withdrawn: `BROKER_NEVER_RECEIVED`, so a 404 no longer ends a `SUBMISSION_UNKNOWN` intent;
   - reversal provenance (Q9): `predecessor_cash_reversal_unlinked`.
+- New strings in rev. 8:
+  - the obligation ID `fee_obligation:<fill_id>`, with states `open` and `closed`;
+  - the field `fee_amount_candidates`, the handover section `unattributed_fees`, and the candidate flag `already_attributed`;
+  - the refusal `fee_activity_already_attributed`;
+  - the manifest field `policy.wind_down.calendar_evidence`;
+  - the event causes `deadline_at_dispatch` and `startup_recovery`.
+- Withdrawn in rev. 8: `fee_corroborated` and `fee_amount_unmatched`. Amount evidence is now `fee_amount_candidates`.
 - New strings in rev. 7:
   - the constants `CRYPTO_SELL_FEE_WAIT_HOURS` and `SUCCESSOR_START_MARGIN_MINUTES`;
   - the freeze refusal `wind_down_end_fee_window_insufficient`;
@@ -1039,5 +1100,5 @@ All on the simulator, with no broker calls.
 7. ~~§7.7 (registry scope).~~ Accepted conditionally (2026-11-07, the Rev.151 review): a per-machine registry is acceptable for the current single-machine deployment, as a hard operational restriction. Broker-fill corroboration is not distributed locking and cannot see another machine's unfilled orders. Applied in rev. 6 (§7.7 limits, §11).
 8. ~~§7.5.1 (`mark_unverified`).~~ Accepted with a clarification (2026-11-07): stale marks never drive a price-dependent decision. Applied in rev. 6 (§7.5.1, REV151-03).
 9. ~~§7.6 (reversal credits).~~ Accepted with provenance conditions (2026-11-07). A credit is bridged automatically only when it is linked to an attributed original fee, its raw digest verifies, and it is recorded once. An unlinked or ambiguous credit stays unresolved. The alert is mandatory either way. Applied in rev. 6 (§7.6).
-10. **§8 step 7 (`DISPATCH_FINALITY_MINUTES`, rev. 6):** the horizon after which an operator may resolve a dispatch the broker still does not show. It gates the operator's action and never resolves anything on its own. The proposed value is 15 minutes, provisional. Does the reviewer want a longer horizon, or a second lookup through the order census before the command is allowed?
-11. ~~§4.5 and §7.6 (crypto USD fees).~~ Decided by the operator (2026-11-10): manual `--resolve-fee` whenever attribution is not proven by broker identity. The exact amount cannot establish ownership, because separate fills can produce identical rounded fees. The computed amount only validates an operator attribution (`fee_attribution_amount_mismatch`). The reviewer is asked to confirm.
+10. **§8 step 7 (`DISPATCH_FINALITY_MINUTES`, rev. 6).** Confirmed by the reviewer (rev.156 review, 2026-11-10): 15 minutes is acceptable provisionally as the operator-resolution minimum, with Rev.154's evidence checks and watch intact. It never proves rejection. The original question was: the horizon after which an operator may resolve a dispatch the broker still does not show. It gates the operator's action and never resolves anything on its own. The proposed value is 15 minutes, provisional. Does the reviewer want a longer horizon, or a second lookup through the order census before the command is allowed?
+11. ~~§4.5 and §7.6 (crypto USD fees).~~ Decided by the operator (2026-11-10): manual `--resolve-fee` whenever attribution is not proven by broker identity. The exact amount cannot establish ownership, because separate fills can produce identical rounded fees. The computed amount only validates an operator attribution (`fee_attribution_amount_mismatch`). The reviewer confirmed it (rev.156 review): the exact amount validates an attribution, and does not establish ownership.
