@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from test_settlement_engine import _no_op_alerter, _repositories
+
 from tradepulse.execution import has_in_flight_intent, reserve_symbol_for_execution
 from tradepulse.models import (
     AssetClass,
@@ -418,14 +419,14 @@ async def test_sweep_retries_a_submission_unknown_intent_and_adopts_its_order(tm
     assert (payload["status"], payload["broker_order_id"]) == ("accepted", "order-9")
 
 
-async def test_sweep_closes_a_submission_unknown_intent_alpaca_never_received(tmp_path):
+async def test_sweep_keeps_a_submission_unknown_intent_when_broker_cannot_find_it(tmp_path):
     repositories = await _repositories(tmp_path)
     await _stranded(repositories, status=TradeIntentStatus.SUBMISSION_UNKNOWN)
     broker = _broker()
     broker.get_order_by_client_order_id.return_value = None  # definitive not-found, past the grace period
-    assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 1
-    assert (await _payload(repositories))["status"] == "rejected"
-    assert await has_in_flight_intent(repositories, BTC) is False
+    assert await _recover_stranded_intents(repositories, broker, _no_op_alerter(), NOW) == 0
+    assert (await _payload(repositories))["status"] == "submission_unknown"
+    assert await has_in_flight_intent(repositories, BTC) is True
 
 
 async def test_sweep_leaves_a_submission_unknown_intent_when_the_lookup_fails_again(tmp_path):

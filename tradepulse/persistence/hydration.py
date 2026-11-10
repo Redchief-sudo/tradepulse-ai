@@ -172,6 +172,7 @@ def decode_trade_intent(d: Mapping[str, Any]) -> TradeIntent:
         order_type=d.get("order_type", "market"),
         signal_timestamp=d.get("signal_timestamp"),
         submitted_at=_datetime_or_none(d.get("submitted_at")),
+        dispatched_at=_datetime_or_none(d.get("dispatched_at")),
     )
 
 

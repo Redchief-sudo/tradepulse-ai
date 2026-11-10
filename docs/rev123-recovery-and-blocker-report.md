@@ -11,6 +11,9 @@ Rev.123 follows Rev.122 (`b0564522`). An external review recommended checking th
 
 The paper account (read-only) holds one IWM 2026-10-30 286 call left by the 2026-09-29 soak, and no open orders. `tradepulse-service.db` does not exist yet.
 
+> Superseded by Rev.154 for absence handling: a sent order is never automatically rejected on not-found.
+> The recovery and test descriptions below record Rev.123's historical behavior.
+
 ## 1. SUBMISSION_UNKNOWN intents were never retried
 
 **Finding.** A submission whose outcome is ambiguous, and whose own client-order-id lookup also fails (a network blip, say), becomes SUBMISSION_UNKNOWN with no broker order id. In-flight recovery needs an order id; the stranded sweep covered only RISK_APPROVED and SUBMITTED. The gateway retries only when the same idempotency key runs again, which a new scan never does. One temporary failure therefore blocked the asset, protective exits included, until an operator noticed.

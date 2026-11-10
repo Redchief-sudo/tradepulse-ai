@@ -1127,7 +1127,7 @@ async def test_disconnection_fails_exactly_the_network_calls_and_spares_local_on
         "get_dividend_announcements": broker.get_dividend_announcements("AAPL", T0.date(), T0.date()),
         "place_order": broker.place_order(_order("AAPL", "1")), "get_order": broker.get_order("x"),
         "get_order_by_client_order_id": broker.get_order_by_client_order_id("x"),
-        "get_open_orders": broker.get_open_orders(), "cancel_order": broker.cancel_order("x"),
+        "get_open_orders": broker.get_open_orders(), "get_order_history": broker.get_order_history(T0), "cancel_order": broker.cancel_order("x"),
         "get_activities": broker.get_activities(), "get_latest_quote": broker.get_latest_quote("AAPL", AssetClass.EQUITY),
         "get_latest_option_quotes": broker.get_latest_option_quotes([OCC]),
         "get_options_chain": broker.get_options_chain("AAPL", "2026-10-01", "2026-12-31"),

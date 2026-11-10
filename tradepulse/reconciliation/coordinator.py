@@ -686,7 +686,20 @@ _STRANDED_STATUSES = (TradeIntentStatus.RISK_APPROVED, TradeIntentStatus.SUBMITT
 # Reasons no retry can clear without an operator; everything else is transient.
 _UNPROVABLE_STRANDED_REASONS = frozenset({
     "ACCOUNT_IDENTITY_UNPROVEN", "STRANDED_ORDER_IDENTITY_MISMATCH", "STRANDED_INTENT_UNDER_INTEGRITY_HOLD",
+    # Rev.154 R154-04: a sent order the broker still cannot find. Only the
+    # broker showing it, or an operator resolve-dispatch, ends it, so it is
+    # alerted once per UTC day with one drift record, not every pass.
+    "SUBMISSION_ABSENCE_UNPROVEN",
 })
+
+
+def _stranded_ready(intent, now):
+    # Rev.154: a sent intent's grace counts from its local dispatch write
+    # (dispatched_at), never from creation. Legacy sent records have no
+    # dispatch time: still look them up (adoption is safe), but never infer
+    # absence from their age.
+    start = intent.created_at if intent.status == TradeIntentStatus.RISK_APPROVED else intent.dispatched_at
+    return start is None or (now - start).total_seconds() >= STRANDED_INTENT_GRACE_SECONDS
 
 
 async def _recover_stranded_intents(repositories, broker, alerts, now, lease_lost=None, *, lock_ttl_seconds=None,
@@ -723,7 +736,7 @@ async def _recover_stranded_intents(repositories, broker, alerts, now, lease_los
         reserved = None  # (asset, token) once the reservation is ours
         try:
             candidate = hydrate("trade_intents", row["payload"])
-            if candidate.broker_order_id or (now - candidate.created_at).total_seconds() < STRANDED_INTENT_GRACE_SECONDS:
+            if candidate.broker_order_id or not _stranded_ready(candidate, now):
                 continue
             token = str(uuid4())
             if not await reserve_symbol_for_execution(database, candidate.asset, token):
@@ -794,7 +807,7 @@ async def _resolve_stranded(repositories, broker, alerts, trade_intent_id, now, 
     original_payload = row["payload"]
     intent = hydrate("trade_intents", original_payload)
     if (intent.status not in _STRANDED_STATUSES or intent.broker_order_id
-            or (now - intent.created_at).total_seconds() < STRANDED_INTENT_GRACE_SECONDS):
+            or not _stranded_ready(intent, now)):
         return False  # resolved or advanced by someone else since the scan -- nothing to do
     approved_on = intent.risk_snapshot.get("broker_account_number")
     try:
@@ -815,10 +828,15 @@ async def _resolve_stranded(repositories, broker, alerts, trade_intent_id, now, 
                           client_order_id=intent.trade_intent_id)
         action = "adopted the broker order Alpaca holds for this client_order_id"
     else:
-        reason = ("BROKER_NEVER_RECEIVED" if intent.status == TradeIntentStatus.SUBMISSION_UNKNOWN
-                  else "STRANDED_BEFORE_SUBMISSION")
-        updated = replace(intent, status=TradeIntentStatus.REJECTED, rejection_reason=reason)
-        action = "closed: Alpaca returned a definitive not-found for this client_order_id"
+        if intent.status == TradeIntentStatus.RISK_APPROVED:
+            updated = replace(intent, status=TradeIntentStatus.REJECTED,
+                              rejection_reason="STRANDED_BEFORE_SUBMISSION")
+            action = "closed an unsent approved intent under its execution reservation"
+        else:
+            updated = replace(intent, status=TradeIntentStatus.SUBMISSION_UNKNOWN)
+            action = "dispatch outcome remains unknown; broker not-found does not prove rejection"
+            if intent.status == TradeIntentStatus.SUBMISSION_UNKNOWN:
+                return await unresolved(intent, "SUBMISSION_ABSENCE_UNPROVEN")
     record = ReconciliationRecord(
         str(uuid4()), "order", intent.trade_intent_id, ReconciliationOutcome.CORRECTED,
         expected={"stranded_intent_resolved": True},
@@ -831,6 +849,18 @@ async def _resolve_stranded(repositories, broker, alerts, trade_intent_id, now, 
         write=True)
     if outcome != "committed":
         return await unresolved(intent, outcome)
+    if updated.status == TradeIntentStatus.SUBMISSION_UNKNOWN:
+        # Rev.154 R154-04: nothing was resolved. The asset is now blocked for
+        # every order, protective exits included, until the broker shows the
+        # order or the operator proves its absence.
+        await alerts.send(
+            "critical",
+            f"SUBMISSION_UNKNOWN: {intent.asset.symbol} {intent.side.value} intent {intent.trade_intent_id} was sent but "
+            "Alpaca cannot find it -- it may still arrive. The asset stays blocked for all orders, including "
+            "protective exits; reconciliation keeps looking it up. If it never appears, run `tradepulse "
+            "resolve-dispatch` (at least 15 minutes after dispatch, with complete broker evidence).",
+            {"trade_intent_id": intent.trade_intent_id})
+        return True
     await alerts.send("warning", f"Stranded {intent.status.value} intent for {intent.asset.symbol} resolved: {action}",
                       {"trade_intent_id": intent.trade_intent_id})
     return True
@@ -912,6 +942,12 @@ async def _recover_inflight_orders(repositories, broker, settlement, alerts, now
         await _record_feed_transition(repositories, record)
 
 
+def _with_dispatch_error(dispatch_error: str | None, error: str) -> str:
+    """Rev.154 R154-01: a later step's failure never hides a late appearance
+    or an unavailable watch lookup found at the start of the pass."""
+    return f"{dispatch_error}; {error}" if dispatch_error else error
+
+
 async def run_reconciliation(
     repositories: PersistenceRepositories,
     broker: BrokerPort,
@@ -925,6 +961,25 @@ async def run_reconciliation(
     fill_overlap_days: int = 7,
 ) -> ReconciliationSummary:
     now = aware_utc(clock(), field_name='reconciliation_observed_at')
+    from .dispatch import check_resolved_dispatches
+
+    # Rev.154 R154-01: a late appearance holds and latches, then the pass goes
+    # on, so the late order's own fills, other assets' stranded intents and the
+    # rest of the accounting are still reconciled. Nothing below can adopt the
+    # resolved order: its intent is REJECTED with no broker order id, so the
+    # sweep never revisits it and its fills reach the unresolved-execution
+    # path (Rev.140 §3.1a). The pass is degraded until the operator
+    # acknowledges the appearance (resolve-dispatch --acknowledge-appearance).
+    dispatch_error = None
+    try:
+        if await check_resolved_dispatches(repositories, broker, alerts, now):
+            dispatch_error = 'RESOLVED_DISPATCH_APPEARED'
+    except Exception as exc:  # noqa: BLE001 - an unavailable watch lookup degrades this pass; the rest still runs
+        dispatch_error = f'DISPATCH_WATCH_UNAVAILABLE: {exc}'
+        await _alert_once(repositories, alerts, event_type="reconciliation_degraded", subject="dispatch_watches",
+                          window=_utc_hour(now), severity="critical",
+                          message=f"Reconciliation degraded -- resolved-dispatch watch lookup unavailable: {exc}",
+                          details={"error": str(exc)}, now=now)
     generation_membership = None
     try:
         from tradepulse.verification.opening import load_bound_opening_checkpoint
@@ -945,7 +1000,7 @@ async def run_reconciliation(
         reason = 'GENERATION_POPULATION_INVALID:' + str(exc)
         await latch_financial_integrity_block(repositories, reason, clock=lambda: now)
         await alerts.send('critical', reason, {})
-        return ReconciliationSummary('degraded', error=reason)
+        return ReconciliationSummary('degraded', error=_with_dispatch_error(dispatch_error, reason))
     if generation_membership is not None:
         await _attribute_dividends(repositories, broker, alerts, now)
     from tradepulse.adoption.accounting import recompute_attributions  # Rev.142 §3.6.2: a projection
@@ -977,7 +1032,7 @@ async def run_reconciliation(
     except Exception as exc:  # noqa: BLE001 - a broker outage here must fail this pass cleanly, not crash the caller
         await _alert_once(repositories, alerts, event_type="reconciliation_degraded", subject="positions", window=_utc_hour(now),
                           severity="critical", message=f"Reconciliation degraded -- Alpaca positions unavailable: {exc}", details={"error": str(exc)}, now=now)
-        return ReconciliationSummary("degraded", error=f"BROKER_POSITIONS_UNAVAILABLE: {exc}")
+        return ReconciliationSummary("degraded", error=_with_dispatch_error(dispatch_error, f"BROKER_POSITIONS_UNAVAILABLE: {exc}"))
 
     try:
         fills_checked, missed_fills_detected, late_fills_recovered = await _reconcile_fills(
@@ -989,7 +1044,7 @@ async def run_reconciliation(
                           severity="critical", message=f"Reconciliation degraded -- Alpaca activities unavailable: {exc}", details={"error": str(exc)}, now=now)
         return ReconciliationSummary(
             "degraded", positions_checked, view_drift_corrected, accounting_drift_detected,
-            error=f"BROKER_ACTIVITIES_UNAVAILABLE: {exc}",
+            error=_with_dispatch_error(dispatch_error, f"BROKER_ACTIVITIES_UNAVAILABLE: {exc}"),
         )
 
     try:
@@ -1000,7 +1055,7 @@ async def run_reconciliation(
         return ReconciliationSummary(
             "degraded", positions_checked, view_drift_corrected, accounting_drift_detected,
             fills_checked, missed_fills_detected, late_fills_recovered,
-            error=f"BROKER_VERIFICATION_UNAVAILABLE: {exc}",
+            error=_with_dispatch_error(dispatch_error, f"BROKER_VERIFICATION_UNAVAILABLE: {exc}"),
         )
 
     try:
@@ -1022,10 +1077,15 @@ async def run_reconciliation(
     if projection_problems:
         projection_error = 'CANONICAL_ACCOUNTING_INCOMPLETE'
         await latch_financial_integrity_block(repositories, projection_error, clock=lambda: now)
-    active_holds = await paginate_all_rows(repositories.integrity_holds)
-    if active_holds:
+    # Rev.154 R154-05: the same count as valuation and the unlock proof. A
+    # SHORT_EXPOSURE hold whose exposure is fully resolved is released by
+    # reset-integrity in its own transaction, so it must not make the very
+    # reconciliation that reset requires report a hold.
+    from tradepulse.quarantine.release import active_hold_count
+    if await repositories.integrity_holds.database.run(active_hold_count):
         projection_error = projection_error or 'ACTIVE_INTEGRITY_HOLD'
+    error = dispatch_error or fee_error or projection_error
     return ReconciliationSummary(
-        "degraded" if fee_error or projection_error or accounting_drift_detected or missed_fills_detected else "ok", positions_checked, view_drift_corrected, accounting_drift_detected,
-        fills_checked, missed_fills_detected, late_fills_recovered, verification_holds_reverified, error=fee_error or projection_error,
+        "degraded" if error or accounting_drift_detected or missed_fills_detected else "ok", positions_checked, view_drift_corrected, accounting_drift_detected,
+        fills_checked, missed_fills_detected, late_fills_recovered, verification_holds_reverified, error=error,
     )

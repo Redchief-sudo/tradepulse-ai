@@ -577,11 +577,22 @@ class AlpacaClient:
         retries on its next cycle. One property remains assumed, because no
         response can show it: that the first page starts at the oldest open
         order."""
+        return await self._order_population()
+
+    async def get_order_history(self, since: datetime, *, page_evidence: list | None = None) -> list[AlpacaOrderResponse]:
+        """Complete all-status history; ambiguous timestamp boundaries fail closed."""
+        if since.tzinfo is None:
+            raise ValueError("order history requires an aware timestamp")
+        return await self._order_population(since=since, page_evidence=page_evidence)
+
+    async def _order_population(self, *, since: datetime | None = None,
+                                page_evidence: list | None = None) -> list[AlpacaOrderResponse]:
         orders: dict[str, AlpacaOrderResponse] = {}
-        after: datetime | None = None
+        after: datetime | None = None if since is None else since - timedelta(microseconds=1)
         boundary_ids: set[str] = set()
         while True:
-            params = {"status": "open", "nested": "false", "direction": "asc", "limit": str(OPEN_ORDERS_PAGE_LIMIT)}
+            params = {"status": "open" if since is None else "all", "nested": "false",
+                      "direction": "asc", "limit": str(OPEN_ORDERS_PAGE_LIMIT)}
             if after is not None:
                 params["after"] = after.isoformat()
             response = await self._request("GET", f"{self._trading_base}/orders", params=params)
@@ -631,6 +642,11 @@ class AlpacaClient:
                 raise AlpacaDataIntegrityError(
                     f"open orders continuation does not overlap the previous page (missing "
                     f"{', '.join(sorted(boundary_ids - page_ids))}); the population cannot be proven complete")
+            if page_evidence is not None:
+                page_evidence.append({"request": dict(params), "order_ids": sorted(page_ids),
+                                      "terminal": not full_page})
+            if since is not None and any(o.submitted_at is None for o in page):
+                raise AlpacaDataIntegrityError("order history contains an order without submitted_at")
             if not full_page:
                 break
             if latest is None:

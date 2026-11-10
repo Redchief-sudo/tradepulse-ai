@@ -320,7 +320,7 @@ At seal, the generation writes `handover.json` into its directory. It is include
   - the local fill ID, the broker fill (activity) ID and the broker order ID;
   - the asset, the fill time and the expected kind (USD CFEE for a crypto sell, FEE for a regulatory equity fee);
   - `origin_generation`. This is this generation, or the earlier one for a still-open fee inherited through a chain (§7.6).
-- **`watched_client_order_ids`** (rev. 6, REV151-02): each client order ID resolved by `resolve-dispatch` and still inside its 30-day watch, with its intent, `submitted_at`, its resolution digest and its origin generation (§8 step 7). The successor keeps watching it.
+- **`watched_client_order_ids`** (rev. 6, REV151-02): each client order ID resolved by `resolve-dispatch` and still inside its 30-day watch, with its intent, `dispatched_at`, its resolution digest and its origin generation (§8 step 7). The successor keeps watching it. Rev.154 stores the watch in `resolved_dispatch_watches`. Carrying it into the handover is still Rev.147 work.
 - **`protection`** (§7.5):
   - `monitoring_released_at`: when the monitor loop stopped, which is before the seal;
   - `next_session_open`: from the Rev.144 calendar;
@@ -687,14 +687,14 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
    - **`RISK_APPROVED`** (never POSTed, because the POST happens only after the `SUBMITTED` commit, step 1): the sweep may close it as `REJECTED` (`STRANDED_BEFORE_SUBMISSION`) without a broker lookup. This is unchanged in effect.
    - **`SUBMITTED` or `SUBMISSION_UNKNOWN`** (may have been POSTed):
      - **Order found:** it is adopted by client order ID, exactly as today.
-     - **404:** the intent becomes, or stays, `SUBMISSION_UNKNOWN`, with `last_absent_at` recorded. It is never made terminal. Its asset stays blocked, as for every `SUBMISSION_UNKNOWN` intent, and the sweep repeats the lookup every pass.
+     - **404:** the intent becomes, or stays, `SUBMISSION_UNKNOWN`. Each absence is recorded as drift, with one record and one critical alert per UTC day (Rev.154). It is never made terminal. Its asset stays blocked, as for every `SUBMISSION_UNKNOWN` intent, and the sweep repeats the lookup every pass.
      - **No time limit:** no timeout, grace period or horizon ever makes the intent terminal on its own.
-   - **The time base:** the `SUBMITTED` write sets the intent's `submitted_at`, which is the dispatch time. The sweep's grace period is measured from `submitted_at`, not from `created_at`.
+   - **The time base:** the `SUBMITTED` write sets the intent's `dispatched_at`, the local dispatch time. `submitted_at` stays the broker's acceptance time (Rev.154 R154-03). The sweep's grace period is measured from `dispatched_at`, not from `created_at`.
 
    **Operator resolution** is the only way to end an intent that stays absent. `tradepulse verification resolve-dispatch --intent <id> --reason "<text>"` is accepted only when all of these hold:
-   - **The horizon has passed:** at least `DISPATCH_FINALITY_MINUTES` since `submitted_at`. This is a precondition for the operator's action, never an automatic resolution. It is provisional, like `FEE_WAIT_MINUTES`.
+   - **The horizon has passed:** at least `DISPATCH_FINALITY_MINUTES` since `dispatched_at`. This is a precondition for the operator's action, never an automatic resolution. It is provisional, like `FEE_WAIT_MINUTES`.
    - **The lookup is still absent:** it runs again at the command and still returns 404.
-   - **No order and no fill in the window:** a complete, completeness-proven census of orders of every status, created from `submitted_at` less the clock-skew allowance up to now, contains no order matching the intent's client order ID or its asset, side and quantity. Also, no FILL activity on the asset in that window is uncited.
+   - **No order and no fill in the window:** a complete, completeness-proven census of orders of every status, created from `dispatched_at` less the clock-skew allowance (5 minutes in Rev.154) up to now, contains no order matching the intent's client order ID or its asset, side and quantity. Also, no FILL activity on the asset in that window is uncited.
 
    On success, the intent becomes `REJECTED` with `SUBMISSION_ABSENT_OPERATOR_RESOLVED`. It cites the census digests, the operator and the reason.
 
@@ -710,6 +710,8 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
    **In the wind-down,** an intent in this state keeps the wind-down out of `COMPLETE`, through the register (step 4). It is `BLOCKED` while the order may still arrive, with the existing escalation alert. Only the broker showing the order, or an operator resolution, moves it. It is never cleared to let the wind-down complete.
 
    **In the build:** this is a change to the existing sweep in `reconciliation/coordinator.py`, in its own commit with its own tests, separate from the wind-down. The stranded-intent blocker text (`blockers.py`) is updated to match.
+
+   **Implemented ahead of Rev.147 in Rev.154** (`docs/rev154-record.md`): the sweep rule, `resolve-dispatch`, the watch, and `--acknowledge-appearance`, which closes an appearance once the late order is terminal and its fills are accounted. Rev.147 still carries the watch across generations and ties it into the wind-down register.
 
 ## 9. Gates
 
@@ -848,7 +850,7 @@ All on the simulator, with no broker calls.
     - **Appears after resolution:** if the POST is released after an operator resolution, the watched ID appears. That gives `RESOLVED_DISPATCH_APPEARED`, a critical alert and an integrity hold, and the order is not adopted.
     - **In the successor:** the watch is carried in the handover, and an ID that appears in the successor gives the same result.
     - **Before the POST:** a `RISK_APPROVED` intent that never reached the `SUBMITTED` commit is closed as `STRANDED_BEFORE_SUBMISSION` without a broker lookup.
-    - **Time base:** the grace period counts from `submitted_at`. An intent created long before its dispatch is not swept early.
+    - **Time base:** the grace period counts from `dispatched_at`. An intent created long before its dispatch is not swept early.
   - **Protective exits:** a SELL at each of the same pauses is never barred.
 - **Generation registry (rev. 5, D01):**
   - **two fresh databases:** two fresh databases for one account. Freezing the second without `--predecessor` refuses with `predecessor_required`, and with a wrong one, `predecessor_not_latest`;
@@ -962,7 +964,7 @@ All on the simulator, with no broker calls.
     - the command `resolve-dispatch`;
     - the outcome `SUBMISSION_ABSENT_OPERATOR_RESOLVED`;
     - the alert and hold `RESOLVED_DISPATCH_APPEARED`;
-    - the handover field `watched_client_order_ids`, and the intent field `last_absent_at`;
+    - the handover field `watched_client_order_ids`, and the intent field `dispatched_at` (Rev.154; it replaces the proposed `last_absent_at`);
     - the provisional constant `DISPATCH_FINALITY_MINUTES`;
     - withdrawn: `BROKER_NEVER_RECEIVED`, so a 404 no longer ends a `SUBMISSION_UNKNOWN` intent;
   - reversal provenance (Q9): `predecessor_cash_reversal_unlinked`.

@@ -448,6 +448,39 @@ async def _run_bootstrap_fill_cursor(settings: Settings, reason: str) -> int:
         await broker.aclose()
 
 
+async def _run_resolve_dispatch(settings: Settings, intent_id: str, reason: str, *, acknowledge_appearance: bool = False) -> int:
+    """`tradepulse resolve-dispatch`: prove a sent order's absence and watch
+    it, or (--acknowledge-appearance) close a late appearance once its order
+    is terminal and every fill is accounted (Rev.154)."""
+    from tradepulse.reconciliation.dispatch import acknowledge_appearance as acknowledge
+    from tradepulse.reconciliation.dispatch import resolve_dispatch
+
+    _require_credentials(settings, require_ai=False)
+    database = AsyncSQLiteDatabase(settings.database_url)
+    await database.initialize()
+    repositories = PersistenceRepositories.create(database)
+    broker = _build_broker(settings)
+    stack = contextlib.ExitStack()
+    try:
+        lease = await _enter_account_lease(stack, broker, "tradepulse resolve-dispatch")
+        if lease is None:
+            return 1
+        with stack:
+            try:
+                if acknowledge_appearance:
+                    await acknowledge(repositories, broker, intent_id, reason, account_lease=lease)
+                else:
+                    await resolve_dispatch(repositories, broker, intent_id, reason, account_lease=lease)
+            except Exception as exc:  # noqa: BLE001 - incomplete broker/provider evidence always refuses closure
+                logger.error("resolve_dispatch_refused", extra={"event": "resolve_dispatch_refused", "reason": str(exc)})
+                return 1
+            event = "dispatch_appearance_acknowledged" if acknowledge_appearance else "dispatch_resolved"
+            logger.info(event, extra={"event": event, "trade_intent_id": intent_id})
+            return 0
+    finally:
+        await broker.aclose()
+
+
 async def _run_quarantine_resolve(settings: Settings, activity_id: str, reason: str) -> int:
     """`tradepulse quarantine resolve --activity --reason` (Rev.140 §3.7):
     resolves quarantined inventory from one verified broker execution. It
@@ -1246,6 +1279,12 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("stop", help="deactivate the trading session (never downgrades an active safety block)")
     subparsers.add_parser("status", help="report the current trading session state and exit")
     subparsers.add_parser("reset-risk", help="acknowledge and clear a RISK_STOPPED kill-switch (run start afterward to resume trading)")
+    dispatch_parser = subparsers.add_parser("resolve-dispatch", help="resolve an absent ambiguous dispatch with broker evidence")
+    dispatch_parser.add_argument("intent_id")
+    dispatch_parser.add_argument("--reason", required=True)
+    dispatch_parser.add_argument("--verification-generation", help="require the frozen official paper-verification generation")
+    dispatch_parser.add_argument("--acknowledge-appearance", action="store_true",
+                                 help="close a RESOLVED_DISPATCH_APPEARED incident: the late order must be terminal and every fill accounted")
     reset_integrity_parser = subparsers.add_parser(
         "reset-integrity", help="clear a FINANCIAL_INTEGRITY_BLOCKED session after a clean reconciliation pass (run start afterward to resume trading)"
     )
@@ -1408,6 +1447,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "reconcile" and generation is not None:
             return asyncio.run(run_official(settings, generation, lambda verification: _run_reconcile(settings),
                                             reconciliation_only=True))
+        if args.command == "resolve-dispatch":
+            if generation is not None:
+                return asyncio.run(run_official(
+                    settings, generation,
+                    lambda verification: _run_resolve_dispatch(settings, args.intent_id, args.reason,
+                                                               acknowledge_appearance=args.acknowledge_appearance),
+                    reconciliation_only=True,
+                ))
+            return asyncio.run(_run_resolve_dispatch(settings, args.intent_id, args.reason,
+                                                     acknowledge_appearance=args.acknowledge_appearance))
         if args.command == "quarantine":
             target = args.activity if args.action == "resolve" else args.lot_id
             if not args.reason.strip() or not target or (args.action == "resolve") == (args.lot_id is not None):

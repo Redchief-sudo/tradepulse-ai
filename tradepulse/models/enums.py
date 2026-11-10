@@ -57,6 +57,7 @@ class IntegrityHoldType(StrEnum):
     # Rev.140 §3.2: an oversell's broker order. Permanent until a verified
     # `quarantine resolve`; never re-verified away by reconciliation.
     SHORT_EXPOSURE = "short_exposure"
+    RESOLVED_DISPATCH_APPEARED = "resolved_dispatch_appeared"
     MIXED_LOT_ORIGIN = "mixed_lot_origin"  # Rev.142 §3.6.3
 
 
