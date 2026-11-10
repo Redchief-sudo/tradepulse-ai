@@ -89,11 +89,11 @@ The spec is split into four plans. Each ends with software that works and is tes
 - Produces, in `policy.py`:
   - the constants from Global Constraints;
   - `wind_down_policy(planned_end_at: datetime) -> dict[str, str]`, returning `{"planned_end_at", "lead_minutes", "crypto_sell_fee_wait_hours", "successor_start_margin_minutes", "fee_wait_minutes", "crypto_fee_rate"}`, all as strings;
-  - `validate_planned_end(planned_end_at: datetime, now: datetime, calendar: MarketCalendar) -> None`. It raises `VerificationError` with one of:
+  - `validate_planned_end(planned_end_at: datetime, now: datetime, calendar: MarketCalendar, *, calendar_verified: bool) -> None`. It raises `VerificationError` with one of:
     - `wind_down_end_not_aware`;
     - `wind_down_end_not_future`;
     - `wind_down_end_inside_session`: inside an XNYS session, or less than 15 min before an open;
-    - `wind_down_end_calendar_unverified`: `CalendarHorizonExceeded`, or no next session;
+    - `wind_down_end_calendar_unverified`: `CalendarHorizonExceeded`, no next session, or `calendar_verified` false;
     - `wind_down_end_fee_window_insufficient`: `planned_end_at` + 30 min + 8 h + 30 min is after the next session's open.
   - `next_session_open(calendar, t) -> datetime`: the first `Session.open` strictly after `t`.
   - `planned_end_at(manifest: dict) -> datetime`.
@@ -110,7 +110,11 @@ The spec is split into four plans. Each ends with software that works and is tes
       - Monday 00:30 ET exactly → **passes**;
       - Monday 00:31 ET → `wind_down_end_fee_window_insufficient`;
       - Sunday 2026-11-15, 23:00 ET → **passes**;
-    - a date past the library horizon → `wind_down_end_calendar_unverified`.
+    - Thanksgiving: Wednesday 2026-11-25, 16:30 ET → passes, with `next_session_open` = 2026-11-27 14:30 UTC (the holiday is skipped). Friday 2026-11-27, 13:30 ET, after the 13:00 early close → passes, not `inside_session`. 12:30 ET that day → `wind_down_end_inside_session`;
+    - daylight saving: Monday 2027-03-15, 00:30 EDT → passes (the open is 13:30 UTC). 00:31 EDT → `wind_down_end_fee_window_insufficient`;
+    - a date past the library horizon → `wind_down_end_calendar_unverified`;
+    - a stale broker cross-check (`CalendarGate.fresh` false) → `wind_down_end_calendar_unverified`.
+  - Note: `validate_planned_end` also takes `calendar_verified: bool`. Freeze passes `CalendarGate(...).fresh(checked_at, now)` from the Rev.144 broker cross-check.
   - `test_freeze_records_wind_down_policy`: the `generation` fixture's manifest has `policy["wind_down"] == wind_down_policy(end_at)`, and `check()["integrity_valid"]` is true.
   - `test_pre_wind_down_generation_is_refused`: following `test_dbae_activation.py::pre_dbae_generation`, monkeypatch `freeze_source` to drop `"wind_down"`. Then `check()["reason"] == "generation_predates_wind_down"`, and `invalid.json` is written.
   - `test_changed_constant_is_configuration_mismatch`: monkeypatch `policy.CRYPTO_SELL_FEE_WAIT_HOURS = 9` after the freeze. `check()["reason"] == "frozen_configuration_mismatch"`.

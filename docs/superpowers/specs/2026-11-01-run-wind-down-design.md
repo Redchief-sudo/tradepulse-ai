@@ -12,6 +12,10 @@
   - §7.6's linked-fee rule can never match a crypto fee, so every late one would need an operator `--resolve-fee`.
   - **Rev. 7:** the wind-down waits up to `CRYPTO_SELL_FEE_WAIT_HOURS = 8` for each of its crypto sells' USD fees before sealing, so in the normal case the fee posts inside its own generation. Freeze refuses a `planned_end_at` that leaves too little time before `next_session_open`.
   - **The amount** corroborates the fee; it never attributes it.
+- **Operator decisions on rev. 7 (2026-11-10):**
+  - **Q11 decided:** an unmatched crypto USD fee needs the operator's `--resolve-fee`. The exact amount cannot establish ownership on its own, because separate fills can produce identical rounded fees. The computed amount *validates* an operator attribution, and never makes one.
+  - **The 8-hour wait is a timeout, not proof of fee completeness.** When it expires, the run's fee accounting is explicitly `incomplete`: each missing fee is listed, and nothing describes the fees as complete.
+  - **The 9-hour rule** is checked against the authoritative next session: the Rev.144 calendar, with its broker cross-check fresh, and with holidays, early closes and daylight-saving changes tested explicitly.
 **Rev. 6 (2026-11-07):** answers the Rev.151 review of rev. 5 (REV151-01..03) and records the reviewer's decisions on open questions 7–9 (see `docs/rev147-rev6-review-response.md`).
 - **REV151-01, an abandoned head:** after `abandoned`, the effective head is the latest `sealed` or `genesis` entry before it. Abandon now needs broker proof, not only an empty intent table: no broker order after the generation's freeze, and no uncited FILL since the effective head. It also needs proof that the database is the frozen one and intact, and that the generation never took over protection. A database that is damaged or lost has a broker-only path. An abandoned generation can never run, freeze or seal again (§7.7).
 - **REV151-02, a delayed POST:** a not-found lookup by client order ID never ends an intent that may have been POSTed. Today the stranded sweep does exactly that after 120 s (`reconciliation/coordinator.py::_resolve_stranded`). This revision withdraws that rule, in the build and for every generation, not only during the wind-down:
@@ -204,15 +208,27 @@ Alpaca posts FEE and CFEE activities dated at midnight, after the fill (`broker/
 - **A crypto sell's USD fee** posted 4 h 16 min 42 s after its fill in the one measured case. It is waited for up to `CRYPTO_SELL_FEE_WAIT_HOURS = 8` after the wind-down's last crypto sell fill.
   - The fee then posts inside its own generation. The existing membership rules class it `in_generation`, and the existing exactly-once ledger records it as an `unallocated_account_fee`. No cross-generation attribution is needed.
   - **Provisional,** because the sample is one sell order. Each run's record states the measured delays, and the constant is revised when they say so.
-- **What the waits are:** they only decide how long the run waits before sealing with a fee still pending. They are not settlement boundaries, and they never declare fee accounting complete.
-- **Fitting the wait into the gap (freeze check):** `planned_end_at` + 30 min + `CRYPTO_SELL_FEE_WAIT_HOURS` + `SUCCESSOR_START_MARGIN_MINUTES` (30) must be no later than `next_session_open`. Otherwise freeze refuses with `wind_down_end_fee_window_insufficient`. For a weekday end at 16:30 ET, the next open is 17 hours away, so the check is met. An end on a Sunday evening before a Monday open is refused.
+- **What the waits are:** they only decide how long the run waits before sealing with a fee still pending. They are timeouts, not settlement boundaries, and they never declare fee accounting complete (operator decision, 2026-11-10).
+  - **An expired wait leaves an explicit unresolved state.** The handover and the run record carry `fee_accounting: "incomplete"`, listing each `pending_fee` with the reason `fee_wait_expired`. The run report says that fee accounting is incomplete. It never describes fee accounting as complete while a pending fee is open.
+  - **`fee_accounting` becomes `"complete"`** only when every pending fee is attributed (§7.6) or resolved (§7.3). That happens in the predecessor's `post_seal_adjustments`, and never by time.
+  - The inventory outcome (`COMPLETE` or `UNRESOLVED_ACCEPTED`) and `fee_accounting` are reported separately, so a proven inventory never implies proven fees.
+- **Fitting the wait into the gap (freeze check):** `planned_end_at` + 30 min + `CRYPTO_SELL_FEE_WAIT_HOURS` + `SUCCESSOR_START_MARGIN_MINUTES` (30) must be no later than `next_session_open`. That is 9 hours before the next open. Otherwise freeze refuses with `wind_down_end_fee_window_insufficient`.
+  - **The authoritative next session.** `next_session_open` is the first XNYS session open strictly after `planned_end_at`, from the Rev.144 calendar, with all times in UTC. A holiday is skipped (it has no session), and daylight-saving changes are absorbed by the UTC session times. An early close moves the session's close, and with it the "inside a session" test, but not the next open.
+  - **The broker must agree.** Freeze also requires the Rev.144 broker calendar cross-check (`CalendarGate`) to be fresh for the dates involved. Otherwise it refuses with `wind_down_end_calendar_unverified`.
+  - **Examples:**
+    - a weekday end at 16:30 ET leaves 17 hours, and passes;
+    - Monday 2026-11-16 at 00:31 ET is refused;
+    - an end on the Wednesday before Thanksgiving (2026-11-25, 16:30 ET) skips the holiday, so the next open is Friday's early-close session at 09:30 ET on 2026-11-27, and it passes;
+    - an end on Friday 2026-11-27 at 13:30 ET, after that early close at 13:00 ET, is outside the session, and passes;
+    - after the 2027-03-14 daylight-saving change, Monday 2027-03-15 at 00:30 EDT is exactly 9 hours before that day's 09:30 EDT open (13:30 UTC, an hour earlier in UTC than the week before), and passes. 00:31 EDT is refused.
 - **Corroboration, not attribution:** each wind-down crypto sell fill is checked against the USD CFEEs posted inside its wait.
   - The expected amount is −ceil_cent(quantity × price × the frozen crypto fee rate). The rate was 0.25% when measured, and it is frozen in the run's manifest.
   - Exactly one match records `fee_corroborated`. No match, or more than one, records `fee_amount_unmatched` with an alert.
   - Either way, the result is evidence in the run's record. Cash and P&L come from the fee activities themselves, never from this computation.
 - **Fee recognized in time:** recorded in the run's accounting as usual, through the existing exactly-once generation cash ledger. Its cash entry ID is `broker:fee:<activity_id>` (`reconciliation/generation_fees.py`).
 - **Fee not yet posted:** when a wait expires, the fee is recorded in the handover as a `pending_fee` (§7.1). It does not block `WIND_DOWN_COMPLETE`. It stays a durable predecessor obligation until it is attributed (§7.6) or resolved by the operator (§7.3). No timeout closes it.
-  - **A crypto USD fee can only be attributed by the operator.** G1 shows it carries no link, so §7.6's linked-fee rule never matches it, and the operator's `--resolve-fee` is the only way to attribute it. The run plan says this. The 8-hour wait exists so that the path is the exception.
+  - **A crypto USD fee can only be attributed by the operator** (Q11, decided 2026-11-10). G1 shows it carries no link, so §7.6's linked-fee rule never matches it, and `--resolve-fee` is the only way to attribute it. The run plan says this. The 8-hour wait exists so that the path is the exception.
+  - **The computed amount validates the attribution.** For a crypto sell's pending fee, `--resolve-fee` also requires the activity's `net_amount` to equal −ceil_cent(fill quantity × fill price × the frozen `crypto_fee_rate`). Otherwise it refuses with `fee_attribution_amount_mismatch`. The amount never selects the fill: the operator names the pending fee and the activity, and the command only checks them.
 
 **Correction to rev. 2.** Rev. 2 said a late fee would be attributed through `verification/soak.py::_late_fee_reopenings`. That is wrong: the function links a new fee to a superseded checkpoint *inside one generation*, and it does nothing once a generation is sealed. Today, a predecessor fee that reaches the successor after the successor's opening checkpoint, dated at midnight before it, is classed `unresolved_generation_membership` by `reconciliation/membership.py` (`new_receipt_predates_opening` or `before_opening_cursor_without_generation_link`). §7.6 defines the missing rule as one new membership class in that same classifier, not as a separate fee pipeline.
 
@@ -940,6 +956,9 @@ All on the simulator, with no broker calls.
   - **Amount mismatch:** an amount that differs by one cent, or two candidate matches, gives `fee_amount_unmatched` and an alert. Cash and P&L still come from the activity.
   - **Native-coin buy fee:** it is waited for within 15 minutes through the existing asset-fee path.
   - **Freeze:** a `planned_end_at` that leaves less than 30 min + 8 h + 30 min before `next_session_open` refuses with `wind_down_end_fee_window_insufficient`. A weekday 16:30 ET end passes.
+  - **Authoritative next session (rev. 7 decision):** the examples in §4.5 are each a test: Thanksgiving 2026 (Wednesday 16:30 ET passes, with the next open on Friday 2026-11-27, an early-close day; Friday 13:30 ET, after the 13:00 close, is outside the session), the daylight-saving change (Monday 2027-03-15 00:30 EDT passes and 00:31 EDT is refused), Monday 2026-11-16 00:30 versus 00:31 ET, and a stale broker cross-check refusing with `wind_down_end_calendar_unverified`.
+  - **Timeout, not completeness:** a wait that expires gives `fee_accounting: "incomplete"`, with each `pending_fee` marked `fee_wait_expired`, and the report says so. A later `--resolve-fee` for each one gives `"complete"` in `post_seal_adjustments`.
+  - **Amount validates an attribution:** `--resolve-fee` naming a crypto USD fee whose amount is one cent off the computed fee refuses with `fee_attribution_amount_mismatch`. Two fills with identical computed fees are never resolved automatically.
 - **Frozen policy:** `generation_predates_wind_down`, and `frozen_configuration_mismatch` on a changed `planned_end_at`.
 - **Property tests:**
   - over random sequences of fills, rejections, timeouts, outages and crashes, check that:
@@ -999,7 +1018,13 @@ All on the simulator, with no broker calls.
     - the provisional constant `DISPATCH_FINALITY_MINUTES`;
     - withdrawn: `BROKER_NEVER_RECEIVED`, so a 404 no longer ends a `SUBMISSION_UNKNOWN` intent;
   - reversal provenance (Q9): `predecessor_cash_reversal_unlinked`.
-- New strings in rev. 7: the constants `CRYPTO_SELL_FEE_WAIT_HOURS` and `SUCCESSOR_START_MARGIN_MINUTES`; the freeze refusal `wind_down_end_fee_window_insufficient`; the evidence results `fee_corroborated` and `fee_amount_unmatched`; the manifest field `crypto_fee_rate`.
+- New strings in rev. 7:
+  - the constants `CRYPTO_SELL_FEE_WAIT_HOURS` and `SUCCESSOR_START_MARGIN_MINUTES`;
+  - the freeze refusal `wind_down_end_fee_window_insufficient`;
+  - the evidence results `fee_corroborated` and `fee_amount_unmatched`;
+  - the manifest field `crypto_fee_rate`;
+  - the handover and record field `fee_accounting` (`complete` or `incomplete`), and the pending-fee reason `fee_wait_expired`;
+  - the amendment refusal `fee_attribution_amount_mismatch`.
 - **Operational restriction (rev. 6, Q7):** one broker account is operated by TradePulse from exactly one machine, and nobody trades it by hand during a run or between generations. The run plan and `docs/operations-runbook.md` state this as a precondition of every run. The registry, the lease and broker corroboration all assume it, and none of them enforces it.
 - The build happens on its own branch and worktree, after Rev.146 is merged. Nothing is merged without review and the operator's approval.
 
@@ -1015,4 +1040,4 @@ All on the simulator, with no broker calls.
 8. ~~§7.5.1 (`mark_unverified`).~~ Accepted with a clarification (2026-11-07): stale marks never drive a price-dependent decision. Applied in rev. 6 (§7.5.1, REV151-03).
 9. ~~§7.6 (reversal credits).~~ Accepted with provenance conditions (2026-11-07). A credit is bridged automatically only when it is linked to an attributed original fee, its raw digest verifies, and it is recorded once. An unlinked or ambiguous credit stays unresolved. The alert is mandatory either way. Applied in rev. 6 (§7.6).
 10. **§8 step 7 (`DISPATCH_FINALITY_MINUTES`, rev. 6):** the horizon after which an operator may resolve a dispatch the broker still does not show. It gates the operator's action and never resolves anything on its own. The proposed value is 15 minutes, provisional. Does the reviewer want a longer horizon, or a second lookup through the order census before the command is allowed?
-11. **§4.5 and §7.6 (crypto USD fees, rev. 7):** G1 shows Alpaca gives a crypto USD fee no broker link. Rev. 7 avoids attributing it across generations by waiting for it inside its own generation, and uses its computed amount as corroboration only. When the wait expires, should the fee still need the operator's `--resolve-fee`, as now? Or would the reviewer accept automatic attribution when exactly one pending crypto sell fill matches the computed amount, under the frozen rate and rounding, within 24 hours? That would be a deliberate exception to "never by amount", so rev. 7 does not adopt it.
+11. ~~§4.5 and §7.6 (crypto USD fees).~~ Decided by the operator (2026-11-10): manual `--resolve-fee` whenever attribution is not proven by broker identity. The exact amount cannot establish ownership, because separate fills can produce identical rounded fees. The computed amount only validates an operator attribution (`fee_attribution_amount_mismatch`). The reviewer is asked to confirm.
