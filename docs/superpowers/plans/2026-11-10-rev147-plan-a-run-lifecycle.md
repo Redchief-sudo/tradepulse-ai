@@ -12,7 +12,7 @@
 
 **Tech Stack:** Python 3.12, SQLite through `AsyncSQLiteDatabase`, pytest with asyncio auto mode, the Rev.144 `MarketCalendar`, and `SimulatedBroker`.
 
-**Spec:** `docs/superpowers/specs/2026-11-01-run-wind-down-design.md`, rev. 9: §3.1–§3.4, §4.5 freeze check, §6.1, §6.2, §8, and the strings in §11.
+**Spec:** `docs/superpowers/specs/2026-11-01-run-wind-down-design.md`, rev. 10: §3.1–§3.4, §4.5 freeze check, §6.1, §6.2, §8, and the strings in §11.
 
 ## Rev.147 plan roadmap
 
@@ -131,7 +131,12 @@ The spec is split into four plans. Each ends with software that works and is tes
     - (c) the broker agrees, but its response stops one day before the next open's date (short coverage);
     - (d) the broker reports a session on Thanksgiving Day.
   - `test_calendar_evidence_is_frozen_not_stored`: after the freeze, `manifest["policy"]["wind_down"]["calendar_evidence"]["rows"]` covers every date from the planned end through the next open, all `agreed`. The `calendar_check_*` tables are empty.
-  - `test_freeze_on_a_weekend_or_holiday` (REV157-03): freeze with `now` = Sunday 2026-11-15 12:00 ET and an end on Monday 2026-11-16 at 16:30 ET passes, with the request starting on Friday 2026-11-13. Freeze with `now` = Thursday 2026-11-26 (Thanksgiving) and an end on Friday 2026-11-27 at 13:30 ET passes. In both, the evidence rows cover every date from the end through the next open, all `agreed`.
+  - `test_freeze_on_a_weekend_or_holiday` (REV157-03; expectations corrected for REV158). `range_start` is the last session on or before the **end date**, so:
+    - `now` = Sunday 2026-11-15 12:00 ET, end Monday 2026-11-16 16:30 ET: passes, `range_start == date(2026, 11, 16)`;
+    - **end on a Sunday** (the original gap): end Sunday 2026-11-15 23:00 ET: passes, `range_start == date(2026, 11, 13)`, rows for 2026-11-15 and 2026-11-16;
+    - **end on a holiday:** end Thursday 2026-11-26 20:00 ET: `range_start == date(2026, 11, 25)`;
+    - `now` = Thursday 2026-11-26, end Friday 2026-11-27 13:30 ET: passes, `range_start == date(2026, 11, 27)`.
+    - In each, the evidence rows cover every date from the end through the next open, all `agreed`, and the simulator records the `get_calendar` call with exactly that start.
   - `test_valid_planned_end_skips_holidays`: from `now` = Wednesday 2026-11-25 17:00 ET, the helper returns Friday 2026-11-27's 13:00 early close plus 30 min, never Thursday.
   - `test_freeze_records_wind_down_policy`: the `generation` fixture's manifest has `policy["wind_down"] == wind_down_policy(end_at)`, and `check()["integrity_valid"]` is true.
   - `test_pre_wind_down_generation_is_refused`: following `test_dbae_activation.py::pre_dbae_generation`, monkeypatch `freeze_source` to drop `"wind_down"`. Then `check()["reason"] == "generation_predates_wind_down"`, and `invalid.json` is written.
@@ -145,7 +150,7 @@ The spec is split into four plans. Each ends with software that works and is tes
 ### Task 3: Entries refused by run state, in the fenced approval
 
 **Files:**
-- Modify: `tradepulse/persistence/repositories.py`. Add `update(..., connection_precondition: Callable[[sqlite3.Connection], Sequence[str]] | None = None)`. It runs after `_check_lease` and `_check_precondition`, inside the same transaction, and raises `RepositoryPreconditionError(reasons)` on any reason.
+- Modify: `tradepulse/persistence/repositories.py`. Add `update(..., connection_precondition: Callable[[sqlite3.Connection, datetime], Sequence[str]] | None = None, clock: Callable[[], datetime] | None = None)`. `connection_precondition` requires `clock` (a `ValueError` otherwise). It runs after `_check_lease` and `_check_precondition`, inside the same transaction, and raises `RepositoryPreconditionError(reasons)` on any reason.
 - Modify: `tradepulse/winddown/state.py`. Add `entry_refusals(connection, generation: str | None, deadline: datetime | None, at: datetime) -> list[str]`. `at` is the **one** decision time the caller sampled inside its transaction (REV157-02). This function never reads a clock.
   - It returns `[]` for `None` (no generation bound), or for `RUNNING` with `at < deadline`.
   - `["RUN_PAUSED"]` for `PAUSED`.
@@ -157,7 +162,7 @@ The spec is split into four plans. Each ends with software that works and is tes
 
 **Interfaces:**
 - Consumes: Task 1's `append_event` and `run_state`.
-- Produces: `entry_refusals` as above, and the `connection_precondition` hook on `update`.
+- Produces: `entry_refusals` as above, and the `connection_precondition: Callable[[sqlite3.Connection, datetime], Sequence[str]]` hook on `update`, with its `clock` argument.
 
 - [ ] **Step 1: Write the failing tests.** They use the `test_dbae_gateway.py` rig (`_rig`, `_buy`, `open_market_calendar`), with `generation="g1"` passed to the gateway.
   - `test_paused_run_refuses_a_buy`: append `run_paused`. Execute a BUY. The result is `rejected` with `["RUN_PAUSED"]`, the simulator received no order, and the intent is `REJECTED`.
@@ -258,16 +263,13 @@ The spec is split into four plans. Each ends with software that works and is tes
   - `PAUSED`: nothing is written.
 
   It returns the resulting state.
-- Produces: `def decide_phase(state: RunState) -> Literal["wind_down", "resume_checks"]`, which is pure.
-  - It returns `"wind_down"` when `now >= planned_end − lead` (appending `WIND_DOWN_REQUESTED` if it is absent), or when the state is `WINDING_DOWN`.
-  - Otherwise it returns `"resume_checks"`.
-  - After the existing checks pass, `run_resumed` is appended (refused if the state is `WINDING_DOWN`), and only then do scan lanes start.
+- Produces: `def decide_phase(state: RunState) -> Literal["wind_down", "resume_checks"]`. It is pure: no clock, no deadline, no writes. It returns `"wind_down"` when `state` is `WINDING_DOWN`, and `"resume_checks"` otherwise (`PAUSED`). The deadline and `end-run` were already turned into `WINDING_DOWN` by `enter_durable_state`, which owns every startup write.
 - Startup order (REV157-04):
   1. load the policy and events;
   2. `enter_durable_state`;
   3. the existing startup reconciliation (`_run_reconcile`);
   4. `decide_phase`;
-  5. on `"resume_checks"`: `verification.check`, `runtime_started` (broker identity), and the reconciliation outcome. Any failure leaves the durable `PAUSED`, returns 1, and starts no scan lane. On success, `run_resumed`.
+  5. on `"resume_checks"`: `verification.check`, `runtime_started` (broker identity), and the reconciliation outcome. Any failure leaves the durable `PAUSED`, returns 1, and starts no scan lane. On success, `run_resumed` is appended (a transition write, refused if the state has become `WINDING_DOWN`), and only then do scan lanes start.
 
 - [ ] **Step 1: Write the failing tests.**
   - `test_crash_without_event_resumes_only_after_checks`: no events, every check passes. The events are exactly `run_paused` (`startup_recovery`), then `run_resumed`, and scan lanes start after the second.
@@ -276,7 +278,8 @@ The spec is split into four plans. Each ends with software that works and is tes
   - `test_reconciliation_failure_after_the_deadline_leaves_wind_down`: `now` is past the deadline, with no events, and `_run_reconcile` raises. A fresh connection reads `WINDING_DOWN`, with `WIND_DOWN_REQUESTED` recorded before the reconciliation call. The recorded call order proves it.
   - `test_startup_recovery_rejects_a_stale_approved_buy`: a `risk_approved` BUY left by the crash is `REJECTED` (`RUN_PAUSED`) by the `startup_recovery` transition.
   - `test_paused_resume_refused_by_identity_change`: the broker reports another account. The state stays `PAUSED`, the result is 1, and no scan lane is started.
-  - `test_restart_after_lead_enters_wind_down`: `now = planned_end − 10 min`. `"wind_down"`, `WIND_DOWN_REQUESTED` appended, and no scan lane.
+  - `test_restart_after_lead_enters_wind_down`: `now = planned_end − 10 min`. `enter_durable_state` appends `WIND_DOWN_REQUESTED`, `decide_phase` returns `"wind_down"`, and no scan lane starts.
+  - `test_decide_phase_is_pure`: `decide_phase(WINDING_DOWN) == "wind_down"` and `decide_phase(PAUSED) == "resume_checks"`, with no database and no clock passed.
   - `test_restart_with_end_run_requested_enters_wind_down` (Review Focus 2).
 - [ ] **Step 2: Run them, and confirm they fail.**
 - [ ] **Step 3: Implement.**

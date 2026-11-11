@@ -1,6 +1,9 @@
 # Rev.147 — Verification run wind-down and generation handover
 
-**Status:** design, rev. 9, for forensic approval. No production code changes and no orders until the spec is approved.
+**Status:** design, rev. 10, for forensic approval. No production code changes and no orders until the spec is approved.
+**Rev. 10 (2026-11-10):** answers the rev.158 review (REV158-01..02 and three Plan A consistency edits).
+- **REV158-01, exactly-once cash representation.** The account-wide check counts cash *representations*, not ledger entries. A fee activity is represented either by exactly one ledger movement, in the generation whose window contains its posting, or, when it posted between generations, by evidence that the successor's opening cash already includes it, with no movement anywhere. No ledger debit is ever written to satisfy the count. The between-generations case is a test (§4.5.1, §7.6.1).
+- **REV158-02, incremental P&L adjustment.** An attribution record carries the fee's `fee_amount` and, separately, its `pnl_adjustment`, the change it makes to the origin's result. For `origin_booked` the adjustment is zero, because the sealed result already contains the fee. The adjusted result is the sealed result + Σ `pnl_adjustment`. The test asserts each adjustment, not only the total (§7.6, §7.6.1).
 **Rev. 9 (2026-11-10):** answers the rev.157 review (REV157-01..04).
 - **REV157-01, cash treatment.** Cash treatment is decided at resolution, from the actual activity named, its generation membership and the existing ledger entries. It is never decided from candidates. Every open obligation is carried forward in one list, whatever its candidates. There are four cash cases, each exactly once, and a two-generation test checks cash and P&L (§4.5.1, §7.6.1).
 - **REV157-02, one decision time.** Inside the dispatch transaction, one timestamp drives both the refusal and the deadline transition. An intent the transition rejected can never be written `SUBMITTED`. The test proves the clock is read while the transaction holds SQLite's write lock (§8 step 1).
@@ -277,9 +280,12 @@ Alpaca posts FEE and CFEE activities dated at midnight, after the fill (`broker/
   2. **`successor_opening`:** the activity is in a successor's opening population (`pre_generation`). Its cash is already in that successor's opening cash. The resolution is attribution only.
   3. **`successor_reclassified`:** the activity was booked in a successor as that successor's own fee (`broker:fee:<id>`, classed `in_generation` there, because it carried no link). No new cash entry is written. The successor writes `generation_predecessor_cash:<id>` with kind `reclassified_fee`, citing the existing cash entry. From then on the successor's equity, P&L and fee totals exclude it as `excluded_predecessor_cash`.
   4. **`successor_bridged`:** the activity is in a successor but not booked there (`unresolved_generation_membership`). It is classified `predecessor_obligation`, and the §7.6.1 bridge writes exactly one `broker:predecessor_cash:<id>` cash entry.
-- **Exactly once,** checked across the account's generations (`fee_cash_not_exactly_once` otherwise):
-  - each fee activity ID has exactly one cash ledger entry, either `broker:fee:<id>` or `broker:predecessor_cash:<id>`, never both, and never one in two generations;
-  - each fee has exactly one P&L owner: the origin generation's adjusted result after resolution, or the generation that booked it before resolution.
+- **Exactly once (corrected in rev. 10, REV158-01),** checked across the account's generations (`fee_cash_not_exactly_once` otherwise). The check counts cash *representations*, not ledger entries. Each fee activity has exactly one, of one of two kinds:
+  - **a ledger movement:** the activity posted inside a generation's window (from its opening checkpoint to its seal). That generation's ledger holds exactly one movement for it, `broker:fee:<id>` or `broker:predecessor_cash:<id>`, never both, and no other generation's ledger holds one;
+  - **opening cash:** the activity posted between generations (after the predecessor's seal and before the successor's opening checkpoint). No ledger anywhere holds a movement for it. The evidence is the successor's opening population: it lists the activity as `pre_generation`, and the opening cash snapshot was taken after the activity's posting time. That snapshot already includes the debit.
+  - Later generations' opening cash carries every earlier debit forward. That is not a second representation, and the check does not count it.
+  - No ledger debit is ever written to make the count come out. An activity with zero movements and no opening-cash evidence, or with a movement and opening-cash evidence from the same successor, fails the check.
+  - Each fee also has exactly one P&L owner: the origin generation's adjusted result after resolution, or the generation that booked it before resolution. A fee represented only by opening cash has no P&L owner until it is resolved, because no generation booked it.
 - The inventory outcome is reported separately from `fee_accounting`.
 
 **Fee not yet posted:** when a wait expires, the fee is recorded in the handover as a `pending_fee` (§7.1). It does not block `WIND_DOWN_COMPLETE`. It stays a durable predecessor obligation until it is attributed (§7.6) or resolved by the operator (§7.3). No timeout closes it.
@@ -621,7 +627,8 @@ Rev. 4 refused the whole startup instead. That would leave every carried positio
 - the activity ID and the SHA-256 of the raw activity;
 - the `pending_fee_id`;
 - the observing generation;
-- the time.
+- the time;
+- (rev. 10, REV158-02) `fee_amount`, the activity's signed `net_amount`, and `pnl_adjustment`, the change the record makes to the origin's result. They are separate fields. `pnl_adjustment` is `0` when the sealed result already contains the fee (`cash_treatment: origin_booked`). It equals `fee_amount` for every other treatment, because the fee is then absent from the sealed result. A `fee_correction` record carries the same two fields.
 
 The successor database keeps a mirroring reconciliation record. The predecessor's reports show the sealed figures, plus a separate `post_seal_adjustments` section built from these records. A sealed figure is never recomputed in place.
 
@@ -696,7 +703,8 @@ The successor database keeps a mirroring reconciliation record. The predecessor'
   - **`in_generation` of the successor:** it is booked as the successor's own fee until resolved. Resolution gives `successor_reclassified`: no new cash entry, and from then on it is excluded from the successor's P&L (§4.5.1).
   - Either way, the activity has one cash entry and one P&L owner at every moment.
 
-**The predecessor side.** The sealed figures never change. `post_seal_adjustments` lists each attributed amount, and the predecessor's adjusted result is the sealed result + Σ adjustments. The fee is in the predecessor's adjusted result once, and in the successor's P&L never. Both generations' cash bridges reconcile.
+**The predecessor side (corrected in rev. 10, REV158-02).** The sealed figures never change. `post_seal_adjustments` lists each attribution with both its `fee_amount` and its `pnl_adjustment`. The predecessor's adjusted result is the sealed result + Σ `pnl_adjustment`, never + Σ `fee_amount`. An `origin_booked` fee is already in the sealed result, so its adjustment is 0; any other attributed fee is applied once, through its adjustment. The fee is in the predecessor's adjusted result once, and in the successor's P&L never. Both generations' cash bridges reconcile.
+- **Worked example:** the sealed fees are −$3.54 (A1). The records are A1 (`origin_booked`, `fee_amount` −3.54, `pnl_adjustment` 0) and A2 (`successor_reclassified`, −3.54, −3.54). The adjusted result is sealed − $3.54, so the total fees are −$7.08, not −$10.62.
 
 ### 7.7 The generation registry (rev. 5, D01)
 
@@ -1025,25 +1033,34 @@ All on the simulator, with no broker calls.
   - **USD fee inside the wait (rev. 8):** a wind-down crypto sell's USD CFEE posts at about 4 h 17 min, within the 8-hour wait.
     - Its cash is booked once, `in_generation`, as an `unallocated_account_fee`, and the cash invariant is `matched`.
     - The fill's obligation stays `open`, with the activity as its candidate, and the handover lists it in `pending_fees` with `fee_accounting: "incomplete"`.
-    - After `--resolve-fee` it is `closed` with `cash_treatment: origin_booked`, and `fee_accounting` is `"complete"` in `post_seal_adjustments`, with no new cash entry.
+    - After `--resolve-fee` it is `closed` with `cash_treatment: origin_booked`, and `fee_accounting` is `"complete"` in `post_seal_adjustments`, with no new cash entry. The record has `fee_amount` = the activity's amount and `pnl_adjustment` = 0, and the adjusted result equals the sealed result (REV158-02).
   - **Two equal expected fees, one activity (REV156-01):** two fills whose expected fees both round to $3.54, with one $3.54 CFEE posted. Both obligations stay `open`, and both list the activity. Resolving the first succeeds. Resolving the second with the same activity refuses with `fee_activity_already_attributed`.
   - **Unrelated or predecessor fee of equal amount:** a $3.54 fee from another fill, or attributed to a predecessor, is a candidate at most. It never closes the obligation, and it is shown `already_attributed` where that applies.
   - **Repeated reconciliation:** ten passes over the same rows give identical obligations and candidates. No activity closes more than one obligation, and the cash ledger has one entry per activity.
   - **Two generations, exactly once (rev. 9, REV157-01).** G1 has two wind-down fills, each expecting $3.54. Activity A1 ($3.54) posts before G1 seals and is booked in G1. Both obligations are carried in G1's `pending_fees`, and both list A1. G2 is frozen and opens. Activity A2 ($3.54) posts after G2's opening, once with each membership:
     - **(a) `in_generation` of G2:** resolving O1 ← A1 gives `origin_booked`. Resolving O2 ← A2 gives `successor_reclassified`. **Checks:**
       - each of A1 and A2 has exactly one cash entry, account-wide;
-      - G1's adjusted P&L includes −$7.08 once;
+      - G1's adjusted P&L includes −$7.08 once. Asserted per record (REV158-02): A1 has `fee_amount` −3.54 and `pnl_adjustment` 0; A2 has −3.54 and −3.54; Σ `pnl_adjustment` = −3.54; the adjusted result is the sealed result − $3.54, not − $10.62;
       - G2's P&L includes neither, after resolution, with `excluded_predecessor_cash` = −$3.54;
       - both generations' cash invariants are `matched` before and after resolution;
       - before resolution, A2 is in G2's P&L once and in G1's never.
-    - **(b) `unresolved_generation_membership` in G2:** resolving O2 ← A2 gives `successor_bridged`, with one `broker:predecessor_cash:A2` entry and no `broker:fee:A2`, and the same P&L totals.
-    - **(c) A2 in G2's opening population:** `successor_opening`, with no cash entry written.
+    - **(b) `unresolved_generation_membership` in G2:** resolving O2 ← A2 gives `successor_bridged`, with one `broker:predecessor_cash:A2` entry and no `broker:fee:A2`, and the same P&L totals and per-record adjustments.
+    - **(c) A2 posts between generations (REV158-01):** A2 posts after G1's seal and before G2's opening checkpoint. G2's opening population lists it as `pre_generation`, and G2's opening cash includes the −$3.54. Resolving O2 ← A2 gives `successor_opening`. **Checks:**
+      - no ledger in G1 or G2 holds a movement for A2, and none is written by the resolution;
+      - the exactly-once check passes for A2 on the opening-cash evidence, and for A1 on its one G1 movement;
+      - A2's record has `fee_amount` −3.54 and `pnl_adjustment` −3.54, and G1's adjusted result is sealed − $3.54;
+      - both cash invariants are `matched` before and after resolution;
+      - **negative:** with a `broker:fee:A2` movement injected into G2's ledger as well, the check fails with `fee_cash_not_exactly_once`. With A2 removed from G2's opening population and no movement anywhere, it also fails.
     - **In every variant:** resolving O2 ← A1 refuses with `fee_activity_already_attributed`, and the exactly-once check passes.
   - **USD fee after the wait:** with the USD CFEE delayed past 8 h, the seal proceeds with a `pending_fee`. In the successor the fee is unlinked, and it is held until `--resolve-fee`.
   - **Amount mismatch:** an obligation with no candidate inside the wait is a `pending_fee` (`fee_wait_expired`). `--resolve-fee` naming an activity one cent off refuses with `fee_attribution_amount_mismatch`. Cash and P&L come from the activities only.
   - **Native-coin buy fee:** it is waited for within 15 minutes through the existing asset-fee path.
   - **Freeze:** a `planned_end_at` that leaves less than 30 min + 8 h + 30 min before `next_session_open` refuses with `wind_down_end_fee_window_insufficient`. A weekday 16:30 ET end passes.
-  - **Calendar coverage (rev. 9, REV157-03):** freeze with `now` = Sunday 2026-11-15 and an end on Monday 2026-11-16 at 16:30 ET passes. So does freeze with `now` = Thanksgiving, 2026-11-26, and an end on Friday 2026-11-27 at 13:30 ET. The request starts at the last session on or before the end date, and each covered date is `agreed`.
+  - **Calendar coverage (rev. 9, REV157-03; expectations corrected in rev. 10):** the request starts at the last session on or before the end date, and each covered date is `agreed`.
+    - `now` = Sunday 2026-11-15, end Monday 2026-11-16 16:30 ET: passes, with the request starting on Monday 2026-11-16;
+    - **the end itself on a Sunday:** end Sunday 2026-11-15 23:00 ET: passes, with the request starting on Friday 2026-11-13, and rows for Sunday 11-15 and Monday 11-16;
+    - **the end on a holiday:** end Thanksgiving, Thursday 2026-11-26 20:00 ET: the request starts on Wednesday 2026-11-25;
+    - `now` = Thanksgiving, end Friday 2026-11-27 13:30 ET: passes, with the request starting on Friday 2026-11-27.
   - **Authoritative next session (rev. 7 decision):** the examples in §4.5 are each a test: Thanksgiving 2026 (Wednesday 16:30 ET passes, with the next open on Friday 2026-11-27, an early-close day; Friday 13:30 ET, after the 13:00 close, is outside the session), the daylight-saving change (Monday 2027-03-15 00:30 EDT passes and 00:31 EDT is refused), Monday 2026-11-16 00:30 versus 00:31 ET, and refusals with `wind_down_end_calendar_unverified`:
     - a fetch that fails;
     - a broker response that is `contested` for any date in the range;
@@ -1109,6 +1126,7 @@ All on the simulator, with no broker calls.
     - the provisional constant `DISPATCH_FINALITY_MINUTES`;
     - withdrawn: `BROKER_NEVER_RECEIVED`, so a 404 no longer ends a `SUBMISSION_UNKNOWN` intent;
   - reversal provenance (Q9): `predecessor_cash_reversal_unlinked`.
+- New strings in rev. 10: the attribution fields `fee_amount` and `pnl_adjustment`.
 - New strings in rev. 9:
   - the attribution field `cash_treatment`, with values `origin_booked`, `successor_opening`, `successor_reclassified` and `successor_bridged`;
   - the bridge kind `reclassified_fee`;
